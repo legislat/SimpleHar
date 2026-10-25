@@ -40,6 +40,7 @@ fn boot_config() -> Result<AppConfig, Vec<ConfigError>> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let boot_started = std::time::Instant::now();
     observability::init();
     // A10 single-instance guard (§0.2 step 3): a second harness refuses to boot.
     let _guard = match SingleInstanceGuard::acquire() {
@@ -58,6 +59,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let config_ms = boot_started.elapsed().as_millis() as u64;
     let mut adapters = std::collections::BTreeMap::new();
     let mock: Arc<dyn EngineAdapter> = Arc::new(MockAdapter);
     adapters.insert("mock".to_string(), mock);
@@ -76,12 +78,19 @@ async fn main() -> ExitCode {
         runtime,
         Arc::clone(&witness),
     );
+    let scan_ms = boot_started.elapsed().as_millis() as u64;
     let listeners = simplehar_se::listeners::ListenerRegistry::new();
+    let boot = simplehar_se::api::BootTimings {
+        config_ms,
+        scan_ms,
+        ..simplehar_se::api::BootTimings::default()
+    };
     let state = Arc::new(ApiState::new(
         config.clone(),
         scheduler.clone(),
         listeners.clone(),
         witness,
+        boot,
     ));
 
     // One shutdown channel for every exit path: Ctrl+C and the tray's Exit item
@@ -98,7 +107,7 @@ async fn main() -> ExitCode {
         );
     }
 
-    match run(state, shutdown_rx).await {
+    match run(state, shutdown_rx, boot_started).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = %error, "harness stopped with an error");
@@ -149,6 +158,7 @@ async fn supervise_listener(
 async fn run(
     state: Arc<ApiState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    boot_started: std::time::Instant,
 ) -> anyhow::Result<()> {
     tracing::info!(
         control = %state.control_addr,
@@ -162,6 +172,34 @@ async fn run(
             category,
             listeners.clone(),
         )));
+    }
+    // §0.2 "ready": every listener is Serving or Down. Wait (bounded) for the
+    // supervisors' first verdict, then record the boot measures.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = state.listeners.snapshot();
+        if snapshot.len() >= state.config.categories.len()
+            || tokio::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    {
+        let all = state.listeners.snapshot();
+        state
+            .boot
+            .write()
+            .expect("boot timings lock poisoned by a writer panic")
+            .set_bound(boot_started.elapsed().as_millis() as u64);
+        tracing::info!(
+            bind_ms = boot_started.elapsed().as_millis() as u64,
+            serving = all
+                .values()
+                .filter(|s| matches!(s, simplehar_se::listeners::ListenerState::Serving))
+                .count(),
+            "boot ready (0.2): config validated, catalog scanned, listeners resolved"
+        );
     }
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},

@@ -36,6 +36,8 @@ use tokio::task::JoinHandle;
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// Pause between G12 release-evidence polls while inside the release deadline.
 const RELEASE_POLL: Duration = Duration::from_millis(50);
+/// Idle sweep cadence (Step 5): thresholds are seconds, so a 2 s tick is ample.
+const IDLE_TICK: Duration = Duration::from_secs(2);
 
 /// Failures reported to swap/unload/cancel callers, with the numbers used (G13).
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -140,6 +142,8 @@ pub struct SlotStatus {
     pub port: Option<u16>,
     /// Admission cost of the occupant in GiB.
     pub need_gib: Option<f64>,
+    /// Seconds since the occupant was last used (None when empty; Step 5).
+    pub idle_s: Option<u64>,
     /// Job currently running for this slot, if any.
     pub loading_job: Option<JobId>,
 }
@@ -231,6 +235,15 @@ impl SchedulerHandle {
         self.call(Command::Unload { category }).await
     }
 
+    /// Records a use of `model` (fire-and-forget): the proxy paths call this on
+    /// every request so the actor's idle check measures real activity (Step 5).
+    /// A dropped actor makes this a no-op.
+    pub fn touch(&self, model: &str) {
+        let _ = self.tx.send(ActorMsg::Touch {
+            model: model.to_string(),
+        });
+    }
+
     /// Re-scans `ModelConf` (hot reload, Step 9): the catalog and its error report
     /// refresh atomically from the actor's single writer.
     ///
@@ -312,6 +325,19 @@ impl Scheduler {
             },
             rx,
         ));
+        // Idle sweep tick (Step 5): cheap actor-side scan into the same queue, so
+        // the single-writer rule holds.
+        let tick_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(IDLE_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if tick_tx.send(ActorMsg::Tick).is_err() {
+                    return;
+                }
+            }
+        });
         SchedulerHandle { tx, events }
     }
 }
@@ -321,6 +347,12 @@ enum ActorMsg {
         cmd: Command,
         reply: Waiter,
     },
+    /// Last-use hint from the proxy paths (fire-and-forget; feeds the idle check).
+    Touch {
+        model: String,
+    },
+    /// Periodic sweep from the tick task: idles out occupants per category policy.
+    Tick,
     Event {
         job: JobId,
         event: Event,
@@ -409,6 +441,8 @@ struct Job {
     victims_released: Vec<String>,
     /// Ledger cost freed by confirmed releases so far (Step 6 minimality check).
     released_cost: f64,
+    /// Outcome wording for unload jobs ("unloaded" / "idle timeout").
+    note: Option<String>,
     slot: Option<usize>,
 }
 
@@ -430,6 +464,8 @@ struct ActorState {
     tx: mpsc::UnboundedSender<ActorMsg>,
     slots: Vec<Slot>,
     jobs: BTreeMap<JobId, Job>,
+    /// Last proxy-side use per model (idle sweep input, Step 5).
+    last_used: HashMap<String, Instant>,
     pending: HashMap<usize, PendingSwap>,
     next_job: u64,
     next_gen: u64,
@@ -457,10 +493,24 @@ fn parse_settle_numbers(numbers: &str) -> (f64, f64) {
     )
 }
 
+/// The occupant's last use: the proxy-side hint when present, else load time.
+fn state_last_used(occupant: &Occupant, last_used: &HashMap<String, Instant>) -> Instant {
+    last_used
+        .get(&occupant.model)
+        .copied()
+        .unwrap_or(occupant.loaded_at)
+        .max(occupant.loaded_at)
+}
+
 async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
     while let Some(msg) = rx.recv().await {
         match msg {
             ActorMsg::Command { cmd, reply } => state.on_command(cmd, reply),
+            ActorMsg::Touch { model } => state.touch_model(&model),
+            ActorMsg::Tick => {
+                state.on_tick();
+                state.publish();
+            }
             ActorMsg::Event { job, event } => state.on_event(job, event),
             ActorMsg::Status { reply } => {
                 let _ = reply.send(state.snapshot());
@@ -523,6 +573,7 @@ impl ActorState {
             tx,
             slots,
             jobs: BTreeMap::new(),
+            last_used: HashMap::new(),
             pending: HashMap::new(),
             next_job: 0,
             next_gen: 0,
@@ -688,55 +739,107 @@ impl ActorState {
             .map(|(i, _)| i)
             .collect();
         for slot in targets {
-            let job_id = JobId(self.next_job);
-            self.next_job += 1;
-            let victim = {
-                let occupant = self.slots[slot]
-                    .occupant
-                    .as_ref()
-                    .expect("invariant: filtered on occupant.is_some");
-                Victim {
-                    model: occupant.model.clone(),
-                    ticket: occupant.ticket.clone(),
-                    slot,
-                    evicted: false,
-                    cost: occupant.need.0,
-                }
-            };
-            let job = Job {
-                kind: JobKind::Unload,
-                model: victim.model.clone(),
-                engine: String::new(),
-                category,
-                state: SwapState::Idle,
-                terminal: false,
-                outcome: None,
-                error: None,
-                need: None,
-                free_at_admit: None,
-                external_at_admit: None,
-                timings: JobTimings::default(),
-                t0: Instant::now(),
-                waiters: Vec::new(),
-                tasks: Vec::new(),
-                spawned: None,
-                readiness: None,
-                victim: Some(victim),
-                victims: Vec::new(),
-                victims_released: Vec::new(),
-                released_cost: 0.0,
-                slot: Some(slot),
-            };
-            self.jobs.insert(job_id, job);
-            self.slots[slot].job = Some(job_id);
-            self.step(job_id, SwapState::Admit);
-            self.step(job_id, SwapState::Quiesce);
-            self.step(job_id, SwapState::Dispose);
-            self.spawn_kill_confirm(job_id);
+            self.begin_unload_slot(slot, "unloaded");
         }
         let _ = reply.send(Ok(Reply::Done));
     }
 
+    /// Starts one unload job for a specific slot (`note` becomes the job outcome:
+    /// "unloaded" for operator/eviction paths, "idle timeout" for the sweep).
+    fn begin_unload_slot(&mut self, slot: usize, note: &str) {
+        let job_id = JobId(self.next_job);
+        self.next_job += 1;
+        let category = self.slots[slot].category;
+        let victim = {
+            let occupant = self.slots[slot]
+                .occupant
+                .as_ref()
+                .expect("invariant: caller checks occupant.is_some");
+            Victim {
+                model: occupant.model.clone(),
+                ticket: occupant.ticket.clone(),
+                slot,
+                evicted: false,
+                cost: occupant.need.0,
+            }
+        };
+        let job = Job {
+            kind: JobKind::Unload,
+            model: victim.model.clone(),
+            engine: String::new(),
+            category,
+            state: SwapState::Idle,
+            terminal: false,
+            outcome: None,
+            error: None,
+            need: None,
+            free_at_admit: None,
+            external_at_admit: None,
+            timings: JobTimings::default(),
+            t0: Instant::now(),
+            waiters: Vec::new(),
+            tasks: Vec::new(),
+            spawned: None,
+            readiness: None,
+            victim: Some(victim),
+            victims: Vec::new(),
+            victims_released: Vec::new(),
+            released_cost: 0.0,
+            slot: Some(slot),
+            note: Some(note.to_string()),
+        };
+        self.jobs.insert(job_id, job);
+        self.slots[slot].job = Some(job_id);
+        self.step(job_id, SwapState::Admit);
+        self.step(job_id, SwapState::Quiesce);
+        self.step(job_id, SwapState::Dispose);
+        self.spawn_kill_confirm(job_id);
+    }
+
+    /// The idle sweep (Step 5, tick-driven): every occupied, job-free slot whose
+    /// category has `idle_timeout_s > 0` and whose model has been unused for the
+    /// threshold starts an unload. WORK defaults to 0 (never idles); config is king.
+    fn on_tick(&mut self) {
+        let now = Instant::now();
+        let due: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                let (Some(occupant), None) = (&slot.occupant, slot.job) else {
+                    return false;
+                };
+                let Some(timeout) = self
+                    .cfg
+                    .categories
+                    .iter()
+                    .find(|cat| cat.id == slot.category)
+                    .map(|cat| cat.idle_timeout_s)
+                    .filter(|timeout| *timeout > 0)
+                else {
+                    return false;
+                };
+                now.duration_since(state_last_used(occupant, &self.last_used))
+                    >= Duration::from_secs(timeout)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for slot in due {
+            let model = self.slots[slot]
+                .occupant
+                .as_ref()
+                .map(|o| o.model.clone())
+                .unwrap_or_default();
+            tracing::info!(slot = self.slots[slot].index, category = %self.slots[slot].category, %model,
+                "idle timeout reached; unloading");
+            self.begin_unload_slot(slot, "idle timeout");
+        }
+    }
+
+    /// Records a proxy-side use of `model` (last-use input for the idle sweep).
+    fn touch_model(&mut self, model: &str) {
+        self.last_used.insert(model.to_string(), Instant::now());
+    }
     fn begin_load(&mut self, slot: usize, entry: ModelEntry, waiters: Vec<Waiter>) {
         let job_id = JobId(self.next_job);
         self.next_job += 1;
@@ -763,6 +866,7 @@ impl ActorState {
             victims: Vec::new(),
             victims_released: Vec::new(),
             released_cost: 0.0,
+            note: None,
             slot: Some(slot),
         };
         let need = budget::need_gb(entry.vram_gb.map(Gibibytes), None);
@@ -1339,9 +1443,13 @@ impl ActorState {
                         self.spawn_settle_task(job_id);
                     }
                 } else {
+                    let note = self.jobs[&job_id]
+                        .note
+                        .clone()
+                        .unwrap_or_else(|| "unloaded".to_string());
                     self.step(job_id, SwapState::Reap);
                     self.step(job_id, SwapState::Idle);
-                    self.finish(job_id, Ok(Reply::Done), "unloaded");
+                    self.finish(job_id, Ok(Reply::Done), &note);
                 }
             }
             (SwapState::Dispose, Event::Released(Err(error))) => {
@@ -1614,6 +1722,7 @@ impl ActorState {
     }
 
     fn snapshot(&self) -> SchedulerStatus {
+        let now = Instant::now();
         SchedulerStatus {
             catalog_errors: self.catalog_errors.clone(),
             slots: self
@@ -1625,6 +1734,10 @@ impl ActorState {
                     model: s.occupant.as_ref().map(|o| o.model.clone()),
                     port: s.occupant.as_ref().map(|o| o.port),
                     need_gib: s.occupant.as_ref().map(|o| o.need.0),
+                    idle_s: s.occupant.as_ref().map(|o| {
+                        let last = state_last_used(o, &self.last_used);
+                        now.duration_since(last).as_secs()
+                    }),
                     loading_job: s.job,
                 })
                 .collect(),

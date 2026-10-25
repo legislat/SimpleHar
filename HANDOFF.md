@@ -350,6 +350,21 @@ Full text in `DESIGN.md`; the load-bearing ones:
     (`settle_blocks_spawn`, 1 s deadline), green on re-run and in two consecutive
     full runs — flake-watch per the T-policy. Gates: fmt clean, clippy
     `-D warnings` clean, **99/99 tests**. **Uncommitted.**
+28. **Idle timeout + boot measures (2026-10-25, built): Step 5's last knob and
+    §0.2's observability.** Idle sweep: the actor owns last-use (proxy paths call
+    the fire-and-forget `SchedulerHandle::touch`, a 2 s `ActorMsg::Tick` scans
+    slots); a category with `idle_timeout_s > 0` unloads occupants unused for the
+    threshold (outcome note "idle timeout" in the ledger; `SlotStatus.idle_s`
+    exposes the idle clock). Config rename: `idle_timeout_min` →
+    **`idle_timeout_s`** (SE-native schema, no compat burden yet; defaults 0 =
+    off, WORK ships 0 — set it explicitly to make WORK idle, config is king).
+    Boot measures (§0.2): `BootTimings {config_ms, scan_ms, bind_ms}` — measured
+    in main (config load, scheduler scan, and bounded wait until every listener
+    is Serving/Down), exposed at `/har/status` `boot`. Tests: `scheduler_idle.rs`
+    (idle unloads RP after threshold with the outcome note; 0 disables; activity
+    resets the clock), smoke asserts the boot section. Gates: fmt clean, clippy
+    `-D warnings` clean, **102/102 tests**. Live: `boot` shows real numbers
+    (config 1 ms, scan 14 ms, bind 30 ms). **Uncommitted.**
 
 ## 5. Open items — pick one per turn and brainstorm it
 

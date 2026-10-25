@@ -31,6 +31,7 @@ fn app() -> axum::Router {
         scheduler,
         simplehar_se::listeners::ListenerRegistry::new(),
         Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        simplehar_se::api::BootTimings::default(),
     )))
 }
 
@@ -69,6 +70,9 @@ async fn health_and_status_answer_on_default_config() {
     );
     assert_eq!(status["control_addr"], "127.0.0.1:8708");
     assert_eq!(status["slots"].as_array().map(Vec::len), Some(4));
+    // §0.2 boot measures are observable at /har/status.
+    assert!(status["boot"]["config_ms"].is_u64(), "boot: {status}");
+    assert!(status["boot"]["scan_ms"].is_u64(), "boot: {status}");
 }
 
 #[tokio::test]

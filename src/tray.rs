@@ -415,6 +415,7 @@ mod tests {
             model: model.map(str::to_string),
             port: model.map(|_| 12345),
             need_gib: model.map(|_| 4.0),
+            idle_s: model.map(|_| 0),
             loading_job: None,
         }
     }

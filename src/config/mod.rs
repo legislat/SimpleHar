@@ -161,9 +161,10 @@ pub struct CategoryConfig {
     /// Categories whose loads may evict occupants of this one (Step 6 hard filter).
     #[serde(default)]
     pub evictable_by: Vec<CategoryId>,
-    /// Idle auto-unload in minutes; 0 disables. WORK never idles (Step 5).
+    /// Idle auto-unload threshold in seconds; 0 disables (Step 5: WORK defaults
+    /// to 0 and never idles out; set it explicitly to make WORK idle — config is king).
     #[serde(default)]
-    pub idle_timeout_min: u64,
+    pub idle_timeout_s: u64,
     /// This category's listener also serves `/har/*` and the control page;
     /// exactly one category sets this (Step 11).
     #[serde(default, skip_serializing_if = "is_true")]
@@ -189,7 +190,7 @@ impl CategoryConfig {
                 default_model: None,
                 max_models: 1,
                 evictable_by: vec![],
-                idle_timeout_min: 0,
+                idle_timeout_s: 0,
                 control: true,
                 engine_ports: vec![],
             },
@@ -199,7 +200,7 @@ impl CategoryConfig {
                 default_model: None,
                 max_models: 1,
                 evictable_by: vec![CategoryId::Work],
-                idle_timeout_min: 0,
+                idle_timeout_s: 0,
                 control: false,
                 engine_ports: vec![],
             },
@@ -209,7 +210,7 @@ impl CategoryConfig {
                 default_model: None,
                 max_models: 1,
                 evictable_by: vec![CategoryId::Work, CategoryId::Rp],
-                idle_timeout_min: 0,
+                idle_timeout_s: 0,
                 control: false,
                 engine_ports: vec![],
             },
@@ -219,7 +220,7 @@ impl CategoryConfig {
                 default_model: None,
                 max_models: 1,
                 evictable_by: vec![CategoryId::Work, CategoryId::Rp],
-                idle_timeout_min: 0,
+                idle_timeout_s: 0,
                 control: false,
                 engine_ports: vec![],
             },

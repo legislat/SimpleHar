@@ -131,6 +131,25 @@ impl From<SchedulerError> for ApiError {
     }
 }
 
+/// Boot measures (§0.2): the numbers that make "the harness is up" observable.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BootTimings {
+    /// Config load + validation duration.
+    pub config_ms: u64,
+    /// Catalog scan duration (measured at scheduler start).
+    pub scan_ms: u64,
+    /// Wall time until every listener was Serving or Down (set by `main`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_ms: Option<u64>,
+}
+
+impl BootTimings {
+    /// Records the bind resolution once all supervisors have verdicts.
+    pub fn set_bound(&mut self, ms: u64) {
+        self.bind_ms = Some(ms);
+    }
+}
+
 /// Shared application state (AGENTS.md: layered extractors, no globals).
 #[derive(Clone)]
 pub struct ApiState {
@@ -144,6 +163,8 @@ pub struct ApiState {
     pub listeners: crate::listeners::ListenerRegistry,
     /// The VRAM witness, shared with the scheduler (Step 4).
     pub witness: Arc<dyn crate::budget::VramWitness>,
+    /// Boot measures (§0.2), filled by `main` as boot progresses.
+    pub boot: Arc<std::sync::RwLock<BootTimings>>,
     /// Runtime `default_model` overrides from `/har/config/default`, layered over
     /// the boot config (Step 9: the yaml/json stays the source of truth; overrides
     /// persist back to it on every set).
@@ -161,6 +182,7 @@ impl ApiState {
         scheduler: SchedulerHandle,
         listeners: crate::listeners::ListenerRegistry,
         witness: Arc<dyn crate::budget::VramWitness>,
+        boot: BootTimings,
     ) -> Self {
         let control_addr = format!(
             "{}:{}",
@@ -172,6 +194,7 @@ impl ApiState {
             scheduler,
             listeners,
             witness,
+            boot: Arc::new(std::sync::RwLock::new(boot)),
             default_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
             proxy: reqwest::Client::builder()
@@ -329,9 +352,15 @@ async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
             value
         })
         .collect();
+    let boot = state
+        .boot
+        .read()
+        .expect("boot timings lock poisoned by a writer panic")
+        .clone();
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
+        "boot": boot,
         "categories": categories,
         "listeners": state.listeners.snapshot(),
         "mem": mem_section(&state).await,
@@ -764,6 +793,7 @@ async fn ensure_target(listener: &ListenerState, body: &Value) -> Result<(String
             occupants.sort_by_key(|&(_, _, used)| std::cmp::Reverse(used)); // MRU first
             if let Some((model, port, _)) = occupants.first() {
                 api.touch(model);
+                api.scheduler.touch(model);
                 return Ok((model.clone(), *port));
             }
             let default = api.default_model(listener.category);
@@ -802,6 +832,7 @@ async fn swap_for_port(api: &ApiState, model: &str, category: CategoryId) -> Res
         Reply::Done => 0,
     };
     api.touch(model);
+    api.scheduler.touch(model);
     Ok(port)
 }
 

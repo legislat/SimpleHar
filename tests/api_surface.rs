@@ -67,6 +67,7 @@ fn app(
         scheduler,
         simplehar_se::listeners::ListenerRegistry::new(),
         Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        simplehar_se::api::BootTimings::default(),
     ));
     let control = control_router(Arc::clone(&state));
     let work = category_router(Arc::clone(&state), CategoryId::Work);
