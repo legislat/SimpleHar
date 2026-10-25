@@ -398,6 +398,29 @@ Full text in `DESIGN.md`; the load-bearing ones:
     tests**; live 0.0.0.0 boot verified (warning + serving + display). Also
     live-verified incidentally: the single-instance guard refused a second
     instance during this turn's testing. **Uncommitted.**
+31. **Discovery + crash-retry milestone (2026-10-25, built): F-4 and T10.1/A9
+    closed.** (a) **serve_model discovery (F-4, Step 10):** at readiness the
+    probe task fetches the engine's `GET /v1/models` first entry
+    (`EngineRuntime::discover_model_id`); the occupant carries `serve_id`, the
+    proxy rewrites `model` to it (harness name as fallback), and a yaml
+    `serve_model` that disagrees becomes a recorded warning in the job ledger
+    (`JobStatus.warnings`) — never trusted. `SlotStatus`/`SwapReceipt`/
+    `Reply::Already` carry serve_id. (b) **Crash-retry (T10.1):** new
+    `Command::Restart {model, category}` — kills the (dead) occupant and loads
+    fresh through the standard replacement path (release + settle + spawn); the
+    proxy retries a connection-level send failure exactly once via Restart,
+    re-resolving the (new) port; never on a genuine upstream status (A9) and
+    never mid-stream (bytes start past send()). Tests: discovery adopts the
+    engine id; mismatch → warning + discovery wins; restart of a missing model
+    degrades to a plain load; genuine 500 surfaced with exactly one ledger job.
+    Mock now always reports its own id `mock-model` at `/v1/models` (an earlier
+    design echoed the yaml's claim back, making mismatch untestable — fixed) and
+    gained a `mock-error` mode. Live (real llama-server): a yaml claiming
+    `serve_model: wrong-id-on-purpose` loaded fine, the slot's serve_id is the
+    engine's real GGUF path, and the job ledger carries the warning verbatim.
+    Gates: fmt clean, clippy `-D warnings` clean, **110/110 tests**.
+    **Uncommitted.** Remaining to v1.0: /har/log ring (Step 16), the T1..T14
+    port, the parallel soak, the cut.
 
 ## 5. Open items — pick one per turn and brainstorm it
 

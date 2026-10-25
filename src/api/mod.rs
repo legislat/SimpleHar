@@ -408,8 +408,9 @@ async fn har_load(
             model,
             category,
             port,
+            serve_id,
         } => {
-            json!({ "status": "already", "model": model, "category": category, "port": port })
+            json!({ "status": "already", "model": model, "category": category, "port": port, "serve_id": serve_id })
         }
         Reply::Done => json!({ "status": "done" }),
     }))
@@ -891,7 +892,15 @@ async fn v1_models(State(listener): State<Arc<ListenerState>>) -> Result<Json<Va
 
 /// Resolves the request to a serving port on this listener, or a typed error:
 /// wrong-category and unknown models `404` **before** any ensure (Step 11).
-async fn ensure_target(listener: &ListenerState, body: &Value) -> Result<(String, u16), ApiError> {
+/// Resolves the request to a serving target on this listener, or a typed error:
+/// wrong-category and unknown models `404` **before** any ensure (Step 11).
+///
+/// Returns `(harness_name, port, serve_id)`; `serve_id` is the engine's
+/// self-reported id (F-4) and is the proxy rewrite target when present.
+async fn ensure_target(
+    listener: &ListenerState,
+    body: &Value,
+) -> Result<(String, u16, Option<String>), ApiError> {
     let api = &listener.api;
     let requested = body.get("model").and_then(Value::as_str);
     match requested {
@@ -919,8 +928,8 @@ async fn ensure_target(listener: &ListenerState, body: &Value) -> Result<(String
                     ),
                 });
             }
-            let port = swap_for_port(api, &entry.name, entry.category).await?;
-            Ok((entry.name.clone(), port))
+            let (port, serve_id) = swap_for_port(api, &entry.name, entry.category).await?;
+            Ok((entry.name.clone(), port, serve_id))
         }
         None => {
             // F-2 rule (operator, 2026-10-24): "use this category".
@@ -942,13 +951,19 @@ async fn ensure_target(listener: &ListenerState, body: &Value) -> Result<(String
             if let Some((model, port, _)) = occupants.first() {
                 api.touch(model);
                 api.scheduler.touch(model);
-                return Ok((model.clone(), *port));
+                let serve_id = status
+                    .slots
+                    .iter()
+                    .find(|slot| slot.model.as_deref() == Some(model.as_str()))
+                    .and_then(|slot| slot.serve_id.clone());
+                return Ok((model.clone(), *port, serve_id));
             }
             let default = api.default_model(listener.category);
             match default {
                 Some(model) => {
-                    let port = swap_for_port(api, &model, listener.category).await?;
-                    Ok((model, port))
+                    let (port, serve_id) =
+                        swap_for_port(api, &model, listener.category).await?;
+                    Ok((model, port, serve_id))
                 }
                 None => Err(ApiError::BadRequest {
                     reason: format!(
@@ -967,21 +982,26 @@ fn slot_loaded_fallback() -> Instant {
     Instant::now() - Duration::from_secs(3_600)
 }
 
-/// Ensures `model` is serving in `category` and returns its engine port.
-async fn swap_for_port(api: &ApiState, model: &str, category: CategoryId) -> Result<u16, ApiError> {
+/// Ensures `model` is serving in `category`; returns its engine port and the
+/// engine's self-reported id (F-4).
+async fn swap_for_port(
+    api: &ApiState,
+    model: &str,
+    category: CategoryId,
+) -> Result<(u16, Option<String>), ApiError> {
     let reply = api
         .scheduler
         .swap(model, category)
         .await
         .map_err(ApiError::from)?;
-    let port = match reply {
-        Reply::Loaded(receipt) => receipt.port,
-        Reply::Already { port, .. } => port,
-        Reply::Done => 0,
+    let (port, serve_id) = match reply {
+        Reply::Loaded(receipt) => (receipt.port, receipt.serve_id),
+        Reply::Already { port, serve_id, .. } => (port, serve_id),
+        Reply::Done => (0, None),
     };
     api.touch(model);
     api.scheduler.touch(model);
-    Ok(port)
+    Ok((port, serve_id))
 }
 
 /// Proxy pass-through: POST /v1/chat/completions | /v1/completions | /v1/embeddings.
@@ -994,20 +1014,46 @@ async fn proxy(
     let Json(mut body) = body.map_err(|rejection| ApiError::BadRequest {
         reason: format!("body must be JSON: {rejection}"),
     })?;
-    let (model, port) = ensure_target(&listener, &body).await?;
+    let (model, port, serve_id) = ensure_target(&listener, &body).await?;
     let path = uri.path().to_string();
-    body["model"] = Value::String(model);
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let upstream = listener
-        .api
-        .proxy
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| ApiError::Upstream {
-            reason: format!("engine on :{port} unreachable: {error}"),
-        })?;
+    // F-4 fix: rewrite to the engine's self-reported id when discovery found one;
+    // the harness name is the fallback (llama engines ignore the field either way).
+    body["model"] = Value::String(serve_id.unwrap_or_else(|| model.clone()));
+
+    // T10.1: a connection-level failure (engine died mid-request) triggers exactly
+    // one reap + reload + retry. A genuine upstream HTTP status is never retried
+    // (A9), and a death mid-stream surfaces in the body stream, past this loop.
+    let mut port = port;
+    let mut attempts = 0;
+    let upstream = loop {
+        let url = format!("http://127.0.0.1:{port}{path}");
+        match listener.api.proxy.post(&url).json(&body).send().await {
+            Ok(upstream) => break upstream,
+            Err(error) => {
+                attempts += 1;
+                if attempts >= 2 {
+                    return Err(ApiError::Upstream {
+                        reason: format!("engine on :{port} unreachable after crash-retry: {error}"),
+                    });
+                }
+                tracing::warn!(
+                    model = %model,
+                    port,
+                    error = %error,
+                    "engine unreachable mid-request; restarting once (T10.1)"
+                );
+                listener
+                    .api
+                    .scheduler
+                    .restart(&model, listener.category)
+                    .await
+                    .map_err(ApiError::from)?;
+                // Re-resolve: the fresh occupant may serve on a different port.
+                let (_, new_port, _) = ensure_target(&listener, &body).await?;
+                port = new_port;
+            }
+        }
+    };
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).map_err(|error| ApiError::Upstream {
             reason: format!("upstream status not representable: {error}"),

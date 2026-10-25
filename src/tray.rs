@@ -416,6 +416,7 @@ mod tests {
             port: model.map(|_| 12345),
             need_gib: model.map(|_| 4.0),
             idle_s: model.map(|_| 0),
+            serve_id: None,
             loading_job: None,
         }
     }
@@ -436,6 +437,7 @@ mod tests {
             need_gib: Some(4.0),
             free_at_admit_gib: Some(66.0),
             victims_released: Vec::new(),
+            warnings: Vec::new(),
             timings: Default::default(),
         }
     }

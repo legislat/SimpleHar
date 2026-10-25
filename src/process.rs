@@ -197,6 +197,13 @@ impl EngineRuntime for ProcessRuntime {
         Ok(false)
     }
 
+    async fn discover_model_id(&self, port: u16) -> Option<String> {
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let response = self.client.get(&url).send().await.ok()?;
+        let body: serde_json::Value = response.json().await.ok()?;
+        body["data"][0]["id"].as_str().map(str::to_string)
+    }
+
     async fn probe(&self, port: u16, readiness: &crate::engine::ReadinessSpec) -> Probe {
         // Fast-fail (Step 3 cancel/dead-engine lesson): a child that already exited
         // must not eat the whole readiness deadline — readiness is unreachable.

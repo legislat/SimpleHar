@@ -185,4 +185,10 @@ pub trait EngineRuntime: Send + Sync {
 
     /// One readiness attempt against `readiness` (Step 7 tri-state).
     async fn probe(&self, port: u16, readiness: &ReadinessSpec) -> Probe;
+
+    /// The engine's self-reported OpenAI model id (`GET /v1/models`, first entry),
+    /// discovered at readiness — the proxy rewrite target (Step 10, F-4 fix).
+    /// `None` when the engine does not answer or reports nothing: callers fall
+    /// back to the harness name.
+    async fn discover_model_id(&self, port: u16) -> Option<String>;
 }

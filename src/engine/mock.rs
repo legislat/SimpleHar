@@ -51,6 +51,7 @@ mod tests {
             category: CategoryId::Work,
             vram_gb: None,
             model_ref: None,
+            serve_model: None,
             file: None,
             raw: BTreeMap::new(),
         }

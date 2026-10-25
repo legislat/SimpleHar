@@ -57,6 +57,10 @@ pub struct ModelEntry {
     /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
     /// Informational for managed models; used for stem/path aliases (Step 10).
     pub model_ref: Option<String>,
+    /// The id the yaml claims the engine reports (`serve_model:`); verified by
+    /// discovery at readiness — a mismatch is a recorded warning, never trusted
+    /// (F-4 fix, Step 10).
+    pub serve_model: Option<String>,
     /// File the entry came from; `None` for synthetic entries (tests, mock).
     pub file: Option<PathBuf>,
     /// Every raw `key: value` from the source file, verbatim — the passthrough the
@@ -121,6 +125,7 @@ impl ModelEntry {
             category,
             vram_gb,
             model_ref: keys.get("model").cloned(),
+            serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
             file: None,
             raw: keys.clone(),
         })

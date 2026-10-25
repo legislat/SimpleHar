@@ -100,6 +100,8 @@ pub enum Reply {
         category: CategoryId,
         /// Port it serves on.
         port: u16,
+        /// The engine's self-reported id (may rewrite differently, F-4).
+        serve_id: Option<String>,
     },
     /// The command was accepted (cancel/unload).
     Done,
@@ -116,6 +118,8 @@ pub struct SwapReceipt {
     pub category: CategoryId,
     /// Engine port.
     pub port: u16,
+    /// The engine's self-reported id (F-4); proxy rewriting targets this.
+    pub serve_id: Option<String>,
 }
 
 /// Immutable status snapshot (Step 2: reads never probe and never mutate).
@@ -144,6 +148,8 @@ pub struct SlotStatus {
     pub need_gib: Option<f64>,
     /// Seconds since the occupant was last used (None when empty; Step 5).
     pub idle_s: Option<u64>,
+    /// The engine's self-reported id, when discovered (F-4).
+    pub serve_id: Option<String>,
     /// Job currently running for this slot, if any.
     pub loading_job: Option<JobId>,
 }
@@ -171,6 +177,8 @@ pub struct JobStatus {
     pub free_at_admit_gib: Option<f64>,
     /// Cross-category victims this job evicted (Step 6, G13 decision inputs).
     pub victims_released: Vec<String>,
+    /// Non-fatal observations (serve_model mismatch, Step 10).
+    pub warnings: Vec<String>,
     /// Step timings (§0.3).
     pub timings: JobTimings,
 }
@@ -233,6 +241,24 @@ impl SchedulerHandle {
     /// [`SchedulerError::ActorGone`] when the actor is no longer running.
     pub async fn unload(&self, category: CategoryId) -> Result<Reply, SchedulerError> {
         self.call(Command::Unload { category }).await
+    }
+
+    /// Restarts `model` in `category`: kills the (dead) occupant and loads it
+    /// fresh — the T10.1 crash-retry primitive.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedulerError`] variants as for [`SchedulerHandle::swap`].
+    pub async fn restart(
+        &self,
+        model: &str,
+        category: CategoryId,
+    ) -> Result<Reply, SchedulerError> {
+        self.call(Command::Restart {
+            model: model.to_string(),
+            category,
+        })
+        .await
     }
 
     /// Records a use of `model` (fire-and-forget): the proxy paths call this on
@@ -372,8 +398,9 @@ enum Event {
     Released(Result<(), SpawnError>),
     /// Engine start finished.
     Spawned(Result<Spawned, SpawnError>),
-    /// Readiness loop finished (terminal tri-state only).
-    Probed(Probe),
+    /// Readiness loop finished (terminal tri-state only) plus the engine's
+    /// self-reported model id when ready and discoverable (Step 10, F-4).
+    Probed(Probe, Option<String>),
     /// Witness sample for admission returned (Err = unavailable, ledger-only).
     Admitted(Result<crate::budget::MemorySample, String>),
     /// Post-release memory settle finished (Err carries the numbers).
@@ -387,6 +414,9 @@ struct Occupant {
     port: u16,
     ticket: SpawnTicket,
     loaded_at: Instant,
+    /// The engine's self-reported model id (discovered at readiness, F-4 fix);
+    /// proxy rewriting targets this, falling back to the harness name.
+    serve_id: Option<String>,
 }
 
 /// A release target during Quiesce/Dispose (Step 6 calls these victims).
@@ -443,6 +473,8 @@ struct Job {
     released_cost: f64,
     /// Outcome wording for unload jobs ("unloaded" / "idle timeout").
     note: Option<String>,
+    /// Non-fatal observations recorded during the job (serve_model mismatch...).
+    warnings: Vec<String>,
     slot: Option<usize>,
 }
 
@@ -620,6 +652,10 @@ impl ActorState {
                 self.on_unload(category, reply);
                 self.publish();
             }
+            Command::Restart { model, category } => {
+                self.on_restart(model, category, reply);
+                self.publish();
+            }
             Command::Reload => {
                 self.refresh_catalog();
                 self.publish();
@@ -648,6 +684,7 @@ impl ActorState {
                         model: occupant.model.clone(),
                         category,
                         port: occupant.port,
+                        serve_id: occupant.serve_id.clone(),
                     }));
                     return;
                 }
@@ -730,6 +767,28 @@ impl ActorState {
         }
     }
 
+    /// T10.1 crash-retry primitive: kill the (dead) occupant of `model`'s slot and
+    /// load it fresh. Reuses the standard replacement path — the dead occupant
+    /// becomes the victim, so release + settle + spawn all run normally.
+    fn on_restart(&mut self, model: String, category: CategoryId, reply: Waiter) {
+        let Some(entry) = self.catalog.iter().find(|m| m.name == model).cloned() else {
+            let _ = reply.send(Err(SchedulerError::UnknownModel(model)));
+            return;
+        };
+        let slot = self.slots.iter().position(|s| {
+            s.category == category
+                && s.job.is_none()
+                && s.occupant.as_ref().is_some_and(|o| o.model == model)
+        });
+        match slot {
+            Some(slot) => self.begin_load(slot, entry, vec![reply]),
+            None => {
+                // Already reaped (idle sweep) or never loaded: a plain load covers it.
+                self.on_swap(model, category, reply);
+            }
+        }
+    }
+
     fn on_unload(&mut self, category: CategoryId, reply: Waiter) {
         let targets: Vec<usize> = self
             .slots
@@ -785,8 +844,9 @@ impl ActorState {
             victims: Vec::new(),
             victims_released: Vec::new(),
             released_cost: 0.0,
-            slot: Some(slot),
             note: Some(note.to_string()),
+            warnings: Vec::new(),
+            slot: Some(slot),
         };
         self.jobs.insert(job_id, job);
         self.slots[slot].job = Some(job_id);
@@ -867,6 +927,7 @@ impl ActorState {
             victims_released: Vec::new(),
             released_cost: 0.0,
             note: None,
+            warnings: Vec::new(),
             slot: Some(slot),
         };
         let need = budget::need_gb(entry.vram_gb.map(Gibibytes), None);
@@ -1292,9 +1353,14 @@ impl ActorState {
         let deadline = Duration::from_secs(self.cfg.load_timeout_s);
         let handle = tokio::spawn(async move {
             let started = Instant::now();
+            let mut discovered = None;
             let terminal = loop {
                 match runtime.probe(port, &readiness).await {
-                    Probe::Ready => break Probe::Ready,
+                    Probe::Ready => {
+                        // Step 10 (F-4): the upstream id is discovered, not asserted.
+                        discovered = runtime.discover_model_id(port).await;
+                        break Probe::Ready;
+                    }
                     Probe::Failed { reason } => break Probe::Failed { reason },
                     Probe::NotYet { reason } => {
                         if started.elapsed() >= deadline {
@@ -1310,7 +1376,7 @@ impl ActorState {
             };
             let _ = tx.send(ActorMsg::Event {
                 job: job_id,
-                event: Event::Probed(terminal),
+                event: Event::Probed(terminal, discovered),
             });
         });
         self.jobs
@@ -1480,17 +1546,17 @@ impl ActorState {
                     "spawn failed",
                 );
             }
-            (SwapState::Ready, Event::Probed(Probe::Ready)) => {
-                self.install(job_id);
+            (SwapState::Ready, Event::Probed(Probe::Ready, discovered)) => {
+                self.install(job_id, discovered);
             }
-            (SwapState::Ready, Event::Probed(Probe::Failed { reason })) => {
+            (SwapState::Ready, Event::Probed(Probe::Failed { reason }, _)) => {
                 self.fail_job(
                     job_id,
                     SchedulerError::EngineFailed(reason),
                     "engine not ready",
                 );
             }
-            (SwapState::Ready, Event::Probed(Probe::NotYet { .. })) => {
+            (SwapState::Ready, Event::Probed(Probe::NotYet { .. }, _)) => {
                 tracing::warn!(%job_id, "probe task sent a non-terminal result; ignored");
             }
             (SwapState::Failed, Event::Released(_)) => {
@@ -1532,7 +1598,8 @@ impl ActorState {
     }
 
     /// `Ready -> Install -> Serving`: the one place an occupant is created (F-6 funnel).
-    fn install(&mut self, job_id: JobId) {
+    /// `discovered_id` is the engine's self-reported id (Step 10, F-4 fix).
+    fn install(&mut self, job_id: JobId, discovered_id: Option<String>) {
         self.set_timing(job_id, |t| &mut t.ready_ms);
         self.step(job_id, SwapState::Install);
         let (slot, model, category, port) = {
@@ -1551,6 +1618,25 @@ impl ActorState {
                 },
             )
         };
+        // F-4: a yaml that claims an id the engine never reports becomes a visible
+        // warning at load time, and the engine's real id wins for rewriting.
+        let serve_id = discovered_id;
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            let declared = self
+                .catalog
+                .iter()
+                .find(|m| m.name == job.model)
+                .and_then(|m| m.serve_model.clone());
+            if let (Some(declared), Some(actual)) = (&declared, &serve_id) {
+                if declared != actual {
+                    let warning = format!(
+                        "serve_model `{declared}` is not reported by the engine; using its real id `{actual}`"
+                    );
+                    tracing::warn!(%job_id, model = %job.model, "{warning}");
+                    job.warnings.push(warning);
+                }
+            }
+        }
         if let Some(slot) = slot {
             let job = &self.jobs[&job_id];
             self.slots[slot].occupant = Some(Occupant {
@@ -1562,6 +1648,7 @@ impl ActorState {
                     .clone()
                     .expect("invariant: install only happens after a spawn"),
                 loaded_at: Instant::now(),
+                serve_id: serve_id.clone(),
             });
         }
         self.set_timing(job_id, |t| &mut t.install_ms);
@@ -1573,6 +1660,7 @@ impl ActorState {
                 model,
                 category,
                 port: port.port,
+                serve_id,
             })),
             "loaded",
         );
@@ -1738,6 +1826,7 @@ impl ActorState {
                         let last = state_last_used(o, &self.last_used);
                         now.duration_since(last).as_secs()
                     }),
+                    serve_id: s.occupant.as_ref().and_then(|o| o.serve_id.clone()),
                     loading_job: s.job,
                 })
                 .collect(),
@@ -1755,6 +1844,7 @@ impl ActorState {
                     need_gib: j.need.map(|n| n.0),
                     free_at_admit_gib: j.free_at_admit.map(|n| n.0),
                     victims_released: j.victims_released.clone(),
+                    warnings: j.warnings.clone(),
                     timings: j.timings,
                 })
                 .collect(),

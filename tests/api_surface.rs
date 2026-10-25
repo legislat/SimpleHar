@@ -54,6 +54,7 @@ fn app(
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+    adapters.insert("mock-error".to_string(), Arc::new(MockAdapter));
     let dir = write_modelconf(specs);
     let scheduler = Scheduler::start(
         config.clone(),
@@ -237,8 +238,9 @@ async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["echo"], true);
     assert_eq!(body["path"], "/v1/chat/completions");
-    // Alias resolved and canonical harness name rewritten into the body.
-    assert_eq!(body["body"]["model"], "qwen3");
+    // Alias resolved to the harness name, then rewritten to the engine's
+    // self-reported id (F-4: the mock reports `mock-model`).
+    assert_eq!(body["body"]["model"], "mock-model");
 }
 
 #[tokio::test]
@@ -252,8 +254,8 @@ async fn no_model_fallback_serves_the_loaded_occupant() {
     let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
-        body["body"]["model"], "qwen3",
-        "fallback must serve the loaded model"
+        body["body"]["model"], "mock-model",
+        "fallback serves the loaded model (rewritten to its engine id)"
     );
 }
 
@@ -272,7 +274,7 @@ async fn no_model_fallback_loads_the_category_default() {
 
     let (status, body) = post_json(&rp, "/v1/chat/completions", r#"{"messages":[]}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["body"]["model"], "default-model");
+    assert_eq!(body["body"]["model"], "mock-model");
     assert_eq!(
         runtime.server_count(),
         1,
@@ -421,7 +423,7 @@ async fn default_model_endpoint_validates_and_takes_effect() {
     // The no-model fallback now loads it without touching the boot config file.
     let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["body"]["model"], "qwen3");
+    assert_eq!(body["body"]["model"], "mock-model");
 }
 
 #[tokio::test]
@@ -610,4 +612,32 @@ async fn request_ids_are_echoed_or_generated() {
         .unwrap_or_default()
         .to_string();
     assert!(id.starts_with("req-"), "generated id: {id}");
+}
+
+#[tokio::test]
+async fn genuine_upstream_error_is_surfaced_never_retried() {
+    // A9: a 500 from the engine is a real answer - no crash-restart, no retry,
+    // exactly one job in the ledger.
+    let (control, work, _, runtime, _) = app(
+        AppConfig::default(),
+        &[("err-model", "mock-error", CategoryId::Work, Some(4.0))],
+    );
+    let (status, _) = post_json(&control, "/har/load", r#"{"model":"err-model"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = post_json(
+        &work,
+        "/v1/chat/completions",
+        r#"{"model":"err-model","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let (_, jobs) = get_json(&control, "/har/jobs").await;
+    assert_eq!(
+        jobs["jobs"].as_array().map(Vec::len),
+        Some(1),
+        "no restart job may exist"
+    );
+    let _ = runtime;
 }

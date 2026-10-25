@@ -23,6 +23,9 @@ pub enum Command {
     /// Load `model` into `category`; same-slot policy is supersede, queue is FIFO
     /// otherwise (Step 2).
     Swap { model: String, category: CategoryId },
+    /// Kill the occupant of `model`'s slot (dead engine) and load it fresh —
+    /// the T10.1 crash-retry primitive: reap + reload in one command.
+    Restart { model: String, category: CategoryId },
     /// Cooperative cancel: observed inside the current step, then cleanup completes
     /// (Step 3 — never a dropped task).
     Cancel { job: JobId },

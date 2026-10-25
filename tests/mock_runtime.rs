@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use axum::extract::State;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
@@ -26,6 +27,9 @@ pub enum MockMode {
     DiesAfterMs(u64),
     /// `/health` always reports not-loaded.
     Never,
+    /// Every proxy target answers 500 (A9: a genuine upstream error is never
+    /// retried).
+    AlwaysError,
 }
 
 fn mode_for(engine: &str) -> MockMode {
@@ -33,6 +37,7 @@ fn mode_for(engine: &str) -> MockMode {
         "mock-slow" => MockMode::DelayMs(2_500),
         "mock-dies" => MockMode::DiesAfterMs(300),
         "mock-never" => MockMode::Never,
+        "mock-error" => MockMode::AlwaysError,
         _ => MockMode::Instant,
     }
 }
@@ -41,6 +46,17 @@ struct MockServer {
     #[allow(dead_code)]
     mode: MockMode,
     handle: tokio::task::JoinHandle<()>,
+}
+
+/// Per-engine server state: behavior mode. The mock always reports its own fixed
+/// id `mock-model` at `/v1/models`, so discovery and yaml mismatches are testable.
+#[derive(Clone)]
+struct MockState {
+    mode: MockMode,
+}
+
+async fn models() -> Json<serde_json::Value> {
+    Json(json!({ "object": "list", "data": [{ "id": "mock-model", "object": "model" }] }))
 }
 
 /// The test `EngineRuntime`: every "engine" is a real localhost HTTP server.
@@ -87,7 +103,10 @@ impl MockRuntime {
     }
 }
 
-async fn health(State(mode): State<MockMode>) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+async fn health(
+    State(state): State<MockState>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let mode = state.mode;
     if let MockMode::DelayMs(ms) = mode {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
@@ -103,14 +122,24 @@ async fn health(State(mode): State<MockMode>) -> (axum::http::StatusCode, Json<s
 /// Proxy echo: any other path answers 200 with the request shape, so proxy tests can
 /// assert what the harness forwarded (including the rewritten `model` field).
 async fn echo(
+    State(state): State<MockState>,
     uri: axum::http::Uri,
     body: Option<Json<serde_json::Value>>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    // A9 test support: this mode is a genuinely-erroring upstream.
+    if state.mode == MockMode::AlwaysError {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "upstream says no",
+        )
+            .into_response();
+    }
     Json(json!({
         "echo": true,
         "path": uri.path(),
         "body": body.map(|Json(value)| value).unwrap_or(serde_json::Value::Null),
     }))
+    .into_response()
 }
 
 #[async_trait]
@@ -135,8 +164,9 @@ impl EngineRuntime for MockRuntime {
             .port();
         let app = Router::new()
             .route("/health", get(health))
+            .route("/v1/models", get(models))
             .fallback(echo)
-            .with_state(mode.clone());
+            .with_state(MockState { mode: mode.clone() });
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -186,5 +216,12 @@ impl EngineRuntime for MockRuntime {
 
     async fn probe(&self, port: u16, readiness: &ReadinessSpec) -> Probe {
         simplehar_se::engine::http_probe(&self.client, port, readiness).await
+    }
+
+    async fn discover_model_id(&self, port: u16) -> Option<String> {
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let response = self.client.get(&url).send().await.ok()?;
+        let body: serde_json::Value = response.json().await.ok()?;
+        body["data"][0]["id"].as_str().map(str::to_string)
     }
 }
