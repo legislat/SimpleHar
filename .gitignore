@@ -2,3 +2,9 @@
 /base-archive
 /logs
 /.env
+# Governing docs are local-only per operator decision (2026-10-25).
+/AGENTS.md
+/AUX-RULES.md
+/DESIGN.md
+/GIT_RULES.md
+/HANDOFF.md
