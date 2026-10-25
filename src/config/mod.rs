@@ -106,6 +106,10 @@ fn default_load_timeout() -> u64 {
     120
 }
 
+fn default_tray_enabled() -> bool {
+    true
+}
+
 fn default_release_timeout() -> u64 {
     60
 }
@@ -221,6 +225,9 @@ pub struct AppConfig {
     /// template schema (Step 3 knobs).
     #[serde(default = "default_load_timeout")]
     pub load_timeout_s: u64,
+    /// Whether the tray icon starts with the harness (Step 15; loopback tool knob, G9).
+    #[serde(default = "default_tray_enabled")]
+    pub tray_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -233,6 +240,7 @@ impl Default for AppConfig {
             protected_ports: default_protected_ports(),
             release_timeout_s: default_release_timeout(),
             load_timeout_s: default_load_timeout(),
+            tray_enabled: default_tray_enabled(),
         }
     }
 }

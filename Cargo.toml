@@ -26,8 +26,15 @@ async-trait = "0.1"
 # HTTP client: engine readiness probes now (mock engine), proxy surface later (Step 11).
 # `stream` enables byte-for-byte SSE pass-through.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+# Tray icon + menu (Step 15): the only GUI dependency; no Qt/egui.
+tray-icon = "0.21"
+# Win32 message pump for the tray thread (Step 15) and Job Objects later (Step 8).
+windows = { version = "0.62", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+] }
 
 # Approved 2026-10-25 but deliberately absent until their module lands (no unused deps):
 # - nvml-wrapper  -> Step 4, budget.rs witness (item 5)
-# - windows       -> Step 8, process.rs Job Objects (item 6)
 # - yaml crate    -> Step 9 ModelConf scan (flat key: value round-trip)

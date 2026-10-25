@@ -136,6 +136,8 @@ pub struct ApiState {
     pub control_addr: String,
     /// The scheduler actor.
     pub scheduler: SchedulerHandle,
+    /// Listener health, written by the supervisors in `main` (red state, §0.2).
+    pub listeners: crate::listeners::ListenerRegistry,
     catalog: Arc<RwLock<Vec<ModelEntry>>>,
     /// Last-use hints per model (fallback MRU for AUX x N; eviction LRU later).
     usage: Arc<Mutex<HashMap<String, Instant>>>,
@@ -143,8 +145,14 @@ pub struct ApiState {
 }
 
 impl ApiState {
-    /// Builds handler state from a validated config, a live scheduler, and the catalog.
-    pub fn new(config: AppConfig, scheduler: SchedulerHandle, catalog: Vec<ModelEntry>) -> Self {
+    /// Builds handler state from a validated config, a live scheduler, the catalog,
+    /// and the listener health registry.
+    pub fn new(
+        config: AppConfig,
+        scheduler: SchedulerHandle,
+        catalog: Vec<ModelEntry>,
+        listeners: crate::listeners::ListenerRegistry,
+    ) -> Self {
         let control_addr = format!(
             "{}:{}",
             config.internal_host,
@@ -153,6 +161,7 @@ impl ApiState {
         ApiState {
             control_addr,
             scheduler,
+            listeners,
             catalog: Arc::new(RwLock::new(catalog)),
             usage: Arc::new(Mutex::new(HashMap::new())),
             proxy: reqwest::Client::builder()
@@ -205,6 +214,7 @@ async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
         "categories": state.config.categories,
+        "listeners": state.listeners.snapshot(),
         "mem": {
             "total_gb": state.config.vram_total_gb,
             "reserve_gb": state.config.vram_reserve_gb,

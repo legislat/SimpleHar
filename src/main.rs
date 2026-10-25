@@ -1,7 +1,6 @@
 //! Entry point: boot order per DESIGN §0.2 — config first, listeners bound before any
 //! engine work (there is none: preload is scrapped), zero engine spawns at boot.
 
-use anyhow::Context;
 use simplehar_se::api::{category_router, control_router, ApiState};
 use simplehar_se::config::{AppConfig, ConfigError};
 use simplehar_se::engine::mock::MockAdapter;
@@ -58,9 +57,29 @@ async fn main() -> ExitCode {
     adapters.insert("mock".to_string(), mock);
     let runtime: Arc<dyn EngineRuntime> = Arc::new(UnimplementedRuntime);
     let scheduler = Scheduler::start(config.clone(), catalog.clone(), adapters, runtime);
-    let state = Arc::new(ApiState::new(config, scheduler, catalog));
+    let listeners = simplehar_se::listeners::ListenerRegistry::new();
+    let state = Arc::new(ApiState::new(
+        config.clone(),
+        scheduler.clone(),
+        catalog,
+        listeners.clone(),
+    ));
 
-    match run(state).await {
+    // One shutdown channel for every exit path: Ctrl+C and the tray's Exit item
+    // (v3.3 §20 lesson: a single Notify can only wake one waiter).
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+    if config.tray_enabled {
+        let control_url = format!("http://{}/", state.control_addr);
+        simplehar_se::tray::spawn(
+            scheduler,
+            listeners,
+            control_url,
+            tokio::runtime::Handle::current(),
+            shutdown,
+        );
+    }
+
+    match run(state, shutdown_rx).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = %error, "harness stopped with an error");
@@ -69,54 +88,70 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Binds every category listener (the control one hosts `/har/*`); a failed
-/// *category* bind is reported and skipped — partial availability beats a dead
-/// process (G11). A failed *control* bind is fatal: without it there is no control
-/// plane.
-async fn run(state: Arc<ApiState>) -> anyhow::Result<()> {
+/// Pause between listener rebind attempts while a port is unavailable.
+const LISTENER_RETRY: Duration = Duration::from_secs(5);
+
+/// Runs one listener under a supervisor: bind, serve, and on any end try to rebind —
+/// a busy port marks the category `Down` (tray red, `/har/status` names the port)
+/// until a retry succeeds. No bind failure is fatal: partial availability beats a
+/// dead process (G11, §0.2 failure contract) — even for the control listener.
+async fn supervise_listener(
+    state: Arc<ApiState>,
+    category: simplehar_se::config::CategoryConfig,
+    listeners: simplehar_se::listeners::ListenerRegistry,
+) {
+    let addr = SocketAddr::new(state.config.internal_host, category.public_port);
+    let router = if category.control {
+        control_router(Arc::clone(&state))
+    } else {
+        category_router(Arc::clone(&state), category.id)
+    };
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                listeners.mark_serving(category.id);
+                tracing::info!(%addr, category = %category.id, "listener serving");
+                if let Err(error) = axum::serve(listener, router.clone()).await {
+                    tracing::error!(%addr, category = %category.id, error = %error,
+                        "listener stopped; attempting rebind");
+                }
+            }
+            Err(error) => {
+                listeners.mark_down(category.id, format!("cannot bind {addr}: {error}"));
+                tracing::error!(%addr, category = %category.id, error = %error,
+                    "listener down (port busy?); retrying; harness continues (G11)");
+            }
+        }
+        tokio::time::sleep(LISTENER_RETRY).await;
+    }
+}
+
+/// Starts one supervisor per category listener and waits for shutdown.
+async fn run(
+    state: Arc<ApiState>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     tracing::info!(
         control = %state.control_addr,
         "simplehar-se booting: listeners before engines, zero engine spawns (§0.2)"
     );
-    let host = state.config.internal_host;
-    let mut servers = Vec::new();
+    let listeners = state.listeners.clone();
+    let mut supervisors = Vec::new();
     for category in state.config.categories.clone() {
-        let addr = SocketAddr::new(host, category.public_port);
-        let router = if category.control {
-            control_router(Arc::clone(&state))
-        } else {
-            category_router(Arc::clone(&state), category.id)
-        };
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => {
-                tracing::info!(%addr, category = %category.id, "listener bound");
-                servers.push(tokio::spawn(async move {
-                    let _ = axum::serve(listener, router).await;
-                }));
-            }
-            Err(error) if category.control => {
-                return Err(anyhow::anyhow!(error)).with_context(|| {
-                    format!("cannot bind control listener {addr} (G11: name the holder and refuse)")
-                });
-            }
-            Err(error) => {
-                tracing::error!(%addr, category = %category.id, error = %error,
-                    "listener bind failed; continuing on the listeners we have (G11)");
-            }
-        }
+        supervisors.push(tokio::spawn(supervise_listener(
+            Arc::clone(&state),
+            category,
+            listeners.clone(),
+        )));
     }
-    shutdown_signal().await;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = shutdown_rx.changed() => {},
+    }
     tracing::info!("shutdown requested; stopping listeners");
-    for server in servers {
-        server.abort();
+    for supervisor in supervisors {
+        supervisor.abort();
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())
-}
-
-/// Resolves on Ctrl+C; a signal-receive error is logged, not fatal.
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(error = %error, "ctrl_c listener failed; continuing until process exit");
-    }
 }

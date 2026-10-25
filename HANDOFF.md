@@ -40,7 +40,8 @@ Resolved term readings and all goals: `DESIGN.md` §0, §0.1-§0.4.
   windows / reqwest / yaml crate land with their modules) and `src/` — `lib.rs`, `main.rs`,
   `config/`, `model/`, `catalog.rs`, `ownership.rs`, `budget.rs`, `scheduler.rs`,
   `engine/{mod,mock}.rs`, `api/`, `observability.rs`, plus `tests/smoke.rs`. **Not created
-  (G14, land with their milestones): `tray.rs`, `process.rs`, `engine/llama.rs`, `webui/`.**
+  (G14, land with their milestones): `process.rs`, `engine/llama.rs`, `webui/`** (`tray.rs`
+  landed 2026-10-25, §4 item 18).
 
 Git: branch `main` tracks `origin/main` = `git@github.com:legislat/SimpleHar.git`
 (deploy key, verified: `ssh -T git@github.com` → `Hi legislat/SimpleHar!`).
@@ -174,6 +175,35 @@ Full text in `DESIGN.md`; the load-bearing ones:
     binary boot-verified: 4 listeners on 8109-8112, typed 400/404 bodies confirmed
     by curl, test instance killed. Known gaps deferred: Host/Origin guard, request
     ids, SSE *events* stream for the page, retry-once-on-crash, `/har/rescan`.
+18. **Tray milestone (2026-10-25, operator spec, built): `src/tray.rs`.** Four states —
+    green (model loaded), yellow (load/unload in flight), gray (nothing loaded),
+    **red (error requiring attention: the latest terminal job errored; its message
+    rides in the tooltip; a later success clears it — flagged reading, operator may
+    prefer sticky-until-clicked)**. Tooltip lists per-category occupants. Left click
+    does nothing. Right-click menu: Open Web UI / Unload All Models / Unload WORK /
+    Unload RP / Unload All AUX / Unload EMB / Exit — same scheduler commands as HTTP,
+    no tray-only path. Runtime-generated circle icons (no assets); Win32 message pump
+    on one dedicated thread (the module's documented `unsafe`, plus an ABI shim for
+    `DefWindowProcW`); 2 s refresh; `CREATE_NO_WINDOW` browser open (E5); Exit +
+    Ctrl+C share one `watch` channel; `tray_enabled` config key (default on).
+    Deps: tray-icon 0.21, windows 0.62 (pump; Job Objects later). DESIGN §15 rewritten
+    with the spec; §0.4 tray row amended. Gates: fmt clean, clippy `-D warnings`
+    clean, **58/58 tests** (2 new tray-state tests); binary boot-verified with the
+    tray up (icon visible, listeners clean, killed after check). **Uncommitted** —
+    say the word for a commit.
+19. **Red state redefined (operator, 2026-10-25, clarifying note; supersedes item 18's
+    flagged reading): red = anything that breaks full functionality with the harness
+    still running** — a listener that cannot bind (port busy) or died and cannot be
+    restarted. Built: `src/listeners.rs` health registry (`Serving`/`Down{reason}`,
+    port named); `main.rs` runs one supervisor per listener (bind → serve → rebind
+    every 5 s on failure; **no bind failure is fatal anymore, including the control
+    listener** — §0.2 "partial availability beats a dead process" now literal);
+    `/har/status` exposes `listeners`; tray red = `any_down()`; per-job errors are NOT
+    red (tooltip/status only). Live-verified both directions: held port 8112 → EMB
+    `Down` with reason in `/har/status` (others serving, tray red condition); freed →
+    supervisor rebound → `Serving`, red clears. Gates: fmt clean, clippy `-D warnings`
+    clean, **61/61 tests** (3 registry + updated tray tests). Still uncommitted with
+    item 18.
 
 ## 5. Open items — pick one per turn and brainstorm it
 

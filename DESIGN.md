@@ -119,7 +119,7 @@ handoff an explicit confirmation gate with an event, not a sleep:
 | Proxy surface: chat/completions/embeddings, byte-for-byte SSE pass-through, `serve_model` rewrite + discovery, retry-once-on-crash, typed `ApiError` statuses, `/har/jobs`, request ids | `/har/events` SSE stream (the page polls in v0); `/har/metrics` |
 | Typed config + per-field error report + atomic comment/CRLF-preserving yaml write-back; `sticky`→AUX and `is_embedding_model`→EMB aliases | Engine template schema final form; hot-edit of templates (item 9) |
 | Control page: persistent header + one tab per category (WORK/RP/AUX/EMB), read-mostly + load/unload + set-default (Step 14) | Per-model tuning UI, theme polish, log-ring viewer |
-| `tracing`, `thiserror`, `clippy -D warnings`, `cargo fmt`, unit + mock-engine tests; T1..T14 ported as `#[ignore]`d operator-gated tests | Tray (its own milestone, Step 15) |
+| `tracing`, `thiserror`, `clippy -D warnings`, `cargo fmt`, unit + mock-engine tests; T1..T14 ported as `#[ignore]`d operator-gated tests | Tray landed early per the operator spec (2026-10-25, Step 15) |
 | | Externals/register display list, protected containers (Step 13) — NInfer/maralab territory |
 
 
@@ -675,14 +675,32 @@ Concrete deltas from v3.3's `index.html`:
 
 ## 15. Step 15 — Tray icon
 
-Keep `tray-icon` (it is the only GUI dependency and it works; no Qt/egui). States gray/amber/
-green per slot occupancy; menu Open page / per-slot unload / unload all / Exit.
+**Operator spec (2026-10-25), pulled forward from "deferred" into the build:**
 
-Change: the tray must not be allowed to become a second source of truth. It renders the same
-`/har/status` snapshot the page uses (via an in-process channel, not a re-derivation), and its
-menu items send the *same* scheduler commands as the HTTP handlers (Step 2) — no tray-only
-code path. Shutdown fan-out uses one `watch::channel<bool>` shared by all listeners (v3.3 §20
-lesson: a single `Notify` can only wake one waiter).
+- **States (icon color):** green = a model is loaded; yellow = a load or unload is in
+  flight; gray = no model loaded; **red = the harness itself is degraded while still
+  running (operator, 2026-10-25, clarifying note): a listener that could not bind
+  (something else holds the port) or died and cannot be restarted.** A supervisor
+  retries dead listeners; red persists until every listener serves again. Per-job
+  failures (a refused load, an engine that never became ready) are *not* red — they
+  do not break the app — they surface in the tooltip and the status page.
+  Precedence: red > yellow > green > gray.
+- **Tooltip (cursor hover):** the loaded models, one line per category, e.g.
+  `SimpleHar — WORK: qwen3 | RP: — | AUX: a, b | EMB: gemma`; on red, the error line
+  is appended.
+- **Left click:** no action.
+- **Right-click menu:** Open Web UI / Unload All Models / Unload WORK / Unload RP /
+  Unload All AUX / Unload EMB / Exit.
+
+Implementation shape kept from the earlier draft: `tray-icon` is the only GUI
+dependency (no Qt/egui); the tray is **not a second source of truth** — it renders the
+same scheduler status snapshot the page uses (in-process, 2 s refresh) and its menu
+items send the *same* scheduler commands as the HTTP handlers (Step 2), no tray-only
+code path. Icons are generated at runtime (no asset files). Shutdown fan-out uses one
+`watch::channel<bool>` shared with Ctrl+C (v3.3 §20 lesson: a single `Notify` can only
+wake one waiter). The Win32 message pump lives on one dedicated thread in `tray.rs` —
+the module's documented `unsafe`, alongside `process.rs` (Step 8). `tray_enabled` is a
+config key (G9), default on. Opening the Web UI uses `CREATE_NO_WINDOW` (defect E5).
 
 ---
 

@@ -24,7 +24,12 @@ fn app() -> axum::Router {
         adapters,
         Arc::new(UnimplementedRuntime) as Arc<dyn EngineRuntime>,
     );
-    control_router(Arc::new(ApiState::new(config, scheduler, Vec::new())))
+    control_router(Arc::new(ApiState::new(
+        config,
+        scheduler,
+        Vec::new(),
+        simplehar_se::listeners::ListenerRegistry::new(),
+    )))
 }
 
 #[tokio::test]

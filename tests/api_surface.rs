@@ -40,7 +40,12 @@ fn app(config: AppConfig, catalog: Vec<ModelEntry>) -> (Router, Router, Router, 
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
     );
-    let state = Arc::new(ApiState::new(config, scheduler, catalog));
+    let state = Arc::new(ApiState::new(
+        config,
+        scheduler,
+        catalog,
+        simplehar_se::listeners::ListenerRegistry::new(),
+    ));
     let control = control_router(Arc::clone(&state));
     let work = category_router(Arc::clone(&state), CategoryId::Work);
     let rp = category_router(Arc::clone(&state), CategoryId::Rp);
