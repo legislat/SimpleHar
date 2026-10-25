@@ -505,3 +505,109 @@ async fn config_model_writes_back_to_the_yaml_file() {
         .contains("cpu_offload: true"));
     let _ = original;
 }
+
+#[tokio::test]
+async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
+    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+
+    // DNS-rebinding guard: a hostname in Host is refused 400 before any handler.
+    let response = control
+        .clone()
+        .oneshot(
+            Request::get("/har/status")
+                .header("host", "evil.example.com")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Loopback shapes pass.
+    for host in ["127.0.0.1:8708", "localhost:8708", "[::1]:8708"] {
+        let response = control
+            .clone()
+            .oneshot(
+                Request::get("/har/status")
+                    .header("host", host)
+                    .body(Body::empty())
+                    .expect("static request"),
+            )
+            .await
+            .expect("in-process request");
+        assert_eq!(response.status(), StatusCode::OK, "host {host}");
+    }
+
+    // CSRF guard: a cross-site Origin on POST is refused 403.
+    let response = control
+        .oneshot(
+            Request::post("/har/unload")
+                .header("host", "127.0.0.1:8708")
+                .header("origin", "http://evil.example.com")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn posts_without_json_content_type_are_415() {
+    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let response = control
+        .oneshot(
+            Request::post("/har/unload")
+                .header("host", "127.0.0.1:8708")
+                .header("content-type", "text/plain")
+                .body(Body::from("{}"))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn request_ids_are_echoed_or_generated() {
+    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+
+    // Client-provided id is echoed.
+    let response = control
+        .clone()
+        .oneshot(
+            Request::get("/har/status")
+                .header("host", "127.0.0.1:8708")
+                .header("x-request-id", "my-trace-1")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(
+        response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("my-trace-1")
+    );
+
+    // Absent id is generated (req-<epoch>-<counter> shape).
+    let response = control
+        .oneshot(
+            Request::get("/health")
+                .header("host", "127.0.0.1:8708")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    let id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(id.starts_with("req-"), "generated id: {id}");
+}

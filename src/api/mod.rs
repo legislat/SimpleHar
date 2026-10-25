@@ -53,6 +53,9 @@ pub enum ApiError {
     /// The request conflicts with live state (cancelled, superseded, holder on port).
     #[error("conflict: {reason}")]
     Conflict { reason: String },
+    /// A POST body lacks the required `application/json` content type — `415`.
+    #[error("unsupported media type: {reason}")]
+    UnsupportedMedia { reason: String },
     /// Real command, later milestone — `501`.
     #[error("not implemented: {reason}")]
     NotImplemented { reason: String },
@@ -70,6 +73,7 @@ impl ApiError {
             ApiError::Unavailable { .. } => "unavailable",
             ApiError::Upstream { .. } => "upstream",
             ApiError::Conflict { .. } => "conflict",
+            ApiError::UnsupportedMedia { .. } => "unsupported_media_type",
             ApiError::NotImplemented { .. } => "not_implemented",
             ApiError::Internal { .. } => "internal",
         }
@@ -83,6 +87,7 @@ impl ApiError {
             ApiError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Upstream { .. } => StatusCode::BAD_GATEWAY,
             ApiError::Conflict { .. } => StatusCode::CONFLICT,
+            ApiError::UnsupportedMedia { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ApiError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             ApiError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -184,11 +189,14 @@ impl ApiState {
         witness: Arc<dyn crate::budget::VramWitness>,
         boot: BootTimings,
     ) -> Self {
-        let control_addr = format!(
-            "{}:{}",
-            config.internal_host,
-            config.control_category().public_port
-        );
+        // 0.0.0.0 is a bind address, not a connect address: display and tray links
+        // use loopback when the harness publishes to the local net.
+        let display_host = if config.internal_host.is_unspecified() {
+            std::net::IpAddr::from([127, 0, 0, 1])
+        } else {
+            config.internal_host
+        };
+        let control_addr = format!("{}:{}", display_host, config.control_category().public_port);
         ApiState {
             control_addr,
             scheduler,
@@ -512,6 +520,146 @@ fn send_state(
         .unwrap_or_else(|_| Event::default().event("har_state").data("{}"));
     tx.send(Ok(event))
         .map_err(|_| tokio::sync::mpsc::error::SendError(()))
+}
+
+/// Process-wide request-id counter (mixed with the boot epoch: unique per run).
+static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REQUEST_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// `x-request-id` is not in the standard header constants.
+const X_REQUEST_ID: axum::http::HeaderName = axum::http::HeaderName::from_static("x-request-id");
+
+fn next_request_id() -> String {
+    let epoch = *REQUEST_EPOCH.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default()
+    });
+    let counter = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("req-{epoch:x}-{counter:x}")
+}
+
+/// The guard + correlation middleware (Step 11 "kept regardless", Step 12):
+/// - **Host** must be loopback-shaped (an IP literal or `localhost`) — a hostname
+///   means a DNS-rebinding attempt, refused `400` before any handler runs;
+/// - **Origin** (when the client sends one — browsers do on cross-site POSTs) must
+///   match the request's Host authority, else `403` (CSRF guard);
+/// - a **POST** body must declare `application/json`, else `415` (Step 11);
+/// - the **request id** comes from the client's `x-request-id` or is generated,
+///   echoed in the response header, and logged at request completion (G6).
+///
+/// Applied in `main` on every listener router, so guards wrap uniformly.
+pub async fn guard(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let request_id = request
+        .headers()
+        .get(&X_REQUEST_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(next_request_id);
+
+    if let Some(reason) = reject_reason(&request) {
+        let response = (
+            reason.status(),
+            Json(json!({
+                "code": reason.code(),
+                "message": reason.to_string(),
+            })),
+        )
+            .into_response();
+        return with_request_id(response, &request_id);
+    }
+
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    response = with_request_id(response, &request_id);
+    tracing::info!(
+        %request_id,
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        "request complete"
+    );
+    response
+}
+
+/// The guard verdict for a request: `Some(reason)` refuses it.
+fn reject_reason(request: &axum::extract::Request) -> Option<ApiError> {
+    let headers = request.headers();
+    if let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !loopback_host(host) {
+            return Some(ApiError::BadRequest {
+                reason: format!(
+                    "Host `{host}` is not a loopback address; SE is a loopback tool and refuses requests addressed by hostname (DNS-rebinding guard)"
+                ),
+            });
+        }
+    }
+    if request.method() == axum::http::Method::POST {
+        if let Some(origin) = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+        {
+            let same_authority = headers
+                .get(axum::http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|host| {
+                    origin_authority(origin).is_some_and(|authority| authority == host)
+                });
+            if !same_authority {
+                return Some(ApiError::Conflict {
+                    reason: format!(
+                        "Origin `{origin}` does not match this listener; cross-site POSTs are refused (CSRF guard)"
+                    ),
+                });
+            }
+        }
+        let json = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("application/json")
+            });
+        if !json {
+            return Some(ApiError::UnsupportedMedia {
+                reason: "POST bodies must declare Content-Type: application/json".to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// `true` for IP literals and `localhost` (with any port, v6 bracketed).
+fn loopback_host(host: &str) -> bool {
+    let authority = host
+        .rsplit_once(':')
+        .map_or(host, |(authority, _)| authority);
+    let authority = authority.trim_start_matches('[').trim_end_matches(']');
+    authority.parse::<std::net::IpAddr>().is_ok() || authority.eq_ignore_ascii_case("localhost")
+}
+
+/// The authority (`host[:port]`) of an `Origin` header value.
+fn origin_authority(origin: &str) -> Option<&str> {
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+}
+
+/// Copies the request id onto the response headers.
+fn with_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = axum::http::HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(&X_REQUEST_ID, value);
+    }
+    response
 }
 
 /// `GET /har/models` — the full unfiltered catalog for the control page (G5: the
@@ -914,6 +1062,7 @@ pub fn category_router(api: Arc<ApiState>, category: CategoryId) -> Router {
             CompressionLayer::new(),
             DefaultBodyLimit::max(PROXY_BODY_LIMIT),
         ))
+        .layer(axum::middleware::from_fn(guard))
 }
 
 /// Builds the control listener: its own category's surface plus `/har/*`.
@@ -934,8 +1083,11 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
         .route("/har/config/model", post(har_config_model));
     Router::new()
         .merge(category_router(Arc::clone(&api), control_category))
-        .merge(har.with_state(Arc::clone(&api)))
-        .merge(crate::webui::router(api))
+        .merge(
+            har.with_state(Arc::clone(&api))
+                .layer(axum::middleware::from_fn(guard)),
+        )
+        .merge(crate::webui::router(Arc::clone(&api)).layer(axum::middleware::from_fn(guard)))
         .layer((
             TraceLayer::new_for_http(),
             CompressionLayer::new(),

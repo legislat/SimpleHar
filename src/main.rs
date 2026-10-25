@@ -164,6 +164,15 @@ async fn run(
         control = %state.control_addr,
         "simplehar-se booting: listeners before engines, zero engine spawns (§0.2)"
     );
+    let host = state.config.internal_host;
+    if !host.is_loopback() {
+        // §0.4, adjusted by the operator note: publishing to the local net trusts
+        // every machine on the segment; there is no auth, only the guards.
+        tracing::warn!(
+            %host,
+            "publishing to the local network: the harness has NO authentication; every device on the segment can load models and drive the GPUs"
+        );
+    }
     let listeners = state.listeners.clone();
     let mut supervisors = Vec::new();
     for category in state.config.categories.clone() {

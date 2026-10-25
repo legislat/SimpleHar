@@ -236,7 +236,10 @@ fn default_categories() -> Vec<CategoryConfig> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
-    /// Loopback address every listener binds on; must be loopback (§0.4 non-goals).
+    /// Address every listener binds on (operator note 2026-10-25): a loopback
+    /// address (default 127.0.0.1) or `0.0.0.0` to publish to the local net.
+    /// Any other address is refused by validation. Note: there is no auth —
+    /// publishing to 0.0.0.0 trusts every machine on the segment (§0.4).
     #[serde(default = "default_internal_host")]
     pub internal_host: IpAddr,
     /// The four category definitions (Step 5); validation requires all four exactly once.
@@ -484,10 +487,13 @@ impl AppConfig {
                 }
             }
         }
-        if !self.internal_host.is_loopback() {
+        if !(self.internal_host.is_loopback() || self.internal_host.is_unspecified()) {
             errors.push(ConfigError::Invalid {
                 field: "internal_host".to_string(),
-                reason: "must be a loopback address (SE is a loopback tool, §0.4)".to_string(),
+                reason: format!(
+                    "must be a loopback address or 0.0.0.0 (local net, no auth - §0.4); got {}",
+                    self.internal_host
+                ),
             });
         }
         errors
@@ -572,7 +578,8 @@ mod tests {
     }
 
     #[test]
-    fn non_loopback_host_is_refused() {
+    fn unicast_lan_host_is_refused_but_unspecified_is_allowed() {
+        // A specific LAN address is refused: publish with 0.0.0.0 instead.
         let cfg = AppConfig {
             internal_host: IpAddr::from([192, 168, 1, 10]),
             ..AppConfig::default()
@@ -580,7 +587,14 @@ mod tests {
         assert!(cfg
             .validate()
             .iter()
-            .any(|e| e.to_string().contains("loopback")));
+            .any(|e| e.to_string().contains("0.0.0.0")));
+
+        // The operator option: 0.0.0.0 publishes to the local net.
+        let cfg = AppConfig {
+            internal_host: IpAddr::from([0, 0, 0, 0]),
+            ..AppConfig::default()
+        };
+        assert!(cfg.validate().is_empty(), "0.0.0.0 must validate");
     }
 
     #[test]

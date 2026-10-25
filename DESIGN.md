@@ -137,7 +137,11 @@ Explicit **non-goals** (kept from v3.x, restated so they are not re-litigated la
   stay in `llama.cpp` / Strata profile JSON / NInfer autostart scripts, which remain the
   source of truth (v3 §16 K6).
 - Not a security boundary against a hostile local user: it is a loopback tool with
-  DNS-rebinding/CSRF guards, not an auth system.
+  DNS-rebinding/CSRF guards, not an auth system. **Adjusted (operator note
+  2026-10-25):** the bind address is a config option — loopback (default) or
+  `0.0.0.0` to publish to the local net; there is still no auth, and `main` logs a
+  loud warning when publishing beyond loopback. LAN clients connect by IP
+  (hostname access stays refused by the rebinding guard).
 
 ---
 

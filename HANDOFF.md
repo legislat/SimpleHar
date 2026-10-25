@@ -365,6 +365,39 @@ Full text in `DESIGN.md`; the load-bearing ones:
     resets the clock), smoke asserts the boot section. Gates: fmt clean, clippy
     `-D warnings` clean, **102/102 tests**. Live: `boot` shows real numbers
     (config 1 ms, scan 14 ms, bind 30 ms). **Uncommitted.**
+29. **Guards + request ids (2026-10-25, built): Step 11/12 security and
+    correlation invariants.** `api::guard` middleware, applied **inside** the
+    router builders (category_router + the control router's /har and webui
+    surfaces) so every consumer gets them by default: (a) **Host** must be
+    loopback-shaped (IP literal or localhost, v6 bracketed ok) — a hostname is a
+    DNS-rebinding attempt, `400` before any handler; (b) **Origin** (when sent)
+    must match the request's Host authority on POST — cross-site `403` (CSRF);
+    (c) POST bodies must declare `application/json` — else **`415`**
+    (`UnsupportedMedia`, new ApiError variant, code `unsupported_media_type`);
+    (d) **request id**: client `x-request-id` echoed, else generated
+    (`req-<epoch:x>-<counter:x>`), set on every response header and logged at
+    request completion with method/path/status (G6 correlation anchor). Tests:
+    rebinding host 400 + loopback shapes pass, foreign Origin 403, 415, id
+    echo/generation. One structural note: the guard was first applied in `main`;
+    tests then showed routers without it — moved into the builders as the
+    default. Gates: fmt clean, clippy `-D warnings` clean, **105/105 tests**.
+    **Uncommitted.** Next: serve_model discovery (F-4) + retry-once-on-crash
+    (T10.1), then /har/log ring (Step 16), then the T1..T14 port.
+30. **Publish-to-LAN option (2026-10-25, operator note, built): the bind address
+    is a config choice.** `internal_host` accepts a loopback address (default
+    127.0.0.1) or `0.0.0.0` (local net); any other (unicast) address is refused
+    by validation naming the two options. When publishing beyond loopback,
+    `main` logs a loud warning once: no authentication, every device on the
+    segment can drive the GPUs (§0.4 as adjusted). Display nuance: `0.0.0.0` is
+    a bind address, not a connect address — `/har/status` `control_addr` and the
+    tray's Open-Web-UI link show 127.0.0.1 when unspecified. Guards unchanged:
+    LAN clients connect by IP (verified live: `http://<lan-ip>:8708/health`
+    answers); hostname Host headers stay refused 400 by the rebinding guard.
+    DESIGN §0.4 non-goal amended with the note. Test: unicast refused but
+    0.0.0.0 validates. Gates: fmt clean, clippy `-D warnings` clean, **105/105
+    tests**; live 0.0.0.0 boot verified (warning + serving + display). Also
+    live-verified incidentally: the single-instance guard refused a second
+    instance during this turn's testing. **Uncommitted.**
 
 ## 5. Open items — pick one per turn and brainstorm it
 
