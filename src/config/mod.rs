@@ -110,13 +110,20 @@ fn default_tray_enabled() -> bool {
     true
 }
 
+fn default_llama_server_exe() -> std::path::PathBuf {
+    std::path::PathBuf::from(r"C:\Inference\llama.cpp\llama-server.exe")
+}
+
+/// First port of the sequential engine-port allocation (HANDOFF §3 SE port plan).
+const ENGINE_PORT_BASE: u16 = 18_109;
+
 fn default_release_timeout() -> u64 {
     60
 }
 
 fn default_protected_ports() -> BTreeSet<u16> {
     // The live v3.3 ecosystem on this box: its public ports, engine ports, and the
-    // manual namespace. SE defaults use 8109-8112 so the two never collide (HANDOFF §3).
+    // manual namespace. SE defaults use 8708-8711 so the two never collide (HANDOFF §3).
     BTreeSet::from([
         8003, 8004, 8005, 8009, 8016, 8017, 8030, 18203, 18204, 18205, 18206, 18207, 18208, 18209,
     ])
@@ -146,10 +153,16 @@ pub struct CategoryConfig {
     /// exactly one category sets this (Step 11).
     #[serde(default, skip_serializing_if = "is_true")]
     pub control: bool,
+    /// Internal engine ports for this category's slots (loopback only). When empty
+    /// or short, ports are assigned sequentially from 18109 in category order
+    /// (HANDOFF §3 port plan: WORK 18109, RP 18110, AUX 18111.., EMB next).
+    #[serde(default)]
+    pub engine_ports: Vec<u16>,
 }
 
 impl CategoryConfig {
-    /// The four shipped categories on the SE port set 8109-8112 (WORK control).
+    /// The four shipped categories on the operator port set 8708-8711 (WORK control;
+    /// operator decision 2026-10-25).
     ///
     /// Eviction privileges reproduce v3.3 semantics: WORK is evicted by nobody, RP by
     /// WORK, AUX and EMB by WORK and RP (DESIGN Steps 5-6).
@@ -157,39 +170,43 @@ impl CategoryConfig {
         vec![
             CategoryConfig {
                 id: CategoryId::Work,
-                public_port: 8109,
+                public_port: 8708,
                 default_model: None,
                 max_models: 1,
                 evictable_by: vec![],
                 idle_timeout_min: 0,
                 control: true,
+                engine_ports: vec![],
             },
             CategoryConfig {
                 id: CategoryId::Rp,
-                public_port: 8110,
+                public_port: 8709,
                 default_model: None,
                 max_models: 1,
                 evictable_by: vec![CategoryId::Work],
                 idle_timeout_min: 0,
                 control: false,
+                engine_ports: vec![],
             },
             CategoryConfig {
                 id: CategoryId::Aux,
-                public_port: 8111,
+                public_port: 8710,
                 default_model: None,
                 max_models: 1,
                 evictable_by: vec![CategoryId::Work, CategoryId::Rp],
                 idle_timeout_min: 0,
                 control: false,
+                engine_ports: vec![],
             },
             CategoryConfig {
                 id: CategoryId::Emb,
-                public_port: 8112,
+                public_port: 8711,
                 default_model: None,
                 max_models: 1,
                 evictable_by: vec![CategoryId::Work, CategoryId::Rp],
                 idle_timeout_min: 0,
                 control: false,
+                engine_ports: vec![],
             },
         ]
     }
@@ -228,6 +245,10 @@ pub struct AppConfig {
     /// Whether the tray icon starts with the harness (Step 15; loopback tool knob, G9).
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
+    /// Path to `llama-server.exe` (A.7: the operator's script is the source of truth
+    /// for flags; the binary path is config).
+    #[serde(default = "default_llama_server_exe")]
+    pub llama_server_exe: std::path::PathBuf,
 }
 
 impl Default for AppConfig {
@@ -241,6 +262,7 @@ impl Default for AppConfig {
             release_timeout_s: default_release_timeout(),
             load_timeout_s: default_load_timeout(),
             tray_enabled: default_tray_enabled(),
+            llama_server_exe: default_llama_server_exe(),
         }
     }
 }
@@ -282,6 +304,29 @@ impl AppConfig {
     /// category is not configured (validation reports duplicates/missing separately).
     pub fn category_mut(&mut self, id: CategoryId) -> Option<&mut CategoryConfig> {
         self.categories.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Resolves the internal engine port per slot (Step 8/11 port plan).
+    ///
+    /// Categories with an explicit `engine_ports` of the right length keep theirs;
+    /// the rest are allocated sequentially from [`ENGINE_PORT_BASE`] in category
+    /// order. Validation checks the resolved plan for collisions.
+    pub fn effective_engine_ports(&self) -> BTreeMap<CategoryId, Vec<u16>> {
+        let mut cursor = ENGINE_PORT_BASE;
+        let mut plan = BTreeMap::new();
+        for category in &self.categories {
+            let explicit_ok = category.engine_ports.len() == category.max_models;
+            let ports: Vec<u16> = if explicit_ok {
+                category.engine_ports.clone()
+            } else {
+                (0..category.max_models)
+                    .map(|offset| cursor + offset as u16)
+                    .collect()
+            };
+            cursor = cursor.saturating_add(category.max_models as u16);
+            plan.insert(category.id, ports);
+        }
+        plan
     }
 
     /// The category whose listener hosts `/har/*` and the control page (Step 11).    ///
@@ -386,6 +431,30 @@ impl AppConfig {
                 reason: "must be positive (readiness deadline, Step 3)".to_string(),
             });
         }
+        // Engine ports: unique among themselves and disjoint from both namespaces.
+        let mut engine_ports_seen = BTreeSet::new();
+        for (category, ports) in self.effective_engine_ports() {
+            for port in ports {
+                if !engine_ports_seen.insert(port) {
+                    errors.push(ConfigError::Invalid {
+                        field: format!("categories.{category}.engine_ports"),
+                        reason: format!("engine port {port} appears more than once"),
+                    });
+                }
+                if self.protected_ports.contains(&port) {
+                    errors.push(ConfigError::Invalid {
+                        field: format!("categories.{category}.engine_ports"),
+                        reason: format!("engine port {port} is in protected_ports"),
+                    });
+                }
+                if self.categories.iter().any(|c| c.public_port == port) {
+                    errors.push(ConfigError::Invalid {
+                        field: format!("categories.{category}.engine_ports"),
+                        reason: format!("engine port {port} collides with a public listener"),
+                    });
+                }
+            }
+        }
         if !self.internal_host.is_loopback() {
             errors.push(ConfigError::Invalid {
                 field: "internal_host".to_string(),
@@ -418,7 +487,7 @@ mod tests {
         assert_eq!(cfg, AppConfig::default());
         assert_eq!(cfg.categories.len(), 4);
         assert_eq!(cfg.control_category().id, CategoryId::Work);
-        assert_eq!(cfg.control_category().public_port, 8109);
+        assert_eq!(cfg.control_category().public_port, 8708);
         assert!(cfg.validate().is_empty());
     }
 
@@ -439,7 +508,7 @@ mod tests {
     #[test]
     fn duplicate_listener_port_is_reported() {
         let mut cfg = AppConfig::default();
-        cfg.categories_mut(CategoryId::Emb).public_port = 8110;
+        cfg.categories_mut(CategoryId::Emb).public_port = 8709;
         let errors = cfg.validate();
         assert!(errors
             .iter()

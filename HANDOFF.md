@@ -58,9 +58,9 @@ without an explicit operator ask.**
 - A **Strata server is live on 127.0.0.1:18203** and may be serving the agent session driving
   this work (the v3.3 test run was halted by exactly this). Never stop, unload, or replace
   anything on 8003/8004/8005/18203/18204 without explicit operator go-ahead.
-- Any SE test run must use its **own port set** (e.g. public 8109-8112, one per category
-  listener, internal 18109-18119 covering AUX ×6, engine 18303+) — the config is
-  declarative, so this is free.
+- Any SE test run must use its **own port set** — public 8708-8711, one per category
+  listener (operator-set 2026-10-25), internal 18109-18119 covering AUX ×6, engine
+  18303+ — the config is declarative, so this is free.
 - GPU: RTX PRO 5000 Blackwell 72 GB (73 415 MiB), driver 616.92, currently ~69-71 GB in use by
   the live engines. RAM 95 GB, ~93 GB in use. Do not launch big models to "test" things.
 - WSL2 `Ubuntu`, user `legislat`, running. `mara-lab` container up ~10 h — protected, never rm.
@@ -204,6 +204,30 @@ Full text in `DESIGN.md`; the load-bearing ones:
     supervisor rebound → `Serving`, red clears. Gates: fmt clean, clippy `-D warnings`
     clean, **61/61 tests** (3 registry + updated tray tests). Still uncommitted with
     item 18.
+20. **Process milestone (2026-10-25, built; A10 included): real engines run.**
+    `src/process.rs`: hidden spawns (`CREATE_NO_WINDOW`) with stdout/stderr →
+    `logs/<name>-<epoch>.log`, one Win32 Job Object per engine tree
+    (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, the crash-proof orphan guarantee —
+    documented `unsafe` with per-block invariants), kill = terminate job + child, G12
+    evidence = child handle signaled AND port refuses TCP (entry cleaned on confirm),
+    probe = shared `http_probe`. `SingleInstanceGuard` (A10): named mutex — verified
+    live: second instance refuses with exit 1. `engine/llama.rs`: A.7 flag table as
+    data + `cpu_offload`/forced `--host`/`--port` extensions; **parity test re-reads
+    `C:\Inference\llama.cpp\start.ps1` and requires the table to match** (passes).
+    `EngineAdapter::spec(model, port)` now takes the assigned port; config gained
+    `engine_ports` per category (sequential plan from 18109: WORK 18109 / RP 18110 /
+    AUX 18111.. / EMB next; validated unique + disjoint) and `llama_server_exe`
+    (default `C:\Inference\llama.cpp\llama-server.exe`). Scheduler assigns each slot
+    its engine port. `engine/unimplemented.rs` deleted. Integration test spawns a
+    real python HTTP child under a Job Object: probes ready over HTTP, log file
+    verified, kill → release confirmed, table cleaned. Gates: fmt clean, clippy
+    `-D warnings` clean, **70/70 tests**; boot + second-instance refusal verified
+    live. **Uncommitted** — next: ModelConf scan (Step 9) to feed the catalog, then
+    the first real load of the smoke-test pair.
+21. **Listener port set fixed by the operator (2026-10-25): public listeners are
+    WORK 8708 / RP 8709 / AUX 8710 / EMB 8711** (control = WORK 8708). Defaults,
+    tests, and HANDOFF §3 updated; engine-port plan unchanged (18109+). Still
+    uncommitted with items 18-20.
 
 ## 5. Open items — pick one per turn and brainstorm it
 

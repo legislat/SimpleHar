@@ -14,5 +14,6 @@ pub mod listeners;
 pub mod model;
 pub mod observability;
 pub mod ownership;
+pub mod process;
 pub mod scheduler;
 pub mod tray;

@@ -56,6 +56,9 @@ pub struct ModelEntry {
     pub model_ref: Option<String>,
     /// File the entry came from; `None` for synthetic entries (tests, mock).
     pub file: Option<PathBuf>,
+    /// Every raw `key: value` from the source file, verbatim — the passthrough the
+    /// llama adapter builds argv from (Step 9 raw map; write-back keeps it honest).
+    pub raw: BTreeMap<String, String>,
 }
 
 /// v3.3-compatible boolean-ish reading of a flat yaml value. Exact parity with the
@@ -116,6 +119,7 @@ impl ModelEntry {
             vram_gb,
             model_ref: keys.get("model").cloned(),
             file: None,
+            raw: keys.clone(),
         })
     }
 }

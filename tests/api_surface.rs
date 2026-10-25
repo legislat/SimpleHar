@@ -27,6 +27,7 @@ fn entry(name: &str, engine: &str, category: CategoryId, vram_gb: Option<f64>) -
         vram_gb,
         model_ref: None,
         file: None,
+        raw: BTreeMap::new(),
     }
 }
 

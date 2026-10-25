@@ -10,7 +10,6 @@ use tower::ServiceExt;
 use simplehar_se::api::{control_router, ApiState};
 use simplehar_se::config::AppConfig;
 use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::unimplemented::UnimplementedRuntime;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
 use simplehar_se::scheduler::Scheduler;
 
@@ -22,7 +21,7 @@ fn app() -> axum::Router {
         config.clone(),
         Vec::new(),
         adapters,
-        Arc::new(UnimplementedRuntime) as Arc<dyn EngineRuntime>,
+        Arc::new(simplehar_se::process::ProcessRuntime::new()) as Arc<dyn EngineRuntime>,
     );
     control_router(Arc::new(ApiState::new(
         config,
@@ -65,7 +64,7 @@ async fn health_and_status_answer_on_default_config() {
         Some(4),
         "four category listeners"
     );
-    assert_eq!(status["control_addr"], "127.0.0.1:8109");
+    assert_eq!(status["control_addr"], "127.0.0.1:8708");
     assert_eq!(status["slots"].as_array().map(Vec::len), Some(4));
 }
 

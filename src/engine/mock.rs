@@ -15,7 +15,7 @@ impl EngineAdapter for MockAdapter {
         "mock"
     }
 
-    fn spec(&self, model: &ModelEntry) -> Result<LaunchSpec, EngineError> {
+    fn spec(&self, model: &ModelEntry, _port: u16) -> Result<LaunchSpec, EngineError> {
         if model.name.trim().is_empty() {
             return Err(EngineError::MissingField {
                 model: model.name.clone(),
@@ -52,12 +52,15 @@ mod tests {
             vram_gb: None,
             model_ref: None,
             file: None,
+            raw: BTreeMap::new(),
         }
     }
 
     #[test]
     fn builds_a_launch_spec_naming_the_model() {
-        let spec = MockAdapter.spec(&entry("qwen3")).expect("valid model");
+        let spec = MockAdapter
+            .spec(&entry("qwen3"), 18109)
+            .expect("valid model");
         assert_eq!(spec.argv, vec!["mock-engine", "--name", "qwen3"]);
         assert_eq!(spec.log_name, "mock-qwen3");
         assert_eq!(
@@ -71,7 +74,9 @@ mod tests {
 
     #[test]
     fn empty_name_is_a_missing_field_refusal() {
-        let err = MockAdapter.spec(&entry(" ")).expect_err("blank name");
+        let err = MockAdapter
+            .spec(&entry(" "), 18109)
+            .expect_err("blank name");
         assert!(matches!(err, EngineError::MissingField { .. }));
     }
 }

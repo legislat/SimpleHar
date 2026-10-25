@@ -359,6 +359,8 @@ struct ActorState {
 struct Slot {
     category: CategoryId,
     index: usize,
+    /// Internal engine port for this slot, from the config port plan (Step 8/11).
+    engine_port: u16,
     occupant: Option<Occupant>,
     job: Option<JobId>,
 }
@@ -384,11 +386,14 @@ impl ActorState {
         tx: mpsc::UnboundedSender<ActorMsg>,
     ) -> Self {
         let mut slots = Vec::new();
+        let port_plan = cfg.effective_engine_ports();
         for cat in &cfg.categories {
-            for index in 0..cat.max_models {
+            let ports = port_plan.get(&cat.id).cloned().unwrap_or_default();
+            for (index, engine_port) in ports.iter().enumerate().take(cat.max_models) {
                 slots.push(Slot {
                     category: cat.id,
                     index,
+                    engine_port: *engine_port,
                     occupant: None,
                     job: None,
                 });
@@ -680,7 +685,13 @@ impl ActorState {
             );
             return;
         };
-        let spec = match adapter.spec(&entry) {
+        let engine_port = self
+            .jobs
+            .get(&job_id)
+            .and_then(|job| job.slot)
+            .map(|slot| self.slots[slot].engine_port)
+            .unwrap_or_default();
+        let spec = match adapter.spec(&entry, engine_port) {
             Ok(spec) => spec,
             Err(error) => {
                 self.on_event(job_id, spawn_error(error.to_string()));
@@ -691,7 +702,7 @@ impl ActorState {
             generation: self.next_gen,
             kind: ResourceKind::ChildProcess,
             pid: 0,
-            port: 0,
+            port: engine_port,
         };
         self.next_gen += 1;
         {

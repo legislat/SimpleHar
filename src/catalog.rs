@@ -49,6 +49,7 @@ pub fn resolve<'a>(query: &str, models: &'a [ModelEntry]) -> Option<&'a ModelEnt
 mod tests {
     use super::*;
     use crate::config::CategoryId;
+    use std::collections::BTreeMap;
 
     fn catalog() -> Vec<ModelEntry> {
         vec![
@@ -59,6 +60,7 @@ mod tests {
                 vram_gb: Some(2.0),
                 model_ref: Some("F:/MODELS/qwen3-0.6b.gguf".to_string()),
                 file: None,
+                raw: BTreeMap::new(),
             },
             ModelEntry {
                 name: "embeddinggemma-2".to_string(),
@@ -67,6 +69,7 @@ mod tests {
                 vram_gb: Some(2.0),
                 model_ref: Some("F:/MODELS/embeddinggemma-2.gguf".to_string()),
                 file: None,
+                raw: BTreeMap::new(),
             },
         ]
     }

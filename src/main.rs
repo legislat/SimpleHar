@@ -3,10 +3,11 @@
 
 use simplehar_se::api::{category_router, control_router, ApiState};
 use simplehar_se::config::{AppConfig, ConfigError};
+use simplehar_se::engine::llama::LlamaAdapter;
 use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::unimplemented::UnimplementedRuntime;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
 use simplehar_se::observability;
+use simplehar_se::process::{ProcessRuntime, SingleInstanceGuard};
 use simplehar_se::scheduler::Scheduler;
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -40,6 +41,14 @@ fn boot_config() -> Result<AppConfig, Vec<ConfigError>> {
 #[tokio::main]
 async fn main() -> ExitCode {
     observability::init();
+    // A10 single-instance guard (§0.2 step 3): a second harness refuses to boot.
+    let _guard = match SingleInstanceGuard::acquire() {
+        Ok(guard) => guard,
+        Err(reason) => {
+            tracing::error!(reason = %reason, "refusing to start");
+            return ExitCode::FAILURE;
+        }
+    };
     let config = match boot_config() {
         Ok(config) => config,
         Err(errors) => {
@@ -55,7 +64,12 @@ async fn main() -> ExitCode {
     let mut adapters = std::collections::BTreeMap::new();
     let mock: Arc<dyn EngineAdapter> = Arc::new(MockAdapter);
     adapters.insert("mock".to_string(), mock);
-    let runtime: Arc<dyn EngineRuntime> = Arc::new(UnimplementedRuntime);
+    let llama: Arc<dyn EngineAdapter> = Arc::new(LlamaAdapter::new(
+        config.llama_server_exe.clone(),
+        config.internal_host.to_string(),
+    ));
+    adapters.insert("llama".to_string(), llama);
+    let runtime: Arc<dyn EngineRuntime> = Arc::new(ProcessRuntime::new());
     let scheduler = Scheduler::start(config.clone(), catalog.clone(), adapters, runtime);
     let listeners = simplehar_se::listeners::ListenerRegistry::new();
     let state = Arc::new(ApiState::new(

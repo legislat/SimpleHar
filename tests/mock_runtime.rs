@@ -183,33 +183,6 @@ impl EngineRuntime for MockRuntime {
     }
 
     async fn probe(&self, port: u16, readiness: &ReadinessSpec) -> Probe {
-        // The mock only ever serves the first HTTP step of a readiness chain.
-        let (path, expect) = match readiness {
-            ReadinessSpec::Http {
-                path,
-                expect_status,
-            } => (path.clone(), *expect_status),
-            ReadinessSpec::Then(first, _) => match first.as_ref() {
-                ReadinessSpec::Http {
-                    path,
-                    expect_status,
-                } => (path.clone(), *expect_status),
-                other => {
-                    return Probe::Failed {
-                        reason: format!("mock runtime cannot probe nested spec {other:?}"),
-                    }
-                }
-            },
-        };
-        let url = format!("http://127.0.0.1:{port}{path}");
-        match self.client.get(&url).send().await {
-            Ok(response) if response.status().as_u16() == expect => Probe::Ready,
-            Ok(response) => Probe::NotYet {
-                reason: format!("health answered {}", response.status()),
-            },
-            Err(error) => Probe::NotYet {
-                reason: format!("no answer yet: {error}"),
-            },
-        }
+        simplehar_se::engine::http_probe(&self.client, port, readiness).await
     }
 }

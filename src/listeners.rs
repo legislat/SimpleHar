@@ -74,7 +74,7 @@ mod tests {
         registry.mark_serving(CategoryId::Work);
         registry.mark_down(
             CategoryId::Emb,
-            "cannot bind 127.0.0.1:8112: address in use".to_string(),
+            "cannot bind 127.0.0.1:8711: address in use".to_string(),
         );
         assert!(registry.any_down());
         let snapshot = registry.snapshot();
@@ -84,7 +84,7 @@ mod tests {
         );
         assert!(matches!(
             snapshot.get(&CategoryId::Emb),
-            Some(ListenerState::Down { reason }) if reason.contains("8112")
+            Some(ListenerState::Down { reason }) if reason.contains("8711")
         ));
     }
 

@@ -28,10 +28,14 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 # Tray icon + menu (Step 15): the only GUI dependency; no Qt/egui.
 tray-icon = "0.21"
-# Win32 message pump for the tray thread (Step 15) and Job Objects later (Step 8).
+# Win32: tray message pump (Step 15) and Job Objects + single-instance mutex (Step 8).
 windows = { version = "0.62", features = [
+    "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_JobObjects",
     "Win32_Graphics_Gdi",
 ] }
 

@@ -5,8 +5,8 @@
 //! constructible from data alone — no adapter may hide a decision a template could
 //! express. Readiness is typed, never a string heuristic (defect D7/E1 class).
 
+pub mod llama;
 pub mod mock;
-pub mod unimplemented;
 
 use crate::model::ModelEntry;
 use crate::ownership::SpawnTicket;
@@ -77,21 +77,52 @@ pub enum Probe {
     Failed { reason: String },
 }
 
-/// Produces launch specs for one engine id (Step 7).
-///
-/// Probing is not part of the trait yet: it lands with the scheduler milestone, on
-/// blocking tasks with deadlines (Step 2), driven by [`ReadinessSpec`] data.
+/// Produces launch specs for one engine id (Step 7). The harness assigns the engine
+/// port from the slot plan (config `engine_ports`); the adapter embeds it in argv.
 pub trait EngineAdapter: Send + Sync {
     /// The `engine:` name this adapter serves.
     fn engine_id(&self) -> &str;
 
-    /// Builds the launch spec for `model`.
+    /// Builds the launch spec for `model`, serving loopback on `port`.
     ///
     /// # Errors
     ///
     /// [`EngineError::MissingField`] / [`EngineError::Rejected`] as documented; these
     /// become `Refused` job records, never panics.
-    fn spec(&self, model: &ModelEntry) -> Result<LaunchSpec, EngineError>;
+    fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError>;
+}
+
+/// Shared HTTP readiness probe (the semantics both runtimes use, Step 7).
+///
+/// `Then` chains probe steps in order: the first non-`Ready` step short-circuits.
+pub async fn http_probe(client: &reqwest::Client, port: u16, readiness: &ReadinessSpec) -> Probe {
+    let (path, expect) = match readiness {
+        ReadinessSpec::Http {
+            path,
+            expect_status,
+        } => (path.clone(), *expect_status),
+        ReadinessSpec::Then(first, _) => match first.as_ref() {
+            ReadinessSpec::Http {
+                path,
+                expect_status,
+            } => (path.clone(), *expect_status),
+            other => {
+                return Probe::Failed {
+                    reason: format!("cannot probe nested spec {other:?}"),
+                }
+            }
+        },
+    };
+    let url = format!("http://127.0.0.1:{port}{path}");
+    match client.get(&url).send().await {
+        Ok(response) if response.status().as_u16() == expect => Probe::Ready,
+        Ok(response) => Probe::NotYet {
+            reason: format!("health answered {}", response.status()),
+        },
+        Err(error) => Probe::NotYet {
+            reason: format!("no answer yet: {error}"),
+        },
+    }
 }
 
 /// Why a spawn/kill/release step failed at the process layer (Step 8).
