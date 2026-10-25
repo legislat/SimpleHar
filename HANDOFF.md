@@ -310,6 +310,23 @@ Full text in `DESIGN.md`; the load-bearing ones:
     from the `4074f67` commit via `git checkout --` and re-applied the one-line
     `-0.0` cosmetic fix (the only uncommitted change lost; recovered before any
     other damage). **Uncommitted.**
+26. **Yaml write-back milestone (2026-10-25, built): page edits persist to the model
+    files (Step 9 remainder).** `model/writeback.rs`: read-modify-write of the raw
+    lines — comments survive (a `key:` inside a commented block is never
+    clobbered), CRLF endings survive (split on `\n` only, `\r` rides per-line;
+    appended lines match the file's dominant ending), unknown keys untouched,
+    removal deletes the line; atomic replace (temp + rename) with pre-write parse
+    validation and post-write re-check that restores the original on failure (the
+    D3/D4 fixes as behavior). `POST /har/config/model` {model, category?, cpu?}:
+    edits the file, hot-rescans the catalog, and frees the slot when a loaded
+    model's category changed so the next use reloads it on the right listener; the
+    reply echoes the edits and the fresh entry state. Page: per-row Cat select and
+    CPU checkbox posting to it (refresh on success, revert + error flash on
+    failure); `/har/models` + merged SSE state carry `cpu_offload`. Gates: fmt
+    clean, clippy `-D warnings` clean, **95/95 tests** (6 writeback unit + 1
+    integration). Live: category+cpu edit against the real binary — header comment
+    and the commented-out old `# category: AUX` line survived verbatim, real key
+    rewritten in place, `cpu_offload: true` appended. **Uncommitted.**
 
 ## 5. Open items — pick one per turn and brainstorm it
 

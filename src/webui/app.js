@@ -258,6 +258,37 @@ function modelRow(status, model, category) {
   );
   row.append(el("td", {}, text(model.engine)));
   row.append(el("td", {}, text(model.vram_gb !== null ? `${model.vram_gb} GiB` : "est.")));
+
+  // Category select: page edits write back into the model yaml (Step 9).
+  const select = el("select", { class: "sh-mini", "aria-label": "category" });
+  for (const option of CATEGORY_ORDER) {
+    select.append(
+      el("option", { value: option, ...(option === model.category ? { selected: "" } : {}) }, text(option)),
+    );
+  }
+  select.addEventListener("change", () =>
+    postJson("/har/config/model", { model: model.id, category: select.value })
+      .then(refresh)
+      .catch((error) => {
+        flashError(error);
+        refresh();
+      }),
+  );
+  row.append(el("td", {}, select));
+
+  // CPU checkbox: forces -ngl 0 for llama engines; write-back is the yaml.
+  const cpu = el("input", { type: "checkbox", "aria-label": "cpu offload" });
+  cpu.checked = model.cpu_offload === true;
+  cpu.addEventListener("change", () =>
+    postJson("/har/config/model", { model: model.id, cpu: cpu.checked })
+      .then(refresh)
+      .catch((error) => {
+        flashError(error);
+        refresh();
+      }),
+  );
+  row.append(el("td", {}, cpu));
+
   const actions = el("td", { class: "sh-row-actions" });
   actions.append(
     el(
@@ -277,7 +308,7 @@ function modelRow(status, model, category) {
         class: "sh-mini",
         onclick: () =>
           postJson("/har/config/default", { category, model: model.id }).catch(() => {}),
-    },
+      },
       text("Set default"),
     ),
   );
@@ -312,13 +343,22 @@ function renderTab(status, category) {
     el(
       "thead",
       {},
-      el("tr", {}, el("th", {}, text("Model")), el("th", {}, text("Engine")), el("th", {}, text("Cost")), el("th", {})),
+      el(
+        "tr",
+        {},
+        el("th", {}, text("Model")),
+        el("th", {}, text("Engine")),
+        el("th", {}, text("Cost")),
+        el("th", {}, text("Cat")),
+        el("th", {}, text("CPU")),
+        el("th", {}),
+      ),
     ),
   );
   const body = el("tbody", {});
   if (models.length === 0) {
     body.append(
-      el("tr", {}, el("td", { colspan: "4", class: "sh-empty" }, text("no models in this category — add a yaml to ModelConf and Rescan"))),
+      el("tr", {}, el("td", { colspan: "6", class: "sh-empty" }, text("no models in this category — add a yaml to ModelConf and Rescan"))),
     );
   }
   for (const model of models) body.append(modelRow(status, model, category));

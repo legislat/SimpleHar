@@ -5,6 +5,7 @@
 //! scan/write milestone (Step 9).
 
 pub mod scan;
+pub mod writeback;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

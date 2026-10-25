@@ -459,3 +459,48 @@ async fn events_stream_serves_sse_with_an_immediate_state() {
     let text = String::from_utf8_lossy(&first);
     assert!(text.contains("har_state"), "frame: {text}");
 }
+
+#[tokio::test]
+async fn config_model_writes_back_to_the_yaml_file() {
+    let (control, _, _, _, modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let file = modelconf.join("qwen3.yaml");
+    let original = std::fs::read_to_string(&file).expect("model file");
+
+    // Category edit: written into the file, catalog refreshed.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let edited = std::fs::read_to_string(&file).expect("read back");
+    assert!(edited.contains("category: AUX"), "was: {edited}");
+    assert!(edited.contains("name: qwen3"), "rest of the file survives");
+
+    // The catalog now shows the new category on the right listener.
+    let (_, rp_models) = get_json(&control, "/har/models").await;
+    let entry = rp_models["data"]
+        .as_array()
+        .expect("list")
+        .iter()
+        .find(|m| m["id"] == "qwen3")
+        .expect("entry");
+    assert_eq!(entry["category"], "AUX");
+
+    // CPU edit: boolean -> yaml key, and back.
+    let (status, _) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","cpu":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(std::fs::read_to_string(&file)
+        .expect("read")
+        .contains("cpu_offload: true"));
+    let _ = original;
+}

@@ -418,6 +418,7 @@ async fn merged_state(state: &ApiState) -> Result<Value, ApiError> {
                 "engine": entry.engine,
                 "category": entry.category,
                 "vram_gb": entry.vram_gb,
+                "cpu_offload": entry.raw.get("cpu_offload").is_some_and(|v| v == "true"),
             })
         })
         .collect();
@@ -498,6 +499,7 @@ async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
                 "engine": entry.engine,
                 "category": entry.category,
                 "vram_gb": entry.vram_gb,
+                "cpu_offload": entry.raw.get("cpu_offload").is_some_and(|v| v == "true"),
             })
         })
         .collect();
@@ -544,6 +546,83 @@ async fn har_config_default(
         "category": category,
         "default_model": effective,
         "persisted": persisted,
+    })))
+}
+
+/// `POST /har/config/model {"model": name, "category"?: WORK|RP|AUX|EMB, "cpu"?: bool}`
+/// — write per-model flags into the model's yaml (Step 9: the file stays the
+/// source of truth). A category change on a *loaded* model frees the slot so the
+/// next use reloads it into the right listener (v3.3 §-behavior, kept).
+async fn har_config_model(
+    State(state): State<Arc<ApiState>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
+        reason: format!("body must be JSON with a `model` field: {rejection}"),
+    })?;
+    let Some(model_name) = body.get("model").and_then(Value::as_str) else {
+        return Err(ApiError::BadRequest {
+            reason: "missing required field `model`".to_string(),
+        });
+    };
+    let catalog = state.catalog().await?;
+    let entry =
+        crate::catalog::resolve(model_name, &catalog).ok_or_else(|| ApiError::NotFound {
+            what: format!("model `{model_name}`"),
+        })?;
+    let path = entry.file.clone().ok_or_else(|| ApiError::BadRequest {
+        reason: format!(
+            "model `{}` has no backing file (synthetic entry)",
+            entry.name
+        ),
+    })?;
+    let old_category = entry.category;
+
+    let mut edits: Vec<(&str, Option<String>)> = Vec::new();
+    if let Some(raw) = body.get("category").and_then(Value::as_str) {
+        let category: CategoryId = raw.parse().map_err(|_| ApiError::BadRequest {
+            reason: format!("unknown category `{raw}` (WORK|RP|AUX|EMB)"),
+        })?;
+        edits.push(("category", Some(category.to_string())));
+    }
+    if let Some(cpu) = body.get("cpu").and_then(Value::as_bool) {
+        edits.push(("cpu_offload", Some(cpu.to_string())));
+    }
+    if edits.is_empty() {
+        return Err(ApiError::BadRequest {
+            reason: "nothing to edit: send `category` and/or `cpu`".to_string(),
+        });
+    }
+    for (key, value) in &edits {
+        crate::model::writeback::set_flag_on_file(&path, key, value.as_deref())
+            .map_err(|reason| ApiError::Internal { reason })?;
+    }
+    // The catalog must reflect the file the moment the operator looks again.
+    state.scheduler.reload().await.map_err(ApiError::from)?;
+
+    // A loaded model whose category changed must move slots, not lie in place.
+    let category_changed = edits.iter().any(|(key, _)| *key == "category");
+    if category_changed && old_category != entry.category {
+        // old_category was the entry's category before the edit; the fresh entry
+        // (post-reload) holds the new one, resolved below from the new catalog.
+        let catalog = state.catalog().await?;
+        if let Some(fresh) = catalog.iter().find(|m| m.name == entry.name) {
+            if fresh.category != old_category {
+                let _ = state.scheduler.unload(old_category).await;
+            }
+        }
+    }
+    let catalog = state.catalog().await?;
+    let fresh = catalog.iter().find(|m| m.name == entry.name);
+    Ok(Json(json!({
+        "status": "edited",
+        "model": entry.name,
+        "edits": edits.iter().map(|(key, value)| json!({
+            "key": key,
+            "value": value,
+        })).collect::<Vec<_>>(),
+        "category": fresh.map(|m| m.category),
+        "cpu_offload": fresh.and_then(|m| m.raw.get("cpu_offload").cloned()),
     })))
 }
 
@@ -820,7 +899,8 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
         .route("/har/unload", post(har_unload))
         .route("/har/rescan", post(har_rescan))
         .route("/har/models", get(har_models))
-        .route("/har/config/default", post(har_config_default));
+        .route("/har/config/default", post(har_config_default))
+        .route("/har/config/model", post(har_config_model));
     Router::new()
         .merge(category_router(Arc::clone(&api), control_category))
         .merge(har.with_state(Arc::clone(&api)))
