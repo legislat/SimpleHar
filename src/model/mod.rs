@@ -1,0 +1,179 @@
+//! Typed per-model configuration from `ModelConf/*.yaml` (DESIGN Steps 9-10).
+//!
+//! The v3.3 files are flat `key: value` documents. This module owns the typed entry and
+//! the documented alias rules; byte-preserving round-trip write-back arrives with the
+//! scan/write milestone (Step 9).
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::config::CategoryId;
+use thiserror::Error;
+
+/// Problems building a [`ModelEntry`] from raw yaml keys; collected per file at scan
+/// time and exposed at `/har/status` — a bad file is skipped and named, never fatal.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum ModelError {
+    /// The `name:` key is absent or empty; the harness name is the canonical id (Step 10).
+    #[error("missing or empty `name` key")]
+    MissingName,
+    /// `category:` is not one of WORK|RP|AUX|EMB.
+    #[error("bad `category` value `{value}`")]
+    BadCategory {
+        /// The unparsable value as it appeared in the file.
+        value: String,
+    },
+    /// `is_embedding_model: true` on a model whose explicit category is not EMB.
+    #[error("category `{value}` conflicts with `is_embedding_model: true` (must be EMB)")]
+    EmbeddingCategoryConflict {
+        /// The explicit, non-EMB category value.
+        value: String,
+    },
+    /// A numeric key could not be parsed.
+    #[error("field `{field}` is not a number: `{value}`")]
+    BadNumber {
+        /// Field name.
+        field: String,
+        /// Raw value.
+        value: String,
+    },
+}
+
+/// One model from `ModelConf/`, typed (Step 10: harness name is canonical).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelEntry {
+    /// Canonical harness name (`name:`); the `model` field clients send.
+    pub name: String,
+    /// Engine id (`engine:`), defaulting to `llama`; may name a template (Step 7).
+    pub engine: String,
+    /// Slot category after alias resolution.
+    pub category: CategoryId,
+    /// Declared admission cost in GiB (Step 4 rule 1); `None` falls back to the
+    /// GGUF-size formula.
+    pub vram_gb: Option<f64>,
+    /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
+    /// Informational for managed models; used for stem/path aliases (Step 10).
+    pub model_ref: Option<String>,
+    /// File the entry came from; `None` for synthetic entries (tests, mock).
+    pub file: Option<PathBuf>,
+}
+
+/// v3.3-compatible boolean-ish reading of a flat yaml value. Exact parity with the
+/// baseline `truthy` table is pinned by a unit test when the scan milestone ports it.
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
+}
+
+impl ModelEntry {
+    /// Builds an entry from a flat `key: value` map (the v3.3 yaml shape), applying the
+    /// documented aliases: `is_embedding_model: true` forces EMB, `sticky: true` maps
+    /// to AUX when no explicit `category:` is present, and the default is WORK
+    /// (Step 5, Step 9).
+    ///
+    /// # Errors
+    ///
+    /// - [`ModelError::MissingName`] when `name` is absent/empty.
+    /// - [`ModelError::BadCategory`] / [`ModelError::EmbeddingCategoryConflict`] on an
+    ///   unusable category combination.
+    /// - [`ModelError::BadNumber`] when `vram_gb` is not a number.
+    pub fn from_flat(keys: &BTreeMap<String, String>) -> Result<Self, ModelError> {
+        let name = keys.get("name").map(String::as_str).unwrap_or_default();
+        if name.trim().is_empty() {
+            return Err(ModelError::MissingName);
+        }
+        let embedding = keys.get("is_embedding_model").is_some_and(|v| truthy(v));
+        let category = match keys.get("category") {
+            Some(raw) => {
+                let parsed: CategoryId = raw
+                    .parse()
+                    .map_err(|_| ModelError::BadCategory { value: raw.clone() })?;
+                if embedding && parsed != CategoryId::Emb {
+                    return Err(ModelError::EmbeddingCategoryConflict { value: raw.clone() });
+                }
+                parsed
+            }
+            None if embedding => CategoryId::Emb,
+            None if keys.get("sticky").is_some_and(|v| truthy(v)) => CategoryId::Aux,
+            None => CategoryId::Work,
+        };
+        let vram_gb = match keys.get("vram_gb") {
+            Some(raw) => Some(raw.parse::<f64>().map_err(|_| ModelError::BadNumber {
+                field: "vram_gb".to_string(),
+                value: raw.clone(),
+            })?),
+            None => None,
+        };
+        Ok(ModelEntry {
+            name: name.trim().to_string(),
+            engine: keys
+                .get("engine")
+                .cloned()
+                .unwrap_or_else(|| "llama".to_string()),
+            category,
+            vram_gb,
+            model_ref: keys.get("model").cloned(),
+            file: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn defaults_to_work_and_llama() {
+        let entry = ModelEntry::from_flat(&flat(&[("name", "qwen3"), ("model", "F:/m.gguf")]))
+            .expect("valid entry");
+        assert_eq!(entry.category, CategoryId::Work);
+        assert_eq!(entry.engine, "llama");
+        assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
+    }
+
+    #[test]
+    fn aliases_sticky_to_aux_and_embedding_to_emb() {
+        let sticky = ModelEntry::from_flat(&flat(&[("name", "a"), ("sticky", "true")]))
+            .expect("valid entry");
+        assert_eq!(sticky.category, CategoryId::Aux);
+
+        let embed = ModelEntry::from_flat(&flat(&[("name", "b"), ("is_embedding_model", "true")]))
+            .expect("valid entry");
+        assert_eq!(embed.category, CategoryId::Emb);
+    }
+
+    #[test]
+    fn explicit_category_wins_and_embedding_conflicts_are_errors() {
+        let rp = ModelEntry::from_flat(&flat(&[("name", "a"), ("category", "RP")]))
+            .expect("valid entry");
+        assert_eq!(rp.category, CategoryId::Rp);
+
+        let err = ModelEntry::from_flat(&flat(&[
+            ("name", "b"),
+            ("category", "WORK"),
+            ("is_embedding_model", "true"),
+        ]))
+        .expect_err("embedding model must live in EMB");
+        assert!(matches!(err, ModelError::EmbeddingCategoryConflict { .. }));
+    }
+
+    #[test]
+    fn missing_name_and_bad_numbers_are_errors() {
+        assert_eq!(
+            ModelEntry::from_flat(&flat(&[])),
+            Err(ModelError::MissingName)
+        );
+        let err = ModelEntry::from_flat(&flat(&[("name", "a"), ("vram_gb", "big")]))
+            .expect_err("vram_gb must be numeric");
+        assert!(matches!(err, ModelError::BadNumber { .. }));
+    }
+}

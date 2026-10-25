@@ -1,0 +1,29 @@
+[package]
+name = "simplehar-se"
+version = "0.1.0"
+edition = "2021"
+description = "One app managing local inference engines with a simple, reliable, adjustable model swap"
+license = "Apache-2.0"
+
+[dependencies]
+# HTTP framework: async handlers returning Result<Response, ApiError> (AGENTS.md convention).
+axum = "0.8"
+# Async runtime; full features for signal handling, fs, process, rt-multi-thread.
+tokio = { version = "1", features = ["full"] }
+# Middleware: ServiceExt for tests; HTTP layers below.
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "timeout"] }
+# Structured logging; no println!/eprintln! on production paths (AGENTS.md).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Error taxonomy per layer (Step 17); anyhow only at main.
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Approved 2026-10-25 but deliberately absent until their module lands (no unused deps):
+# - nvml-wrapper  -> Step 4, budget.rs witness (item 5)
+# - windows       -> Step 8, process.rs Job Objects (item 6)
+# - reqwest       -> Step 11 proxy/probes
+# - yaml crate    -> Step 9 ModelConf scan (flat key: value round-trip)
