@@ -336,3 +336,87 @@ vram_gb: 4
     let (_, body) = get_json(&work, "/v1/models").await;
     assert_eq!(body["data"].as_array().map(Vec::len), Some(2));
 }
+
+#[tokio::test]
+async fn control_page_serves_assets() {
+    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let (status, _) = get_json_html(&control, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get_json_html(&control, "/style.css").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get_json_html(&control, "/app.js").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+async fn get_json_html(app_router: &Router, path: &str) -> (StatusCode, String) {
+    let response = app_router
+        .clone()
+        .oneshot(
+            Request::get(path)
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn har_models_lists_the_full_catalog() {
+    let (control, _, _, _, _) = app(
+        AppConfig::default(),
+        &[
+            ("work-model", "mock", CategoryId::Work, Some(4.0)),
+            ("embed-model", "mock", CategoryId::Emb, Some(2.0)),
+        ],
+    );
+    let (status, body) = get_json(&control, "/har/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().map(Vec::len), Some(2));
+}
+
+#[tokio::test]
+async fn default_model_endpoint_validates_and_takes_effect() {
+    let (control, work, _, _, _) = app(
+        AppConfig::default(),
+        &[
+            ("qwen3", "mock", CategoryId::Work, Some(4.0)),
+            ("emb-model", "mock", CategoryId::Emb, Some(2.0)),
+        ],
+    );
+
+    // Wrong category: 400 with the reason.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"RP","model":"qwen3"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+
+    // Valid set: ok, and the status reflects it.
+    let (status, _) = post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"WORK","model":"qwen3"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, status_body) = get_json(&control, "/har/status").await;
+    let work_cat = status_body["categories"]
+        .as_array()
+        .expect("categories")
+        .iter()
+        .find(|cat| cat["id"] == "WORK")
+        .expect("WORK");
+    assert_eq!(work_cat["default_model"], "qwen3");
+
+    // The no-model fallback now loads it without touching the boot config file.
+    let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["body"]["model"], "qwen3");
+}

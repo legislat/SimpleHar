@@ -194,6 +194,24 @@ impl EngineRuntime for ProcessRuntime {
     }
 
     async fn probe(&self, port: u16, readiness: &crate::engine::ReadinessSpec) -> Probe {
+        // Fast-fail (Step 3 cancel/dead-engine lesson): a child that already exited
+        // must not eat the whole readiness deadline — readiness is unreachable.
+        let exited = {
+            let mut engines = self.engines.lock().expect("engine table lock");
+            engines.get_mut(&port).and_then(|engine| {
+                engine
+                    .child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .map(|status| status.to_string())
+            })
+        };
+        if let Some(status) = exited {
+            return Probe::Failed {
+                reason: format!("engine process exited early ({status})"),
+            };
+        }
         http_probe(&self.client, port, readiness).await
     }
 }

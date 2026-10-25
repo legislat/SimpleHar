@@ -1,0 +1,379 @@
+// SimpleHar SE — control page logic (Step 14). Vanilla JS, no framework: the page
+// only renders /har/* JSON; every action is an API call that also exists headless.
+"use strict";
+
+const CATEGORY_ORDER = ["WORK", "RP", "AUX", "EMB"];
+const POLL_MS = 2000;
+
+let state = { status: null, models: [], activeTab: "WORK" };
+
+// ---------- tiny helpers ----------
+
+async function getJson(path) {
+  const response = await fetch(path);
+  if (!response.ok) {
+    throw new Error(`${path} -> ${response.status}`);
+  }
+  return response.json();
+}
+
+async function postJson(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.message || `${path} -> ${response.status}`);
+  }
+  return data;
+}
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === "class") node.className = value;
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (value !== null && value !== undefined) node.setAttribute(key, value);
+  }
+  for (const child of children) {
+    if (child === null || child === undefined) continue;
+    node.append(child);
+  }
+  return node;
+}
+
+function text(value) {
+  return document.createTextNode(String(value));
+}
+
+// ---------- theme (adaptive light/dark with a sticky toggle) ----------
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem("sh-theme", theme);
+  const toggle = document.getElementById("sh-theme-toggle");
+  if (toggle) toggle.textContent = theme === "dark" ? "Light" : "Dark";
+}
+
+function initTheme() {
+  const stored = localStorage.getItem("sh-theme");
+  const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  applyTheme(stored || (prefersDark ? "dark" : "light"));
+  document.getElementById("sh-theme-toggle").addEventListener("click", () => {
+    const current = document.documentElement.getAttribute("data-theme");
+    applyTheme(current === "dark" ? "light" : "dark");
+  });
+}
+
+// ---------- rendering ----------
+
+function slotJobsFor(status, category) {
+  return status.jobs.filter((job) => job.category === category && !job.terminal);
+}
+
+function renderSlotCard(status, category) {
+  const slots = status.slots.filter((slot) => slot.category === category);
+  const loading = slotJobsFor(status, category).length > 0;
+  const card = el("article", { class: "sh-slot" });
+  const head = el("h4", {}, text(category), el("span", {}, text(categoryPort(status, category))));
+  card.append(head);
+  if (category === "AUX") {
+    // The AUX card splits horizontally: one slim row per occupant (operator spec).
+    if (slots.length === 0) card.append(el("div", { class: "sh-empty" }, text("no slots")));
+    for (const slot of slots) {
+      const row = el("div", { class: "sh-occupant-row" });
+      if (slot.model) {
+        row.append(el("span", { class: "sh-occupant" }, text(slot.model)));
+        row.append(unloadButton(category));
+      } else if (slot.loading_job !== null) {
+        row.append(el("span", { class: "sh-empty" }, text("loading…")));
+      } else {
+        row.append(el("span", { class: "sh-empty" }, text("—")));
+      }
+      card.append(row);
+    }
+    return card;
+  }
+  const main = el("div", { class: "sh-slot-main" });
+  const slot = slots[0];
+  if (slot && slot.model) {
+    main.append(el("span", { class: "sh-occupant" }, text(slot.model)));
+    main.append(unloadButton(category));
+  } else if (loading) {
+    main.append(el("span", { class: "sh-empty" }, text("loading…")));
+  } else {
+    main.append(el("span", { class: "sh-empty" }, text("—")));
+  }
+  card.append(main);
+  return card;
+}
+
+function unloadButton(category) {
+  return el(
+    "button",
+    {
+      class: "sh-mini",
+      onclick: () =>
+        postJson("/har/unload", { category }).catch((error) => flashError(error)),
+    },
+    text("Unload"),
+  );
+}
+
+function categoryPort(status, category) {
+  const entry = status.categories.find((cat) => cat.id === category);
+  return entry ? `:${entry.public_port}` : "";
+}
+
+function renderMemory(status) {
+  const mem = status.mem;
+  const ledger = status.slots.reduce((sum, slot) => sum + (slot.need_gib || 0), 0);
+  const usedPct = Math.min(100, (ledger / mem.total_gb) * 100);
+  const reservePct = (mem.reserve_gb / mem.total_gb) * 100;
+  return el(
+    "div",
+    { class: "sh-mem" },
+    el(
+      "div",
+      {},
+      el("label", {}, text(`VRAM ledger ${ledger.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (witness: NVML pending)`)),
+      el("div", { class: "sh-bar" }, el("i", { style: `width:${usedPct}%` })),
+    ),
+    el(
+      "div",
+      {},
+      el("label", {}, text(`Reserve ${mem.reserve_gb.toFixed(1)} GiB (held away from admission)`)),
+      el("div", { class: "sh-bar", "data-tone": "reserve" }, el("i", { style: `width:${reservePct}%` })),
+    ),
+  );
+}
+
+function renderHeader(status) {
+  const loaded = status.slots.filter((slot) => slot.model).length;
+  const anyDown = Object.values(status.listeners).some(
+    (listener) => typeof listener === "object",
+  );
+  const headline = el(
+    "div",
+    { class: "sh-headline" },
+    el("h1", { class: "sh-title" }, text("SimpleHar SE")),
+    el(
+      "span",
+      { class: "sh-badge", "data-tone": loaded > 0 ? "ok" : "none" },
+      text(loaded > 0 ? `${loaded} loaded` : "idle"),
+    ),
+    anyDown
+      ? el("span", { class: "sh-badge", "data-tone": "bad" }, text("listener down"))
+      : null,
+  );
+  const endpoints = el(
+    "div",
+    { class: "sh-endpoints" },
+    ...status.categories.map((cat) =>
+      el(
+        "a",
+        { href: `http://${window.location.hostname}:${cat.public_port}/v1/models` },
+        text(`${cat.id} :${cat.public_port}${cat.control ? " (control)" : ""}`),
+      ),
+    ),
+    el(
+      "button",
+      {
+        class: "sh-mini outline",
+        onclick: () => postJson("/har/rescan", {}).then(refresh).catch((error) => flashError(error)),
+      },
+      text("Rescan"),
+    ),
+  );
+  const slots = el(
+    "div",
+    { class: "sh-slots" },
+    ...CATEGORY_ORDER.map((category) => renderSlotCard(status, category)),
+  );
+  const errors = (status.catalog_errors || []).map(
+    (error) => `${error.file}: ${error.reason}`,
+  );
+  return el(
+    "div",
+    {},
+    headline,
+    endpoints,
+    slots,
+    renderMemory(status),
+    errors.length > 0
+      ? el("div", { class: "sh-catalog-errors" }, text(errors.join(" · ")))
+      : null,
+  );
+}
+
+function modelRow(status, model, category) {
+  const serving = status.slots.some(
+    (slot) => slot.category === category && slot.model === model.id,
+  );
+  const loading = slotJobsFor(status, category).some((job) => job.model === model.id);
+  const failed = status.jobs.some(
+    (job) => job.terminal && job.model === model.id && job.error,
+  );
+  const dotState = serving ? "serving" : loading ? "loading" : failed ? "failed" : "idle";
+  const row = el("tr", {});
+  row.append(
+    el(
+      "td",
+      {},
+      el("span", { class: "sh-dot", "data-state": dotState }),
+      el("strong", {}, text(model.id)),
+    ),
+  );
+  row.append(el("td", {}, text(model.engine)));
+  row.append(el("td", {}, text(model.vram_gb !== null ? `${model.vram_gb} GiB` : "est.")));
+  const actions = el("td", { class: "sh-row-actions" });
+  actions.append(
+    el(
+      "button",
+      {
+        class: "sh-mini",
+        onclick: () =>
+          postJson("/har/load", { model: model.id }).catch((error) => flashError(error)),
+      },
+      text("Load"),
+    ),
+  );
+  actions.append(
+    el(
+      "button",
+      {
+        class: "sh-mini",
+        onclick: () =>
+          postJson("/har/config/default", { category, model: model.id }).catch(() => {}),
+    },
+      text("Set default"),
+    ),
+  );
+  row.append(actions);
+  return row;
+}
+
+function renderTab(status, category) {
+  const entry = status.categories.find((cat) => cat.id === category);
+  const models = state.models.filter((model) => model.category === category);
+  const panel = el("div", { class: "sh-panel-head" });
+  panel.append(text(`listener :${entry ? entry.public_port : "?"}`));
+  panel.append(
+    text(entry && entry.default_model ? `default: ${entry.default_model}` : "default: none"),
+  );
+  if (entry && entry.default_model) {
+    panel.append(
+      el(
+        "button",
+        {
+          class: "sh-mini",
+          onclick: () =>
+            postJson("/har/config/default", { category, model: null }).catch(() => {}),
+        },
+        text("Clear default"),
+      ),
+    );
+  }
+  const table = el(
+    "table",
+    { class: "sh-models" },
+    el(
+      "thead",
+      {},
+      el("tr", {}, el("th", {}, text("Model")), el("th", {}, text("Engine")), el("th", {}, text("Cost")), el("th", {})),
+    ),
+  );
+  const body = el("tbody", {});
+  if (models.length === 0) {
+    body.append(
+      el("tr", {}, el("td", { colspan: "4", class: "sh-empty" }, text("no models in this category — add a yaml to ModelConf and Rescan"))),
+    );
+  }
+  for (const model of models) body.append(modelRow(status, model, category));
+  table.append(body);
+  return el("div", { class: "sh-tabpanel" }, panel, table);
+}
+
+function renderTabs() {
+  const tabs = el("div", { class: "sh-tabs", role: "tablist" });
+  for (const category of CATEGORY_ORDER) {
+    tabs.append(
+      el("button", {
+        class: "sh-tab",
+        role: "tab",
+        "aria-selected": String(state.activeTab === category),
+        onclick: () => {
+          state.activeTab = category;
+          render();
+        },
+      }, text(category)),
+    );
+  }
+  return tabs;
+}
+
+function renderJobs(status) {
+  const recent = status.jobs.slice(-5).reverse();
+  if (recent.length === 0) return null;
+  const wrap = el("div", { class: "sh-jobs" });
+  wrap.append(el("h3", {}, text("Recent jobs")));
+  for (const job of recent) {
+    const line = el("div", { class: "sh-job" });
+    line.append(text(`${job.id} · ${job.model} · ${job.state}`));
+    if (job.error) line.append(el("span", { class: "sh-job-error" }, text(job.error)));
+    wrap.append(line);
+  }
+  return wrap;
+}
+
+function flashError(error) {
+  const box = document.getElementById("sh-flash");
+  box.textContent = String(error.message || error);
+  box.hidden = false;
+  setTimeout(() => {
+    box.hidden = true;
+  }, 6000);
+}
+
+function render() {
+  const status = state.status;
+  if (!status) return;
+  const headerHost = document.getElementById("sh-header");
+  headerHost.replaceChildren(renderHeader(status));
+  const mainHost = document.getElementById("sh-main");
+  const jobs = renderJobs(status);
+  mainHost.replaceChildren(
+    renderTabs(),
+    renderTab(status, state.activeTab),
+    ...(jobs ? [jobs] : []),
+    el(
+      "footer",
+      { class: "sh-footer" },
+      text("SimpleHar SE — slots, jobs and refusals straight from /har/*"),
+    ),
+  );
+}
+
+// ---------- polling loop ----------
+
+async function refresh() {
+  try {
+    const [status, catalog] = await Promise.all([
+      getJson("/har/status"),
+      getJson("/har/models"),
+    ]);
+    state.status = status;
+    state.models = catalog.data;
+    render();
+  } catch (error) {
+    flashError(error);
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  initTheme();
+  refresh();
+  setInterval(refresh, POLL_MS);
+});

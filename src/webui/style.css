@@ -1,0 +1,238 @@
+/* SimpleHar SE — control page theme (Step 14).
+ * Pico CSS is the base; nothing here uses Pico defaults as-is. The design follows
+ * the harness domain: dark "machine room" surfaces in dark mode, paper-white but
+ * low-noise in light mode, one accent (the WORK green), category accent dots, and
+ * a persistent header so slot state and memory never scroll away. */
+
+:root {
+  --sh-accent: #2ea04370;
+  --sh-accent-solid: #2ea043;
+  --sh-warn: #d89b1d;
+  --sh-bad: #c0392b;
+  --sh-radius: 10px;
+  --sh-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+/* Typography: explicit header + body faces (AGENTS.md web rules). */
+html[data-theme="dark"] {
+  --pico-background-color: #10141a;
+  --pico-card-background-color: #161c24;
+  --pico-card-border-color: #232c38;
+  --pico-muted-color: #7d8896;
+}
+html[data-theme="light"] {
+  --pico-background-color: #f5f4f1;
+  --pico-card-background-color: #ffffff;
+  --pico-card-border-color: #e2e0da;
+  --pico-muted-color: #6b6f76;
+  --sh-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+body {
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 0.92rem;
+}
+
+h1, h2, h3, .sh-title {
+  font-family: "Sora", "Inter", system-ui, sans-serif;
+  letter-spacing: -0.01em;
+}
+
+/* Persistent header: always visible while the model tabs scroll under it. */
+header.sh-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  padding: 0.7rem 1rem 0.9rem;
+  margin-bottom: 1rem;
+  background: var(--pico-card-background-color);
+  border-bottom: 1px solid var(--pico-card-border-color);
+  box-shadow: var(--sh-card-shadow);
+}
+
+.sh-headline {
+  display: flex;
+  align-items: baseline;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.sh-title {
+  font-size: 1.25rem;
+  font-weight: 700;
+  margin: 0;
+}
+
+.sh-badge {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  background: var(--sh-accent);
+  color: var(--pico-color);
+}
+
+.sh-badge[data-tone="none"] { background: transparent; color: var(--pico-muted-color); }
+.sh-badge[data-tone="bad"] { background: #c0392b40; color: var(--sh-bad); }
+
+.sh-endpoints {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  color: var(--pico-muted-color);
+  font-size: 0.8rem;
+  margin-top: 0.25rem;
+}
+
+.sh-endpoints a { color: var(--pico-muted-color); }
+
+/* Slot cards: one per category; the AUX card is a horizontal stack of one-line
+ * occupant rows (operator mockup, 2026-10-25). */
+.sh-slots {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.6rem;
+  margin-top: 0.7rem;
+}
+
+.sh-slot {
+  border: 1px solid var(--pico-card-border-color);
+  border-radius: var(--sh-radius);
+  padding: 0.55rem 0.7rem;
+  background: var(--pico-background-color);
+}
+
+.sh-slot h4 {
+  margin: 0 0 0.3rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--pico-muted-color);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.sh-slot-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 1.9rem;
+}
+
+.sh-occupant { font-weight: 600; overflow-wrap: anywhere; }
+.sh-empty { color: var(--pico-muted-color); font-style: italic; }
+
+.sh-occupant-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 1.9rem;
+  padding: 0.1rem 0;
+  border-top: 1px dashed var(--pico-card-border-color);
+}
+.sh-occupant-row:first-of-type { border-top: 0; }
+
+/* Memory bars: ledger numbers labeled honestly (NVML witness is not wired yet). */
+.sh-mem {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.8rem;
+  margin-top: 0.7rem;
+}
+
+.sh-bar { height: 10px; border-radius: 6px; background: var(--pico-card-border-color); overflow: hidden; }
+.sh-bar > i { display: block; height: 100%; background: var(--sh-accent-solid); }
+.sh-bar[data-tone="reserve"] > i { background: var(--sh-warn); }
+.sh-mem label { font-size: 0.75rem; color: var(--pico-muted-color); display: block; margin-bottom: 0.2rem; }
+
+/* Tabs: models live below the header (operator mockup). */
+.sh-tabs {
+  display: flex;
+  gap: 0.3rem;
+  margin: 0.6rem 0 0.8rem;
+  flex-wrap: wrap;
+}
+
+.sh-tab {
+  border: 1px solid var(--pico-card-border-color);
+  border-radius: var(--sh-radius) var(--sh-radius) 0 0;
+  background: transparent;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.sh-tab[aria-selected="true"] {
+  background: var(--pico-card-background-color);
+  border-bottom-color: var(--pico-card-background-color);
+}
+
+.sh-tabpanel {
+  border: 1px solid var(--pico-card-border-color);
+  border-radius: 0 var(--sh-radius) var(--sh-radius) var(--sh-radius);
+  padding: 0.9rem 1rem;
+  background: var(--pico-card-background-color);
+}
+
+.sh-panel-head {
+  display: flex;
+  gap: 0.8rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  color: var(--pico-muted-color);
+  font-size: 0.82rem;
+  margin-bottom: 0.6rem;
+}
+
+table.sh-models { margin-bottom: 0; }
+table.sh-models td, table.sh-models th { padding: 0.45rem 0.6rem; }
+
+.sh-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  margin-right: 0.4rem;
+  background: var(--pico-muted-color);
+}
+.sh-dot[data-state="serving"] { background: var(--sh-accent-solid); }
+.sh-dot[data-state="loading"] { background: var(--sh-warn); }
+.sh-dot[data-state="failed"] { background: var(--sh-bad); }
+
+.sh-row-actions { display: flex; gap: 0.35rem; justify-content: flex-end; }
+.sh-row-actions button { padding: 0.25rem 0.7rem; font-size: 0.8rem; margin: 0; }
+
+/* Job strip: the last few ledger entries with their reasons. */
+.sh-jobs { margin-top: 1rem; }
+.sh-job {
+  display: flex;
+  gap: 0.8rem;
+  align-items: baseline;
+  padding: 0.25rem 0;
+  font-size: 0.8rem;
+  border-bottom: 1px dashed var(--pico-card-border-color);
+}
+.sh-job:last-child { border-bottom: 0; }
+.sh-job-error { color: var(--sh-bad); overflow-wrap: anywhere; }
+
+.sh-catalog-errors { color: var(--sh-bad); font-size: 0.8rem; margin: 0.4rem 0 0; }
+
+/* Small controls: unload buttons and the theme toggle. */
+.sh-mini {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+  margin: 0;
+  width: auto;
+}
+
+.sh-theme-toggle { position: absolute; right: 1rem; top: 0.7rem; }
+
+footer.sh-footer {
+  color: var(--pico-muted-color);
+  font-size: 0.75rem;
+  margin-top: 1.2rem;
+  text-align: right;
+}

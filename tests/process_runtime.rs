@@ -171,3 +171,52 @@ fn single_instance_guard_refuses_a_second_holder() {
     let second = simplehar_se::process::SingleInstanceGuard::acquire();
     assert!(second.is_err(), "a second harness must be refused (A10)");
 }
+
+#[tokio::test]
+async fn probe_fails_fast_when_the_child_already_exited() {
+    // A child that dies immediately must fail readiness now, not after the deadline.
+    let runtime = ProcessRuntime::new();
+    let spec = LaunchSpec {
+        argv: vec![
+            "python".to_string(),
+            "-c".to_string(),
+            "import sys; sys.exit(3)".to_string(),
+        ],
+        cwd: PathBuf::from("."),
+        env: BTreeMap::new(),
+        log_name: "process-runtime-dies".to_string(),
+        readiness: ReadinessSpec::Http {
+            path: "/health".to_string(),
+            expect_status: 200,
+        },
+    };
+    let ticket = ticket(TEST_PORT + 1);
+    if runtime.spawn(&spec, ticket.clone()).await.is_err() {
+        eprintln!("python unavailable; skipping");
+        return;
+    }
+    let started = std::time::Instant::now();
+    let probe = loop {
+        let probe = runtime
+            .probe(
+                ticket.port,
+                &ReadinessSpec::Http {
+                    path: "/health".to_string(),
+                    expect_status: 200,
+                },
+            )
+            .await;
+        if matches!(probe, Probe::Failed { .. }) {
+            break probe;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            panic!("dead child must fail readiness fast; last probe: {probe:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let Probe::Failed { reason } = probe else {
+        unreachable!("checked above")
+    };
+    assert!(reason.contains("exited early"), "was: {reason}");
+    runtime.kill(&ticket).await.expect("cleanup kill");
+}

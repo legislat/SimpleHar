@@ -248,6 +248,29 @@ Full text in `DESIGN.md`; the load-bearing ones:
     with the engine's own reason in the job record** — the funnel held. Known
     refinement (next turn): probe should fast-fail when the child has already
     exited (a dead engine currently eats the full `load_timeout`).
+23. **Page + defaults + fast-fail (2026-10-25, built): the control page is real.**
+    (a) `process.rs` probe now fast-fails when the tracked child already exited
+    ("engine process exited early") — a dead engine no longer eats `load_timeout`
+    (test: python child that exits immediately). (b) `POST /har/config/default`
+    {category, model|null}: validates against the catalog (model must belong to the
+    category), takes effect immediately via in-memory overrides, and persists to
+    `simplehar.json` atomically (parse-patch-temp-rename); `/har/status` shows
+    effective defaults; the no-model fallback honors overrides. (c) `GET
+    /har/models` — full unfiltered catalog for the page (per-listener `/v1/models`
+    stays category-filtered). (d) **`src/webui/`**: the Step 14 page — vendored
+    Pico 2.1.1 + `style.css` + vanilla `app.js` + `index.html` via `include_str!`;
+    persistent header (title + loaded badge + listener-down badge, endpoint line +
+    Rescan, one slot card per category with Unload — the AUX card as one-line
+    occupant rows — and labeled memory bars: ledger honestly marked "NVML witness
+    pending"); category tabs below with per-model Load / Set-default, listener port
+    and effective default per tab; recent-jobs strip with errors; adaptive
+    light/dark with a sticky toggle (localStorage), Sora/Inter typography. Gates:
+    fmt clean, clippy `-D warnings` clean, **82/82 tests**. Live: page assets on
+    8708; rescan → set-default (persisted to simplehar.json, verified) → a bare
+    no-model chat **loaded the real Qwen3-0.6B on demand and answered** (operator
+    rule 4 end-to-end). **Uncommitted.** Next candidates: NVML witness (item 5),
+    SSE events stream replacing the 2 s polling, write-back for per-model yaml
+    flags, T1..T14 port.
 
 ## 5. Open items — pick one per turn and brainstorm it
 

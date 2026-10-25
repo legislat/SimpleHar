@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -138,6 +138,10 @@ pub struct ApiState {
     pub scheduler: SchedulerHandle,
     /// Listener health, written by the supervisors in `main` (red state, §0.2).
     pub listeners: crate::listeners::ListenerRegistry,
+    /// Runtime `default_model` overrides from `/har/config/default`, layered over
+    /// the boot config (Step 9: the yaml/json stays the source of truth; overrides
+    /// persist back to it on every set).
+    default_overrides: Arc<Mutex<BTreeMap<CategoryId, Option<String>>>>,
     /// Last-use hints per model (fallback MRU for AUX x N; eviction LRU later).
     usage: Arc<Mutex<HashMap<String, Instant>>>,
     proxy: reqwest::Client,
@@ -160,6 +164,7 @@ impl ApiState {
             control_addr,
             scheduler,
             listeners,
+            default_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
             proxy: reqwest::Client::builder()
                 .timeout(Duration::from_secs(600))
@@ -181,6 +186,40 @@ impl ApiState {
             .await
             .map_err(ApiError::from)?
             .models)
+    }
+
+    /// The effective `default_model` for a category: runtime override, else boot
+    /// config (Step 11 fallback rule).
+    pub fn default_model(&self, category: CategoryId) -> Option<String> {
+        let overrides = self
+            .default_overrides
+            .lock()
+            .expect("default override lock poisoned by a writer panic");
+        match overrides.get(&category) {
+            Some(override_value) => override_value.clone(),
+            None => self
+                .config
+                .categories
+                .iter()
+                .find(|cat| cat.id == category)
+                .and_then(|cat| cat.default_model.clone()),
+        }
+    }
+
+    /// Sets (or clears, with `None`) the category default and persists it to
+    /// `simplehar.json` atomically (temp file + rename). In-memory wins even when
+    /// persistence fails (logged); the response says which happened.
+    pub fn set_default_model(
+        &self,
+        category: CategoryId,
+        model: Option<&str>,
+    ) -> (Option<String>, bool) {
+        self.default_overrides
+            .lock()
+            .expect("default override lock poisoned by a writer panic")
+            .insert(category, model.map(str::to_string));
+        let persisted = persist_default_model(&self.config, category, model);
+        (model.map(str::to_string), persisted)
     }
 
     fn touch(&self, model: &str) {
@@ -210,13 +249,82 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
+/// Writes `category.default_model` into `simplehar.json` atomically: parse the
+/// on-disk file (or the boot config when absent), patch the one field, temp+rename.
+fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option<&str>) -> bool {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("simplehar.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("simplehar.json"));
+    let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "simplehar.json unreadable; rewriting from boot config");
+            serde_json::to_value(&*config).expect("invariant: config serializes")
+        }),
+        Err(_) => serde_json::to_value(config).expect("invariant: config serializes"),
+    };
+    let id = category.to_string();
+    let Some(categories) = root.get_mut("categories").and_then(|c| c.as_array_mut()) else {
+        tracing::error!("cannot persist default_model: no categories in simplehar.json");
+        return false;
+    };
+    let mut patched = false;
+    for entry in categories.iter_mut() {
+        if entry.get("id").and_then(|v| v.as_str()) == Some(id.as_str()) {
+            let map = match entry.as_object_mut() {
+                Some(map) => map,
+                None => continue,
+            };
+            match model {
+                Some(name) => {
+                    map.insert("default_model".to_string(), Value::String(name.to_string()));
+                }
+                None => {
+                    map.insert("default_model".to_string(), Value::Null);
+                }
+            }
+            patched = true;
+            break;
+        }
+    }
+    if !patched {
+        tracing::error!(category = %id, "cannot persist default_model: category not found");
+        return false;
+    }
+    let text = serde_json::to_string_pretty(&root).expect("invariant: JSON serializes");
+    let tmp = path.with_extension("json.tmp");
+    if let Err(error) = std::fs::write(&tmp, text.as_bytes()) {
+        tracing::error!(error = %error, "cannot persist default_model: write failed");
+        return false;
+    }
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        tracing::error!(error = %error, "cannot persist default_model: rename failed");
+        return false;
+    }
+    tracing::info!(category = %id, model = ?model, "default_model persisted to simplehar.json");
+    true
+}
+
 /// `GET /har/status`: boot info + slot table + jobs, one call (G13).
 async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let scheduler = state.scheduler.status().await.map_err(ApiError::from)?;
+    let categories: Vec<Value> = state
+        .config
+        .categories
+        .iter()
+        .map(|cat| {
+            let mut value = serde_json::to_value(cat).expect("invariant: category serializes");
+            value["default_model"] = match state.default_model(cat.id) {
+                Some(model) => Value::String(model),
+                None => Value::Null,
+            };
+            value
+        })
+        .collect();
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
-        "categories": state.config.categories,
+        "categories": categories,
         "listeners": state.listeners.snapshot(),
         "mem": {
             "total_gb": state.config.vram_total_gb,
@@ -288,6 +396,69 @@ async fn har_unload(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "status": "unloading", "category": category })))
+}
+
+/// `GET /har/models` — the full unfiltered catalog for the control page (G5: the
+/// per-listener `/v1/models` stays category-filtered).
+async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
+    let catalog = state.catalog().await?;
+    let models: Vec<Value> = catalog
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.name,
+                "object": "model",
+                "owned_by": "simplehar",
+                "engine": entry.engine,
+                "category": entry.category,
+                "vram_gb": entry.vram_gb,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "object": "list", "data": models })))
+}
+
+/// `POST /har/config/default {"category": …, "model": name|null}` — set the
+/// category's default model (Step 11 fallback); validated against the catalog and
+/// persisted to `simplehar.json` atomically.
+async fn har_config_default(
+    State(state): State<Arc<ApiState>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
+        reason: format!("body must be JSON with `category` and optional `model`: {rejection}"),
+    })?;
+    let Some(raw_category) = body.get("category").and_then(Value::as_str) else {
+        return Err(ApiError::BadRequest {
+            reason: "missing required field `category` (WORK|RP|AUX|EMB)".to_string(),
+        });
+    };
+    let category: CategoryId = raw_category.parse().map_err(|_| ApiError::BadRequest {
+        reason: format!("unknown category `{raw_category}`"),
+    })?;
+    let requested = body.get("model").and_then(Value::as_str);
+    if let Some(model) = requested {
+        let catalog = state.catalog().await?;
+        let entry =
+            crate::catalog::resolve(model, &catalog).ok_or_else(|| ApiError::BadRequest {
+                reason: format!("unknown model `{model}`"),
+            })?;
+        if entry.category != category {
+            return Err(ApiError::BadRequest {
+                reason: format!(
+                    "model `{}` belongs to {}, not {}",
+                    entry.name, entry.category, category
+                ),
+            });
+        }
+    }
+    let (effective, persisted) = state.set_default_model(category, requested);
+    Ok(Json(json!({
+        "status": "ok",
+        "category": category,
+        "default_model": effective,
+        "persisted": persisted,
+    })))
 }
 
 /// `POST /har/rescan` — re-scan `ModelConf`; the reply carries the new counts and
@@ -400,12 +571,7 @@ async fn ensure_target(listener: &ListenerState, body: &Value) -> Result<(String
                 api.touch(model);
                 return Ok((model.clone(), *port));
             }
-            let default = api
-                .config
-                .categories
-                .iter()
-                .find(|cat| cat.id == listener.category)
-                .and_then(|cat| cat.default_model.clone());
+            let default = api.default_model(listener.category);
             match default {
                 Some(model) => {
                     let port = swap_for_port(api, &model, listener.category).await?;
@@ -535,10 +701,13 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
         .route("/har/jobs/{id}", get(har_job))
         .route("/har/load", post(har_load))
         .route("/har/unload", post(har_unload))
-        .route("/har/rescan", post(har_rescan));
+        .route("/har/rescan", post(har_rescan))
+        .route("/har/models", get(har_models))
+        .route("/har/config/default", post(har_config_default));
     Router::new()
         .merge(category_router(Arc::clone(&api), control_category))
-        .merge(har.with_state(api))
+        .merge(har.with_state(Arc::clone(&api)))
+        .merge(crate::webui::router(api))
         .layer((
             TraceLayer::new_for_http(),
             CompressionLayer::new(),
