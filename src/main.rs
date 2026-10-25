@@ -10,6 +10,7 @@ use simplehar_se::observability;
 use simplehar_se::process::{ProcessRuntime, SingleInstanceGuard};
 use simplehar_se::scheduler::Scheduler;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,9 +21,16 @@ use std::time::Duration;
 /// or any validation failure is fatal and every problem is logged (never silently
 /// defaulted — defect D1).
 fn boot_config() -> Result<AppConfig, Vec<ConfigError>> {
-    let path = std::env::current_exe()
+    // The test harness (and operators) can point at a config anywhere; otherwise
+    // the config lives beside the executable.
+    let path = std::env::var("SIMPLEHAR_CONFIG")
+        .map(PathBuf::from)
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("simplehar.json")));
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("simplehar.json")))
+        });
     let config = match &path {
         Some(path) if path.exists() => AppConfig::load(path).map_err(|e| vec![e])?,
         _ => {
@@ -78,6 +86,22 @@ async fn main() -> ExitCode {
         runtime,
         Arc::clone(&witness),
     );
+    if !config.modelconf_dir.exists() {
+        // Friendly default: a missing ModelConf dir is created, not reported —
+        // "no config file" still means a usable harness (§0.1); the operator adds
+        // yamls and rescans.
+        match std::fs::create_dir_all(&config.modelconf_dir) {
+            Ok(()) => tracing::info!(
+                dir = %config.modelconf_dir.display(),
+                "ModelConf dir created (drop model yamls in and Rescan)"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                dir = %config.modelconf_dir.display(),
+                "cannot create ModelConf dir; the catalog will report it"
+            ),
+        }
+    }
     let scan_ms = boot_started.elapsed().as_millis() as u64;
     let listeners = simplehar_se::listeners::ListenerRegistry::new();
     let boot = simplehar_se::api::BootTimings {

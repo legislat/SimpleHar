@@ -5,7 +5,16 @@
 const CATEGORY_ORDER = ["WORK", "RP", "AUX", "EMB"];
 const POLL_MS = 2000;
 
-let state = { status: null, models: [], activeTab: "WORK" };
+// Anything a re-render would lose must live here: render() rebuilds the whole
+// DOM on every SSE push, so UI state (open tabs, log panel) is state, not DOM.
+let state = {
+  status: null,
+  models: [],
+  activeTab: "WORK",
+  logOpen: false,
+  logLoaded: false,
+  logEntries: null,
+};
 
 // ---------- tiny helpers ----------
 
@@ -320,7 +329,7 @@ function renderTab(status, category) {
   const entry = status.categories.find((cat) => cat.id === category);
   const models = state.models.filter((model) => model.category === category);
   const panel = el("div", { class: "sh-panel-head" });
-  panel.append(text(`listener :${entry ? entry.public_port : "?"}`));
+  panel.append(text(`listener :${entry ? entry.public_port : "?"} · `));
   panel.append(
     text(entry && entry.default_model ? `default: ${entry.default_model}` : "default: none"),
   );
@@ -384,27 +393,29 @@ function renderTabs() {
   return tabs;
 }
 
+function logLine(entry) {
+  return el(
+    "div",
+    { class: "sh-job" },
+    text(`${new Date(entry.ts_ms).toLocaleTimeString()} ${entry.level} ${entry.message}`),
+    entry.level === "ERROR" || entry.level === "WARN"
+      ? el("span", { class: "sh-job-error" }, text(` ${entry.target}`))
+      : null,
+  );
+}
+
 async function toggleLog(details) {
-  if (details.open && !details.dataset.loaded) {
-    details.dataset.loaded = "1";
-    try {
-      const data = await getJson("/har/log?limit=80");
-      const body = details.querySelector(".sh-log-body");
-      body.replaceChildren(
-        ...data.events.map((entry) =>
-          el(
-            "div",
-            { class: "sh-job" },
-            text(`${new Date(entry.ts_ms).toLocaleTimeString()} ${entry.level} ${entry.message}`),
-            entry.level === "ERROR" || entry.level === "WARN"
-              ? el("span", { class: "sh-job-error" }, text(` ${entry.target}`))
-              : null,
-          ),
-        ),
-      );
-    } catch (error) {
-      flashError(error);
-    }
+  state.logOpen = details.open;
+  if (!details.open || state.logLoaded) return;
+  state.logLoaded = true;
+  try {
+    const data = await getJson("/har/log?limit=80");
+    state.logEntries = data.events;
+    const body = details.querySelector(".sh-log-body");
+    if (body) body.replaceChildren(...state.logEntries.map(logLine));
+  } catch (error) {
+    state.logLoaded = false;
+    flashError(error);
   }
 }
 
@@ -438,11 +449,18 @@ function render() {
   headerHost.replaceChildren(renderHeader(status));
   const mainHost = document.getElementById("sh-main");
   const jobs = renderJobs(status);
+  const logBody = el("div", { class: "sh-log-body" });
+  if (state.logEntries) logBody.replaceChildren(...state.logEntries.map(logLine));
+  else logBody.append(text("open to load /har/log"));
   const logBox = el(
     "details",
-    { class: "sh-jobs", ontoggle: (event) => toggleLog(event.target) },
+    {
+      class: "sh-jobs",
+      open: state.logOpen ? "" : null,
+      ontoggle: (event) => toggleLog(event.target),
+    },
     el("summary", {}, text("Harness log (last events)")),
-    el("div", { class: "sh-log-body" }, text("open to load /har/log")),
+    logBody,
   );
   mainHost.replaceChildren(
     renderTabs(),
@@ -463,11 +481,10 @@ let pollTimer = null;
 let sse = null;
 
 function applyState(doc) {
-  state.status = doc.status;
+  // The SSE document IS the full /har/status body plus `models` — one shape
+  // everywhere, no per-panel re-derivation.
+  state.status = doc;
   state.models = doc.models || [];
-  if (doc.listeners) {
-    state.status.listeners = doc.listeners;
-  }
   render();
 }
 

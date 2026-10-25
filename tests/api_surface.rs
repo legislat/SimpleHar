@@ -158,12 +158,18 @@ async fn unload_bodies_are_strict() {
     );
     post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
 
-    // No category field: 400, never an implicit unload-all.
-    let (status, _) = post_json(&control, "/har/unload", "{}").await;
+    // No category/model but a NON-EMPTY body: 400 (the object is unrecognized).
+    let (status, _) = post_json(&control, "/har/unload", r#"{"unknown":1}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     // Garbage: 400.
     let (status, _) = post_json(&control, "/har/unload", "not json").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Model unload of a not-loaded model: accepted (Done), idempotent (T12.2).
+    let (status, _) = post_json(&control, "/har/unload", r#"{"model":"never-loaded"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    // Explicit empty object: unload-all (T12.4) - accepted.
+    let (status, _) = post_json(&control, "/har/unload", "{}").await;
+    assert_eq!(status, StatusCode::OK);
     // Valid: accepted and actually unloads.
     let (status, body) = post_json(&control, "/har/unload", r#"{"category":"WORK"}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");

@@ -195,9 +195,7 @@ fn handle_menu(id: MenuId) {
             }
         }
         Command::UnloadAll => {
-            for category in CategoryId::all() {
-                let _ = ctx.runtime.block_on(ctx.scheduler.unload(category));
-            }
+            let _ = ctx.runtime.block_on(ctx.scheduler.unload_all());
         }
         Command::Unload(category) => {
             let _ = ctx.runtime.block_on(ctx.scheduler.unload(category));

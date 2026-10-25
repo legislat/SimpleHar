@@ -346,6 +346,13 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
 
 /// `GET /har/status`: boot info + slot table + jobs, one call (G13).
 async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(status_document(&state).await?))
+}
+
+/// The full `/har/status` document: config categories, mem, boot, listener
+/// health, slots, jobs, and catalog errors — one call (G13). Also the body of
+/// every SSE `har_state` event (Step 14: one push replaces the page's state).
+async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
     let scheduler = state.scheduler.status().await.map_err(ApiError::from)?;
     let categories: Vec<Value> = state
         .config
@@ -365,18 +372,18 @@ async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
         .read()
         .expect("boot timings lock poisoned by a writer panic")
         .clone();
-    Ok(Json(json!({
+    Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
         "boot": boot,
         "categories": categories,
         "listeners": state.listeners.snapshot(),
-        "mem": mem_section(&state).await,
+        "mem": mem_section(state).await,
         "slots": scheduler.slots,
         "jobs": scheduler.jobs,
         "catalog_errors": scheduler.catalog_errors,
         "config_errors": [],
-    })))
+    }))
 }
 
 /// `POST /har/load {"model": name}` — waits through the load and returns the receipt;
@@ -416,35 +423,48 @@ async fn har_load(
     }))
 }
 
-/// `POST /har/unload {"category": "WORK"}` — strict body: `{}` or garbage is `400`,
-/// never an implicit unload-all (v3.3 CRITICAL fix).
+/// `POST /har/unload` — `{"category": "WORK"}` one category, `{"model": name}`
+/// one slot (T12.1), `{}` every occupied slot (T12.4, the explicit unload-all),
+/// garbage `400` (the v3.3 CRITICAL fix was about *unparseable* bodies, never an
+/// implicit unload-all). Unloading a loading slot cancels the load (T8).
 async fn har_unload(
     State(state): State<Arc<ApiState>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
-        reason: format!("body must be JSON with a `category` field: {rejection}"),
+        reason: format!("body must be JSON: {rejection}"),
     })?;
-    let Some(raw) = body.get("category").and_then(Value::as_str) else {
-        return Err(ApiError::BadRequest {
-            reason: "missing required field `category` (WORK|RP|AUX|EMB); unload-all is deliberate and not implicit".to_string(),
-        });
-    };
-    let category: CategoryId = raw.parse().map_err(|_| ApiError::BadRequest {
-        reason: format!("unknown category `{raw}` (WORK|RP|AUX|EMB)"),
-    })?;
-    state
-        .scheduler
-        .unload(category)
-        .await
-        .map_err(ApiError::from)?;
-    Ok(Json(json!({ "status": "unloading", "category": category })))
+    if let Some(raw) = body.get("category").and_then(Value::as_str) {
+        let category: CategoryId = raw.parse().map_err(|_| ApiError::BadRequest {
+            reason: format!("unknown category `{raw}` (WORK|RP|AUX|EMB)"),
+        })?;
+        state
+            .scheduler
+            .unload(category)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(Json(json!({ "status": "unloading", "category": category })));
+    }
+    if let Some(model) = body.get("model").and_then(Value::as_str) {
+        state
+            .scheduler
+            .unload_model(model)
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(Json(json!({ "status": "unloading", "model": model })));
+    }
+    if body.as_object().is_some_and(|map| map.is_empty()) {
+        state.scheduler.unload_all().await.map_err(ApiError::from)?;
+        return Ok(Json(json!({ "status": "unloading", "scope": "all" })));
+    }
+    Err(ApiError::BadRequest {
+        reason: "unrecognized body: send {} (all), {\"category\": …} or {\"model\": …}".to_string(),
+    })
 }
 
 /// The merged document every `har_state` event carries: one push replaces the
 /// page's per-panel polling (Step 14).
 async fn merged_state(state: &ApiState) -> Result<Value, ApiError> {
-    let status = state.scheduler.status().await.map_err(ApiError::from)?;
     let catalog = state.catalog().await?;
     let models: Vec<Value> = catalog
         .iter()
@@ -460,11 +480,9 @@ async fn merged_state(state: &ApiState) -> Result<Value, ApiError> {
             })
         })
         .collect();
-    Ok(json!({
-        "status": status,
-        "models": models,
-        "listeners": state.listeners.snapshot(),
-    }))
+    let mut document = status_document(state).await?;
+    document["models"] = Value::Array(models);
+    Ok(document)
 }
 
 /// `GET /har/events` — one SSE stream: the current state immediately, then a push

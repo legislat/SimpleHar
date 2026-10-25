@@ -261,6 +261,29 @@ impl SchedulerHandle {
         .await
     }
 
+    /// Unloads one model's slot (T12.1). A loading swap for it is cancelled
+    /// first (cleanup still completes, Step 3).
+    ///
+    /// # Errors
+    ///
+    /// [`SchedulerError::ActorGone`] when the actor is no longer running.
+    pub async fn unload_model(&self, model: &str) -> Result<Reply, SchedulerError> {
+        self.call(Command::UnloadModel {
+            model: model.to_string(),
+        })
+        .await
+    }
+
+    /// Unloads every occupied slot across all categories (T12.4). Loading jobs
+    /// are cancelled; cleanup completes.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedulerError::ActorGone`] when the actor is no longer running.
+    pub async fn unload_all(&self) -> Result<Reply, SchedulerError> {
+        self.call(Command::UnloadAll).await
+    }
+
     /// Records a use of `model` (fire-and-forget): the proxy paths call this on
     /// every request so the actor's idle check measures real activity (Step 5).
     /// A dropped actor makes this a no-op.
@@ -652,6 +675,14 @@ impl ActorState {
                 self.on_unload(category, reply);
                 self.publish();
             }
+            Command::UnloadModel { model } => {
+                self.on_unload_model(&model, reply);
+                self.publish();
+            }
+            Command::UnloadAll => {
+                self.on_unload_all(reply);
+                self.publish();
+            }
             Command::Restart { model, category } => {
                 self.on_restart(model, category, reply);
                 self.publish();
@@ -794,11 +825,51 @@ impl ActorState {
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.category == category && s.occupant.is_some() && s.job.is_none())
+            .filter(|(_, s)| s.category == category)
             .map(|(i, _)| i)
             .collect();
-        for slot in targets {
-            self.begin_unload_slot(slot, "unloaded");
+        self.unload_slots(targets, reply);
+    }
+
+    /// T12.1: unload one model's slot; a loading swap for it is cancelled first.
+    /// A loading slot has no occupant yet — the in-flight job's model is the
+    /// only way to find it (T8: unload during load = cancel, cleanup completes).
+    fn on_unload_model(&mut self, model: &str, reply: Waiter) {
+        let targets: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.occupant.as_ref().is_some_and(|o| o.model == model)
+                    || s.job
+                        .is_some_and(|j| self.jobs.get(&j).is_some_and(|job| job.model == model))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        self.unload_slots(targets, reply);
+    }
+
+    /// T12.4: unload every occupied slot; loading jobs are cancelled.
+    fn on_unload_all(&mut self, reply: Waiter) {
+        let targets: Vec<usize> = (0..self.slots.len())
+            .filter(|&i| self.slots[i].occupant.is_some() || self.slots[i].job.is_some())
+            .collect();
+        self.unload_slots(targets, reply);
+    }
+
+    /// Shared unload path: free slots start an unload job; slots with an
+    /// in-flight job get that job cancelled (T8: unload during load = cancel,
+    /// and the cancellation still runs kill + release confirmation).
+    fn unload_slots(&mut self, slots: Vec<usize>, reply: Waiter) {
+        for slot in slots {
+            match self.slots[slot].job {
+                Some(job_id) => self.cancel_job(job_id, "unloaded by request"),
+                None => {
+                    if self.slots[slot].occupant.is_some() {
+                        self.begin_unload_slot(slot, "unloaded");
+                    }
+                }
+            }
         }
         let _ = reply.send(Ok(Reply::Done));
     }

@@ -391,6 +391,86 @@ async fn unload_frees_slot_ledger_and_engine() {
 }
 
 #[tokio::test]
+async fn unload_model_during_load_cancels_and_kills_engine() {
+    // T12.1 + T8: unloading a still-loading model cancels its swap and the
+    // cancellation still runs kill + release confirmation.
+    let (handle, runtime) = harness(
+        config(10),
+        &[("qwen3", "mock-slow", CategoryId::Work, Some(4.0))],
+    );
+
+    let job = spawn_and_find_job(&handle).await;
+    assert!(
+        matches!(
+            handle.unload_model("qwen3").await.expect("accepted"),
+            Reply::Done
+        ),
+        "unload of a loading slot is a Done (the cancel rides the job)"
+    );
+    wait_until(&handle, 5, |s| {
+        s.jobs.iter().any(|j| j.id == job && j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let job_status = status.jobs.iter().find(|j| j.id == job).unwrap();
+    assert!(job_status
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .contains("unloaded by request"));
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "cancelled swap must not leak an engine"
+    );
+    // T12.2: unloading a model that is not loaded is an idempotent Done.
+    assert!(matches!(
+        handle.unload_model("ghost").await.expect("idempotent"),
+        Reply::Done
+    ));
+}
+
+#[tokio::test]
+async fn unload_all_clears_every_category_and_cancels_inflight() {
+    // T12.4 (the tray's Unload All): every occupied slot releases, every
+    // in-flight job cancels, nothing leaks.
+    let (handle, runtime) = harness(
+        config(10),
+        &[
+            ("work06", "mock", CategoryId::Work, Some(4.0)),
+            ("rp06", "mock-slow", CategoryId::Rp, Some(4.0)),
+        ],
+    );
+
+    handle
+        .swap("work06", CategoryId::Work)
+        .await
+        .expect("loads");
+    submit_and_vanish(&handle, "rp06", CategoryId::Rp).await;
+    wait_until(&handle, 5, |s| {
+        s.slots
+            .iter()
+            .any(|slot| slot.category == CategoryId::Rp && slot.loading_job.is_some())
+    })
+    .await;
+
+    assert!(matches!(
+        handle.unload_all().await.expect("accepted"),
+        Reply::Done
+    ));
+    wait_until(&handle, 8, |s| {
+        s.slots.iter().all(|slot| slot.model.is_none()) && s.jobs.iter().all(|j| j.terminal)
+    })
+    .await;
+    assert_eq!(runtime.server_count(), 0, "unload-all kills every engine");
+    assert!(matches!(
+        handle.unload_all().await.expect("idempotent"),
+        Reply::Done
+    ));
+}
+
+#[tokio::test]
 async fn control_plane_answers_while_a_slow_load_runs() {
     // A1: v3.3 held a global lock through wait_ready; SE must not.
     let (handle, _runtime) = harness(

@@ -29,8 +29,14 @@ pub enum Command {
     /// Cooperative cancel: observed inside the current step, then cleanup completes
     /// (Step 3 — never a dropped task).
     Cancel { job: JobId },
-    /// Unload every occupant of a category.
+    /// Unload every occupant of a category; a loading slot in it is cancelled
+    /// first (T8 semantics: unload during load = cancel, cleanup completes).
     Unload { category: CategoryId },
+    /// Unload one model's slot (T12.1); a loading swap for it is cancelled.
+    UnloadModel { model: String },
+    /// Unload every occupied slot across all categories (T12.4, the tray's
+    /// Unload All); loading jobs are cancelled.
+    UnloadAll,
     /// Re-scan `ModelConf` (hot reload, Step 9).
     Reload,
 }
