@@ -129,25 +129,55 @@ function categoryPort(status, category) {
 
 function renderMemory(status) {
   const mem = status.mem;
-  const ledger = status.slots.reduce((sum, slot) => sum + (slot.need_gib || 0), 0);
-  const usedPct = Math.min(100, (ledger / mem.total_gb) * 100);
+  const ledger = mem.ledger_gb || 0;
+  const ledgerPct = Math.min(100, (ledger / mem.total_gb) * 100);
   const reservePct = (mem.reserve_gb / mem.total_gb) * 100;
-  return el(
-    "div",
-    { class: "sh-mem" },
+  const observed = mem.observed_used_gb;
+  const observedPct =
+    observed === null || observed === undefined
+      ? null
+      : Math.min(100, (observed / mem.total_gb) * 100);
+  const bars = [
     el(
       "div",
       {},
-      el("label", {}, text(`VRAM ledger ${ledger.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (witness: NVML pending)`)),
-      el("div", { class: "sh-bar" }, el("i", { style: `width:${usedPct}%` })),
+      el(
+        "label",
+        {},
+        text(
+          `VRAM ledger ${ledger.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (what admission budgets)`,
+        ),
+      ),
+      el("div", { class: "sh-bar" }, el("i", { style: `width:${ledgerPct}%` })),
     ),
     el(
       "div",
       {},
       el("label", {}, text(`Reserve ${mem.reserve_gb.toFixed(1)} GiB (held away from admission)`)),
-      el("div", { class: "sh-bar", "data-tone": "reserve" }, el("i", { style: `width:${reservePct}%` })),
+      el(
+        "div",
+        { class: "sh-bar", "data-tone": "reserve" },
+        el("i", { style: `width:${reservePct}%` }),
+      ),
     ),
-  );
+  ];
+  if (observedPct !== null) {
+    bars.push(
+      el(
+        "div",
+        {},
+        el(
+          "label",
+          {},
+          text(
+            `Observed ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (witness: ${mem.source}; external ${(mem.external_gb || 0).toFixed(1)} GiB)`,
+          ),
+        ),
+        el("div", { class: "sh-bar", "data-tone": "observed" }, el("i", { style: `width:${observedPct}%` })),
+      ),
+    );
+  }
+  return el("div", { class: "sh-mem" }, ...bars);
 }
 
 function renderHeader(status) {

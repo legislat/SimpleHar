@@ -129,7 +129,8 @@ impl EngineRuntime for ProcessRuntime {
                 return Err(SpawnError::SpawnFailed { reason });
             }
         }
-        tracing::info!(port = ticket.port, pid = child.id(), log = %log_path.display(),
+        let pid = child.id().unwrap_or(0);
+        tracing::info!(port = ticket.port, pid, log = %log_path.display(),
             "engine spawned under a kill-on-close job object");
         self.engines.lock().expect("engine table lock").insert(
             ticket.port,
@@ -139,7 +140,10 @@ impl EngineRuntime for ProcessRuntime {
                 terminated: false,
             },
         );
-        Ok(Spawned { port: ticket.port })
+        Ok(Spawned {
+            port: ticket.port,
+            pid,
+        })
     }
 
     async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError> {

@@ -70,7 +70,9 @@ impl MockRuntime {
         }
     }
 
-    /// Number of live engines (leak-check helper for F-1 / F-6).
+    /// Number of live engines (leak-check helper for F-1 / F-6). Used by the
+    /// scheduler_actor test binary; other binaries sharing this module may not.
+    #[allow(dead_code)]
     pub fn server_count(&self) -> usize {
         self.servers.lock().expect("mock runtime lock").len()
     }
@@ -151,7 +153,7 @@ impl EngineRuntime for MockRuntime {
             .lock()
             .expect("mock runtime lock")
             .insert(port, MockServer { mode, handle });
-        Ok(Spawned { port })
+        Ok(Spawned { port, pid: 0 })
     }
 
     async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError> {

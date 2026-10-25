@@ -68,6 +68,7 @@ fn harness(cfg: AppConfig, specs: &[Spec]) -> (SchedulerHandle, MockRuntime) {
         write_modelconf(specs),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn simplehar_se::engine::EngineRuntime>,
+        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
     );
     (handle, runtime)
 }

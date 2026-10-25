@@ -98,6 +98,93 @@ pub fn admit(
     }
 }
 
+/// One witness observation of the card (Step 4 rules 2-4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemorySample {
+    /// Total VRAM in GiB.
+    pub total_gib: f64,
+    /// Used VRAM in GiB (all processes).
+    pub used_gib: f64,
+    /// Per-process usage in GiB: `(pid, used)`.
+    pub processes: Vec<(u32, f64)>,
+}
+
+impl MemorySample {
+    /// Usage not attributable to `own_pids` — the external reservation the budget
+    /// must subtract (Step 4 rule 2).
+    pub fn external_gib(&self, own_pids: &[u32]) -> f64 {
+        self.processes
+            .iter()
+            .filter(|(pid, _)| !own_pids.contains(pid))
+            .map(|(_, used)| *used)
+            .sum()
+    }
+
+    /// Whether memory settled to `baseline + tolerance` after a release (§0.3: the
+    /// settle window is only legal after a release).
+    pub fn settled(&self, baseline_gib: f64, tolerance_gib: f64) -> bool {
+        self.used_gib <= baseline_gib + tolerance_gib
+    }
+}
+
+/// The VRAM witness: NVML in-process when the driver library is present,
+/// `nvidia-smi` as the fallback, and a caller-visible error when neither answers
+/// (the admission gate then runs ledger-only, logged loudly — never a stale guess).
+#[async_trait::async_trait]
+pub trait VramWitness: Send + Sync {
+    /// Samples the card. Implementations may cache briefly (status polling must
+    /// not spawn a process storm); errors mean "unavailable", not zero.
+    async fn sample(&self) -> Result<MemorySample, String>;
+}
+
+/// A witness that never answers: admission runs ledger-only and settle is skipped
+/// (tests and machines without a GPU — the actor treats Err as "unavailable").
+pub struct LedgerOnlyWitness;
+
+#[async_trait::async_trait]
+impl VramWitness for LedgerOnlyWitness {
+    async fn sample(&self) -> Result<MemorySample, String> {
+        Err("witness unavailable (ledger-only mode)".to_string())
+    }
+}
+
+/// `nvidia-smi --query-gpu=...` CSV output -> sample (pure; unit-tested).
+pub fn parse_smi_sample(gpu_csv: &str, apps_csv: &str) -> Result<MemorySample, String> {
+    let parse_gib = |column: usize, line: &str| -> Result<f64, String> {
+        let mib: f64 = line
+            .split(',')
+            .nth(column)
+            .ok_or_else(|| format!("short --query-gpu line: {line:?}"))?
+            .trim()
+            .parse()
+            .map_err(|_| format!("not a number in --query-gpu line: {line:?}"))?;
+        Ok(mib / 1024.0)
+    };
+    let first = gpu_csv.lines().next().ok_or("empty --query-gpu output")?;
+    let total_gib = parse_gib(0, first)?;
+    let used_gib = parse_gib(1, first)?;
+    let mut processes = Vec::new();
+    for line in apps_csv.lines() {
+        let Some((pid, used)) = line.split_once(',') else {
+            continue;
+        };
+        let pid: u32 = match pid.trim().parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let used: f64 = match used.trim().trim_end_matches(" MiB").parse::<f64>() {
+            Ok(mib) => mib / 1024.0,
+            Err(_) => continue,
+        };
+        processes.push((pid, used));
+    }
+    Ok(MemorySample {
+        total_gib,
+        used_gib,
+        processes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

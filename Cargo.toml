@@ -39,6 +39,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
 ] }
 
-# Approved 2026-10-25 but deliberately absent until their module lands (no unused deps):
-# - nvml-wrapper  -> Step 4, budget.rs witness (item 5)
-# - yaml crate    -> Step 9 ModelConf scan (flat key: value round-trip)
+# NVML in-process witness with a graceful `nvidia-smi` fallback (Step 4, item 5).
+nvml-wrapper = "0.10"
+
+# Approved but deliberately absent until its module lands (no unused deps):
+# - yaml crate    -> Step 9 ModelConf write-back (flat key: value round-trip)

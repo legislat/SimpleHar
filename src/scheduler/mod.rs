@@ -65,6 +65,17 @@ pub enum SchedulerError {
     /// The job was cancelled by request or superseded by a newer load.
     #[error("cancelled: {0}")]
     Cancelled(String),
+    /// Memory did not settle to the expected baseline within `settle_timeout_s`
+    /// after a confirmed release; nothing was double-spawned (§0.3).
+    #[error(
+        "settle timeout: {used_gib:.1} GiB used vs {expected_gib:.1} GiB expected after release"
+    )]
+    SettleTimeout {
+        /// Witness-used at the timeout, in GiB.
+        used_gib: f64,
+        /// Baseline (remaining ledger + externals + tolerance), in GiB.
+        expected_gib: f64,
+    },
     /// The actor task is gone (shutting down).
     #[error("scheduler is not running")]
     ActorGone,
@@ -276,9 +287,10 @@ impl Scheduler {
         models_dir: PathBuf,
         adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
         runtime: Arc<dyn EngineRuntime>,
+        witness: Arc<dyn crate::budget::VramWitness>,
     ) -> SchedulerHandle {
         let (tx, rx) = mpsc::unbounded_channel();
-        let state = ActorState::new(cfg, models_dir, adapters, runtime, tx.clone());
+        let state = ActorState::new(cfg, models_dir, adapters, runtime, witness, tx.clone());
         tokio::spawn(actor_loop(state, rx));
         SchedulerHandle { tx }
     }
@@ -310,6 +322,10 @@ enum Event {
     Spawned(Result<Spawned, SpawnError>),
     /// Readiness loop finished (terminal tri-state only).
     Probed(Probe),
+    /// Witness sample for admission returned (Err = unavailable, ledger-only).
+    Admitted(Result<crate::budget::MemorySample, String>),
+    /// Post-release memory settle finished (Err carries the numbers).
+    Settled(Result<(), String>),
 }
 
 /// A slot occupant as owned by the actor.
@@ -345,6 +361,10 @@ struct Job {
     error: Option<SchedulerError>,
     need: Option<Gibibytes>,
     free_at_admit: Option<Gibibytes>,
+    /// External VRAM observed at admit (victim still owned); the settle gate holds
+    /// this constant so a dead own engine's leftover memory cannot masquerade as a
+    /// foreign holder (§0.3).
+    external_at_admit: Option<f64>,
     timings: JobTimings,
     t0: Instant,
     waiters: Vec<Waiter>,
@@ -371,6 +391,7 @@ struct ActorState {
     catalog_errors: Vec<crate::model::scan::ScanError>,
     adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
     runtime: Arc<dyn EngineRuntime>,
+    witness: Arc<dyn crate::budget::VramWitness>,
     tx: mpsc::UnboundedSender<ActorMsg>,
     slots: Vec<Slot>,
     jobs: BTreeMap<JobId, Job>,
@@ -386,6 +407,19 @@ struct Slot {
     engine_port: u16,
     occupant: Option<Occupant>,
     job: Option<JobId>,
+}
+
+/// Splits the settle task's "U GiB used vs E GiB expected" payload back into
+/// numbers for the typed error (kept simple: two f64s, space-separated).
+fn parse_settle_numbers(numbers: &str) -> (f64, f64) {
+    let values: Vec<f64> = numbers
+        .split_whitespace()
+        .filter_map(|token| token.parse::<f64>().ok())
+        .collect();
+    (
+        values.first().copied().unwrap_or(f64::NAN),
+        values.get(1).copied().unwrap_or(f64::NAN),
+    )
 }
 
 async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
@@ -412,9 +446,10 @@ impl ActorState {
         models_dir: PathBuf,
         adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
         runtime: Arc<dyn EngineRuntime>,
+        witness: Arc<dyn crate::budget::VramWitness>,
         tx: mpsc::UnboundedSender<ActorMsg>,
     ) -> Self {
-        let mut state = Self::empty(cfg, models_dir, adapters, runtime, tx);
+        let mut state = Self::empty(cfg, models_dir, adapters, runtime, witness, tx);
         state.refresh_catalog();
         state
     }
@@ -424,6 +459,7 @@ impl ActorState {
         models_dir: PathBuf,
         adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
         runtime: Arc<dyn EngineRuntime>,
+        witness: Arc<dyn crate::budget::VramWitness>,
         tx: mpsc::UnboundedSender<ActorMsg>,
     ) -> Self {
         let mut slots = Vec::new();
@@ -447,6 +483,7 @@ impl ActorState {
             catalog_errors: Vec::new(),
             adapters,
             runtime,
+            witness,
             tx,
             slots,
             jobs: BTreeMap::new(),
@@ -628,6 +665,7 @@ impl ActorState {
                 error: None,
                 need: None,
                 free_at_admit: None,
+                external_at_admit: None,
                 timings: JobTimings::default(),
                 t0: Instant::now(),
                 waiters: Vec::new(),
@@ -662,6 +700,7 @@ impl ActorState {
             error: None,
             need: None,
             free_at_admit: None,
+            external_at_admit: None,
             timings: JobTimings::default(),
             t0,
             waiters,
@@ -693,21 +732,60 @@ impl ActorState {
             ticket: o.ticket.clone(),
         });
         job.victim = victim.clone();
-        let victim_need = self.slots[slot].occupant.as_ref().map_or(0.0, |o| o.need.0);
-        let free = budget::free_gb(
-            Gibibytes(self.cfg.vram_total_gb),
-            Gibibytes(self.cfg.vram_reserve_gb),
-            self.ledger_sum(),
-            Gibibytes(0.0),
-        );
-        let projected = Gibibytes(free.0 + victim_need);
-        job.free_at_admit = Some(free);
         self.jobs.insert(job_id, job);
         self.slots[slot].job = Some(job_id);
         self.set_timing(job_id, |t| &mut t.queue_ms);
         self.step(job_id, SwapState::Admit);
-        let need = self.jobs[&job_id].need.expect("invariant: set above");
-        if need.0 > projected.0 {
+        // Step 4: the gate is evaluated against the ledger with the witness as a
+        // fresh, reconciling sample — sampled on a task, never inline in the actor.
+        let witness = Arc::clone(&self.witness);
+        let tx = self.tx.clone();
+        let handle = tokio::spawn(async move {
+            let _ = tx.send(ActorMsg::Event {
+                job: job_id,
+                event: Event::Admitted(witness.sample().await),
+            });
+        });
+        self.jobs
+            .get_mut(&job_id)
+            .expect("invariant: caller holds a live job id")
+            .tasks
+            .push(handle);
+    }
+
+    /// The Admit decision, once the witness sample returns: external reservations
+    /// subtract (rule 2), then the ledger gate decides (rules 1-4).
+    fn finish_admit(&mut self, job_id: JobId, sample: Result<crate::budget::MemorySample, String>) {
+        let (total_gib, external_gib) = match &sample {
+            Ok(sample) => (sample.total_gib, sample.external_gib(&self.own_pids())),
+            Err(reason) => {
+                tracing::warn!(reason = %reason,
+                    "witness unavailable; admission runs ledger-only (no stale guesses, F-3/F-7)");
+                (self.cfg.vram_total_gb, 0.0)
+            }
+        };
+        let need = self.jobs[&job_id].need.unwrap_or_default();
+        let victim_need = self.jobs[&job_id]
+            .slot
+            .map(|slot| self.slots[slot].occupant.as_ref().map_or(0.0, |o| o.need.0))
+            .unwrap_or(0.0);
+        let ledger = self.ledger_sum();
+        let free = budget::free_gb(
+            Gibibytes(total_gib),
+            Gibibytes(self.cfg.vram_reserve_gb),
+            ledger,
+            Gibibytes(external_gib),
+        );
+        let external_at_admit = match &sample {
+            Ok(sample) => Some(sample.external_gib(&self.own_pids())),
+            Err(_) => None,
+        };
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.free_at_admit = Some(free);
+            job.external_at_admit = external_at_admit;
+        }
+        self.set_timing(job_id, |t| &mut t.admit_ms);
+        if need.0 > free.0 + victim_need {
             self.step(job_id, SwapState::AdmitFail);
             self.finish(
                 job_id,
@@ -720,14 +798,91 @@ impl ActorState {
             );
             return;
         }
-        self.set_timing(job_id, |t| &mut t.admit_ms);
         self.step(job_id, SwapState::Quiesce);
         self.step(job_id, SwapState::Dispose);
-        if victim.is_some() {
+        if self.jobs[&job_id].victim.is_some() {
             self.spawn_kill_confirm(job_id);
         } else {
             self.begin_spawn(job_id);
         }
+    }
+
+    /// PIDs of everything this harness spawned (occupants + in-flight spawns), for
+    /// witness attribution of external usage (Step 4 rule 2).
+    fn own_pids(&self) -> Vec<u32> {
+        let mut pids: Vec<u32> = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.occupant.as_ref())
+            .map(|occupant| occupant.ticket.pid)
+            .collect();
+        pids.extend(
+            self.jobs
+                .values()
+                .filter_map(|job| job.spawned.as_ref())
+                .map(|ticket| ticket.pid),
+        );
+        pids
+    }
+
+    /// §0.3 memory evidence: after a confirmed release, wait until the witness sees
+    /// `remaining ledger + externals + tolerance` before the spawn fires.
+    fn spawn_settle_task(&mut self, job_id: JobId) {
+        let baseline = self.ledger_sum().0;
+        let tolerance = self.cfg.witness_tolerance_gb;
+        // Externals are frozen at admit: a leftover from our own dead engine must
+        // show up as "used above expected", not as a foreign holder.
+        let external = self.jobs[&job_id].external_at_admit.unwrap_or(0.0);
+        let deadline = Duration::from_secs(self.cfg.settle_timeout_s);
+        let witness = Arc::clone(&self.witness);
+        let tx = self.tx.clone();
+        let handle = tokio::spawn(async move {
+            let started = Instant::now();
+            loop {
+                match witness.sample().await {
+                    Ok(sample) => {
+                        let expected = baseline + external + tolerance;
+                        if sample.used_gib <= expected {
+                            let _ = tx.send(ActorMsg::Event {
+                                job: job_id,
+                                event: Event::Settled(Ok(())),
+                            });
+                            return;
+                        }
+                    }
+                    Err(reason) => {
+                        tracing::warn!(reason = %reason,
+                            "witness unavailable during settle; proceeding (release was confirmed)");
+                        let _ = tx.send(ActorMsg::Event {
+                            job: job_id,
+                            event: Event::Settled(Ok(())),
+                        });
+                        return;
+                    }
+                }
+                if started.elapsed() >= deadline {
+                    let numbers = match witness.sample().await {
+                        Ok(sample) => format!(
+                            "{:.1} GiB used vs {:.1} GiB expected",
+                            sample.used_gib,
+                            baseline + external + tolerance
+                        ),
+                        Err(_) => "no witness sample".to_string(),
+                    };
+                    let _ = tx.send(ActorMsg::Event {
+                        job: job_id,
+                        event: Event::Settled(Err(numbers)),
+                    });
+                    return;
+                }
+                tokio::time::sleep(PROBE_INTERVAL).await;
+            }
+        });
+        self.jobs
+            .get_mut(&job_id)
+            .expect("invariant: caller holds a live job id")
+            .tasks
+            .push(handle);
     }
 
     /// `Dispose -> Spawn` edge (G12): only called after release is confirmed, or when
@@ -892,6 +1047,16 @@ impl ActorState {
             return; // a stale step result after cancel/supersede
         }
         let state = job.state;
+        // The admission decision is witness-driven (Step 4); every other step
+        // matches its expected state.
+        if let Event::Admitted(sample) = event {
+            if state == SwapState::Admit {
+                self.finish_admit(job_id, sample);
+            } else {
+                tracing::warn!(%job_id, ?state, "stale admission sample ignored");
+            }
+            return;
+        }
         match (state, event) {
             (SwapState::Dispose, Event::Released(Ok(()))) => {
                 self.set_timing(job_id, |t| &mut t.release_ms);
@@ -900,7 +1065,9 @@ impl ActorState {
                     self.slots[slot].occupant = None;
                 }
                 if self.jobs[&job_id].kind == JobKind::Load {
-                    self.begin_spawn(job_id);
+                    // §0.3: release is proven; now the memory evidence must settle
+                    // before the spawn fires (settle is only legal after a release).
+                    self.spawn_settle_task(job_id);
                 } else {
                     self.step(job_id, SwapState::Reap);
                     self.step(job_id, SwapState::Idle);
@@ -922,6 +1089,7 @@ impl ActorState {
             (SwapState::Spawn, Event::Spawned(Ok(spawned))) => {
                 if let Some(ticket) = self.jobs.get_mut(&job_id).and_then(|j| j.spawned.as_mut()) {
                     ticket.port = spawned.port;
+                    ticket.pid = spawned.pid;
                 }
                 self.set_timing(job_id, |t| &mut t.spawn_ms);
                 self.step(job_id, SwapState::Ready);
@@ -965,6 +1133,20 @@ impl ActorState {
                     .unwrap_or_else(|| SchedulerError::Cancelled("cancelled".to_string()));
                 self.finish(job_id, Err(error), "cancelled");
             }
+            (SwapState::Dispose, Event::Settled(Ok(()))) => {
+                self.begin_spawn(job_id);
+            }
+            (SwapState::Dispose, Event::Settled(Err(numbers))) => {
+                let (used, expected) = parse_settle_numbers(&numbers);
+                self.fail_job(
+                    job_id,
+                    SchedulerError::SettleTimeout {
+                        used_gib: used,
+                        expected_gib: expected,
+                    },
+                    "memory did not settle after release",
+                );
+            }
             (other_state, other_event) => {
                 tracing::warn!(state = ?other_state, event = ?other_event, %job_id, "unexpected event ignored");
             }
@@ -985,7 +1167,10 @@ impl ActorState {
                 job.slot,
                 job.model.clone(),
                 job.category,
-                Spawned { port: ticket.port },
+                Spawned {
+                    port: ticket.port,
+                    pid: 0,
+                },
             )
         };
         if let Some(slot) = slot {

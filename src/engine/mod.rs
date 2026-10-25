@@ -144,11 +144,13 @@ pub enum SpawnError {
     },
 }
 
-/// A started engine instance; the runtime assigned `port` (Step 8).
+/// A started engine instance (Step 8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Spawned {
     /// Port the engine now serves on.
     pub port: u16,
+    /// OS process id, for witness attribution (0 when the runtime has no process).
+    pub pid: u32,
 }
 
 /// Process-layer operations, driven by the scheduler actor but never executed inline

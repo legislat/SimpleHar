@@ -271,6 +271,28 @@ Full text in `DESIGN.md`; the load-bearing ones:
     rule 4 end-to-end). **Uncommitted.** Next candidates: NVML witness (item 5),
     SSE events stream replacing the 2 s polling, write-back for per-model yaml
     flags, T1..T14 port.
+24. **NVML witness milestone (2026-10-25, built): Step 4 choice D is real — F-3/F-7
+    closed.** `src/witness.rs`: `NvmlWitness` (nvml-wrapper in-process, total +
+    used + per-process compute list, 2 s TTL cache) with the approved
+    `nvidia-smi` fallback (`--query-gpu` + `--query-compute-apps`, spawn_blocking
+    with timeout, logged loudly once); errors mean "unavailable" — admission runs
+    ledger-only, never a stale guess. `budget.rs`: `MemorySample` (external_gib by
+    pid attribution, settled check), `VramWitness` trait, `LedgerOnlyWitness` for
+    tests. Actor: admission is now a witness-driven async step (Event::Admitted →
+    `finish_admit`: external reservations subtract via per-process attribution with
+    own pids from `Spawned{port,pid}`); **settle-after-release** gates
+    Dispose→Spawn (Event::Settled): externals frozen at admit so a dead own
+    engine's leftover cannot masquerade as a foreign holder; timeout refuses with
+    `settle timeout: U GiB used vs E GiB expected` (SchedulerError::SettleTimeout
+    → 503) and never double-spawns. Config: `settle_timeout_s` (30),
+    `witness_tolerance_gb` (2.0). `/har/status` mem now carries
+    ledger/observed/external/source; the page shows a third "Observed" bar with the
+    witness label. Tests: 5 witness-suite tests (scripted FakeWitness: external
+    blocks admission with numbers; settle blocks spawn while released memory is
+    visible; settle passes once memory returns; smi CSV parsing; skip-safe live
+    NVML sample). Gates: fmt clean, clippy `-D warnings` clean, **87/87 tests**.
+    Live: `/har/status` shows real card numbers (71.69 GiB total, observed used,
+    source witness). **Uncommitted** — say the word.
 
 ## 5. Open items — pick one per turn and brainstorm it
 

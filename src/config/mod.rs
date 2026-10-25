@@ -110,6 +110,14 @@ fn default_tray_enabled() -> bool {
     true
 }
 
+fn default_settle_timeout() -> u64 {
+    30
+}
+
+fn default_witness_tolerance() -> f64 {
+    2.0
+}
+
 fn default_modelconf_dir() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
@@ -259,6 +267,13 @@ pub struct AppConfig {
     /// Directory of per-model flat yaml files (Step 9); missing dir = empty catalog.
     #[serde(default = "default_modelconf_dir")]
     pub modelconf_dir: std::path::PathBuf,
+    /// G12 memory-settle deadline after a confirmed release (§0.3).
+    #[serde(default = "default_settle_timeout")]
+    pub settle_timeout_s: u64,
+    /// Witness tolerance in GiB: disagreement within this band is not a re-sample
+    /// trigger, and settle accepts `baseline + tolerance` (Step 4 rule 4).
+    #[serde(default = "default_witness_tolerance")]
+    pub witness_tolerance_gb: f64,
 }
 
 impl Default for AppConfig {
@@ -274,6 +289,8 @@ impl Default for AppConfig {
             tray_enabled: default_tray_enabled(),
             llama_server_exe: default_llama_server_exe(),
             modelconf_dir: default_modelconf_dir(),
+            settle_timeout_s: default_settle_timeout(),
+            witness_tolerance_gb: default_witness_tolerance(),
         }
     }
 }

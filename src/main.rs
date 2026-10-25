@@ -67,17 +67,21 @@ async fn main() -> ExitCode {
     ));
     adapters.insert("llama".to_string(), llama);
     let runtime: Arc<dyn EngineRuntime> = Arc::new(ProcessRuntime::new());
+    let witness: Arc<dyn simplehar_se::budget::VramWitness> =
+        Arc::new(simplehar_se::witness::NvmlWitness::new());
     let scheduler = Scheduler::start(
         config.clone(),
         config.modelconf_dir.clone(),
         adapters,
         runtime,
+        Arc::clone(&witness),
     );
     let listeners = simplehar_se::listeners::ListenerRegistry::new();
     let state = Arc::new(ApiState::new(
         config.clone(),
         scheduler.clone(),
         listeners.clone(),
+        witness,
     ));
 
     // One shutdown channel for every exit path: Ctrl+C and the tray's Exit item

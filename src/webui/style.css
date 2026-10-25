@@ -146,6 +146,7 @@ header.sh-header {
 .sh-bar { height: 10px; border-radius: 6px; background: var(--pico-card-border-color); overflow: hidden; }
 .sh-bar > i { display: block; height: 100%; background: var(--sh-accent-solid); }
 .sh-bar[data-tone="reserve"] > i { background: var(--sh-warn); }
+.sh-bar[data-tone="observed"] > i { background: #4a7fb5; }
 .sh-mem label { font-size: 0.75rem; color: var(--pico-muted-color); display: block; margin-bottom: 0.2rem; }
 
 /* Tabs: models live below the header (operator mockup). */

@@ -119,6 +119,9 @@ impl From<SchedulerError> for ApiError {
             SchedulerError::Cancelled(reason) => ApiError::Conflict {
                 reason: format!("cancelled: {reason}"),
             },
+            SchedulerError::SettleTimeout { .. } => ApiError::Unavailable {
+                reason: error.to_string(),
+            },
             SchedulerError::ActorGone => ApiError::Internal {
                 reason: "scheduler is not running".to_string(),
             },
@@ -138,6 +141,8 @@ pub struct ApiState {
     pub scheduler: SchedulerHandle,
     /// Listener health, written by the supervisors in `main` (red state, §0.2).
     pub listeners: crate::listeners::ListenerRegistry,
+    /// The VRAM witness, shared with the scheduler (Step 4).
+    pub witness: Arc<dyn crate::budget::VramWitness>,
     /// Runtime `default_model` overrides from `/har/config/default`, layered over
     /// the boot config (Step 9: the yaml/json stays the source of truth; overrides
     /// persist back to it on every set).
@@ -154,6 +159,7 @@ impl ApiState {
         config: AppConfig,
         scheduler: SchedulerHandle,
         listeners: crate::listeners::ListenerRegistry,
+        witness: Arc<dyn crate::budget::VramWitness>,
     ) -> Self {
         let control_addr = format!(
             "{}:{}",
@@ -164,6 +170,7 @@ impl ApiState {
             control_addr,
             scheduler,
             listeners,
+            witness,
             default_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
             proxy: reqwest::Client::builder()
@@ -326,10 +333,7 @@ async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
         "control_addr": state.control_addr,
         "categories": categories,
         "listeners": state.listeners.snapshot(),
-        "mem": {
-            "total_gb": state.config.vram_total_gb,
-            "reserve_gb": state.config.vram_reserve_gb,
-        },
+        "mem": mem_section(&state).await,
         "slots": scheduler.slots,
         "jobs": scheduler.jobs,
         "catalog_errors": scheduler.catalog_errors,
@@ -471,6 +475,36 @@ async fn har_rescan(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
         "models": catalog.models.len(),
         "catalog_errors": catalog.errors,
     })))
+}
+
+/// The `/har/status` memory block: declared config numbers plus what the witness
+/// actually sees, labeled with its source (F-7 lesson: never present a number
+/// without saying whose number it is).
+async fn mem_section(state: &ApiState) -> Value {
+    let ledger: f64 = state
+        .scheduler
+        .status()
+        .await
+        .map(|status| status.slots.iter().filter_map(|slot| slot.need_gib).sum())
+        .unwrap_or_default();
+    match state.witness.sample().await {
+        Ok(sample) => json!({
+            "total_gb": sample.total_gib,
+            "reserve_gb": state.config.vram_reserve_gb,
+            "ledger_gb": ledger,
+            "observed_used_gb": sample.used_gib,
+            "external_gb": sample.external_gib(&[]),
+            "source": "witness",
+        }),
+        Err(reason) => json!({
+            "total_gb": state.config.vram_total_gb,
+            "reserve_gb": state.config.vram_reserve_gb,
+            "ledger_gb": ledger,
+            "observed_used_gb": null,
+            "external_gb": null,
+            "source": format!("unavailable ({reason})"),
+        }),
+    }
 }
 
 /// `GET /har/jobs` — the ledger this timekeeping always pretended to be (F-5 fix).

@@ -60,11 +60,13 @@ fn app(
         dir.clone(),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
+        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
     );
     let state = Arc::new(ApiState::new(
         config,
         scheduler,
         simplehar_se::listeners::ListenerRegistry::new(),
+        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
     ));
     let control = control_router(Arc::clone(&state));
     let work = category_router(Arc::clone(&state), CategoryId::Work);

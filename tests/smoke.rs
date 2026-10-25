@@ -24,11 +24,13 @@ fn app() -> axum::Router {
         modelconf,
         adapters,
         Arc::new(simplehar_se::process::ProcessRuntime::new()) as Arc<dyn EngineRuntime>,
+        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
     );
     control_router(Arc::new(ApiState::new(
         config,
         scheduler,
         simplehar_se::listeners::ListenerRegistry::new(),
+        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
     )))
 }
 
