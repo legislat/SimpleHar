@@ -384,6 +384,30 @@ function renderTabs() {
   return tabs;
 }
 
+async function toggleLog(details) {
+  if (details.open && !details.dataset.loaded) {
+    details.dataset.loaded = "1";
+    try {
+      const data = await getJson("/har/log?limit=80");
+      const body = details.querySelector(".sh-log-body");
+      body.replaceChildren(
+        ...data.events.map((entry) =>
+          el(
+            "div",
+            { class: "sh-job" },
+            text(`${new Date(entry.ts_ms).toLocaleTimeString()} ${entry.level} ${entry.message}`),
+            entry.level === "ERROR" || entry.level === "WARN"
+              ? el("span", { class: "sh-job-error" }, text(` ${entry.target}`))
+              : null,
+          ),
+        ),
+      );
+    } catch (error) {
+      flashError(error);
+    }
+  }
+}
+
 function renderJobs(status) {
   const recent = status.jobs.slice(-5).reverse();
   if (recent.length === 0) return null;
@@ -414,10 +438,17 @@ function render() {
   headerHost.replaceChildren(renderHeader(status));
   const mainHost = document.getElementById("sh-main");
   const jobs = renderJobs(status);
+  const logBox = el(
+    "details",
+    { class: "sh-jobs", ontoggle: (event) => toggleLog(event.target) },
+    el("summary", {}, text("Harness log (last events)")),
+    el("div", { class: "sh-log-body" }, text("open to load /har/log")),
+  );
   mainHost.replaceChildren(
     renderTabs(),
     renderTab(status, state.activeTab),
     ...(jobs ? [jobs] : []),
+    logBox,
     el(
       "footer",
       { class: "sh-footer" },

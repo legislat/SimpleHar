@@ -663,6 +663,22 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
     response
 }
 
+/// `GET /har/log?limit=N` — the last N harness log events from the in-memory
+/// ring (Step 16): why did the last load fail, without opening files.
+async fn har_log(
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = query
+        .get("limit")
+        .and_then(|limit| limit.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(crate::observability::RING_CAPACITY);
+    let (events, dropped) = crate::observability::ring_tail(limit);
+    Ok(Json(
+        json!({ "events": events, "dropped": dropped, "capacity": crate::observability::RING_CAPACITY }),
+    ))
+}
+
 /// `GET /har/models` — the full unfiltered catalog for the control page (G5: the
 /// per-listener `/v1/models` stays category-filtered).
 async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
@@ -1120,6 +1136,7 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
         .route("/har/status", get(har_status))
         .route("/har/jobs", get(har_jobs))
         .route("/har/events", get(har_events))
+        .route("/har/log", get(har_log))
         .route("/har/jobs/{id}", get(har_job))
         .route("/har/load", post(har_load))
         .route("/har/unload", post(har_unload))

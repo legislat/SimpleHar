@@ -641,3 +641,25 @@ async fn genuine_upstream_error_is_surfaced_never_retried() {
     );
     let _ = runtime;
 }
+
+#[tokio::test]
+async fn har_log_serves_the_ring() {
+    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    // Push a marker entry straight into the ring (the test binary has no global
+    // subscriber; the endpoint reads the same process-global storage).
+    simplehar_se::observability::ring_push(simplehar_se::observability::LogEntry::now(
+        "ERROR",
+        "test::har_log",
+        "last load failed: need 50 GiB",
+    ));
+    let (status, body) = get_json(&control, "/har/log?limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+    let events = body["events"].as_array().expect("events list");
+    assert!(events.iter().any(|entry| {
+        entry["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("last load failed")
+    }));
+    assert!(body["capacity"].is_u64());
+}

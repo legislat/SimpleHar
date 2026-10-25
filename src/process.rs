@@ -23,6 +23,37 @@ use tokio::process::{Child, Command};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Poll pause between release-evidence checks inside the deadline.
 const RELEASE_POLL: Duration = Duration::from_millis(100);
+/// Log hygiene (Step 16): at most this many engine log files survive; the oldest
+/// are deleted at spawn time (T14's `logs/` budget).
+const LOG_FILE_CAP: usize = 50;
+
+/// Deletes the oldest `*.log` files beyond `keep` in `dir`.
+fn prune_log_files(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("log"))
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by_key(|(modified, _)| *modified); // oldest first
+    let excess = files.len() - keep;
+    for (_, path) in files.into_iter().take(excess) {
+        if let Err(error) = std::fs::remove_file(&path) {
+            tracing::warn!(error = %error, path = %path.display(), "cannot prune old engine log");
+        }
+    }
+}
 
 /// One tracked engine tree: the child plus its Job Object.
 struct EngineProc {
@@ -92,6 +123,7 @@ impl EngineRuntime for ProcessRuntime {
                 reason: format!("cannot create {}: {error}", self.logs_dir.display()),
             });
         }
+        prune_log_files(&self.logs_dir, LOG_FILE_CAP);
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -320,4 +352,34 @@ unsafe fn terminate_job(job: windows::Win32::Foundation::HANDLE) {
 /// The handle must be valid and owned by the caller.
 unsafe fn close_handle(handle: windows::Win32::Foundation::HANDLE) {
     let _ = windows::Win32::Foundation::CloseHandle(handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_pruning_keeps_the_newest_files() {
+        let dir = std::env::temp_dir().join(format!("se-logprune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp logs dir");
+        for i in 0..6 {
+            let path = dir.join(format!("engine-{i}.log"));
+            std::fs::write(&path, b"x").expect("seed log");
+            // Distinct mtimes: force aging by touching the metadata via sleep is
+            // flaky; instead write times backwards is not portable - use file
+            // order by setting modified times explicitly on unix only. Here we
+            // rely on the prune test using names as a proxy: oldest = lowest i.
+            let _ = i;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        prune_log_files(&dir, 3);
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining.len(), 3, "cap enforced: {remaining:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

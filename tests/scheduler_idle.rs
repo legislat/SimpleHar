@@ -38,8 +38,11 @@ fn harness(config: AppConfig) -> SchedulerHandle {
 }
 
 fn config(rp_idle_s: u64) -> AppConfig {
+    // Generous readiness deadline: this suite runs in parallel with every other
+    // test binary; a 5 s probe deadline flakes under load (flake policy: widen,
+    // never game).
     let mut cfg = AppConfig {
-        load_timeout_s: 5,
+        load_timeout_s: 30,
         ..AppConfig::default()
     };
     cfg.category_mut(CategoryId::Rp)

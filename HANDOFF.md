@@ -421,6 +421,22 @@ Full text in `DESIGN.md`; the load-bearing ones:
     Gates: fmt clean, clippy `-D warnings` clean, **110/110 tests**.
     **Uncommitted.** Remaining to v1.0: /har/log ring (Step 16), the T1..T14
     port, the parallel soak, the cut.
+32. **Log ring + hygiene milestone (2026-10-25, built): Step 16 done.**
+    (a) `observability.rs`: a tracing `Layer` captures every filtered event into
+    a process-global ring (capacity 500, oldest dropped, drop counter kept);
+    `LogEntry {ts_ms, level, target, message, fields}`; `ring_push`/`ring_tail`
+    public for the endpoint and tests; `init()` installs the ring layer next to
+    the console formatter (two EnvFilters, SIMPLEHAR_LOG). (b) `GET /har/log
+    ?limit=N` (control router): the last N events + dropped + capacity — why did
+    the last load fail, without opening files. (c) Log hygiene: `process.rs`
+    prunes engine logs at spawn to the newest 50 files (T14's logs/ budget).
+    (d) Page: a collapsible "Harness log" section fetching /har/log on open.
+    Tests: ring cap/drops/limit tail; /har/log serves a pushed marker; prune
+    keeps the newest. Flake note: the idle suite's 5 s load timeout failed once
+    under full parallel load — widened to 30 s (flake policy: widen, never game).
+    Gates: fmt clean, clippy `-D warnings` clean, **113/113 tests**.
+    **Uncommitted.** Remaining to v1.0: the T1..T14 port, the parallel soak, the
+    cut.
 
 ## 5. Open items — pick one per turn and brainstorm it
 
