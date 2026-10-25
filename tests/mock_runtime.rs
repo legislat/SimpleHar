@@ -75,7 +75,9 @@ impl MockRuntime {
         self.servers.lock().expect("mock runtime lock").len()
     }
 
-    /// Whether nothing accepts on `port` anymore (release evidence, G12).
+    /// Whether nothing accepts on `port` anymore (release evidence, G12). Used by the
+    /// scheduler_actor test binary; other binaries sharing this module may not call it.
+    #[allow(dead_code)]
     pub async fn is_dead(&self, port: u16) -> bool {
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -94,6 +96,19 @@ async fn health(State(mode): State<MockMode>) -> (axum::http::StatusCode, Json<s
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(json!({ "status": "ok", "loaded": loaded })))
+}
+
+/// Proxy echo: any other path answers 200 with the request shape, so proxy tests can
+/// assert what the harness forwarded (including the rewritten `model` field).
+async fn echo(
+    uri: axum::http::Uri,
+    body: Option<Json<serde_json::Value>>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "echo": true,
+        "path": uri.path(),
+        "body": body.map(|Json(value)| value).unwrap_or(serde_json::Value::Null),
+    }))
 }
 
 #[async_trait]
@@ -118,6 +133,7 @@ impl EngineRuntime for MockRuntime {
             .port();
         let app = Router::new()
             .route("/health", get(health))
+            .fallback(echo)
             .with_state(mode.clone());
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;

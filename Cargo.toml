@@ -24,7 +24,8 @@ serde_json = "1"
 # dyn-compatible async methods for the EngineRuntime trait (Step 7).
 async-trait = "0.1"
 # HTTP client: engine readiness probes now (mock engine), proxy surface later (Step 11).
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# `stream` enables byte-for-byte SSE pass-through.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 
 # Approved 2026-10-25 but deliberately absent until their module lands (no unused deps):
 # - nvml-wrapper  -> Step 4, budget.rs witness (item 5)

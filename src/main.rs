@@ -1,13 +1,18 @@
-//! Entry point: boot order per DESIGN §0.2 — config first, listeners before any engine
-//! work (there is none: preload is scrapped), zero engine spawns at boot.
-
-use std::process::ExitCode;
-use std::sync::Arc;
+//! Entry point: boot order per DESIGN §0.2 — config first, listeners bound before any
+//! engine work (there is none: preload is scrapped), zero engine spawns at boot.
 
 use anyhow::Context;
-use simplehar_se::api::{router, ApiState};
+use simplehar_se::api::{category_router, control_router, ApiState};
 use simplehar_se::config::{AppConfig, ConfigError};
+use simplehar_se::engine::mock::MockAdapter;
+use simplehar_se::engine::unimplemented::UnimplementedRuntime;
+use simplehar_se::engine::{EngineAdapter, EngineRuntime};
 use simplehar_se::observability;
+use simplehar_se::scheduler::Scheduler;
+use std::net::SocketAddr;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Loads and validates boot config from beside the executable.
 ///
@@ -45,12 +50,16 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let state = Arc::new(ApiState::from(config));
-    tracing::info!(
-        control = %state.control_addr,
-        categories = 4,
-        "simplehar-se booting: control listener first, zero engine spawns (§0.2)"
-    );
+    // The catalog is empty until the ModelConf scan lands (Step 9); the mock adapter
+    // is registered so operator-supplied mock entries work out of the box.
+    let catalog = Vec::new();
+    let mut adapters = std::collections::BTreeMap::new();
+    let mock: Arc<dyn EngineAdapter> = Arc::new(MockAdapter);
+    adapters.insert("mock".to_string(), mock);
+    let runtime: Arc<dyn EngineRuntime> = Arc::new(UnimplementedRuntime);
+    let scheduler = Scheduler::start(config.clone(), catalog.clone(), adapters, runtime);
+    let state = Arc::new(ApiState::new(config, scheduler, catalog));
+
     match run(state).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -60,25 +69,49 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Binds the control listener and serves until Ctrl+C.
-///
-/// # Errors
-///
-/// Propagates bind/serve failures with context (the port and address are named,
-/// matching the G11 failure contract).
+/// Binds every category listener (the control one hosts `/har/*`); a failed
+/// *category* bind is reported and skipped — partial availability beats a dead
+/// process (G11). A failed *control* bind is fatal: without it there is no control
+/// plane.
 async fn run(state: Arc<ApiState>) -> anyhow::Result<()> {
-    let addr: std::net::SocketAddr = state
-        .control_addr
-        .parse()
-        .context("control address must be a valid socket address")?;
-    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
-        format!("cannot bind control listener {addr} (name the holder and continue — G11)")
-    })?;
-    tracing::info!(%addr, "control listener bound");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("control listener stopped with an error")
+    tracing::info!(
+        control = %state.control_addr,
+        "simplehar-se booting: listeners before engines, zero engine spawns (§0.2)"
+    );
+    let host = state.config.internal_host;
+    let mut servers = Vec::new();
+    for category in state.config.categories.clone() {
+        let addr = SocketAddr::new(host, category.public_port);
+        let router = if category.control {
+            control_router(Arc::clone(&state))
+        } else {
+            category_router(Arc::clone(&state), category.id)
+        };
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                tracing::info!(%addr, category = %category.id, "listener bound");
+                servers.push(tokio::spawn(async move {
+                    let _ = axum::serve(listener, router).await;
+                }));
+            }
+            Err(error) if category.control => {
+                return Err(anyhow::anyhow!(error)).with_context(|| {
+                    format!("cannot bind control listener {addr} (G11: name the holder and refuse)")
+                });
+            }
+            Err(error) => {
+                tracing::error!(%addr, category = %category.id, error = %error,
+                    "listener bind failed; continuing on the listeners we have (G11)");
+            }
+        }
+    }
+    shutdown_signal().await;
+    tracing::info!("shutdown requested; stopping listeners");
+    for server in servers {
+        server.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok(())
 }
 
 /// Resolves on Ctrl+C; a signal-receive error is logged, not fatal.

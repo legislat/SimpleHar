@@ -6,6 +6,7 @@
 //! express. Readiness is typed, never a string heuristic (defect D7/E1 class).
 
 pub mod mock;
+pub mod unimplemented;
 
 use crate::model::ModelEntry;
 use crate::ownership::SpawnTicket;

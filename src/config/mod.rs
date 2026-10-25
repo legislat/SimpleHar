@@ -266,8 +266,17 @@ impl AppConfig {
         AppConfig::parse(&text)
     }
 
-    /// The category whose listener hosts `/har/*` and the control page (Step 11).
+    /// Mutable access to one category definition, if present.
     ///
+    /// # Returns
+    ///
+    /// `Some(&mut CategoryConfig)` for the first entry with this id, `None` when the
+    /// category is not configured (validation reports duplicates/missing separately).
+    pub fn category_mut(&mut self, id: CategoryId) -> Option<&mut CategoryConfig> {
+        self.categories.iter_mut().find(|c| c.id == id)
+    }
+
+    /// The category whose listener hosts `/har/*` and the control page (Step 11).    ///
     /// # Panics
     ///
     /// Only when the exactly-one-control invariant was not checked by `validate`;

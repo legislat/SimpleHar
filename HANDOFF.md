@@ -156,6 +156,24 @@ Full text in `DESIGN.md`; the load-bearing ones:
     async-trait, reqwest. Gates: fmt clean, clippy `-D warnings` clean, **45/45
     tests**. Not yet wired into `main`/HTTP (next: API surface — `/har/load`,
     `/har/unload`, `/har/jobs`, per-category listeners + no-model fallback).
+17. **API surface milestone (2026-10-25, committed): the harness is headless-usable.**
+    Typed `SchedulerError → ApiError` mapping (E1: 404/400/503/502/409/501/500 by type,
+    admission numbers travel in the message). Control routes on the designated listener:
+    `/har/load` (waits through the load, idempotent via waiter attach), strict
+    `/har/unload {"category"}` (400, never implicit all), `/har/jobs` + `/har/jobs/{id}`,
+    extended `/har/status` (categories + slots + jobs + mem config). Four per-category
+    listeners: filtered `/v1/models`, wrong-category/unknown `404` **before** any
+    ensure, no-model fallback (loaded occupant MRU → `default_model` load → `400`
+    naming the listener), proxy pass-through of chat/completions/embeddings with
+    `model` rewrite and byte-streamed responses (SSE-capable; 1 GiB body limit).
+    `main.rs` binds all listeners (category bind failure → log + skip, G11 partial;
+    control bind failure → fatal). `engine::unimplemented` placeholder runtime for the
+    binary: boots clean, loads refuse with "process runtime lands with Step 8" —
+    `process.rs` is the next milestone, then the ModelConf scan (catalog is empty
+    until then). Gates: fmt clean, clippy `-D warnings` clean, **56/56 tests**;
+    binary boot-verified: 4 listeners on 8109-8112, typed 400/404 bodies confirmed
+    by curl, test instance killed. Known gaps deferred: Host/Origin guard, request
+    ids, SSE *events* stream for the page, retry-once-on-crash, `/har/rescan`.
 
 ## 5. Open items — pick one per turn and brainstorm it
 
