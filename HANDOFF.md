@@ -327,6 +327,29 @@ Full text in `DESIGN.md`; the load-bearing ones:
     integration). Live: category+cpu edit against the real binary — header comment
     and the commented-out old `# category: AUX` line survived verbatim, real key
     rewritten in place, `cpu_offload: true` appended. **Uncommitted.**
+27. **Cross-category eviction milestone (2026-10-25, built): Step 6 complete — the
+    swap product's last core behavior.** When admission is short after the
+    same-slot replacement, `plan_victims` covers the deficit from *evictable*
+    occupants: hard filters first (`evictable_by` per victim category; a
+    non-evictable occupant becomes a named blocker with "only WORK can evict
+    WORK"-style reasons), then the cheapest sufficient set by exhaustive search
+    over the ≤9 slots (tie-break: fewer victims), release order least-protected
+    first / LRU within. Victims release **one at a time** with a gate re-check
+    after each confirmed release (`released_cost` accumulates on the job) — the
+    loop stops the moment the load fits, so no more is killed than needed; the
+    final release still runs the §0.3 witness settle before the spawn. Refusal
+    contract (G6): `Insufficient` now carries `victims_considered` +
+    `blockers` and renders them ("blocked by: work50 (nothing may evict WORK)");
+    `JobStatus.victims_released` records evictions in the ledger. `Victim` gained
+    slot/cost/evicted. Tests: `tests/scheduler_eviction.rs` — WORK evicts AUX,
+    cheapest-set minimality (12+20 loaded, deficit 15 → only 20 dies),
+    RP-cannot-evict-WORK refusal with the blocker contract, AUX-cannot-evict
+    refusal keeping both occupants. Two early test failures were my wrong
+    premises (deficit arithmetic; a same-slot replacement that legitimately fit),
+    not code bugs. One flake observed once under full parallel load
+    (`settle_blocks_spawn`, 1 s deadline), green on re-run and in two consecutive
+    full runs — flake-watch per the T-policy. Gates: fmt clean, clippy
+    `-D warnings` clean, **99/99 tests**. **Uncommitted.**
 
 ## 5. Open items — pick one per turn and brainstorm it
 

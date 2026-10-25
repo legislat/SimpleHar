@@ -17,6 +17,28 @@ impl std::fmt::Display for Gibibytes {
     }
 }
 
+/// A candidate victim the eviction planner considered (Step 6 refusal contract).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VictimInfo {
+    /// Harness name of the candidate.
+    pub model: String,
+    /// Category it occupies.
+    pub category: String,
+    /// Its admission cost.
+    pub need_gib: f64,
+}
+
+/// A model that blocks the load and cannot be evicted (Step 6 hard filters).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockerInfo {
+    /// Harness name of the blocker.
+    pub model: String,
+    /// Category it occupies.
+    pub category: String,
+    /// Why it is not evictable ("only WORK can evict WORK").
+    pub reason: String,
+}
+
 /// Refusal reasons of the admission gate, with the numbers used (G13).
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum AdmissionError {
@@ -24,8 +46,10 @@ pub enum AdmissionError {
     /// (v3.3's F-7 lied about the reason).
     #[error("under-specified model: no `vram_gb` and no GGUF size to estimate from")]
     UnderSpecified,
-    /// The gate rejected the load; the numbers travel with the refusal (Step 6 contract).
-    #[error("insufficient VRAM: need {need}, free {free}, reserve {reserve}")]
+    /// The gate rejected the load and no sufficient eviction set exists; the
+    /// numbers, the candidates considered, and the named blockers all travel with
+    /// the refusal (Step 6 contract, G6).
+    #[error("insufficient VRAM: need {need}, free {free}, reserve {reserve}{tail}", tail = insufficient_tail(.victims_considered, .blockers))]
     Insufficient {
         /// Declared or estimated cost of the wanted load.
         need: Gibibytes,
@@ -33,7 +57,38 @@ pub enum AdmissionError {
         free: Gibibytes,
         /// Reserve subtracted before the gate.
         reserve: Gibibytes,
+        /// Candidates the planner considered (may be empty when none exist).
+        victims_considered: Vec<VictimInfo>,
+        /// Models that cannot be evicted, with reasons.
+        blockers: Vec<BlockerInfo>,
     },
+}
+
+/// The human tail of the [`AdmissionError::Insufficient`] message: who was
+/// considered and who blocks, so the refusal explains itself (G6).
+fn insufficient_tail(victims_considered: &[VictimInfo], blockers: &[BlockerInfo]) -> String {
+    let mut tail = String::new();
+    if !victims_considered.is_empty() {
+        tail.push_str("; considered evicting: ");
+        tail.push_str(
+            &victims_considered
+                .iter()
+                .map(|v| format!("{} ({}), {:.1} GiB", v.model, v.category, v.need_gib))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if !blockers.is_empty() {
+        tail.push_str("; blocked by: ");
+        tail.push_str(
+            &blockers
+                .iter()
+                .map(|b| format!("{} ({})", b.model, b.reason))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    tail
 }
 
 /// GGUF-size fallback factor kept from v3.3 (DESIGN Step 4 rule 1).
@@ -94,6 +149,8 @@ pub fn admit(
             need,
             free,
             reserve,
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
         })
     }
 }
@@ -237,6 +294,7 @@ mod tests {
                 need,
                 free,
                 reserve,
+                ..
             } => {
                 assert!(close(need.0, 50.0));
                 assert!(close(free.0, 40.0));

@@ -165,6 +165,8 @@ pub struct JobStatus {
     pub need_gib: Option<f64>,
     /// Free VRAM at admit time in GiB (the number that was used).
     pub free_at_admit_gib: Option<f64>,
+    /// Cross-category victims this job evicted (Step 6, G13 decision inputs).
+    pub victims_released: Vec<String>,
     /// Step timings (§0.3).
     pub timings: JobTimings,
 }
@@ -360,6 +362,13 @@ struct Occupant {
 struct Victim {
     model: String,
     ticket: SpawnTicket,
+    /// The slot the victim occupies, cleared when its release is confirmed.
+    slot: usize,
+    /// Admission cost freed by this release (ledger arithmetic, Step 6 re-check).
+    cost: f64,
+    /// True when this victim was a cross-category eviction (vs a same-slot
+    /// replacement); recorded in the job ledger (G13).
+    evicted: bool,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -393,6 +402,13 @@ struct Job {
     readiness: Option<ReadinessSpec>,
     /// The previous occupant this job must release before spawning.
     victim: Option<Victim>,
+    /// Cross-category victims queued by the eviction planner (Step 6), released
+    /// one at a time after the same-slot replacement (if any).
+    victims: Vec<Victim>,
+    /// Cross-category victims whose release is confirmed (observability, G13).
+    victims_released: Vec<String>,
+    /// Ledger cost freed by confirmed releases so far (Step 6 minimality check).
+    released_cost: f64,
     slot: Option<usize>,
 }
 
@@ -682,6 +698,9 @@ impl ActorState {
                 Victim {
                     model: occupant.model.clone(),
                     ticket: occupant.ticket.clone(),
+                    slot,
+                    evicted: false,
+                    cost: occupant.need.0,
                 }
             };
             let job = Job {
@@ -703,6 +722,9 @@ impl ActorState {
                 spawned: None,
                 readiness: None,
                 victim: Some(victim),
+                victims: Vec::new(),
+                victims_released: Vec::new(),
+                released_cost: 0.0,
                 slot: Some(slot),
             };
             self.jobs.insert(job_id, job);
@@ -738,6 +760,9 @@ impl ActorState {
             spawned: None,
             readiness: None,
             victim: None,
+            victims: Vec::new(),
+            victims_released: Vec::new(),
+            released_cost: 0.0,
             slot: Some(slot),
         };
         let need = budget::need_gb(entry.vram_gb.map(Gibibytes), None);
@@ -760,6 +785,9 @@ impl ActorState {
         let victim = self.slots[slot].occupant.as_ref().map(|o| Victim {
             model: o.model.clone(),
             ticket: o.ticket.clone(),
+            slot,
+            evicted: false,
+            cost: o.need.0,
         });
         job.victim = victim.clone();
         self.jobs.insert(job_id, job);
@@ -816,25 +844,193 @@ impl ActorState {
         }
         self.set_timing(job_id, |t| &mut t.admit_ms);
         if need.0 > free.0 + victim_need {
-            self.step(job_id, SwapState::AdmitFail);
-            self.finish(
-                job_id,
-                Err(SchedulerError::Admission(AdmissionError::Insufficient {
-                    need,
-                    free,
-                    reserve: Gibibytes(self.cfg.vram_reserve_gb),
-                })),
-                "admission refused",
-            );
-            return;
+            // Step 6: try to cover the deficit with evictable cross-category
+            // victims before refusing — cheapest sufficient set, hard filters.
+            let deficit = need.0 - free.0 - victim_need;
+            match self.plan_victims(job_id, deficit) {
+                Ok(victims) => {
+                    if let Some(job) = self.jobs.get_mut(&job_id) {
+                        job.victims = victims;
+                    }
+                    tracing::info!(
+                        %job_id,
+                        victims = ?self.jobs[&job_id].victims.iter().map(|v| &v.model).collect::<Vec<_>>(),
+                        deficit_gib = deficit,
+                        "admission short: evicting victims"
+                    );
+                }
+                Err((considered, blockers)) => {
+                    self.step(job_id, SwapState::AdmitFail);
+                    self.finish(
+                        job_id,
+                        Err(SchedulerError::Admission(AdmissionError::Insufficient {
+                            need,
+                            free,
+                            reserve: Gibibytes(self.cfg.vram_reserve_gb),
+                            victims_considered: considered,
+                            blockers,
+                        })),
+                        "admission refused",
+                    );
+                    return;
+                }
+            }
         }
         self.step(job_id, SwapState::Quiesce);
         self.step(job_id, SwapState::Dispose);
+        // Ensure a release target: the same-slot replacement first, else the first
+        // queued cross-category victim.
+        if self.jobs[&job_id].victim.is_none() {
+            self.dequeue_victim(job_id);
+        }
         if self.jobs[&job_id].victim.is_some() {
             self.spawn_kill_confirm(job_id);
         } else {
             self.begin_spawn(job_id);
         }
+    }
+
+    /// Step 6 planner: among occupants evictable by this job's category, pick the
+    /// cheapest sufficient set (exhaustive over the ≤9 slots; tie-break: fewer
+    /// victims). Hard filters first — a non-evictable occupant becomes a named
+    /// blocker, never a candidate. Release order: least-protected first, LRU
+    /// within a category.
+    fn plan_victims(
+        &self,
+        job_id: JobId,
+        deficit: f64,
+    ) -> Result<
+        Vec<Victim>,
+        (
+            Vec<crate::budget::VictimInfo>,
+            Vec<crate::budget::BlockerInfo>,
+        ),
+    > {
+        let load_category = self.jobs[&job_id].category;
+        let job_slot = self.jobs[&job_id].slot;
+        let evictable_by = |category: CategoryId| {
+            self.cfg
+                .categories
+                .iter()
+                .find(|cat| cat.id == category)
+                .map(|cat| cat.evictable_by.clone())
+                .unwrap_or_default()
+        };
+        let mut candidates: Vec<(usize, f64)> = Vec::new();
+        let mut considered = Vec::new();
+        let mut blockers = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if job_slot == Some(index) {
+                continue; // the same-slot replacement is already accounted
+            }
+            let Some(occupant) = &slot.occupant else {
+                continue;
+            };
+            let allowed = evictable_by(slot.category).contains(&load_category);
+            if allowed {
+                candidates.push((index, occupant.need.0));
+                considered.push(crate::budget::VictimInfo {
+                    model: occupant.model.clone(),
+                    category: slot.category.to_string(),
+                    need_gib: occupant.need.0,
+                });
+            } else {
+                let allowed_list = evictable_by(slot.category);
+                let reason = if allowed_list.is_empty() {
+                    format!("nothing may evict {}", slot.category)
+                } else {
+                    format!(
+                        "only {} can evict {}",
+                        allowed_list
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" and "),
+                        slot.category
+                    )
+                };
+                blockers.push(crate::budget::BlockerInfo {
+                    model: occupant.model.clone(),
+                    category: slot.category.to_string(),
+                    reason,
+                });
+            }
+        }
+        let n = candidates.len();
+        if n == 0 {
+            return Err((considered, blockers));
+        }
+        // Exhaustive cheapest covering subset (n ≤ 9 slots → ≤512 masks).
+        let mut best: Option<u32> = None;
+        let mut best_sum = f64::INFINITY;
+        let mut best_count = usize::MAX;
+        for mask in 1u32..(1 << n) {
+            let (mut sum, mut count) = (0.0, 0);
+            for (bit, (_, cost)) in candidates.iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    sum += cost;
+                    count += 1;
+                }
+            }
+            if sum + 1e-9 >= deficit
+                && (sum < best_sum || (sum <= best_sum + 1e-9 && count < best_count))
+            {
+                best_sum = sum;
+                best_count = count;
+                best = Some(mask);
+            }
+        }
+        let Some(mask) = best else {
+            return Err((considered, blockers));
+        };
+        // Release order: least-protected first (more categories may evict it),
+        // LRU within the same protection level.
+        let mut chosen: Vec<usize> = (0..n).filter(|bit| mask & (1 << bit) != 0).collect();
+        chosen.sort_by(|&a, &b| {
+            let (slot_a, slot_b) = (candidates[a].0, candidates[b].0);
+            let prot = |index: usize| evictable_by(self.slots[index].category).len();
+            prot(slot_b).cmp(&prot(slot_a)).then_with(|| {
+                let lru = |index: usize| {
+                    self.slots[index]
+                        .occupant
+                        .as_ref()
+                        .map_or(Instant::now(), |o| o.loaded_at)
+                };
+                lru(slot_a).cmp(&lru(slot_b))
+            })
+        });
+        let victims = chosen
+            .into_iter()
+            .map(|bit| {
+                let (index, _) = candidates[bit];
+                let occupant = self.slots[index]
+                    .occupant
+                    .as_ref()
+                    .expect("invariant: candidates come from live occupants");
+                Victim {
+                    model: occupant.model.clone(),
+                    ticket: occupant.ticket.clone(),
+                    slot: index,
+                    evicted: true,
+                    cost: occupant.need.0,
+                }
+            })
+            .collect();
+        Ok(victims)
+    }
+
+    /// Moves the next queued victim into the release slot; `false` when the queue
+    /// is empty (Step 6: one at a time).
+    fn dequeue_victim(&mut self, job_id: JobId) -> bool {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        if job.victims.is_empty() {
+            return false;
+        }
+        let next = job.victims.remove(0);
+        job.victim = Some(next);
+        true
     }
 
     /// PIDs of everything this harness spawned (occupants + in-flight spawns), for
@@ -1025,15 +1221,19 @@ impl ActorState {
     fn spawn_kill_confirm(&mut self, job_id: JobId) {
         let victim = {
             let job = &self.jobs[&job_id];
-            let ticket = job
-                .victim
-                .as_ref()
-                .map(|v| v.ticket.clone())
-                .or_else(|| job.spawned.clone())
-                .expect("invariant: kill targets exist for jobs in release phases");
-            Victim {
-                model: job.model.clone(),
-                ticket,
+            match job.victim.as_ref() {
+                Some(victim) => victim.clone(),
+                // Failure/cancel reaping: the kill target is the job's own spawn.
+                None => Victim {
+                    model: job.model.clone(),
+                    ticket: job
+                        .spawned
+                        .clone()
+                        .expect("invariant: kill targets exist for jobs in release phases"),
+                    slot: job.slot.expect("invariant: spawned jobs have a slot"),
+                    evicted: false,
+                    cost: 0.0,
+                },
             }
         };
         let tx = self.tx.clone();
@@ -1095,14 +1295,49 @@ impl ActorState {
         match (state, event) {
             (SwapState::Dispose, Event::Released(Ok(()))) => {
                 self.set_timing(job_id, |t| &mut t.release_ms);
-                let slot = self.jobs[&job_id].slot;
-                if let Some(slot) = slot {
-                    self.slots[slot].occupant = None;
+                // Clear the released victim's own slot (same-slot replacement or a
+                // cross-category evictee — never the job's slot blindly).
+                let released = self.jobs[&job_id].victim.clone();
+                if let Some(victim) = &released {
+                    if self.slots[victim.slot]
+                        .occupant
+                        .as_ref()
+                        .map(|o| o.ticket.clone())
+                        == Some(victim.ticket.clone())
+                    {
+                        self.slots[victim.slot].occupant = None;
+                    }
+                    if let Some(job) = self.jobs.get_mut(&job_id) {
+                        job.released_cost += victim.cost;
+                        if victim.evicted {
+                            job.victims_released.push(victim.model.clone());
+                        }
+                    }
                 }
                 if self.jobs[&job_id].kind == JobKind::Load {
-                    // §0.3: release is proven; now the memory evidence must settle
-                    // before the spawn fires (settle is only legal after a release).
-                    self.spawn_settle_task(job_id);
+                    // Step 6: release cross victims one at a time; after each
+                    // release re-check the gate and stop as soon as it is satisfied
+                    // (minimality — never kill more than the load needs).
+                    if self.dequeue_victim(job_id) {
+                        let need = self.jobs[&job_id].need.unwrap_or_default().0;
+                        // free_at_admit was computed with everything still in the
+                        // ledger; every confirmed release has since freed its cost.
+                        let available = self.jobs[&job_id].free_at_admit.map_or(0.0, |f| f.0)
+                            + self.jobs[&job_id].released_cost;
+                        if need <= available {
+                            if let Some(job) = self.jobs.get_mut(&job_id) {
+                                job.victims.clear();
+                            }
+                            tracing::info!(%job_id, "release sufficient; skipping remaining victims");
+                            self.spawn_settle_task(job_id);
+                        } else {
+                            self.spawn_kill_confirm(job_id);
+                        }
+                    } else {
+                        // §0.3: release is proven; now the memory evidence must
+                        // settle before the spawn fires.
+                        self.spawn_settle_task(job_id);
+                    }
                 } else {
                     self.step(job_id, SwapState::Reap);
                     self.step(job_id, SwapState::Idle);
@@ -1406,6 +1641,7 @@ impl ActorState {
                     error: j.error.as_ref().map(|e| e.to_string()),
                     need_gib: j.need.map(|n| n.0),
                     free_at_admit_gib: j.free_at_admit.map(|n| n.0),
+                    victims_released: j.victims_released.clone(),
                     timings: j.timings,
                 })
                 .collect(),

@@ -434,6 +434,7 @@ mod tests {
             error: error.map(str::to_string),
             need_gib: Some(4.0),
             free_at_admit_gib: Some(66.0),
+            victims_released: Vec::new(),
             timings: Default::default(),
         }
     }

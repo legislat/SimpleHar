@@ -980,6 +980,8 @@ mod tests {
             need: crate::budget::Gibibytes(50.0),
             free: crate::budget::Gibibytes(20.0),
             reserve: crate::budget::Gibibytes(2.0),
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
         });
         let mapped = ApiError::from(admission);
         assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
