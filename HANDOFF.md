@@ -141,6 +141,21 @@ Full text in `DESIGN.md`; the load-bearing ones:
     -- -D warnings` clean, **32/32 tests pass**; binary booted on 127.0.0.1:8109,
     answered `/health` + `/har/status`, then killed (test instance only). Next: §6
     step 3 — the scheduler actor + state machine against the mock engine.
+16. **Scheduler actor milestone (2026-10-25, committed):** the product core runs.
+    `scheduler/` split into `vocab.rs` (commands, `SwapState`, transition graph) and
+    `mod.rs` (single-writer actor: mpsc commands + oneshot waiters, event-driven steps
+    — every engine step is a spawned task, so `status`/`cancel`/`unload` never queue
+    behind a load; waiter-list dedup for identical loads; supersede with pending
+    restart for same-category loads; jobs ledger with per-job timings and terminal
+    records; kill+confirm release flow with `release_timeout_s`). `EngineRuntime`
+    trait (async-trait) + `SpawnError`; mock runtime in `tests/mock_runtime.rs`
+    (real axum servers on ephemeral ports, modes mock/mock-slow/mock-dies/mock-never);
+    12 integration tests pin F-1, F-6, F-4-class already-loaded, T3.4, T8, A1,
+    admission numbers, under-specified, unload, deadline-failure. **Graph amendment:**
+    unload completes `Dispose → Reap → Idle` (DESIGN §3 note). Deps added:
+    async-trait, reqwest. Gates: fmt clean, clippy `-D warnings` clean, **45/45
+    tests**. Not yet wired into `main`/HTTP (next: API surface — `/har/load`,
+    `/har/unload`, `/har/jobs`, per-category listeners + no-model fallback).
 
 ## 5. Open items — pick one per turn and brainstorm it
 

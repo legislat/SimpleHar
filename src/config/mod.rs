@@ -98,6 +98,14 @@ fn default_vram_reserve() -> f64 {
     2.0
 }
 
+fn default_vram_total() -> f64 {
+    72.0
+}
+
+fn default_load_timeout() -> u64 {
+    120
+}
+
 fn default_release_timeout() -> u64 {
     60
 }
@@ -200,12 +208,19 @@ pub struct AppConfig {
     /// GiB kept unreachable by admission (Step 4 rule 2).
     #[serde(default = "default_vram_reserve")]
     pub vram_reserve_gb: f64,
+    /// Total VRAM of the card in GiB; the ledger's ceiling (Step 4).
+    #[serde(default = "default_vram_total")]
+    pub vram_total_gb: f64,
     /// Ports the harness must never bind or touch — the manual namespace (Step 1).
     #[serde(default = "default_protected_ports")]
     pub protected_ports: BTreeSet<u16>,
     /// G12 release-confirmation deadline in seconds for one dispose (§0.3).
     #[serde(default = "default_release_timeout")]
     pub release_timeout_s: u64,
+    /// Readiness deadline per load in seconds; per-model override lands with the
+    /// template schema (Step 3 knobs).
+    #[serde(default = "default_load_timeout")]
+    pub load_timeout_s: u64,
 }
 
 impl Default for AppConfig {
@@ -214,8 +229,10 @@ impl Default for AppConfig {
             internal_host: default_internal_host(),
             categories: default_categories(),
             vram_reserve_gb: default_vram_reserve(),
+            vram_total_gb: default_vram_total(),
             protected_ports: default_protected_ports(),
             release_timeout_s: default_release_timeout(),
+            load_timeout_s: default_load_timeout(),
         }
     }
 }
@@ -339,6 +356,18 @@ impl AppConfig {
                     ),
                 });
             }
+        }
+        if self.vram_total_gb <= 0.0 {
+            errors.push(ConfigError::Invalid {
+                field: "vram_total_gb".to_string(),
+                reason: "must be positive (the ledger ceiling, Step 4)".to_string(),
+            });
+        }
+        if self.load_timeout_s == 0 {
+            errors.push(ConfigError::Invalid {
+                field: "load_timeout_s".to_string(),
+                reason: "must be positive (readiness deadline, Step 3)".to_string(),
+            });
         }
         if !self.internal_host.is_loopback() {
             errors.push(ConfigError::Invalid {

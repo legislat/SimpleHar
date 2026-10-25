@@ -1,14 +1,11 @@
-//! Scheduler commands and the swap state machine (DESIGN Steps 2-3).
-//!
-//! The actor runtime (single writer, oneshot waiters) lands with the scheduler
-//! milestone; this module pins the vocabulary it will run: the command set and the
-//! legal-transition graph, each individually testable — the 358-line `ensure()` of v3.3
-//! becomes a machine whose edges are data.
+//! Scheduler vocabulary: commands, job ids, and the swap state machine graph
+//! (DESIGN Steps 2-3).
 
 use crate::config::CategoryId;
+use serde::Serialize;
 
 /// Identity of one swap job, observable at `GET /har/jobs` (Step 2/12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct JobId(pub u64);
 
 impl std::fmt::Display for JobId {
@@ -40,7 +37,7 @@ pub enum Command {
 /// `Dispose -> Spawn` is a *confirmation gate*, not a delay: the edge is legal only
 /// once release is proven (G12); the spawn fires immediately on that event. A release
 /// that cannot be proven inside `release_timeout_s` takes `Failed -> Reap` and refuses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum SwapState {
     /// No job on the slot.
     Idle,
@@ -100,6 +97,10 @@ pub fn transition_allowed(from: SwapState, to: SwapState) -> bool {
             | (Failed, Reap)
             | (Reap, Idle)
             | (CancelRequested, Reap)
+            // Unload jobs (2026-10-25 amendment): a deliberate unload ends with its
+            // release confirmed in Dispose and teardown complete in Reap — the one
+            // edge the swap graph shares with unload.
+            | (Dispose, Reap)
     );
     let cancel =
         to == CancelRequested && !matches!(from, Idle | CancelRequested | Reap | AdmitFail);
@@ -176,5 +177,12 @@ mod tests {
     #[test]
     fn job_ids_display_stably() {
         assert_eq!(JobId(7).to_string(), "job-7");
+    }
+
+    #[test]
+    fn unload_completes_dispose_to_reap_to_idle() {
+        use SwapState::*;
+        assert!(transition_allowed(Dispose, Reap));
+        assert!(transition_allowed(Reap, Idle));
     }
 }

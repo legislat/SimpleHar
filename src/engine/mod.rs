@@ -8,6 +8,7 @@
 pub mod mock;
 
 use crate::model::ModelEntry;
+use crate::ownership::SpawnTicket;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -90,4 +91,64 @@ pub trait EngineAdapter: Send + Sync {
     /// [`EngineError::MissingField`] / [`EngineError::Rejected`] as documented; these
     /// become `Refused` job records, never panics.
     fn spec(&self, model: &ModelEntry) -> Result<LaunchSpec, EngineError>;
+}
+
+/// Why a spawn/kill/release step failed at the process layer (Step 8).
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum SpawnError {
+    /// The engine could not be started.
+    #[error("spawn failed: {reason}")]
+    SpawnFailed {
+        /// What went wrong.
+        reason: String,
+    },
+    /// The kill path failed for a resource the harness owns.
+    #[error("kill failed for {holder}: {reason}")]
+    KillFailed {
+        /// Human name of the resource (model or container).
+        holder: String,
+        /// What went wrong.
+        reason: String,
+    },
+}
+
+/// A started engine instance; the runtime assigned `port` (Step 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spawned {
+    /// Port the engine now serves on.
+    pub port: u16,
+}
+
+/// Process-layer operations, driven by the scheduler actor but never executed inline
+/// in the actor loop (Step 2: no I/O in the actor; Step 8: one implementation).
+///
+/// The production implementation (hidden spawn, Job Objects, log files, container
+/// labels) is the future `process.rs`; the mock implementation used by tests lives in
+/// `tests/mock_runtime.rs` (Step 19).
+#[async_trait::async_trait]
+pub trait EngineRuntime: Send + Sync {
+    /// Starts an engine for `spec`; the ticket stamps provenance on the result.
+    ///
+    /// # Errors
+    ///
+    /// [`SpawnError::SpawnFailed`] when the engine cannot be started.
+    async fn spawn(&self, spec: &LaunchSpec, ticket: SpawnTicket) -> Result<Spawned, SpawnError>;
+
+    /// Stops an owned resource. Only ever called with an owned ticket (Step 1).
+    ///
+    /// # Errors
+    ///
+    /// [`SpawnError::KillFailed`] when the stop command itself fails.
+    async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError>;
+
+    /// G12 release evidence: `true` only when death is *proven* (handle signaled /
+    /// job tree empty / container gone + port closed).
+    ///
+    /// # Errors
+    ///
+    /// [`SpawnError::KillFailed`] when the evidence check cannot be performed.
+    async fn release_confirmed(&self, ticket: &SpawnTicket) -> Result<bool, SpawnError>;
+
+    /// One readiness attempt against `readiness` (Step 7 tri-state).
+    async fn probe(&self, port: u16, readiness: &ReadinessSpec) -> Probe;
 }

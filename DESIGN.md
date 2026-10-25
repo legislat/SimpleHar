@@ -236,6 +236,10 @@ Invariant per transition, and it is enforced by a single `finish()` that no path
 every exit path sets exactly one of {slot installed, `last_error` + `reaped: true`} — never
 neither (that is exactly F-6), and never a slot without a live backing resource.
 
+Amendment (2026-10-25, actor milestone): **unload jobs walk the same machine** and complete
+`Dispose → Reap → Idle` — release confirmed, teardown done. It is the one edge unload
+shares with the failure/cancel paths into `Reap`.
+
 `Dispose → Spawn` is a **confirmation gate, not a delay** (G12, §0.3): the edge is only legal
 once release is *proven* for that resource (handle signaled + job tree empty, or container gone +
 port refusing), and the spawn fires immediately on that event with `release_ms` recorded. A

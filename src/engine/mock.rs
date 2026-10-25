@@ -29,7 +29,7 @@ impl EngineAdapter for MockAdapter {
                 model.name.clone(),
             ],
             cwd: PathBuf::from("."),
-            env: BTreeMap::new(),
+            env: BTreeMap::from([("MOCK_ENGINE".to_string(), model.engine.clone())]),
             log_name: format!("mock-{}", model.name),
             readiness: ReadinessSpec::Http {
                 path: "/health".to_string(),
