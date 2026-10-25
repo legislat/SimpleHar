@@ -293,6 +293,23 @@ Full text in `DESIGN.md`; the load-bearing ones:
     NVML sample). Gates: fmt clean, clippy `-D warnings` clean, **87/87 tests**.
     Live: `/har/status` shows real card numbers (71.69 GiB total, observed used,
     source witness). **Uncommitted** — say the word.
+25. **SSE events stream (2026-10-25, built): the page polls nothing.** The actor
+    owns a `broadcast::Sender<SchedulerStatus>` and **publishes a snapshot after
+    every mutation** (job transitions, swap/unload/reload; reads never publish);
+    `SchedulerHandle::subscribe()`. `GET /har/events` (control listener): one SSE
+    stream that sends the merged state doc (status + models + listeners) as
+    `har_state` events — the current state immediately on connect, then a push per
+    mutation, keepalives by the SSE layer, laggy subscribers resync via the next
+    full-state merge. The page connects one `EventSource` on load; on stream drop
+    it degrades to the 2 s polling fallback and retries the stream after 10 s
+    (Step 14: "one SSE stream with a polling fallback"). Dep: tokio-stream. New
+    test: content-type + immediate first frame. Gates: fmt clean, clippy
+    `-D warnings` clean, **88/88 tests**. Live: 7 `har_state` frames observed
+    during a real Qwen3-0.6B load+unload cycle. One incident, transparently: a
+    failed python edit truncated `src/api/mod.rs` to zero bytes mid-turn; recovered
+    from the `4074f67` commit via `git checkout --` and re-applied the one-line
+    `-0.0` cosmetic fix (the only uncommitted change lost; recovered before any
+    other damage). **Uncommitted.**
 
 ## 5. Open items — pick one per turn and brainstorm it
 

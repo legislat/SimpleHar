@@ -386,9 +386,22 @@ function render() {
   );
 }
 
-// ---------- polling loop ----------
+// ---------- event stream with polling fallback (Step 14) ----------
+
+let pollTimer = null;
+let sse = null;
+
+function applyState(doc) {
+  state.status = doc.status;
+  state.models = doc.models || [];
+  if (doc.listeners) {
+    state.status.listeners = doc.listeners;
+  }
+  render();
+}
 
 async function refresh() {
+  // Polling fallback and the rescan button both use the plain endpoints.
   try {
     const [status, catalog] = await Promise.all([
       getJson("/har/status"),
@@ -402,8 +415,39 @@ async function refresh() {
   }
 }
 
+function startPolling() {
+  if (pollTimer !== null) return;
+  pollTimer = setInterval(refresh, POLL_MS);
+}
+
+function stopPolling() {
+  if (pollTimer === null) return;
+  clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+function connectEvents() {
+  stopPolling();
+  sse = new EventSource("/har/events");
+  sse.addEventListener("har_state", (message) => {
+    try {
+      applyState(JSON.parse(message.data));
+    } catch (error) {
+      flashError(error);
+    }
+  });
+  sse.onopen = () => stopPolling();
+  sse.onerror = () => {
+    // Stream dropped (server restart, sleep): degrade to polling, retry SSE later.
+    sse.close();
+    sse = null;
+    startPolling();
+    setTimeout(connectEvents, 10000);
+  };
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   initTheme();
-  refresh();
-  setInterval(refresh, POLL_MS);
+  refresh(); // first paint without waiting for the stream
+  connectEvents();
 });

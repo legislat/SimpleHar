@@ -21,6 +21,7 @@ use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderValue, StatusCode};
+use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -402,6 +403,87 @@ async fn har_unload(
     Ok(Json(json!({ "status": "unloading", "category": category })))
 }
 
+/// The merged document every `har_state` event carries: one push replaces the
+/// page's per-panel polling (Step 14).
+async fn merged_state(state: &ApiState) -> Result<Value, ApiError> {
+    let status = state.scheduler.status().await.map_err(ApiError::from)?;
+    let catalog = state.catalog().await?;
+    let models: Vec<Value> = catalog
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.name,
+                "object": "model",
+                "owned_by": "simplehar",
+                "engine": entry.engine,
+                "category": entry.category,
+                "vram_gb": entry.vram_gb,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "status": status,
+        "models": models,
+        "listeners": state.listeners.snapshot(),
+    }))
+}
+
+/// `GET /har/events` — one SSE stream: the current state immediately, then a push
+/// after every scheduler mutation (keepalives by the SSE layer); a dropped stream
+/// degrades to the page's polling fallback (Step 12 / Step 14).
+#[allow(clippy::type_complexity)]
+async fn har_events(
+    State(state): State<Arc<ApiState>>,
+) -> Sse<
+    KeepAliveStream<
+        tokio_stream::wrappers::UnboundedReceiverStream<Result<Event, std::convert::Infallible>>,
+    >,
+> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut pushes = state.scheduler.subscribe();
+        // The immediate snapshot: the page renders once without waiting for a change.
+        if let Ok(doc) = merged_state(&state).await {
+            if send_state(&tx, &doc).is_err() {
+                return;
+            }
+        }
+        loop {
+            match pushes.recv().await {
+                Ok(_) => {
+                    if let Ok(doc) = merged_state(&state).await {
+                        if send_state(&tx, &doc).is_err() {
+                            return; // subscriber gone
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Missed pushes are fine: the next merge carries the full state.
+                    if let Ok(doc) = merged_state(&state).await {
+                        let _ = send_state(&tx, &doc);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+    Sse::new(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+}
+
+/// Sends one `har_state` event; `Err` means the subscriber disconnected.
+fn send_state(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, std::convert::Infallible>>,
+    doc: &Value,
+) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
+    let event = Event::default()
+        .event("har_state")
+        .json_data(doc)
+        .unwrap_or_else(|_| Event::default().event("har_state").data("{}"));
+    tx.send(Ok(event))
+        .map_err(|_| tokio::sync::mpsc::error::SendError(()))
+}
+
 /// `GET /har/models` — the full unfiltered catalog for the control page (G5: the
 /// per-listener `/v1/models` stays category-filtered).
 async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
@@ -732,6 +814,7 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
     let har: Router<Arc<ApiState>> = Router::new()
         .route("/har/status", get(har_status))
         .route("/har/jobs", get(har_jobs))
+        .route("/har/events", get(har_events))
         .route("/har/jobs/{id}", get(har_job))
         .route("/har/load", post(har_load))
         .route("/har/unload", post(har_unload))

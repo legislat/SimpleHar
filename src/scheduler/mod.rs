@@ -192,6 +192,7 @@ type Waiter = oneshot::Sender<Result<Reply, SchedulerError>>;
 #[derive(Debug, Clone)]
 pub struct SchedulerHandle {
     tx: mpsc::UnboundedSender<ActorMsg>,
+    events: tokio::sync::broadcast::Sender<SchedulerStatus>,
 }
 
 impl SchedulerHandle {
@@ -251,6 +252,16 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ActorGone)
     }
 
+    /// Subscribes to status pushes: the actor publishes a snapshot after every
+    /// state mutation (Step 12: the events stream, so the page polls nothing).
+    ///
+    /// # Returns
+    ///
+    /// A broadcast receiver; laggy subscribers miss snapshots, never block the actor.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<SchedulerStatus> {
+        self.events.subscribe()
+    }
+
     /// Snapshot of slots and jobs; never probes, never mutates (Step 2).
     ///
     /// # Errors
@@ -291,8 +302,15 @@ impl Scheduler {
     ) -> SchedulerHandle {
         let (tx, rx) = mpsc::unbounded_channel();
         let state = ActorState::new(cfg, models_dir, adapters, runtime, witness, tx.clone());
-        tokio::spawn(actor_loop(state, rx));
-        SchedulerHandle { tx }
+        let (events, _) = tokio::sync::broadcast::channel::<SchedulerStatus>(64);
+        tokio::spawn(actor_loop(
+            ActorState {
+                events: events.clone(),
+                ..state
+            },
+            rx,
+        ));
+        SchedulerHandle { tx, events }
     }
 }
 
@@ -392,6 +410,7 @@ struct ActorState {
     adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
     runtime: Arc<dyn EngineRuntime>,
     witness: Arc<dyn crate::budget::VramWitness>,
+    events: tokio::sync::broadcast::Sender<SchedulerStatus>,
     tx: mpsc::UnboundedSender<ActorMsg>,
     slots: Vec<Slot>,
     jobs: BTreeMap<JobId, Job>,
@@ -484,6 +503,7 @@ impl ActorState {
             adapters,
             runtime,
             witness,
+            events: tokio::sync::broadcast::channel(64).0,
             tx,
             slots,
             jobs: BTreeMap::new(),
@@ -521,11 +541,21 @@ impl ActorState {
 
     fn on_command(&mut self, cmd: Command, reply: Waiter) {
         match cmd {
-            Command::Swap { model, category } => self.on_swap(model, category, reply),
-            Command::Cancel { job } => self.on_cancel(job, reply),
-            Command::Unload { category } => self.on_unload(category, reply),
+            Command::Swap { model, category } => {
+                self.on_swap(model, category, reply);
+                self.publish();
+            }
+            Command::Cancel { job } => {
+                self.on_cancel(job, reply);
+                self.publish();
+            }
+            Command::Unload { category } => {
+                self.on_unload(category, reply);
+                self.publish();
+            }
             Command::Reload => {
                 self.refresh_catalog();
+                self.publish();
                 let _ = reply.send(Ok(Reply::Done));
             }
         }
@@ -1040,6 +1070,11 @@ impl ActorState {
     }
 
     fn on_event(&mut self, job_id: JobId, event: Event) {
+        self.apply_event(job_id, event);
+        self.publish();
+    }
+
+    fn apply_event(&mut self, job_id: JobId, event: Event) {
         let Some(job) = self.jobs.get(&job_id) else {
             return;
         };
@@ -1299,6 +1334,12 @@ impl ActorState {
                 }
             }
         }
+    }
+
+    /// Publishes a snapshot to event subscribers after every mutation (Step 12).
+    /// Send errors are laggy or gone subscribers — never the actor's problem.
+    fn publish(&self) {
+        let _ = self.events.send(self.snapshot());
     }
 
     fn ledger_sum(&self) -> Gibibytes {

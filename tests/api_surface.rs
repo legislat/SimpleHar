@@ -422,3 +422,40 @@ async fn default_model_endpoint_validates_and_takes_effect() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["body"]["model"], "qwen3");
 }
+
+#[tokio::test]
+async fn events_stream_serves_sse_with_an_immediate_state() {
+    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let response = control
+        .oneshot(
+            Request::get("/har/events")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+
+    // The first frame must arrive without waiting for a mutation.
+    let mut stream = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        use tokio_stream::StreamExt;
+        stream.next().await
+    })
+    .await
+    .expect("first frame within 5s")
+    .expect("stream alive")
+    .expect("frame is bytes");
+    let text = String::from_utf8_lossy(&first);
+    assert!(text.contains("har_state"), "frame: {text}");
+}

@@ -39,6 +39,8 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
 ] }
 
+# Stream adapters: broadcast receiver -> SSE body stream (Step 12 events).
+tokio-stream = "0.1"
 # NVML in-process witness with a graceful `nvidia-smi` fallback (Step 4, item 5).
 nvml-wrapper = "0.10"
 
