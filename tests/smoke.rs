@@ -17,16 +17,17 @@ fn app() -> axum::Router {
     let config = AppConfig::default();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+    let modelconf = std::env::temp_dir().join(format!("se-smoke-{}", std::process::id()));
+    std::fs::create_dir_all(&modelconf).expect("temp ModelConf dir");
     let scheduler = Scheduler::start(
         config.clone(),
-        Vec::new(),
+        modelconf,
         adapters,
         Arc::new(simplehar_se::process::ProcessRuntime::new()) as Arc<dyn EngineRuntime>,
     );
     control_router(Arc::new(ApiState::new(
         config,
         scheduler,
-        Vec::new(),
         simplehar_se::listeners::ListenerRegistry::new(),
     )))
 }

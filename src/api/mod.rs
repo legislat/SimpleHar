@@ -26,7 +26,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
@@ -138,7 +138,6 @@ pub struct ApiState {
     pub scheduler: SchedulerHandle,
     /// Listener health, written by the supervisors in `main` (red state, §0.2).
     pub listeners: crate::listeners::ListenerRegistry,
-    catalog: Arc<RwLock<Vec<ModelEntry>>>,
     /// Last-use hints per model (fallback MRU for AUX x N; eviction LRU later).
     usage: Arc<Mutex<HashMap<String, Instant>>>,
     proxy: reqwest::Client,
@@ -150,7 +149,6 @@ impl ApiState {
     pub fn new(
         config: AppConfig,
         scheduler: SchedulerHandle,
-        catalog: Vec<ModelEntry>,
         listeners: crate::listeners::ListenerRegistry,
     ) -> Self {
         let control_addr = format!(
@@ -162,7 +160,6 @@ impl ApiState {
             control_addr,
             scheduler,
             listeners,
-            catalog: Arc::new(RwLock::new(catalog)),
             usage: Arc::new(Mutex::new(HashMap::new())),
             proxy: reqwest::Client::builder()
                 .timeout(Duration::from_secs(600))
@@ -172,12 +169,18 @@ impl ApiState {
         }
     }
 
-    /// Catalog snapshot (readers never block on each other).
-    pub fn catalog(&self) -> Vec<ModelEntry> {
-        self.catalog
-            .read()
-            .expect("catalog lock poisoned by a writer panic")
-            .clone()
+    /// Catalog snapshot from the actor (Step 2: one writer, snapshot reads).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Internal`] when the scheduler actor is gone.
+    pub async fn catalog(&self) -> Result<Vec<ModelEntry>, ApiError> {
+        Ok(self
+            .scheduler
+            .catalog()
+            .await
+            .map_err(ApiError::from)?
+            .models)
     }
 
     fn touch(&self, model: &str) {
@@ -221,6 +224,7 @@ async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
         },
         "slots": scheduler.slots,
         "jobs": scheduler.jobs,
+        "catalog_errors": scheduler.catalog_errors,
         "config_errors": [],
     })))
 }
@@ -239,7 +243,7 @@ async fn har_load(
             reason: "missing required field `model`".to_string(),
         });
     };
-    let catalog = state.catalog();
+    let catalog = state.catalog().await?;
     let entry = crate::catalog::resolve(model, &catalog).ok_or_else(|| ApiError::NotFound {
         what: format!("model `{model}`; known models are listed at each listener's /v1/models"),
     })?;
@@ -286,6 +290,18 @@ async fn har_unload(
     Ok(Json(json!({ "status": "unloading", "category": category })))
 }
 
+/// `POST /har/rescan` — re-scan `ModelConf`; the reply carries the new counts and
+/// every catalog error (Step 9: a bad file is named, never fatal).
+async fn har_rescan(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
+    state.scheduler.reload().await.map_err(ApiError::from)?;
+    let catalog = state.scheduler.catalog().await.map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "status": "rescanned",
+        "models": catalog.models.len(),
+        "catalog_errors": catalog.errors,
+    })))
+}
+
 /// `GET /har/jobs` — the ledger this timekeeping always pretended to be (F-5 fix).
 async fn har_jobs(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let scheduler = state.scheduler.status().await.map_err(ApiError::from)?;
@@ -313,10 +329,9 @@ async fn har_job(
 
 /// `GET /v1/models` — exactly this listener's category, never the full catalog
 /// (no cross-category disclosure, G5).
-async fn v1_models(State(listener): State<Arc<ListenerState>>) -> Json<Value> {
-    let models: Vec<Value> = listener
-        .api
-        .catalog()
+async fn v1_models(State(listener): State<Arc<ListenerState>>) -> Result<Json<Value>, ApiError> {
+    let catalog = listener.api.catalog().await?;
+    let models: Vec<Value> = catalog
         .iter()
         .filter(|entry| entry.category == listener.category)
         .map(|entry| {
@@ -328,7 +343,7 @@ async fn v1_models(State(listener): State<Arc<ListenerState>>) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "object": "list", "data": models }))
+    Ok(Json(json!({ "object": "list", "data": models })))
 }
 
 /// Resolves the request to a serving port on this listener, or a typed error:
@@ -338,7 +353,7 @@ async fn ensure_target(listener: &ListenerState, body: &Value) -> Result<(String
     let requested = body.get("model").and_then(Value::as_str);
     match requested {
         Some(model) => {
-            let catalog = api.catalog();
+            let catalog = api.catalog().await?;
             let entry =
                 crate::catalog::resolve(model, &catalog).ok_or_else(|| ApiError::NotFound {
                     what: format!(
@@ -519,7 +534,8 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
         .route("/har/jobs", get(har_jobs))
         .route("/har/jobs/{id}", get(har_job))
         .route("/har/load", post(har_load))
-        .route("/har/unload", post(har_unload));
+        .route("/har/unload", post(har_unload))
+        .route("/har/rescan", post(har_rescan));
     Router::new()
         .merge(category_router(Arc::clone(&api), control_category))
         .merge(har.with_state(api))

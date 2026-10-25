@@ -228,6 +228,26 @@ Full text in `DESIGN.md`; the load-bearing ones:
     WORK 8708 / RP 8709 / AUX 8710 / EMB 8711** (control = WORK 8708). Defaults,
     tests, and HANDOFF §3 updated; engine-port plan unchanged (18109+). Still
     uncommitted with items 18-20.
+22. **ModelConf scan milestone (2026-10-25, committed): the catalog is real files —
+    and the FIRST REAL ENGINE LOAD happened.** `model/scan.rs`: flat yaml parser
+    with quote/inline-comment handling (D2), invalid/duplicate keys *reported* not
+    dropped (D3), `scan_dir` → `Catalog{models, errors}` (bad file skipped + named,
+    missing dir = one error, never fatal). The **scheduler owns the catalog** (single
+    writer): `Scheduler::start(cfg, models_dir, …)` scans at boot; `Command::Reload`
+    rescans; `handle.catalog()` snapshot; `SchedulerStatus.catalog_errors`;
+    `default_model` cross-checked against the catalog. API: catalog fetched from the
+    actor, `POST /har/rescan` (counts + errors), `/har/status` carries
+    `catalog_errors`. Config: `modelconf_dir` (default `<exe>/ModelConf`). All test
+    harnesses now write real temp ModelConf dirs (actor + api + smoke). Gates: fmt
+    clean, clippy `-D warnings` clean, **78/78 tests**. **Live demo (all on the SE
+    port set):** boot → `/v1/models` lists `qwen3-0.6b` from yaml; `/har/load`
+    spawned the real hidden `llama-server.exe` under a Job Object (log captured);
+    chat completion through the proxy answered (Qwen3-0.6B Q8, cpu_offload —
+    exactly the v3.3 smoke-test pair); unload → slot emptied, port 18109 refuses,
+    zero orphan processes. A first attempt with a wrong model path was **refused
+    with the engine's own reason in the job record** — the funnel held. Known
+    refinement (next turn): probe should fast-fail when the child has already
+    exited (a dead engine currently eats the full `load_timeout`).
 
 ## 5. Open items — pick one per turn and brainstorm it
 

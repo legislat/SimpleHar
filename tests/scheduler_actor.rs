@@ -8,7 +8,6 @@ mod mock_runtime;
 use mock_runtime::MockRuntime;
 use simplehar_se::config::{AppConfig, CategoryId};
 use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::model::ModelEntry;
 use simplehar_se::scheduler::{
     JobId, Reply, Scheduler, SchedulerError, SchedulerHandle, SwapState,
 };
@@ -23,19 +22,37 @@ fn config(load_timeout_s: u64) -> AppConfig {
     }
 }
 
-fn entry(name: &str, engine: &str, category: CategoryId, vram_gb: Option<f64>) -> ModelEntry {
-    ModelEntry {
-        name: name.to_string(),
-        engine: engine.to_string(),
-        category,
-        vram_gb,
-        model_ref: None,
-        file: None,
-        raw: BTreeMap::new(),
+type Spec = (&'static str, &'static str, CategoryId, Option<f64>);
+
+/// Writes flat model yamls into a fresh temp ModelConf dir; returns its path.
+fn write_modelconf(specs: &[Spec]) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "se-modelconf-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp ModelConf dir");
+    for (name, engine, category, vram_gb) in specs {
+        let mut yaml = format!(
+            "name: {name}
+engine: {engine}
+category: {category}
+"
+        );
+        if let Some(vram) = vram_gb {
+            yaml.push_str(&format!(
+                "vram_gb: {vram}
+"
+            ));
+        }
+        std::fs::write(dir.join(format!("{name}.yaml")), yaml).expect("model yaml");
     }
+    dir
 }
 
-fn harness(cfg: AppConfig, catalog: Vec<ModelEntry>) -> (SchedulerHandle, MockRuntime) {
+fn harness(cfg: AppConfig, specs: &[Spec]) -> (SchedulerHandle, MockRuntime) {
     let runtime = MockRuntime::new();
     let mut adapters = BTreeMap::new();
     let adapter: Arc<dyn simplehar_se::engine::EngineAdapter> = Arc::new(MockAdapter);
@@ -48,7 +65,7 @@ fn harness(cfg: AppConfig, catalog: Vec<ModelEntry>) -> (SchedulerHandle, MockRu
     }
     let handle = Scheduler::start(
         cfg,
-        catalog,
+        write_modelconf(specs),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn simplehar_se::engine::EngineRuntime>,
     );
@@ -106,8 +123,7 @@ fn terminal_jobs(
 
 #[tokio::test]
 async fn loads_model_into_empty_category_and_ledger() {
-    let catalog = vec![entry("qwen3", "mock", CategoryId::Work, Some(4.0))];
-    let (handle, runtime) = harness(config(5), catalog);
+    let (handle, runtime) = harness(config(5), &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
 
     let reply = handle
         .swap("qwen3", CategoryId::Work)
@@ -135,8 +151,7 @@ async fn loads_model_into_empty_category_and_ledger() {
 
 #[tokio::test]
 async fn same_model_same_category_is_already_and_idempotent() {
-    let catalog = vec![entry("qwen3", "mock", CategoryId::Work, Some(4.0))];
-    let (handle, runtime) = harness(config(5), catalog);
+    let (handle, runtime) = harness(config(5), &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
 
     handle
         .swap("qwen3", CategoryId::Work)
@@ -153,8 +168,10 @@ async fn same_model_same_category_is_already_and_idempotent() {
 #[tokio::test]
 async fn concurrent_identical_loads_share_one_job_and_one_engine() {
     // F-6: two loads for the same model and category must not race.
-    let catalog = vec![entry("qwen3", "mock-slow", CategoryId::Work, Some(4.0))];
-    let (handle, runtime) = harness(config(10), catalog);
+    let (handle, runtime) = harness(
+        config(10),
+        &[("qwen3", "mock-slow", CategoryId::Work, Some(4.0))],
+    );
 
     let (a, b) = tokio::join!(
         handle.swap("qwen3", CategoryId::Work),
@@ -179,11 +196,13 @@ async fn concurrent_identical_loads_share_one_job_and_one_engine() {
 
 #[tokio::test]
 async fn different_model_replaces_occupant_and_kills_previous() {
-    let catalog = vec![
-        entry("model-a", "mock", CategoryId::Work, Some(4.0)),
-        entry("model-b", "mock", CategoryId::Work, Some(4.0)),
-    ];
-    let (handle, runtime) = harness(config(5), catalog);
+    let (handle, runtime) = harness(
+        config(5),
+        &[
+            ("model-a", "mock", CategoryId::Work, Some(4.0)),
+            ("model-b", "mock", CategoryId::Work, Some(4.0)),
+        ],
+    );
 
     let Reply::Loaded(first) = handle
         .swap("model-a", CategoryId::Work)
@@ -216,11 +235,13 @@ async fn different_model_replaces_occupant_and_kills_previous() {
 #[tokio::test]
 async fn rapid_a_then_b_ends_with_exactly_b() {
     // T3.4: a slow A is superseded by B; the end state is B serving, A's engine dead.
-    let catalog = vec![
-        entry("model-a", "mock-slow", CategoryId::Work, Some(4.0)),
-        entry("model-b", "mock", CategoryId::Work, Some(4.0)),
-    ];
-    let (handle, runtime) = harness(config(10), catalog);
+    let (handle, runtime) = harness(
+        config(10),
+        &[
+            ("model-a", "mock-slow", CategoryId::Work, Some(4.0)),
+            ("model-b", "mock", CategoryId::Work, Some(4.0)),
+        ],
+    );
 
     // Drop the waiter on purpose: the client aborts immediately after submitting A.
     submit_and_vanish(&handle, "model-a", CategoryId::Work).await;
@@ -245,8 +266,10 @@ async fn rapid_a_then_b_ends_with_exactly_b() {
 #[tokio::test]
 async fn client_abort_mid_load_leaves_a_serving_slot_and_no_orphan() {
     // F-1: the waiter disappears; the load itself must complete.
-    let catalog = vec![entry("qwen3", "mock-slow", CategoryId::Work, Some(4.0))];
-    let (handle, runtime) = harness(config(10), catalog);
+    let (handle, runtime) = harness(
+        config(10),
+        &[("qwen3", "mock-slow", CategoryId::Work, Some(4.0))],
+    );
 
     submit_and_vanish(&handle, "qwen3", CategoryId::Work).await;
     wait_until(&handle, 8, |s| {
@@ -263,8 +286,10 @@ async fn client_abort_mid_load_leaves_a_serving_slot_and_no_orphan() {
 #[tokio::test]
 async fn cancel_mid_load_kills_engine_and_empties_slot() {
     // T8: cancel is observed inside a step and completes cleanup.
-    let catalog = vec![entry("qwen3", "mock-slow", CategoryId::Work, Some(4.0))];
-    let (handle, runtime) = harness(config(10), catalog);
+    let (handle, runtime) = harness(
+        config(10),
+        &[("qwen3", "mock-slow", CategoryId::Work, Some(4.0))],
+    );
 
     let job = spawn_and_find_job(&handle).await;
     handle.cancel(job).await.expect("cancel accepted");
@@ -291,11 +316,13 @@ async fn cancel_mid_load_kills_engine_and_empties_slot() {
 #[tokio::test]
 async fn admission_refusal_carries_the_numbers_and_keeps_the_slot() {
     // 50 + 50 > 72 - 2: the second load must refuse with need/free in the message.
-    let catalog = vec![
-        entry("big-a", "mock", CategoryId::Work, Some(50.0)),
-        entry("big-b", "mock", CategoryId::Rp, Some(50.0)),
-    ];
-    let (handle, runtime) = harness(config(5), catalog);
+    let (handle, runtime) = harness(
+        config(5),
+        &[
+            ("big-a", "mock", CategoryId::Work, Some(50.0)),
+            ("big-b", "mock", CategoryId::Rp, Some(50.0)),
+        ],
+    );
 
     handle
         .swap("big-a", CategoryId::Work)
@@ -329,8 +356,7 @@ async fn admission_refusal_carries_the_numbers_and_keeps_the_slot() {
 #[tokio::test]
 async fn under_specified_model_refuses_with_the_real_reason() {
     // F-7 lesson: the refusal must name under-specification, not blame a neighbor.
-    let catalog = vec![entry("ghost", "mock", CategoryId::Work, None)];
-    let (handle, _runtime) = harness(config(5), catalog);
+    let (handle, _runtime) = harness(config(5), &[("ghost", "mock", CategoryId::Work, None)]);
 
     let error = handle
         .swap("ghost", CategoryId::Work)
@@ -344,8 +370,7 @@ async fn under_specified_model_refuses_with_the_real_reason() {
 
 #[tokio::test]
 async fn unload_frees_slot_ledger_and_engine() {
-    let catalog = vec![entry("qwen3", "mock", CategoryId::Work, Some(4.0))];
-    let (handle, runtime) = harness(config(5), catalog);
+    let (handle, runtime) = harness(config(5), &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
 
     handle.swap("qwen3", CategoryId::Work).await.expect("loads");
     handle
@@ -367,11 +392,13 @@ async fn unload_frees_slot_ledger_and_engine() {
 #[tokio::test]
 async fn control_plane_answers_while_a_slow_load_runs() {
     // A1: v3.3 held a global lock through wait_ready; SE must not.
-    let catalog = vec![
-        entry("slow", "mock-slow", CategoryId::Work, Some(4.0)),
-        entry("quick", "mock", CategoryId::Rp, Some(4.0)),
-    ];
-    let (handle, _runtime) = harness(config(10), catalog);
+    let (handle, _runtime) = harness(
+        config(10),
+        &[
+            ("slow", "mock-slow", CategoryId::Work, Some(4.0)),
+            ("quick", "mock", CategoryId::Rp, Some(4.0)),
+        ],
+    );
 
     submit_and_vanish(&handle, "slow", CategoryId::Work).await;
     tokio::time::sleep(Duration::from_millis(150)).await; // let the load get going
@@ -407,8 +434,10 @@ async fn control_plane_answers_while_a_slow_load_runs() {
 
 #[tokio::test]
 async fn engine_that_never_becomes_ready_fails_within_the_deadline() {
-    let catalog = vec![entry("broken", "mock-never", CategoryId::Work, Some(4.0))];
-    let (handle, runtime) = harness(config(1), catalog);
+    let (handle, runtime) = harness(
+        config(1),
+        &[("broken", "mock-never", CategoryId::Work, Some(4.0))],
+    );
 
     let error = handle
         .swap("broken", CategoryId::Work)

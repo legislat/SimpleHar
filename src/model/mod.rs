@@ -4,6 +4,8 @@
 //! the documented alias rules; byte-preserving round-trip write-back arrives with the
 //! scan/write milestone (Step 9).
 
+pub mod scan;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -40,7 +42,7 @@ pub enum ModelError {
 }
 
 /// One model from `ModelConf/`, typed (Step 10: harness name is canonical).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ModelEntry {
     /// Canonical harness name (`name:`); the `model` field clients send.
     pub name: String,

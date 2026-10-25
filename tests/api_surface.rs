@@ -13,44 +13,63 @@ use simplehar_se::api::{category_router, control_router, ApiState};
 use simplehar_se::config::{AppConfig, CategoryId};
 use simplehar_se::engine::mock::MockAdapter;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
-use simplehar_se::model::ModelEntry;
 use simplehar_se::scheduler::Scheduler;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-fn entry(name: &str, engine: &str, category: CategoryId, vram_gb: Option<f64>) -> ModelEntry {
-    ModelEntry {
-        name: name.to_string(),
-        engine: engine.to_string(),
-        category,
-        vram_gb,
-        model_ref: None,
-        file: None,
-        raw: BTreeMap::new(),
+type Spec = (&'static str, &'static str, CategoryId, Option<f64>);
+
+fn write_modelconf(specs: &[Spec]) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "se-api-modelconf-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp ModelConf dir");
+    for (name, engine, category, vram_gb) in specs {
+        let mut yaml = format!(
+            "name: {name}
+engine: {engine}
+category: {category}
+"
+        );
+        if let Some(vram) = vram_gb {
+            yaml.push_str(&format!(
+                "vram_gb: {vram}
+"
+            ));
+        }
+        std::fs::write(dir.join(format!("{name}.yaml")), yaml).expect("model yaml");
     }
+    dir
 }
 
-fn app(config: AppConfig, catalog: Vec<ModelEntry>) -> (Router, Router, Router, MockRuntime) {
+fn app(
+    config: AppConfig,
+    specs: &[Spec],
+) -> (Router, Router, Router, MockRuntime, std::path::PathBuf) {
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+    let dir = write_modelconf(specs);
     let scheduler = Scheduler::start(
         config.clone(),
-        catalog.clone(),
+        dir.clone(),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
     );
     let state = Arc::new(ApiState::new(
         config,
         scheduler,
-        catalog,
         simplehar_se::listeners::ListenerRegistry::new(),
     ));
     let control = control_router(Arc::clone(&state));
     let work = category_router(Arc::clone(&state), CategoryId::Work);
     let rp = category_router(Arc::clone(&state), CategoryId::Rp);
-    (control, work, rp, runtime)
+    (control, work, rp, runtime, dir)
 }
 
 async fn post_json(app: &Router, path: &str, body: &str) -> (StatusCode, Value) {
@@ -92,8 +111,10 @@ async fn get_json(app: &Router, path: &str) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn load_flow_populates_jobs_and_status() {
-    let catalog = vec![entry("qwen3", "mock", CategoryId::Work, Some(4.0))];
-    let (control, _work, _rp, runtime) = app(AppConfig::default(), catalog);
+    let (control, _work, _rp, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
 
     let (status, body) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -119,7 +140,7 @@ async fn load_flow_populates_jobs_and_status() {
 
 #[tokio::test]
 async fn load_unknown_model_is_typed_not_found() {
-    let (control, _, _, _) = app(AppConfig::default(), vec![]);
+    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
     let (status, body) = post_json(&control, "/har/load", r#"{"model":"ghost"}"#).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "not_found");
@@ -127,8 +148,10 @@ async fn load_unknown_model_is_typed_not_found() {
 
 #[tokio::test]
 async fn unload_bodies_are_strict() {
-    let catalog = vec![entry("qwen3", "mock", CategoryId::Work, Some(4.0))];
-    let (control, _, _, _) = app(AppConfig::default(), catalog);
+    let (control, _, _, _, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
     post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
 
     // No category field: 400, never an implicit unload-all.
@@ -146,11 +169,13 @@ async fn unload_bodies_are_strict() {
 
 #[tokio::test]
 async fn models_are_filtered_per_listener() {
-    let catalog = vec![
-        entry("work-model", "mock", CategoryId::Work, Some(4.0)),
-        entry("embed-model", "mock", CategoryId::Emb, Some(2.0)),
-    ];
-    let (_, work, rp, _) = app(AppConfig::default(), catalog);
+    let (_, work, rp, _, _modelconf) = app(
+        AppConfig::default(),
+        &[
+            ("work-model", "mock", CategoryId::Work, Some(4.0)),
+            ("embed-model", "mock", CategoryId::Emb, Some(2.0)),
+        ],
+    );
 
     let (status, body) = get_json(&work, "/v1/models").await;
     assert_eq!(status, StatusCode::OK);
@@ -170,8 +195,10 @@ async fn models_are_filtered_per_listener() {
 #[tokio::test]
 async fn wrong_category_is_404_before_any_load() {
     // The RP listener must refuse a WORK model with 404 and create no job.
-    let catalog = vec![entry("work-model", "mock", CategoryId::Work, Some(4.0))];
-    let (control, _, rp, runtime) = app(AppConfig::default(), catalog);
+    let (control, _, rp, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("work-model", "mock", CategoryId::Work, Some(4.0))],
+    );
 
     let (status, body) = post_json(&rp, "/v1/chat/completions", r#"{"model":"work-model"}"#).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
@@ -191,8 +218,10 @@ async fn wrong_category_is_404_before_any_load() {
 
 #[tokio::test]
 async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
-    let catalog = vec![entry("qwen3", "mock", CategoryId::Work, Some(4.0))];
-    let (control, work, _, runtime) = app(AppConfig::default(), catalog);
+    let (control, work, _, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
     post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
     assert_eq!(runtime.server_count(), 1);
 
@@ -211,8 +240,10 @@ async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
 
 #[tokio::test]
 async fn no_model_fallback_serves_the_loaded_occupant() {
-    let catalog = vec![entry("qwen3", "mock", CategoryId::Work, Some(4.0))];
-    let (control, work, _, _) = app(AppConfig::default(), catalog);
+    let (control, work, _, _, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
     post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
 
     let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
@@ -225,13 +256,16 @@ async fn no_model_fallback_serves_the_loaded_occupant() {
 
 #[tokio::test]
 async fn no_model_fallback_loads_the_category_default() {
-    let catalog = vec![entry("default-model", "mock", CategoryId::Rp, Some(4.0))];
     let mut config = AppConfig::default();
     config
         .category_mut(CategoryId::Rp)
         .expect("default config has RP")
         .default_model = Some("default-model".to_string());
-    let (control, _, rp, runtime) = app(config, catalog);
+    let (control, _, rp, runtime, _modelconf) = app(
+        config,
+        &[("default-model", "mock", CategoryId::Rp, Some(4.0))],
+    );
+    let _ = control;
 
     let (status, body) = post_json(&rp, "/v1/chat/completions", r#"{"messages":[]}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -246,7 +280,7 @@ async fn no_model_fallback_loads_the_category_default() {
 
 #[tokio::test]
 async fn no_model_without_default_is_400_naming_the_listener() {
-    let (_, work, _, _) = app(AppConfig::default(), vec![]);
+    let (_, work, _, _, _) = app(AppConfig::default(), &[]);
     let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let message = body["message"].as_str().unwrap_or_default();
@@ -258,11 +292,13 @@ async fn no_model_without_default_is_400_naming_the_listener() {
 
 #[tokio::test]
 async fn admission_refusal_via_proxy_is_503_with_numbers() {
-    let catalog = vec![
-        entry("big-a", "mock", CategoryId::Work, Some(50.0)),
-        entry("big-b", "mock", CategoryId::Rp, Some(50.0)),
-    ];
-    let (control, _, rp, _) = app(AppConfig::default(), catalog);
+    let (control, _, rp, _, _) = app(
+        AppConfig::default(),
+        &[
+            ("big-a", "mock", CategoryId::Work, Some(50.0)),
+            ("big-b", "mock", CategoryId::Rp, Some(50.0)),
+        ],
+    );
     post_json(&control, "/har/load", r#"{"model":"big-a"}"#).await;
 
     let (status, body) = post_json(&rp, "/v1/chat/completions", r#"{"model":"big-b"}"#).await;
@@ -272,4 +308,31 @@ async fn admission_refusal_via_proxy_is_503_with_numbers() {
         message.contains("need 50.0 GiB") && message.contains("free 20.0 GiB"),
         "was: {message}"
     );
+}
+
+#[tokio::test]
+async fn rescan_picks_up_new_model_files() {
+    let (control, work, _, _, modelconf) = app(
+        AppConfig::default(),
+        &[("first", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let (status, body) = get_json(&work, "/v1/models").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().map(Vec::len), Some(1));
+
+    std::fs::write(
+        modelconf.join("second.yaml"),
+        "name: second
+engine: mock
+category: WORK
+vram_gb: 4
+",
+    )
+    .expect("write second model");
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["models"], 2);
+
+    let (_, body) = get_json(&work, "/v1/models").await;
+    assert_eq!(body["data"].as_array().map(Vec::len), Some(2));
 }

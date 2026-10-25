@@ -25,6 +25,7 @@ use crate::model::ModelEntry;
 use crate::ownership::{ResourceKind, SpawnTicket};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -111,6 +112,8 @@ pub struct SchedulerStatus {
     pub slots: Vec<SlotStatus>,
     /// Job ledger, oldest first.
     pub jobs: Vec<JobStatus>,
+    /// Catalog problems from the last scan (bad files, unresolved defaults).
+    pub catalog_errors: Vec<crate::model::scan::ScanError>,
 }
 
 /// One slot as seen by `/har/status` (Step 12).
@@ -214,13 +217,27 @@ impl SchedulerHandle {
         self.call(Command::Unload { category }).await
     }
 
-    /// Re-scan `ModelConf` (lands with the scan milestone, Step 9).
+    /// Re-scans `ModelConf` (hot reload, Step 9): the catalog and its error report
+    /// refresh atomically from the actor's single writer.
     ///
     /// # Errors
     ///
-    /// [`SchedulerError::Unsupported`] until then.
+    /// [`SchedulerError::ActorGone`] when the actor is no longer running.
     pub async fn reload(&self) -> Result<Reply, SchedulerError> {
         self.call(Command::Reload).await
+    }
+
+    /// Catalog snapshot (Step 2: reads are snapshots owned by the actor).
+    ///
+    /// # Errors
+    ///
+    /// [`SchedulerError::ActorGone`] when the actor is no longer running.
+    pub async fn catalog(&self) -> Result<crate::model::scan::Catalog, SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(ActorMsg::Catalog { reply: tx })
+            .map_err(|_| SchedulerError::ActorGone)?;
+        rx.await.map_err(|_| SchedulerError::ActorGone)
     }
 
     /// Snapshot of slots and jobs; never probes, never mutates (Step 2).
@@ -252,15 +269,16 @@ impl SchedulerHandle {
 pub struct Scheduler;
 
 impl Scheduler {
-    /// Spawns the actor task and returns its handle.
+    /// Spawns the actor task and returns its handle. The catalog is scanned from
+    /// `models_dir` at construction (§0.2 step 6) and re-scanned by [`Command::Reload`].
     pub fn start(
         cfg: AppConfig,
-        catalog: Vec<ModelEntry>,
+        models_dir: PathBuf,
         adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
         runtime: Arc<dyn EngineRuntime>,
     ) -> SchedulerHandle {
         let (tx, rx) = mpsc::unbounded_channel();
-        let state = ActorState::new(cfg, catalog, adapters, runtime, tx.clone());
+        let state = ActorState::new(cfg, models_dir, adapters, runtime, tx.clone());
         tokio::spawn(actor_loop(state, rx));
         SchedulerHandle { tx }
     }
@@ -277,6 +295,9 @@ enum ActorMsg {
     },
     Status {
         reply: oneshot::Sender<SchedulerStatus>,
+    },
+    Catalog {
+        reply: oneshot::Sender<crate::model::scan::Catalog>,
     },
 }
 
@@ -345,7 +366,9 @@ struct PendingSwap {
 
 struct ActorState {
     cfg: AppConfig,
+    models_dir: PathBuf,
     catalog: Vec<ModelEntry>,
+    catalog_errors: Vec<crate::model::scan::ScanError>,
     adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
     runtime: Arc<dyn EngineRuntime>,
     tx: mpsc::UnboundedSender<ActorMsg>,
@@ -373,6 +396,12 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
             ActorMsg::Status { reply } => {
                 let _ = reply.send(state.snapshot());
             }
+            ActorMsg::Catalog { reply } => {
+                let _ = reply.send(crate::model::scan::Catalog {
+                    models: state.catalog.clone(),
+                    errors: state.catalog_errors.clone(),
+                });
+            }
         }
     }
 }
@@ -380,7 +409,19 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
 impl ActorState {
     fn new(
         cfg: AppConfig,
-        catalog: Vec<ModelEntry>,
+        models_dir: PathBuf,
+        adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
+        runtime: Arc<dyn EngineRuntime>,
+        tx: mpsc::UnboundedSender<ActorMsg>,
+    ) -> Self {
+        let mut state = Self::empty(cfg, models_dir, adapters, runtime, tx);
+        state.refresh_catalog();
+        state
+    }
+
+    fn empty(
+        cfg: AppConfig,
+        models_dir: PathBuf,
         adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
         runtime: Arc<dyn EngineRuntime>,
         tx: mpsc::UnboundedSender<ActorMsg>,
@@ -401,7 +442,9 @@ impl ActorState {
         }
         ActorState {
             cfg,
-            catalog,
+            models_dir,
+            catalog: Vec::new(),
+            catalog_errors: Vec::new(),
             adapters,
             runtime,
             tx,
@@ -413,15 +456,40 @@ impl ActorState {
         }
     }
 
+    /// Rescans `ModelConf` and cross-checks `default_model`s (§0.2 step 6, Step 9).
+    fn refresh_catalog(&mut self) {
+        let catalog = crate::model::scan::scan_dir(&self.models_dir);
+        let mut errors = catalog.errors;
+        for category in &self.cfg.categories {
+            if let Some(default) = &category.default_model {
+                if !catalog.models.iter().any(|m| &m.name == default) {
+                    errors.push(crate::model::scan::ScanError {
+                        file: "config".to_string(),
+                        reason: format!(
+                            "default_model `{default}` for {} is not in the catalog",
+                            category.id
+                        ),
+                    });
+                }
+            }
+        }
+        tracing::info!(
+            models = catalog.models.len(),
+            errors = errors.len(),
+            "catalog scanned"
+        );
+        self.catalog = catalog.models;
+        self.catalog_errors = errors;
+    }
+
     fn on_command(&mut self, cmd: Command, reply: Waiter) {
         match cmd {
             Command::Swap { model, category } => self.on_swap(model, category, reply),
             Command::Cancel { job } => self.on_cancel(job, reply),
             Command::Unload { category } => self.on_unload(category, reply),
             Command::Reload => {
-                let _ = reply.send(Err(SchedulerError::Unsupported(
-                    "catalog rescan lands with the ModelConf scan milestone (Step 9)".to_string(),
-                )));
+                self.refresh_catalog();
+                let _ = reply.send(Ok(Reply::Done));
             }
         }
     }
@@ -1086,6 +1154,7 @@ impl ActorState {
 
     fn snapshot(&self) -> SchedulerStatus {
         SchedulerStatus {
+            catalog_errors: self.catalog_errors.clone(),
             slots: self
                 .slots
                 .iter()

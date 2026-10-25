@@ -401,7 +401,11 @@ mod tests {
     use crate::scheduler::{JobStatus, SlotStatus, SwapState};
 
     fn status(slots: Vec<SlotStatus>, jobs: Vec<JobStatus>) -> SchedulerStatus {
-        SchedulerStatus { slots, jobs }
+        SchedulerStatus {
+            slots,
+            jobs,
+            catalog_errors: Vec::new(),
+        }
     }
 
     fn slot(category: CategoryId, model: Option<&str>) -> SlotStatus {
@@ -494,6 +498,7 @@ mod tests {
                 slot2(CategoryId::Aux, Some("b")),
             ],
             jobs: vec![],
+            catalog_errors: Vec::new(),
         };
         let text = tooltip(&loaded_status);
         assert!(text.contains("WORK: qwen3"), "was: {text}");

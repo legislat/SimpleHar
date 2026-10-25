@@ -58,9 +58,6 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The catalog is empty until the ModelConf scan lands (Step 9); the mock adapter
-    // is registered so operator-supplied mock entries work out of the box.
-    let catalog = Vec::new();
     let mut adapters = std::collections::BTreeMap::new();
     let mock: Arc<dyn EngineAdapter> = Arc::new(MockAdapter);
     adapters.insert("mock".to_string(), mock);
@@ -70,12 +67,16 @@ async fn main() -> ExitCode {
     ));
     adapters.insert("llama".to_string(), llama);
     let runtime: Arc<dyn EngineRuntime> = Arc::new(ProcessRuntime::new());
-    let scheduler = Scheduler::start(config.clone(), catalog.clone(), adapters, runtime);
+    let scheduler = Scheduler::start(
+        config.clone(),
+        config.modelconf_dir.clone(),
+        adapters,
+        runtime,
+    );
     let listeners = simplehar_se::listeners::ListenerRegistry::new();
     let state = Arc::new(ApiState::new(
         config.clone(),
         scheduler.clone(),
-        catalog,
         listeners.clone(),
     ));
 

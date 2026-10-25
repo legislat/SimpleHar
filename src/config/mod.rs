@@ -110,6 +110,13 @@ fn default_tray_enabled() -> bool {
     true
 }
 
+fn default_modelconf_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("ModelConf")))
+        .unwrap_or_else(|| std::path::PathBuf::from("ModelConf"))
+}
+
 fn default_llama_server_exe() -> std::path::PathBuf {
     std::path::PathBuf::from(r"C:\Inference\llama.cpp\llama-server.exe")
 }
@@ -249,6 +256,9 @@ pub struct AppConfig {
     /// for flags; the binary path is config).
     #[serde(default = "default_llama_server_exe")]
     pub llama_server_exe: std::path::PathBuf,
+    /// Directory of per-model flat yaml files (Step 9); missing dir = empty catalog.
+    #[serde(default = "default_modelconf_dir")]
+    pub modelconf_dir: std::path::PathBuf,
 }
 
 impl Default for AppConfig {
@@ -263,6 +273,7 @@ impl Default for AppConfig {
             load_timeout_s: default_load_timeout(),
             tray_enabled: default_tray_enabled(),
             llama_server_exe: default_llama_server_exe(),
+            modelconf_dir: default_modelconf_dir(),
         }
     }
 }
