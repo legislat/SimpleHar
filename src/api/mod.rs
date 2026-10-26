@@ -52,6 +52,11 @@ pub enum ApiError {
     /// so clients can tell "card busy with foreigners" from plain over-commit.
     #[error("service unavailable: {reason}")]
     BelowLaunchFloor { reason: String },
+    /// The card could not be read at all, so admission refused rather than guessed
+    /// (503). Distinct from `unavailable` (over-commit) so a client can tell a dead
+    /// witness from a busy card.
+    #[error("service unavailable: {reason}")]
+    WitnessUnavailable { reason: String },
     /// The engine could not be started or never became ready — `502`.
     #[error("upstream failure: {reason}")]
     Upstream { reason: String },
@@ -77,6 +82,7 @@ impl ApiError {
             ApiError::BadRequest { .. } => "bad_request",
             ApiError::Unavailable { .. } => "unavailable",
             ApiError::BelowLaunchFloor { .. } => "below_launch_floor",
+            ApiError::WitnessUnavailable { .. } => "witness_unavailable",
             ApiError::Upstream { .. } => "upstream",
             ApiError::Conflict { .. } => "conflict",
             ApiError::UnsupportedMedia { .. } => "unsupported_media_type",
@@ -90,9 +96,9 @@ impl ApiError {
         match self {
             ApiError::NotFound { .. } => StatusCode::NOT_FOUND,
             ApiError::BadRequest { .. } => StatusCode::BAD_REQUEST,
-            ApiError::Unavailable { .. } | ApiError::BelowLaunchFloor { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            ApiError::Unavailable { .. }
+            | ApiError::BelowLaunchFloor { .. }
+            | ApiError::WitnessUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Upstream { .. } => StatusCode::BAD_GATEWAY,
             ApiError::Conflict { .. } => StatusCode::CONFLICT,
             ApiError::UnsupportedMedia { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -135,6 +141,13 @@ impl From<SchedulerError> for ApiError {
                     crate::budget::AdmissionError::BelowLaunchFloor { .. }
                 ) {
                     ApiError::BelowLaunchFloor {
+                        reason: reason.to_string(),
+                    }
+                } else if matches!(
+                    reason,
+                    crate::budget::AdmissionError::WitnessUnavailable { .. }
+                ) {
+                    ApiError::WitnessUnavailable {
                         reason: reason.to_string(),
                     }
                 } else {
@@ -957,28 +970,55 @@ async fn har_config_logging(
 /// actually sees, labeled with its source (F-7 lesson: never present a number
 /// without saying whose number it is).
 async fn mem_section(state: &ApiState) -> Value {
-    let ledger: f64 = state
+    // Loads committed but not yet installed: their bytes are not on the card yet,
+    // so admission debits them and the bar shows the same debit (the retired ledger
+    // bar could not express this — it counted installed occupants only).
+    let booked_gb: f64 = state
         .scheduler
         .status()
         .await
-        .map(|status| status.slots.iter().filter_map(|slot| slot.need_gib).sum())
+        .map(|status| {
+            status
+                .jobs
+                .iter()
+                .filter(|job| {
+                    job.kind == crate::scheduler::JobKind::Load
+                        && matches!(
+                            job.state,
+                            crate::scheduler::SwapState::Admit
+                                | crate::scheduler::SwapState::Quiesce
+                                | crate::scheduler::SwapState::Dispose
+                                | crate::scheduler::SwapState::Spawn
+                                | crate::scheduler::SwapState::Ready
+                                | crate::scheduler::SwapState::Install
+                        )
+                })
+                .filter_map(|job| job.need_gib)
+                .sum()
+        })
         .unwrap_or_default();
     let ram = crate::witness::ram_sample();
     let mut section = match state.witness.sample().await {
-        Ok(sample) => json!({
-            "total_gb": sample.total_gib,
-            "reserve_gb": state.config.vram_reserve_gb,
-            "ledger_gb": ledger,
-            "observed_used_gb": sample.used_gib,
-            "external_gb": sample.external_gib(&[]),
-            "source": "witness",
-        }),
+        Ok(sample) => {
+            let attributed = sample.process_total_gib();
+            json!({
+                "total_gb": sample.total_gib,
+                "reserve_gb": state.config.vram_reserve_gb,
+                "booked_gb": booked_gb,
+                "observed_used_gb": sample.used_gib,
+                // What NVML accounted across all processes, or `null` when it
+                // answered with no usable per-process figures at all (WDDM
+                // degradation): absence, never a fake 0.0 GiB (review 2026-10-26).
+                "attributed_gb": (attributed > 0.0).then_some(attributed),
+                "source": state.witness.source(),
+            })
+        }
         Err(reason) => json!({
             "total_gb": state.config.vram_total_gb,
             "reserve_gb": state.config.vram_reserve_gb,
-            "ledger_gb": ledger,
+            "booked_gb": booked_gb,
             "observed_used_gb": null,
-            "external_gb": null,
+            "attributed_gb": null,
             "source": format!("unavailable ({reason})"),
         }),
     };
@@ -1438,6 +1478,10 @@ mod tests {
             need: crate::budget::Gibibytes(50.0),
             free: crate::budget::Gibibytes(20.0),
             reserve: crate::budget::Gibibytes(2.0),
+            facts: crate::budget::BudgetFacts {
+                budget: Some(crate::budget::Gibibytes(20.0)),
+                observed_free: None,
+            },
             victims_considered: Vec::new(),
             blockers: Vec::new(),
         });

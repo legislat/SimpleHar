@@ -138,37 +138,25 @@ function categoryPort(status, category) {
 
 function renderMemory(status) {
   const mem = status.mem;
-  const ledger = mem.ledger_gb || 0;
-  const ledgerPct = Math.min(100, (ledger / mem.total_gb) * 100);
   const reservePct = (mem.reserve_gb / mem.total_gb) * 100;
   const observed = mem.observed_used_gb;
   const observedPct =
     observed === null || observed === undefined
       ? null
       : Math.min(100, (observed / mem.total_gb) * 100);
-  const bars = [
-    el(
-      "div",
-      {},
-      el(
-        "label",
-        {},
-        text(
-          `VRAM ledger ${ledger.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (what admission budgets; hatched = ${mem.reserve_gb.toFixed(1)} GiB reserve)`,
-        ),
-      ),
-      el(
-        "div",
-        { class: "sh-bar" },
-        el("i", { style: `width:${ledgerPct}%` }),
-        el("u", {
-          class: "sh-reserve",
-          style: `left:${(100 - reservePct).toFixed(2)}%;width:${reservePct.toFixed(2)}%`,
-        }),
-      ),
-    ),
-  ];
+  const bars = [];
+  // One bar, one truth: what the card itself reports. The ledger bar left with the
+  // ledger (operator 2026-10-26) — nothing budgets against it any more, and two
+  // bars showing two "VRAM used" numbers is how the 69.7-vs-1.8 GiB lie survived
+  // a release. Hatched = the reserve band admission keeps clear; "booked" = loads
+  // committed but not yet installed, which the card cannot have accounted for.
   if (observedPct !== null) {
+    const attribution =
+      mem.attributed_gb == null
+        ? "per-process attribution unavailable"
+        : "attributed " + mem.attributed_gb.toFixed(1) + " GiB";
+    const booked =
+      mem.booked_gb > 0 ? "; booked " + mem.booked_gb.toFixed(1) + " GiB in flight" : "";
     bars.push(
       el(
         "div",
@@ -177,10 +165,18 @@ function renderMemory(status) {
           "label",
           {},
           text(
-            `Observed ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (witness: ${mem.source}; external ${(mem.external_gb || 0).toFixed(1)} GiB)`,
+            `VRAM ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (${mem.source}; ${attribution}${booked}; hatched = ${mem.reserve_gb.toFixed(1)} GiB reserve)`,
           ),
         ),
-        el("div", { class: "sh-bar", "data-tone": "observed" }, el("i", { style: `width:${observedPct}%` })),
+        el(
+          "div",
+          { class: "sh-bar", "data-tone": "observed" },
+          el("i", { style: `width:${observedPct}%` }),
+          el("u", {
+            class: "sh-reserve",
+            style: `left:${(100 - reservePct).toFixed(2)}%;width:${reservePct.toFixed(2)}%`,
+          }),
+        ),
       ),
     );
   }

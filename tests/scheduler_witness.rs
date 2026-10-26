@@ -1,8 +1,9 @@
-//! Witness integration tests (Step 4, choice D): admission subtracts external
-//! reservations observed by the witness, and the settle-after-release gate blocks a
-//! spawn while the released engine's memory is still visible. Driven by a scripted
-//! `FakeWitness` against the mock engine; plus pure parser tests and one skip-safe
-//! live NVML sample.
+//! Witness integration tests: the card's own reading is the budget (observed free,
+//! credited for a pending same-slot release and debited for loads still in flight),
+//! the settle-after-release gate blocks a spawn until the bytes are physically back,
+//! and a real witness that cannot answer is a refusal rather than a guess. Driven by
+//! a scripted `FakeWitness` against the mock engine; plus pure parser tests and one
+//! skip-safe live NVML sample.
 
 mod mock_runtime;
 
@@ -41,6 +42,10 @@ impl FakeWitness {
 
 #[async_trait]
 impl VramWitness for FakeWitness {
+    fn source(&self) -> String {
+        "fake".to_string()
+    }
+
     async fn sample(&self) -> Result<MemorySample, String> {
         if let Some(sample) = self
             .override_now
@@ -118,9 +123,10 @@ async fn wait_until(
 }
 
 #[tokio::test]
-async fn admission_subtracts_witness_externals() {
-    // The card is 72 GiB; a foreign process (pid 900) holds 70. A 4 GiB load must
-    // refuse with the numbers (Step 4 rule 2; the F-7 lie is gone).
+async fn admission_refuses_when_the_card_has_no_room() {
+    // The card is 72 GiB and reports 70 used — whatever holds it (a foreign process
+    // appears here as per-process data, but the physical reading alone suffices), a
+    // 4 GiB load must refuse with the numbers (G13: the F-7 lie is gone).
     let witness = FakeWitness::with(vec![sample(72.0, 70.0, vec![(900, 70.0)])]);
     let cfg = AppConfig {
         settle_timeout_s: 2,
@@ -141,36 +147,41 @@ async fn admission_subtracts_witness_externals() {
 }
 
 #[tokio::test]
-async fn settle_blocks_spawn_while_released_memory_is_visible() {
-    // Load model A (witness sees 4 GiB under our pid), then swap to B: after the
-    // release, the witness still reports 4 GiB — settle must time out, refuse with
-    // the numbers, and never spawn B (G12: no double-spawn).
-    let witness = FakeWitness::with(vec![
-        sample(72.0, 4.0, vec![(0, 4.0)]), // admit A: ours
-    ]);
+async fn settle_blocks_spawn_while_the_card_has_not_freed() {
+    // Load model A, then swap to B while the card still reports the released
+    // engine's bytes: the settle gate refuses with the numbers and never spawns B
+    // (G12: no double-spawn). The gate is physical free vs the gate target — a
+    // leftover that still leaves room is no reason to refuse (operator 2026-10-26:
+    // the ledger-baseline form timed out every swap against a ~3 GiB desktop floor
+    // that had nothing to do with the release).
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
     let cfg = AppConfig {
         settle_timeout_s: 1,
         ..AppConfig::default()
     };
-    let handle = harness(
+    let handle = harness_models(
         cfg,
-        &[("a", CategoryId::Work), ("b", CategoryId::Work)],
+        &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 8.0)],
         Arc::new(witness.clone()),
     );
 
     let Reply::Loaded(_) = handle.swap("a", CategoryId::Work).await.expect("a loads") else {
         panic!("expected Loaded");
     };
-    // The settle samples now see the leftover as used-above-expected (externals
-    // were 0 at admit), so the gate holds until the deadline.
+    // A's memory never comes back: 68 of 72 used leaves 4.0 GiB free — under the
+    // 8.0 GiB gate even with the witness tolerance — while B's own admit fits,
+    // because the victim's 8 GiB are credited to it.
+    witness.set(sample(72.0, 68.0, vec![]));
     let error = handle
         .swap("b", CategoryId::Work)
         .await
-        .expect_err("settle must refuse while memory is not released");
+        .expect_err("settle must refuse while the card is still full");
     let message = error.to_string();
     assert!(message.contains("settle timeout"), "was: {message}");
-    assert!(message.contains("4.0 GiB used"), "was: {message}");
-    assert!(message.contains("2.0 GiB expected"), "was: {message}");
+    assert!(
+        message.contains("4.0 GiB free after release, 8.0 GiB required"),
+        "was: {message}"
+    );
 
     let status = handle.status().await.expect("actor alive");
     assert!(
@@ -180,22 +191,26 @@ async fn settle_blocks_spawn_while_released_memory_is_visible() {
 }
 
 #[tokio::test]
-async fn settle_passes_once_memory_returns_to_baseline() {
-    // Same start, but mid-settle the witness drops to baseline: B loads and serves.
-    let witness = FakeWitness::with(vec![sample(72.0, 4.0, vec![(0, 4.0)])]);
+async fn settle_passes_once_the_card_frees() {
+    // Same start, but the card is genuinely full while B waits; mid-settle the
+    // memory returns: B loads and serves.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
     let cfg = AppConfig {
         settle_timeout_s: 5,
         ..AppConfig::default()
     };
-    let handle = harness(
+    let handle = harness_models(
         cfg,
-        &[("a", CategoryId::Work), ("b", CategoryId::Work)],
+        &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 8.0)],
         Arc::new(witness.clone()),
     );
 
     let Reply::Loaded(_) = handle.swap("a", CategoryId::Work).await.expect("a loads") else {
         panic!("expected Loaded");
     };
+    // Hold the card full so the settle gate has a real reason to wait: 4.0 GiB
+    // free against an 8.0 GiB gate, tolerance included.
+    witness.set(sample(72.0, 68.0, vec![]));
     let awaiting_b = {
         let handle = handle.clone();
         tokio::spawn(async move { handle.swap("b", CategoryId::Work).await })
@@ -209,12 +224,140 @@ async fn settle_passes_once_memory_returns_to_baseline() {
             })
     })
     .await;
-    witness.set(sample(72.0, 0.0, vec![]));
+    witness.set(sample(72.0, 20.0, vec![]));
     let reply = awaiting_b
         .await
         .expect("task alive")
         .expect("b loads after settle");
     assert!(matches!(reply, Reply::Loaded(_)), "got {reply:?}");
+}
+
+/// `harness` with a per-model `vram_gb` (the shared one pins 4 GiB for everything).
+fn harness_models(
+    cfg: AppConfig,
+    specs: &[(&'static str, CategoryId, f64)],
+    witness: Arc<dyn VramWitness>,
+) -> SchedulerHandle {
+    let runtime = MockRuntime::new();
+    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+    adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+    let dir = std::env::temp_dir().join(format!(
+        "se-wit-{}-{}",
+        std::process::id(),
+        specs.first().map_or("x", |(name, _, _)| *name)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    for (name, category, vram) in specs {
+        std::fs::write(
+            dir.join(format!("{name}.yaml")),
+            format!("name: {name}\nengine: mock\ncategory: {category}\nvram_gb: {vram}\n"),
+        )
+        .expect("model yaml");
+    }
+    Scheduler::start(
+        cfg,
+        dir,
+        adapters,
+        Arc::new(runtime) as Arc<dyn EngineRuntime>,
+        witness,
+    )
+}
+
+/// A real witness that cannot answer and does not claim ledger mode: the card is
+/// unreadable, so there is no honest number to budget against.
+struct DeadWitness;
+
+#[async_trait]
+impl VramWitness for DeadWitness {
+    fn source(&self) -> String {
+        "dead".to_string()
+    }
+
+    async fn sample(&self) -> Result<MemorySample, String> {
+        Err("nvml absent and nvidia-smi failed".to_string())
+    }
+}
+
+#[tokio::test]
+async fn unreadable_card_refuses_rather_than_guesses() {
+    // F-3/F-7: on a GPU box a dead witness is a named refusal, never a fallback
+    // onto bookkeeping — that is exactly how v3.3 over-committed onto a saturated
+    // card (operator 2026-10-26: the ledger left the gate).
+    let cfg = AppConfig {
+        settle_timeout_s: 1,
+        ..AppConfig::default()
+    };
+    let handle = harness(cfg, &[("qwen3", CategoryId::Work)], Arc::new(DeadWitness));
+
+    let error = handle
+        .swap("qwen3", CategoryId::Work)
+        .await
+        .expect_err("no sample, no load");
+    let message = error.to_string();
+    assert!(message.contains("witness unavailable"), "was: {message}");
+    assert!(
+        message.contains("nvidia-smi failed"),
+        "the witness's own reason must travel: {message}"
+    );
+
+    let status = handle.status().await.expect("actor alive");
+    assert!(
+        status.slots.iter().all(|slot| slot.model.is_none()),
+        "refused before spawn"
+    );
+    assert!(status
+        .jobs
+        .iter()
+        .any(|job| job.state == simplehar_se::scheduler::SwapState::AdmitFail));
+}
+
+#[tokio::test]
+async fn concurrent_loads_cannot_double_spend_the_same_bytes() {
+    // An 18 GiB load sits in the settle window (its victim's bytes have not come
+    // back), so the card still reads 58 of 72 used. A 4 GiB load in another
+    // category must be refused: those 18 GiB are committed even though the card
+    // cannot have accounted for them yet. The retired ledger counted installed
+    // occupants only, so it admitted both and over-committed (operator 2026-10-26).
+    let witness = FakeWitness::with(vec![sample(72.0, 58.0, vec![])]);
+    let cfg = AppConfig {
+        settle_timeout_s: 30,
+        vram_reserve_gb: 2.0,
+        ..AppConfig::default()
+    };
+    let handle = harness_models(
+        cfg,
+        &[
+            ("a0", CategoryId::Work, 10.0),
+            ("a1", CategoryId::Work, 18.0),
+            ("b", CategoryId::Rp, 4.0),
+        ],
+        Arc::new(witness),
+    );
+
+    handle
+        .swap("a0", CategoryId::Work)
+        .await
+        .expect("a0 loads (12.0 GiB available)");
+    let parked = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("a1", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "a1" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+
+    let error = handle
+        .swap("b", CategoryId::Rp)
+        .await
+        .expect_err("the 18 GiB still in flight must be debited");
+    let message = error.to_string();
+    assert!(message.contains("insufficient VRAM"), "was: {message}");
+    assert!(message.contains("need 4.0 GiB"), "was: {message}");
+    parked.abort();
 }
 
 #[test]
@@ -226,8 +369,16 @@ fn smi_parser_handles_csv_shapes() {
     assert_eq!(parsed.processes.len(), 2);
     assert_eq!(parsed.processes[0], (900, 2.0));
     assert_eq!(parsed.external_gib(&[900]), 0.5);
-    assert!(parsed.settled(67.5, 0.1));
-    assert!(!parsed.settled(0.0, 0.1));
+    // The settle gate is *physical free*, not a baseline: this sample (total 24,
+    // used 67.5) has nothing free, so only a zero target clears the tolerance.
+    assert!(parsed.freed_for(0.0, 0.1));
+    assert!(!parsed.freed_for(1.0, 0.1));
+    let roomy = parse_smi_sample("73728, 30720\n", "").expect("parses");
+    assert!(
+        roomy.freed_for(40.0, 0.1),
+        "42 GiB free clears a 40 GiB gate"
+    );
+    assert!(!roomy.freed_for(45.0, 0.1));
     assert!(parse_smi_sample("", "").is_err());
 }
 

@@ -112,6 +112,16 @@ impl Default for NvmlWitness {
 
 #[async_trait]
 impl VramWitness for NvmlWitness {
+    fn source(&self) -> String {
+        // Naming the source is the point: a fallback reading must never be
+        // displayed as an in-process NVML one (F-7).
+        if self.nvml.is_none() || *self.fell_back.lock().expect("witness lock") {
+            "nvidia-smi (fallback)".to_string()
+        } else {
+            "NVML".to_string()
+        }
+    }
+
     async fn sample(&self) -> Result<MemorySample, String> {
         if let Some((at, sample)) = self.cache.lock().expect("witness lock").as_ref() {
             if at.elapsed() < SAMPLE_TTL {

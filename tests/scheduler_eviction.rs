@@ -27,6 +27,10 @@ type Procs = Vec<(u32, f64)>;
 struct FakeWitness {
     queue: Arc<Mutex<VecDeque<MemorySample>>>,
     live: Arc<Mutex<Option<Procs>>>,
+    /// Overrides `used_gib` on *every* reading. An override, not a queue step:
+    /// unrelated samples (the measured-footprint task, a status poll) also pop the
+    /// queue, so a scripted sequence silently shifts when anyone else asks.
+    used: Arc<Mutex<Option<f64>>>,
 }
 
 impl FakeWitness {
@@ -34,7 +38,12 @@ impl FakeWitness {
         FakeWitness {
             queue: Arc::new(Mutex::new(samples.into())),
             live: Arc::new(Mutex::new(None)),
+            used: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn set_used(&self, used: f64) {
+        *self.used.lock().expect("witness used lock") = Some(used);
     }
 
     fn set_procs(&self, procs: Procs) {
@@ -44,6 +53,10 @@ impl FakeWitness {
 
 #[async_trait]
 impl VramWitness for FakeWitness {
+    fn source(&self) -> String {
+        "fake".to_string()
+    }
+
     async fn sample(&self) -> Result<MemorySample, String> {
         let mut base = {
             let mut queue = self.queue.lock().expect("witness queue lock");
@@ -59,6 +72,9 @@ impl VramWitness for FakeWitness {
         };
         if let Some(procs) = self.live.lock().expect("witness lock").as_ref() {
             base.processes = procs.clone();
+        }
+        if let Some(used) = *self.used.lock().expect("witness used lock") {
+            base.used_gib = used;
         }
         Ok(base)
     }
@@ -150,16 +166,18 @@ fn model_of(
 
 #[tokio::test]
 async fn work_load_evicts_aux_victim_when_short() {
-    // Card 72, reserve 2: AUX holds 30 GiB; WORK wants 50 -> free 40, deficit 10,
-    // the AUX victim (evictable by WORK) is released, then WORK serves.
-    let witness = FakeWitness::with(vec![sample(72.0, 30.0), sample(72.0, 0.0)]);
+    // Card 72, reserve 2: AUX holds 30 GiB *and the card says so*; WORK wants 50 ->
+    // 40 available, deficit 10, the AUX victim (evictable by WORK) is released, then
+    // WORK serves. The readings are consistent on purpose: with the ledger gone the
+    // card is the budget, and a card reporting 0 GiB used owes no eviction.
+    let witness = FakeWitness::with(vec![sample(72.0, 30.0)]);
     let handle = harness(
         1,
         &[
             ("aux30", "mock", CategoryId::Aux, 30.0),
             ("work50", "mock", CategoryId::Work, 50.0),
         ],
-        Arc::new(witness),
+        Arc::new(witness.clone()),
     );
 
     let Reply::Loaded(_) = handle
@@ -169,9 +187,22 @@ async fn work_load_evicts_aux_victim_when_short() {
     else {
         panic!("expected Loaded");
     };
-    let Reply::Loaded(receipt) = handle
-        .swap("work50", CategoryId::Work)
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work50", CategoryId::Work).await })
+    };
+    // The victim is queued and the gate is holding: 42 GiB free is still 8 short
+    // of the 50 GiB this load is gated on.
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work50" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    witness.set_used(0.0);
+    let Reply::Loaded(receipt) = loading
         .await
+        .expect("task alive")
         .expect("work loads after evicting")
     else {
         panic!("expected Loaded");
@@ -199,13 +230,10 @@ async fn work_load_evicts_aux_victim_when_short() {
 
 #[tokio::test]
 async fn eviction_picks_the_cheapest_sufficient_victim() {
-    // Two AUX slots: 12 GiB and 20 GiB loaded (ledger 32, free 38). WORK 53 ->
-    // deficit 15: the 12 alone does not cover, 12+20 overshoots - the 20 alone is
-    // the cheapest sufficient set, and the 12 must survive (minimality).
-    let witness = FakeWitness::with(vec![
-        sample(72.0, 32.0), // admit: aux12 + aux20 loaded
-        sample(72.0, 12.0), // settle after the 20 was released: only aux12 left
-    ]);
+    // Two AUX slots: 12 GiB and 20 GiB loaded (card reports 32 used -> 38 available).
+    // WORK 53 -> deficit 15: the 12 alone does not cover, 12+20 overshoots - the 20
+    // alone is the cheapest sufficient set, and the 12 must survive (minimality).
+    let witness = FakeWitness::with(vec![sample(72.0, 32.0)]);
     let handle = harness(
         2,
         &[
@@ -213,7 +241,7 @@ async fn eviction_picks_the_cheapest_sufficient_victim() {
             ("aux20", "mock", CategoryId::Aux, 20.0),
             ("work53", "mock", CategoryId::Work, 53.0),
         ],
-        Arc::new(witness),
+        Arc::new(witness.clone()),
     );
 
     handle
@@ -224,11 +252,19 @@ async fn eviction_picks_the_cheapest_sufficient_victim() {
         .swap("aux20", CategoryId::Aux)
         .await
         .expect("aux20 loads");
-    let Reply::Loaded(_) = handle
-        .swap("work53", CategoryId::Work)
-        .await
-        .expect("work loads")
-    else {
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work53", CategoryId::Work).await })
+    };
+    // Held in the settle window until the card reports the victim's bytes back.
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work53" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    witness.set_used(12.0);
+    let Reply::Loaded(_) = loading.await.expect("task alive").expect("work loads") else {
         panic!("expected Loaded");
     };
 
@@ -325,9 +361,18 @@ async fn aux_load_cannot_evict_anything_cross_category() {
         .swap("aux55", CategoryId::Aux)
         .await
         .expect_err("AUX may not evict other categories");
-    assert!(error
-        .to_string()
-        .contains("insufficient VRAM: need 55.0 GiB, free 20.0 GiB"));
+    let message = error.to_string();
+    // G13: the message prints the figure the gate compared — the 20.0 GiB ledger
+    // free plus the 30.0 GiB same-slot release it was about to reclaim — and names
+    // both truths it was derived from (review, 2026-10-26).
+    assert!(
+        message.contains("insufficient VRAM: need 55.0 GiB, free 50.0 GiB"),
+        "was: {message}"
+    );
+    assert!(
+        message.contains("budget 20.0 GiB") && message.contains("observed free 22.0 GiB"),
+        "the refusal must name the budget and the observed reading: {message}"
+    );
     let status = handle.status().await.expect("actor alive");
     let aux_models: Vec<Option<String>> = status
         .slots
@@ -506,7 +551,7 @@ async fn settle_refuses_when_observed_card_stays_busy() {
         .expect("job recorded");
     let error = job.error.clone().expect("failed job carries the reason");
     assert!(
-        error.contains("below the required"),
+        error.contains("52.0 GiB free after release, 65.0 GiB required"),
         "explanatory settle error: {error}"
     );
 }

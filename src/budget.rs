@@ -39,6 +39,48 @@ pub struct BlockerInfo {
     pub reason: String,
 }
 
+/// The budgets a refusal was measured against, carried so the message can name
+/// which one bound. `free` in the refusal is the figure the gate compared; these
+/// are the inputs behind it, each printed only where it disagrees (G13).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BudgetFacts {
+    /// Ledger budget at decision time: total - reserve - ledger - attributed
+    /// external. `None` in tests that assert the compared figure alone.
+    pub budget: Option<Gibibytes>,
+    /// Physical free the witness saw at decision time; `None` when it was down.
+    pub observed_free: Option<Gibibytes>,
+}
+
+impl BudgetFacts {
+    /// The parenthetical naming every truth that differs from the compared figure.
+    /// Empty when they all agree, so a plain refusal stays one clean sentence
+    /// (review 2026-10-26: `free 69.7 GiB` printed while the card held 1.8 GiB).
+    #[must_use]
+    pub fn detail(&self, compared: Gibibytes) -> String {
+        let mut parts = Vec::new();
+        if let Some(budget) = self
+            .budget
+            .filter(|b| (b.0 - compared.0).abs() > DISAGREE_GIB)
+        {
+            parts.push(format!("budget {budget}"));
+        }
+        if let Some(observed) = self
+            .observed_free
+            .filter(|o| (o.0 - compared.0).abs() > DISAGREE_GIB)
+        {
+            parts.push(format!("observed free {observed}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        }
+    }
+}
+
+/// How far apart two GiB figures must be before the refusal bothers naming both.
+const DISAGREE_GIB: f64 = 0.05;
+
 /// Refusal reasons of the admission gate, with the numbers used (G13).
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum AdmissionError {
@@ -51,17 +93,33 @@ pub enum AdmissionError {
     /// rather than booked on faith).
     #[error("cost `exact` requires an explicit `vram_gb` (the engine's computed requirement)")]
     ExactUndeclared,
+    /// The card could not be read at all (NVML and the `nvidia-smi` fallback both
+    /// failed) and this is a real GPU box, so there is no honest number to budget
+    /// against. Refused rather than guessed: admission is the product, and a stale
+    /// or absent reading is exactly how v3.3 over-committed onto a saturated card
+    /// (F-3/F-7). A `ledger_only` witness is exempt — there the ledger is the
+    /// declared source of truth (tests, machines without a GPU).
+    #[error("witness unavailable, refusing to guess: {reason}")]
+    WitnessUnavailable {
+        /// Why the sample failed, verbatim from the witness.
+        reason: String,
+    },
     /// The gate rejected the load and no sufficient eviction set exists; the
     /// numbers, the candidates considered, and the named blockers all travel with
     /// the refusal (Step 6 contract, G6).
-    #[error("insufficient VRAM: need {need}, free {free}, reserve {reserve}{tail}", tail = insufficient_tail(.victims_considered, .blockers))]
+    #[error("insufficient VRAM: need {need}, free {free}, reserve {reserve}{detail}{tail}",
+        detail = .facts.detail(*free),
+        tail = insufficient_tail(.victims_considered, .blockers)
+    )]
     Insufficient {
         /// Declared or estimated cost of the wanted load.
         need: Gibibytes,
-        /// Budget remaining at decision time.
+        /// The figure the gate actually compared.
         free: Gibibytes,
         /// Reserve subtracted before the gate.
         reserve: Gibibytes,
+        /// The inputs `free` was derived from (ledger / observed).
+        facts: BudgetFacts,
         /// Candidates the planner considered (may be empty when none exist).
         victims_considered: Vec<VictimInfo>,
         /// Models that cannot be evicted, with reasons.
@@ -71,14 +129,19 @@ pub enum AdmissionError {
     /// at decision time sits below `launch_only_with_at_least_vram_free`, so the
     /// load is refused BEFORE spawn — launching a greedy-offload quant onto a
     /// busy card thrashes RAM/SSD for minutes (operator design note 2026-10-26).
-    #[error("launch floor not met: at least {min_free} free required, free {free}, reserve {reserve}{tail}", tail = insufficient_tail(.victims_considered, .blockers))]
+    #[error("launch floor not met: at least {min_free} free required, free {free}, reserve {reserve}{detail}{tail}",
+        detail = .facts.detail(*free),
+        tail = insufficient_tail(.victims_considered, .blockers)
+    )]
     BelowLaunchFloor {
         /// Configured floor in GiB (model key, or the greedy global default).
         min_free: Gibibytes,
-        /// Budget remaining at decision time.
+        /// The figure the gate actually compared.
         free: Gibibytes,
         /// Reserve subtracted before the gate.
         reserve: Gibibytes,
+        /// The inputs `free` was derived from (ledger / observed).
+        facts: BudgetFacts,
         /// Candidates the planner considered (may be empty when none exist).
         victims_considered: Vec<VictimInfo>,
         /// Models that cannot be evicted, with reasons.
@@ -137,18 +200,19 @@ pub fn need_gb(
         .ok_or(AdmissionError::UnderSpecified)
 }
 
-/// Budget remaining for a new load (Step 4 rule 2): total, minus reserve, minus the
-/// ledger of live occupants, minus observed external reservations.
+/// Budget remaining for a new load: total, minus the reserve band, minus what is
+/// already committed to the card.
 ///
-/// The result may be negative — that is information (over-commit), not an error; the
-/// gate compares it against the need and refuses with both numbers.
-pub fn free_gb(
-    total: Gibibytes,
-    reserve: Gibibytes,
-    ledger_sum: Gibibytes,
-    external_reserved: Gibibytes,
-) -> Gibibytes {
-    Gibibytes(total.0 - reserve.0 - ledger_sum.0 - external_reserved.0)
+/// `occupied` is the physical reading (`used_gib`) whenever the witness can be
+/// read — the stopper is observed VRAM, and it accounts for foreign tenants,
+/// under-booked greedy engines and our own pending releases alike. The ledger
+/// figure is passed only by a `ledger_only` witness (tests, machines without a
+/// GPU), where nothing else exists.
+///
+/// The result may be negative — that is information (over-commit), not an error;
+/// the gate compares it against the need and refuses with both numbers.
+pub fn free_gb(total: Gibibytes, reserve: Gibibytes, occupied: Gibibytes) -> Gibibytes {
+    Gibibytes(total.0 - reserve.0 - occupied.0)
 }
 
 /// Decides a load against the budget.
@@ -160,10 +224,9 @@ pub fn admit(
     need: Gibibytes,
     total: Gibibytes,
     reserve: Gibibytes,
-    ledger_sum: Gibibytes,
-    external_reserved: Gibibytes,
+    occupied: Gibibytes,
 ) -> Result<(), AdmissionError> {
-    let free = free_gb(total, reserve, ledger_sum, external_reserved);
+    let free = free_gb(total, reserve, occupied);
     if need.0 <= free.0 {
         Ok(())
     } else {
@@ -171,6 +234,10 @@ pub fn admit(
             need,
             free,
             reserve,
+            facts: BudgetFacts {
+                budget: Some(free),
+                observed_free: None,
+            },
             victims_considered: Vec::new(),
             blockers: Vec::new(),
         })
@@ -199,8 +266,9 @@ impl MemorySample {
             .fold((0usize, 0f64), |(n, s), used| (n + 1, s + used))
     }
 
-    /// Usage not attributable to `own_pids` — the external reservation the budget
-    /// must subtract (Step 4 rule 2).
+    /// Usage not attributable to `own_pids`. Display/diagnostic only since the
+    /// ledger left the gate: the physical `used_gib` already accounts for foreign
+    /// holders, so the budget never subtracts this a second time.
     pub fn external_gib(&self, own_pids: &[u32]) -> f64 {
         self.attributed(own_pids, false).1
     }
@@ -219,10 +287,17 @@ impl MemorySample {
         (count > 0 && total > 0.0).then_some(total)
     }
 
-    /// Whether memory settled to `baseline + tolerance` after a release (§0.3: the
-    /// settle window is only legal after a release).
-    pub fn settled(&self, baseline_gib: f64, tolerance_gib: f64) -> bool {
-        self.used_gib <= baseline_gib + tolerance_gib
+    /// Whether the card has physically freed to `target_gib` of free space, within
+    /// tolerance (§0.3: the settle window is only legal after a release).
+    ///
+    /// This replaced the ledger-era form (`used <= ledger + external + tolerance`).
+    /// On a box where per-process attribution reports nothing, that form compared a
+    /// 2.0 GiB tolerance against a ~3.3 GiB desktop floor and timed out every swap
+    /// that had anything else resident — a phantom leak, never a real one
+    /// (operator 2026-10-26).
+    #[must_use]
+    pub fn freed_for(&self, target_gib: f64, tolerance_gib: f64) -> bool {
+        (self.total_gib - self.used_gib).max(0.0) + tolerance_gib >= target_gib
     }
 }
 
@@ -234,6 +309,19 @@ pub trait VramWitness: Send + Sync {
     /// Samples the card. Implementations may cache briefly (status polling must
     /// not spawn a process storm); errors mean "unavailable", not zero.
     async fn sample(&self) -> Result<MemorySample, String>;
+
+    /// Whose number it was: the label the page prints beside every figure, so an
+    /// `nvidia-smi` fallback is never read as an in-process NVML reading (F-7 —
+    /// never present a number without saying whose number it is).
+    fn source(&self) -> String;
+
+    /// Whether the ledger is the declared source of truth instead of the card.
+    /// Only a witness that deliberately never answers sets this (tests, machines
+    /// without a GPU); a real witness that fails is a refusal, not a fallback
+    /// ([`AdmissionError::WitnessUnavailable`]).
+    fn ledger_only(&self) -> bool {
+        false
+    }
 }
 
 /// A witness that never answers: admission runs ledger-only and settle is skipped
@@ -242,6 +330,14 @@ pub struct LedgerOnlyWitness;
 
 #[async_trait::async_trait]
 impl VramWitness for LedgerOnlyWitness {
+    fn source(&self) -> String {
+        "ledger-only".to_string()
+    }
+
+    fn ledger_only(&self) -> bool {
+        true
+    }
+
     async fn sample(&self) -> Result<MemorySample, String> {
         Err("witness unavailable (ledger-only mode)".to_string())
     }
@@ -333,6 +429,7 @@ mod tests {
             min_free: Gibibytes(6.0),
             free: Gibibytes(4.0),
             reserve: Gibibytes(2.0),
+            facts: BudgetFacts::default(),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
         }
@@ -347,27 +444,48 @@ mod tests {
     }
 
     #[test]
+    fn refusal_names_the_truth_that_clamped_the_budget() {
+        // The 2026-10-26 review: a card holding 1.8 GiB was refused with
+        // "free 69.7 GiB" because the message printed the ledger figure.
+        let clamped = AdmissionError::Insufficient {
+            need: Gibibytes(34.0),
+            free: Gibibytes(1.8),
+            reserve: Gibibytes(2.0),
+            facts: BudgetFacts {
+                budget: Some(Gibibytes(69.7)),
+                observed_free: Some(Gibibytes(1.8)),
+            },
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
+        }
+        .to_string();
+        assert!(clamped.contains("free 1.8 GiB"), "{clamped}");
+        assert!(clamped.contains("budget 69.7 GiB"), "{clamped}");
+        assert!(!clamped.contains("observed free"), "{clamped}");
+        // Full agreement stays one clean sentence, no parenthetical.
+        let plain = AdmissionError::Insufficient {
+            need: Gibibytes(34.0),
+            free: Gibibytes(30.0),
+            reserve: Gibibytes(2.0),
+            facts: BudgetFacts {
+                budget: Some(Gibibytes(30.0)),
+                observed_free: Some(Gibibytes(30.0)),
+            },
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
+        }
+        .to_string();
+        assert!(!plain.contains('('), "{plain}");
+    }
+
+    #[test]
     fn accepted_never_exceeds_budget_and_refusal_carries_numbers() {
         let total = Gibibytes(72.0);
         let reserve = Gibibytes(2.0);
-        // 26 need, 30 already on the ledger, 0 external -> 40 free: accept.
-        assert!(admit(
-            Gibibytes(26.0),
-            total,
-            reserve,
-            Gibibytes(30.0),
-            Gibibytes(0.0)
-        )
-        .is_ok());
+        // 26 need, 30 already on the card -> 40 free: accept.
+        assert!(admit(Gibibytes(26.0), total, reserve, Gibibytes(30.0)).is_ok());
         // 50 need against the same state: refuse with need/free/reserve in the error.
-        let err = admit(
-            Gibibytes(50.0),
-            total,
-            reserve,
-            Gibibytes(30.0),
-            Gibibytes(0.0),
-        )
-        .expect_err("must refuse");
+        let err = admit(Gibibytes(50.0), total, reserve, Gibibytes(30.0)).expect_err("must refuse");
         match err {
             AdmissionError::Insufficient {
                 need,

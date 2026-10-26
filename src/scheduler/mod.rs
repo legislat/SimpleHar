@@ -18,7 +18,7 @@ mod vocab;
 
 pub use vocab::{transition_allowed, Command, JobId, SwapState};
 
-use crate::budget::{self, AdmissionError, Gibibytes};
+use crate::budget::{self, AdmissionError, BudgetFacts, Gibibytes};
 use crate::config::{AppConfig, CategoryId};
 use crate::engine::{EngineAdapter, EngineRuntime, Probe, ReadinessSpec, SpawnError, Spawned};
 use crate::model::ModelEntry;
@@ -67,23 +67,15 @@ pub enum SchedulerError {
     /// The job was cancelled by request or superseded by a newer load.
     #[error("cancelled: {0}")]
     Cancelled(String),
-    /// Memory did not settle to the expected baseline within `settle_timeout_s`
-    /// after a confirmed release; nothing was double-spawned (§0.3). When the
-    /// failure is the observed gate (launch floor / need), the clause names the
-    /// free vs required the card actually showed (operator 2026-10-26).
-    #[error(
-        "settle timeout: {used_gib:.1} GiB used vs {expected_gib:.1} GiB expected after release{tail}",
-        tail = settle_tail(*free_gib, *required_gib)
-    )]
+    /// The card had not physically freed the gate target within `settle_timeout_s`
+    /// after a confirmed release; nothing was double-spawned (§0.3). The reason is
+    /// the witness's own numbers, composed once at the emit site and carried
+    /// structurally — the gate never re-parses a human string.
+    #[error("settle timeout: {reason}")]
     SettleTimeout {
-        /// Witness-used at the timeout, in GiB.
-        used_gib: f64,
-        /// Baseline (remaining ledger + externals + tolerance), in GiB.
-        expected_gib: f64,
-        /// Observed free at the timeout, when the gate (not the baseline) failed.
-        free_gib: Option<f64>,
-        /// The gate target that free failed to reach.
-        required_gib: Option<f64>,
+        /// What the settle gate saw, e.g. `12.4 GiB free after release, 34.0 GiB
+        /// required (used 58.2 of 72.0)`.
+        reason: String,
     },
     /// The actor task is gone (shutting down).
     #[error("scheduler is not running")]
@@ -557,10 +549,6 @@ struct Job {
     /// pid-attributed measured footprint, which is meaningless for a client
     /// process that exits before the container is ready (review, 2026-10-26).
     container: Option<String>,
-    /// External VRAM observed at admit (victim still owned); the settle gate holds
-    /// this constant so a dead own engine's leftover memory cannot masquerade as a
-    /// foreign holder (§0.3).
-    external_at_admit: Option<f64>,
     timings: JobTimings,
     t0: Instant,
     waiters: Vec<Waiter>,
@@ -617,38 +605,6 @@ struct Slot {
     engine_port: u16,
     occupant: Option<Occupant>,
     job: Option<JobId>,
-}
-
-/// Splits the settle task's "U GiB used vs E GiB expected" payload back into
-/// numbers for the typed error (kept simple: two f64s, space-separated).
-fn parse_settle_numbers(numbers: &str) -> (f64, f64) {
-    let values: Vec<f64> = numbers
-        .split_whitespace()
-        .filter_map(|token| token.parse::<f64>().ok())
-        .collect();
-    (
-        values.first().copied().unwrap_or(f64::NAN),
-        values.get(1).copied().unwrap_or(f64::NAN),
-    )
-}
-
-/// The gate clause of the settle task's timeout text (emit site:
-/// `spawn_settle_task`), recovered for the typed error.
-fn parse_settle_gate(numbers: &str) -> Option<(f64, f64)> {
-    let rest = numbers.split_once("observed free ")?.1;
-    let (free, required) = rest.split_once(" GiB below the required ")?;
-    let required = required.split_once(" GiB").map_or(required, |(r, _)| r);
-    Some((free.parse().ok()?, required.parse().ok()?))
-}
-
-/// Optional trailing clause of [`SchedulerError::SettleTimeout`].
-fn settle_tail(free_gib: Option<f64>, required_gib: Option<f64>) -> String {
-    match (free_gib, required_gib) {
-        (Some(free), Some(required)) => {
-            format!("; observed free {free:.1} GiB below the required {required:.1} GiB")
-        }
-        _ => String::new(),
-    }
 }
 
 /// The occupant's last use: the proxy-side hint when present, else load time.
@@ -1014,7 +970,6 @@ impl ActorState {
             free_at_admit: None,
             observed_at_admit: None,
             container: None,
-            external_at_admit: None,
             timings: JobTimings::default(),
             t0: Instant::now(),
             waiters: Vec::new(),
@@ -1156,7 +1111,6 @@ impl ActorState {
             free_at_admit: None,
             observed_at_admit: None,
             container: None,
-            external_at_admit: None,
             timings: JobTimings::default(),
             t0,
             waiters,
@@ -1213,6 +1167,7 @@ impl ActorState {
             self.slots[slot].job = Some(job_id);
             self.step(job_id, SwapState::Admit);
             self.step(job_id, SwapState::AdmitFail);
+            self.log_refusal(job_id, &error, "need");
             self.finish(job_id, Err(error), "under-specified");
             return;
         }
@@ -1245,15 +1200,36 @@ impl ActorState {
             .push(handle);
     }
 
-    /// The Admit decision, once the witness sample returns: external reservations
-    /// subtract (rule 2), then the ledger gate decides (rules 1-4).
+    /// The Admit decision, once the witness sample returns. The card's own reading
+    /// is the budget (operator 2026-10-26): `total - reserve - observed_used`,
+    /// credited for the occupant this job is about to release and debited for what
+    /// other loads have already committed. The ledger survives only as the `budget`
+    /// figure a refusal quotes, and as the whole basis of `ledger_only` witness mode.
     fn finish_admit(&mut self, job_id: JobId, sample: Result<crate::budget::MemorySample, String>) {
-        let (total_gib, external_gib) = match &sample {
-            Ok(sample) => (sample.total_gib, sample.external_gib(&self.own_pids())),
-            Err(reason) => {
-                tracing::warn!(reason = %reason,
-                    "witness unavailable; admission runs ledger-only (no stale guesses, F-3/F-7)");
-                (self.cfg.vram_total_gb, 0.0)
+        // A real witness that cannot answer is a refusal, never a fallback onto a
+        // bookkeeping guess (F-3/F-7: this is exactly how v3.3 over-committed).
+        if sample.is_err() && !self.witness.ledger_only() {
+            let reason = sample
+                .as_ref()
+                .err()
+                .map_or_else(|| "no sample".to_string(), String::clone);
+            self.step(job_id, SwapState::AdmitFail);
+            let error = SchedulerError::Admission(AdmissionError::WitnessUnavailable { reason });
+            self.log_refusal(job_id, &error, "witness");
+            self.finish(job_id, Err(error), "witness down");
+            return;
+        }
+        let (total_gib, occupied, observed_free) = match &sample {
+            Ok(sample) => (
+                sample.total_gib,
+                sample.used_gib,
+                Some((sample.total_gib - sample.used_gib).max(0.0)),
+            ),
+            Err(_) => {
+                // The declared mode of a witness that never answers (tests, a box
+                // without a GPU): the ledger is then the only truth there is.
+                tracing::debug!("witness never answers (ledger_only); budgeting the ledger");
+                (self.cfg.vram_total_gb, self.ledger_sum().0, None)
             }
         };
         let declared = self.jobs[&job_id].need;
@@ -1262,20 +1238,23 @@ impl ActorState {
             .slot
             .map(|slot| self.slots[slot].occupant.as_ref().map_or(0.0, |o| o.need.0))
             .unwrap_or(0.0);
-        let ledger = self.ledger_sum();
-        let free = budget::free_gb(
-            Gibibytes(total_gib),
-            Gibibytes(self.cfg.vram_reserve_gb),
-            ledger,
-            Gibibytes(external_gib),
-        );
-        let external_at_admit = match &sample {
-            Ok(sample) => Some(sample.external_gib(&self.own_pids())),
-            Err(_) => None,
+        // The bytes this job is about to reclaim are still physically on the card at
+        // sample time, so they are credited; what other loads have committed but not
+        // yet installed is debited, or two concurrent loads spend the same free GiB.
+        let in_flight = self.in_flight_need(job_id);
+        let free =
+            Gibibytes(total_gib - self.cfg.vram_reserve_gb - occupied + victim_need - in_flight);
+        let facts = BudgetFacts {
+            budget: Some(budget::free_gb(
+                Gibibytes(total_gib),
+                Gibibytes(self.cfg.vram_reserve_gb),
+                self.ledger_sum(),
+            )),
+            observed_free: observed_free.map(Gibibytes),
         };
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.free_at_admit = Some(free);
-            job.external_at_admit = external_at_admit;
+            job.observed_at_admit = observed_free;
         }
         self.set_timing(job_id, |t| &mut t.admit_ms);
         let (greedy, model_floor) = {
@@ -1298,41 +1277,19 @@ impl ActorState {
         // every NaN comparison is false, which would read as "fits".
         if need.0.is_nan() || floor.is_some_and(|f| !f.is_finite()) {
             self.step(job_id, SwapState::AdmitFail);
-            self.finish(
-                job_id,
-                Err(SchedulerError::Admission(AdmissionError::UnderSpecified)),
-                "under-specified",
-            );
+            let error = SchedulerError::Admission(AdmissionError::UnderSpecified);
+            self.log_refusal(job_id, &error, "bad-size");
+            self.finish(job_id, Err(error), "under-specified");
             return;
         }
-        let budget_room = free.0 + victim_need;
-        // Observed physical truth (operator 2026-10-26): the stopper is OBSERVED
-        // VRAM, not a ledger flattered by missing per-process attribution — a
-        // greedy engine can sit on the card using far more than it booked. When a
-        // same-slot victim is about to be released, the pre-release reading would
-        // double-count the victim's own memory and make replacement impossible;
-        // the clamp is then deferred to the settle gate, which samples AFTER the
-        // release has landed.
-        let observed_clamp = match &sample {
-            Ok(s) if self.jobs[&job_id].victim.is_none() => Some((total_gib - s.used_gib).max(0.0)),
-            _ => None,
-        };
-        let room = observed_clamp.map_or(budget_room, |o| budget_room.min(o));
-        if let (Some(obs), Some(job)) = (
-            sample
-                .as_ref()
-                .ok()
-                .map(|s| (s.total_gib - s.used_gib).max(0.0)),
-            self.jobs.get_mut(&job_id),
-        ) {
-            job.observed_at_admit = Some(obs);
-        }
+        // One truth now: `free` already is the physical reading, credited and
+        // debited. `facts` carries the originals so a refusal can name which bound.
         let need_deficit = if greedy {
             0.0
         } else {
-            (need.0 - room).max(0.0)
+            (need.0 - free.0).max(0.0)
         };
-        let floor_deficit = floor.map(|f| (f - room).max(0.0)).unwrap_or(0.0);
+        let floor_deficit = floor.map(|f| (f - free.0).max(0.0)).unwrap_or(0.0);
         let deficit = need_deficit.max(floor_deficit);
         // What `available` (free_at_admit + released) must reach before spawn.
         // Comparing only `need` re-admits the bug this review caught: greedy
@@ -1370,21 +1327,25 @@ impl ActorState {
                                 min_free: Gibibytes(floor.expect(
                                     "invariant: floor_deficit > 0 implies a configured floor",
                                 )),
-                                // G13: print the number the gate actually compared.
-                                free: Gibibytes(room),
+                                // G13: the figure the gate actually compared.
+                                free,
                                 reserve,
+                                facts,
                                 victims_considered: considered,
                                 blockers,
                             }
                         } else {
                             AdmissionError::Insufficient {
                                 need,
+                                // G13: the compared figure, never the flattering one.
                                 free,
                                 reserve,
+                                facts,
                                 victims_considered: considered,
                                 blockers,
                             }
                         };
+                    self.log_refusal(job_id, &SchedulerError::Admission(error.clone()), "gate");
                     self.finish(
                         job_id,
                         Err(SchedulerError::Admission(error)),
@@ -1396,11 +1357,11 @@ impl ActorState {
         }
         // A greedy tenant books what it will actually grab — its nominal size if
         // that fits, else the room available *including* the victims this very
-        // admit queued for release (they are not in `free` yet but will be gone
-        // before spawn). Never its offload-able nominal size (starves the card)
-        // and never zero when it will hold real VRAM (under-books the ledger).
+        // admit queued for release (their bytes are still counted as used but will
+        // be gone before spawn). Never its offload-able nominal size (starves the
+        // card) and never zero when it will hold real VRAM (under-books the gate).
         if greedy {
-            let planned_room = budget_room
+            let planned_room = free.0
                 + self.jobs[&job_id]
                     .victims
                     .iter()
@@ -1425,7 +1386,8 @@ impl ActorState {
                 floor_gib = floor,
                 free_gib = free.0,
                 observed_at_admit_gib = job.observed_at_admit,
-                room_gib = room,
+                budget_gib = facts.budget.map(|budget| budget.0),
+                booked_gib = self.in_flight_need(job_id),
                 victim = ?job.victim.as_ref().map(|v| v.model.clone()),
                 victims = ?job.victims.iter().map(|v| v.model.clone()).collect::<Vec<_>>(),
                 gate_gib = gate_target,
@@ -1589,36 +1551,16 @@ impl ActorState {
         true
     }
 
-    /// PIDs of everything this harness spawned (occupants + in-flight spawns), for
-    /// witness attribution of external usage (Step 4 rule 2).
-    fn own_pids(&self) -> Vec<u32> {
-        let mut pids: Vec<u32> = self
-            .slots
-            .iter()
-            .filter_map(|slot| slot.occupant.as_ref())
-            .map(|occupant| occupant.ticket.pid)
-            .collect();
-        pids.extend(
-            self.jobs
-                .values()
-                .filter_map(|job| job.spawned.as_ref())
-                .map(|ticket| ticket.pid),
-        );
-        pids
-    }
-
-    /// §0.3 memory evidence: after a confirmed release, wait until the witness sees
-    /// `remaining ledger + externals + tolerance` before the spawn fires. The gate
-    /// target (max(need, launch floor)) must also be met by the FRESH observed free
-    /// — this is where a replacement load proves the card truly emptied
-    /// (operator 2026-10-26: the stopper is observed VRAM, judged after release).
+    /// §0.3 memory evidence: after a confirmed release, wait until the card has
+    /// *physically* freed the gate target (`max(need, launch floor)`, within the
+    /// witness tolerance) before the spawn fires. This is where a replacement load
+    /// proves the card truly emptied (operator 2026-10-26: the stopper is observed
+    /// VRAM, judged after release). No ledger baseline is consulted — an
+    /// unattributable desktop floor is not a leak.
     fn spawn_settle_task(&mut self, job_id: JobId) {
-        let baseline = self.ledger_sum().0;
         let tolerance = self.cfg.witness_tolerance_gb;
         let gate = self.jobs[&job_id].gate_target.unwrap_or(0.0);
-        // Externals are frozen at admit: a leftover from our own dead engine must
-        // show up as "used above expected", not as a foreign holder.
-        let external = self.jobs[&job_id].external_at_admit.unwrap_or(0.0);
+        let model = self.jobs[&job_id].model.clone();
         let deadline = Duration::from_secs(self.cfg.settle_timeout_s);
         let witness = Arc::clone(&self.witness);
         let tx = self.tx.clone();
@@ -1627,14 +1569,12 @@ impl ActorState {
             loop {
                 match witness.sample().await {
                     Ok(sample) => {
-                        let expected = baseline + external + tolerance;
                         let observed_free = (sample.total_gib - sample.used_gib).max(0.0);
-                        if sample.used_gib <= expected && observed_free >= gate {
+                        if sample.freed_for(gate, tolerance) {
                             if crate::observability::extended_logging() {
                                 tracing::info!(
                                     used_gib = sample.used_gib,
                                     total_gib = sample.total_gib,
-                                    expected_gib = expected,
                                     free_gib = observed_free,
                                     gate_gib = gate,
                                     "settle evidence (extended)"
@@ -1661,17 +1601,21 @@ impl ActorState {
                     let numbers = match witness.sample().await {
                         Ok(sample) => {
                             let observed_free = (sample.total_gib - sample.used_gib).max(0.0);
-                            let mut msg = format!(
-                                "{:.1} GiB used vs {:.1} GiB expected",
-                                sample.used_gib,
-                                baseline + external + tolerance
+                            let msg = format!(
+                                "{:.1} GiB free after release, {:.1} GiB required (used {:.1} of {:.1})",
+                                observed_free, gate, sample.used_gib, sample.total_gib
                             );
-                            if gate > 0.0 && observed_free < gate {
-                                msg.push_str(&format!(
-                                    "; observed free {:.1} GiB below the required {:.1} GiB",
-                                    observed_free, gate
-                                ));
-                            }
+                            // The load that never spawned must still be readable
+                            // in the ring (§0.3 evidence, operator 2026-10-26).
+                            tracing::warn!(
+                                %job_id,
+                                %model,
+                                used_gib = sample.used_gib,
+                                total_gib = sample.total_gib,
+                                free_gib = observed_free,
+                                gate_gib = gate,
+                                "settle timeout: the card never freed the required space"
+                            );
                             msg
                         }
                         Err(_) => "no witness sample".to_string(),
@@ -2020,17 +1964,10 @@ impl ActorState {
             (SwapState::Dispose, Event::Settled(Ok(()))) => {
                 self.begin_spawn(job_id);
             }
-            (SwapState::Dispose, Event::Settled(Err(numbers))) => {
-                let (used, expected) = parse_settle_numbers(&numbers);
-                let gate = parse_settle_gate(&numbers);
+            (SwapState::Dispose, Event::Settled(Err(reason))) => {
                 self.fail_job(
                     job_id,
-                    SchedulerError::SettleTimeout {
-                        used_gib: used,
-                        expected_gib: expected,
-                        free_gib: gate.map(|(f, _)| f),
-                        required_gib: gate.map(|(_, r)| r),
-                    },
+                    SchedulerError::SettleTimeout { reason },
                     "memory did not settle after release",
                 );
             }
@@ -2259,6 +2196,27 @@ impl ActorState {
         let _ = self.events.send(self.snapshot());
     }
 
+    /// A refusal is the product's headline event (G6): it reaches the ring whatever
+    /// the extended-logging switch says, because a load that never spawned would
+    /// otherwise leave no trace there at all (operator 2026-10-26: five refusals in
+    /// one session, zero lines at `/har/log`).
+    fn log_refusal(&self, job_id: JobId, error: &SchedulerError, stage: &str) {
+        let job = &self.jobs[&job_id];
+        tracing::warn!(
+            %job_id,
+            model = %job.model,
+            category = ?job.category,
+            stage,
+            need_gib = job.need.map(|need| need.0),
+            free_gib = job.free_at_admit.map(|free| free.0),
+            observed_at_admit_gib = job.observed_at_admit,
+            floor_gib = job.launch_floor,
+            gate_gib = job.gate_target,
+            error = %error,
+            "admission refused"
+        );
+    }
+
     fn ledger_sum(&self) -> Gibibytes {
         Gibibytes(
             self.slots
@@ -2267,6 +2225,32 @@ impl ActorState {
                 .map(|o| o.need.0)
                 .sum(),
         )
+    }
+
+    /// GiB committed to *other* loads that have passed admission but are not yet
+    /// installed occupants. The card cannot account for them yet (their engines are
+    /// still spawning), so without this debit two concurrent loads in different
+    /// categories both spend the same free bytes — the retired ledger never covered
+    /// it either, it summed installed occupants only (operator 2026-10-26).
+    fn in_flight_need(&self, except: JobId) -> f64 {
+        self.jobs
+            .iter()
+            .filter(|(id, job)| {
+                **id != except
+                    && job.kind == JobKind::Load
+                    && !job.terminal
+                    && matches!(
+                        job.state,
+                        SwapState::Admit
+                            | SwapState::Quiesce
+                            | SwapState::Dispose
+                            | SwapState::Spawn
+                            | SwapState::Ready
+                            | SwapState::Install
+                    )
+            })
+            .map(|(_, job)| job.need.map_or(0.0, |need| need.0))
+            .sum()
     }
 
     fn step(&mut self, job_id: JobId, to: SwapState) {
