@@ -6,8 +6,6 @@ models between four category listeners with a typed, single-writer scheduler,
 admits loads against a real memory ledger, and refuses — with reasons — rather
 than overcommitting.
 
-Rewrite of SimpleHar v3.3; the design rationale lives in `DESIGN.md`.
-
 ## Requirements
 
 - Windows 10/11 with an NVIDIA GPU (NVML witness; `nvidia-smi` fallback).
@@ -45,17 +43,20 @@ Each public listener answers OpenAI-style `/v1/models` (category-filtered),
 `/v1/chat/completions`, `/v1/embeddings`. A request naming no model (or the
 engine's default id) loads that category's `default_model` instead of erroring.
 
-## Configuration: `simplehar.json`
+## Configuration: `simplehar-se.json`
 
 Lives beside the executable; override the path with the `SIMPLEHAR_CONFIG`
-environment variable. **The config file is the truth**: `default_model` changes
+environment variable. It is SE's own file: the older app's `simplehar.json` is read
+once, to migrate, and never written. **The config file is the truth**:
+`default_model` changes
 made on the page persist back to the exact file boot read (atomic rewrite),
 partial files are completed, an invalid file is fatal with every problem logged
 — never silently defaulted.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN — **no auth**, see Security |
+| `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN — set `control_token` first, see Security |
+| `control_token` | *unset* | When set, every route but the page assets demands it (`X-Har-Token` or `Authorization: Bearer`); `SIMPLEHAR_TOKEN` overrides it and keeps the secret out of the file |
 | `categories` | four defaults | Per-category `id`, `public_port`, `max_models`, `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), `engine_ports` |
 | `vram_total_gb` | `72.0` | Admission ceiling |
 | `vram_reserve_gb` | `2.0` | Kept unreachable by admission |
@@ -64,8 +65,8 @@ partial files are completed, an invalid file is fatal with every problem logged
 | `load_timeout_s` | `120` | Readiness deadline per load; per-model override via the `load_timeout:` yaml key |
 | `release_timeout_s` | `60` | Kill-confirmation deadline (G12) |
 | `settle_timeout_s` | `30` | Memory-settle deadline after release |
-| `protected_ports` | v3.3 ecosystem set | Ports the harness must never bind or touch |
-| `wsl_distro` / `wsl_user` | `Ubuntu` / `legislat` | WSL coordinates for ninfer containers |
+| `protected_ports` | `8003-8005`, `8009`, `8016-8017`, `8030`, `18203-18209` | Ports the harness must never bind or touch |
+| `wsl_distro` / `wsl_user` | `Ubuntu` / *(set this)* | WSL coordinates for ninfer containers |
 | `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary |
 | `modelconf_dir` | `<exe dir>\ModelConf` | Catalog directory |
 | `tray_enabled` | `true` | Tray icon at boot |
@@ -107,8 +108,8 @@ short-lived `wsl.exe -d <wsl_distro> -u <wsl_user> -- bash <ninfer_autostart>
 **then** `/v1/models` 200. Because the container outlives the client, unload
 reaps it by name (`docker rm -f <ninfer_container>`); the release evidence is
 the port closing after the reaping, not the client's exit. Every ninfer model the
-catalog carries is managed — v3.3 `external: true` was scrapped (operator,
-2026-10-26), so the key is inert and such an entry loads like any other; manual
+catalog carries is managed — the legacy `external: true` key is inert (scrapped by the
+operator, 2026-10-26), so such an entry loads like any other; manual
 servers the harness did not spawn are never registered or monitored, only
 subtracted from VRAM via the witness. A harness crash can orphan a container (the job object only reaps
 the client); the next load of that name reconciles by removing the stale
@@ -210,6 +211,12 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
 
 ## Security note
 
-The harness has **no authentication**. `internal_host: 0.0.0.0` (Publish to LAN)
-trusts every machine on the segment to load/unload models and drive the GPUs;
-it exists for LAN boxes and warns loudly at boot. Default is loopback only.
+Set `control_token` (or `SIMPLEHAR_TOKEN`, which wins so the secret can stay out of
+the file) and the whole control surface — `/har/*`, the control category's `/v1/*`
+proxy, and the page's own API calls — requires it on `X-Har-Token` or
+`Authorization: Bearer`. Only `/`, `/index.html`, `/app.js` and `/style.css` answer
+unauthenticated, so the page can load and ask. The token is never logged and never
+accepted from a URL. With no token set the harness has **no authentication**:
+`internal_host: 0.0.0.0` (Publish to LAN) then trusts every machine on the segment to
+load/unload models and drive the GPUs; it exists for LAN boxes and warns loudly at
+boot. Default is loopback only.
