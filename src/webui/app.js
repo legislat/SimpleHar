@@ -154,19 +154,17 @@ function renderMemory(status) {
         "label",
         {},
         text(
-          `VRAM ledger ${ledger.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (what admission budgets)`,
+          `VRAM ledger ${ledger.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (what admission budgets; hatched = ${mem.reserve_gb.toFixed(1)} GiB reserve)`,
         ),
       ),
-      el("div", { class: "sh-bar" }, el("i", { style: `width:${ledgerPct}%` })),
-    ),
-    el(
-      "div",
-      {},
-      el("label", {}, text(`Reserve ${mem.reserve_gb.toFixed(1)} GiB (held away from admission)`)),
       el(
         "div",
-        { class: "sh-bar", "data-tone": "reserve" },
-        el("i", { style: `width:${reservePct}%` }),
+        { class: "sh-bar" },
+        el("i", { style: `width:${ledgerPct}%` }),
+        el("u", {
+          class: "sh-reserve",
+          style: `left:${(100 - reservePct).toFixed(2)}%;width:${reservePct.toFixed(2)}%`,
+        }),
       ),
     ),
   ];

@@ -151,9 +151,16 @@ header.sh-header {
   margin-top: 0.7rem;
 }
 
-.sh-bar { height: 10px; border-radius: 6px; background: var(--pico-card-border-color); overflow: hidden; }
+.sh-bar { height: 10px; border-radius: 6px; background: var(--pico-card-border-color); overflow: hidden; position: relative; }
 .sh-bar > i { display: block; height: 100%; background: var(--sh-accent-solid); }
-.sh-bar[data-tone="reserve"] > i { background: var(--sh-warn); }
+/* Reserved slice marked on the ledger bar (operator: no standalone bar, 2026-10-26). */
+.sh-bar > u.sh-reserve {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--sh-warn);
+  background: repeating-linear-gradient(45deg, var(--sh-warn) 0 3px, transparent 3px 6px);
+}
 .sh-bar[data-tone="observed"] > i { background: #4a7fb5; }
 .sh-bar[data-tone="ram"] > i { background: #7a5fb0; }
 .sh-errline { color: var(--sh-bad); font-size: 0.8rem; margin-top: 0.4rem; }
