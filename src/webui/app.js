@@ -285,7 +285,9 @@ function modelRow(status, model, category) {
   // The dot follows the newest job for this model only: a fail that a later
   // load+unload superseded must not keep the row red (operator 2026-10-26).
   const last = status.jobs.filter((job) => job.model === model.id).at(-1);
-  const failed = !!last && last.terminal && last.kind === "Load" && !!last.error;
+  // The server owns the fault rule (`fault_of`: failed LOAD, cancels excluded) so the
+  // row dot and the headline can never disagree (review, 2026-10-26).
+  const failed = !!last && last.is_fault === true;
   const dotState = serving ? "serving" : loading ? "loading" : failed ? "failed" : "idle";
   const row = el("tr", {});
   // Operator layout (2026-10-26): actions first, then the name, then the rest —

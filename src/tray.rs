@@ -431,6 +431,8 @@ mod tests {
             terminal,
             outcome: Some("loaded".to_string()),
             error: error.map(str::to_string),
+            // Independently restated (this fixture is Load with a non-cancel outcome).
+            is_fault: terminal && error.is_some(),
             need_gib: Some(4.0),
             free_at_admit_gib: Some(66.0),
             observed_at_admit_gib: Some(64.0),

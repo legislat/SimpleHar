@@ -175,6 +175,10 @@ pub struct JobStatus {
     pub outcome: Option<String>,
     /// Terminal error, human-readable with the numbers (G13).
     pub error: Option<String>,
+    /// Whether this row is a genuine fault — a failed LOAD, deliberate cancels
+    /// excluded. Derived once here (`fault_of`) so the row dot and the headline can
+    /// never disagree (duplication review, 2026-10-26).
+    pub is_fault: bool,
     /// Admission cost in GiB, once computed.
     pub need_gib: Option<f64>,
     /// Free VRAM at admit time in GiB (the number that was used).
@@ -192,6 +196,17 @@ pub struct JobStatus {
     pub timings: JobTimings,
 }
 
+/// The single fault rule: a terminal **LOAD** whose outcome was not a deliberate
+/// cancel and that carries an error. Unload failures are visible in the jobs strip
+/// only; cancels (unload-during-load, supersede) are operator policy, not faults.
+/// The headline, the tray and the per-row dot all read this — two surfaces deriving
+/// the predicate separately is how a cancelled load came to pin a red dot
+/// (duplication review, 2026-10-26).
+#[must_use]
+pub fn fault_of(terminal: bool, kind: JobKind, outcome: Option<&str>, has_error: bool) -> bool {
+    terminal && kind == JobKind::Load && outcome != Some("cancelled") && has_error
+}
+
 /// The job that owns the sticky headline fault (A3) — the single derivation
 /// shared by the page header and the tray tooltip so the surfaces cannot drift.
 /// Rules: only LOAD jobs count (unload failures are visible in the jobs strip);
@@ -203,10 +218,12 @@ pub struct JobStatus {
 #[must_use]
 pub fn headline_fault(jobs: &[JobStatus]) -> Option<&JobStatus> {
     let fault = jobs.iter().rev().find(|job| {
-        job.terminal
-            && job.kind == JobKind::Load
-            && job.outcome.as_deref() != Some("cancelled")
-            && job.error.is_some()
+        fault_of(
+            job.terminal,
+            job.kind,
+            job.outcome.as_deref(),
+            job.error.is_some(),
+        )
     })?;
     let cleared = jobs.iter().any(|later| {
         later.id > fault.id
@@ -2352,6 +2369,7 @@ impl ActorState {
                     gate_target_gib: j.gate_target,
                     victims_released: j.victims_released.clone(),
                     warnings: j.warnings.clone(),
+                    is_fault: fault_of(j.terminal, j.kind, j.outcome.as_deref(), j.error.is_some()),
                     timings: j.timings,
                 })
                 .collect(),
@@ -2381,6 +2399,9 @@ mod tests {
             terminal: true,
             outcome: Some(outcome.to_string()),
             error: error.map(str::to_string),
+            // Recomputed here independently of `fault_of`, so a broken rule cannot
+            // quietly make its own fixture consistent.
+            is_fault: kind == JobKind::Load && error.is_some() && outcome != "cancelled",
             need_gib: None,
             free_at_admit_gib: None,
             observed_at_admit_gib: None,
@@ -2389,6 +2410,29 @@ mod tests {
             warnings: Vec::new(),
             timings: Default::default(),
         }
+    }
+
+    #[test]
+    fn only_a_failed_load_is_a_fault() {
+        // The row dot and the headline share one rule: a supersede or
+        // unload-during-load must not pin a red row (duplication review, 2026-10-26).
+        let cancelled = job(
+            7,
+            JobKind::Load,
+            "m",
+            Some("cancelled by unload"),
+            "cancelled",
+        );
+        assert!(!cancelled.is_fault, "a cancel is policy, not a fault");
+        assert!(headline_fault(&[cancelled]).is_none());
+        let failed = job(8, JobKind::Load, "m", Some("settle timeout"), "failed");
+        assert!(failed.is_fault);
+        assert!(headline_fault(&[failed]).is_some());
+        let unload = job(9, JobKind::Unload, "m", Some("spawn failed"), "failed");
+        assert!(
+            !unload.is_fault,
+            "unload failures live in the jobs strip only"
+        );
     }
 
     fn failed(id: u64, model: &str) -> JobStatus {
