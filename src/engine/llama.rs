@@ -30,7 +30,11 @@ const FLAG_TABLE: &[(&str, &str)] = &[
 
 /// `jinja` truthiness per `start.ps1`: only `true`, `1`, `on` (case-sensitive
 /// membership in the script's `-in 'true','1','on'`; note `yes` is *not* included).
-fn jinja_on(value: &str) -> bool {
+/// Also the canonical read of `cpu_offload` — the engine's behavior, so the
+/// control page's CPU checkbox uses THIS (not `model::truthy`) and can never
+/// disagree with whether `-ngl 0` was actually forced (review finding, 2026-10-26).
+#[must_use]
+pub fn jinja_on(value: &str) -> bool {
     matches!(value, "true" | "1" | "on")
 }
 

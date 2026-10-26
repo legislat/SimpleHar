@@ -271,13 +271,10 @@ pub fn tooltip(status: &SchedulerStatus) -> String {
             line.push_str(&format!("{category}: {}", models.join(", ")));
         }
     }
-    if let Some(error) = status
-        .jobs
-        .iter()
-        .rfind(|job| job.terminal)
-        .and_then(|j| j.error.clone())
-    {
-        line.push_str(&format!("\n{error}"));
+    if let Some(fault) = crate::scheduler::headline_fault(&status.jobs) {
+        if let Some(error) = &fault.error {
+            line.push_str(&format!("\n{error}"));
+        }
     }
     line
 }
@@ -422,6 +419,7 @@ mod tests {
     fn job(terminal: bool, error: Option<&str>) -> JobStatus {
         JobStatus {
             id: crate::scheduler::JobId(0),
+            kind: crate::scheduler::JobKind::Load,
             model: "m".to_string(),
             category: CategoryId::Work,
             state: if terminal {

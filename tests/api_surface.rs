@@ -55,6 +55,8 @@ fn app(
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
     adapters.insert("mock-error".to_string(), Arc::new(MockAdapter));
+    adapters.insert("mock-never".to_string(), Arc::new(MockAdapter));
+    adapters.insert("mock-slow".to_string(), Arc::new(MockAdapter));
     let dir = write_modelconf(specs);
     let scheduler = Scheduler::start(
         config.clone(),
@@ -616,6 +618,57 @@ async fn defaults_persist_to_the_config_boot_loaded_even_under_a_custom_path() {
         .expect("WORK");
     assert_eq!(work_json["default_model"], "qwen3");
     let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn last_error_is_the_newest_failed_load_and_survives_unrelated_success() {
+    // A3 (API wiring): a genuine engine failure pins `last_error` (502, names the
+    // model + readiness); a newer failure takes the headline; an unrelated
+    // successful load of a DIFFERENT model does not mask a real fault (finding 2).
+    // The pure derivation rules (same-model clear, cancel/unload skip) are pinned
+    // by the `headline_fault` unit test in src/scheduler/mod.rs.
+    let config = AppConfig {
+        load_timeout_s: 2,
+        ..AppConfig::default()
+    };
+    let (control, _, _, _, _) = app(
+        config,
+        &[
+            ("bad", "mock-never", CategoryId::Work, Some(4.0)),
+            ("bad2", "mock-never", CategoryId::Work, Some(4.0)),
+            ("good", "mock", CategoryId::Work, Some(4.0)),
+        ],
+    );
+
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"bad"}"#).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+    let (_, doc) = get_json(&control, "/har/status").await;
+    let first = doc["last_error"].as_str().unwrap_or_default().to_string();
+    assert!(
+        first.contains("bad@WORK") && first.contains("ready"),
+        "the failed load pins last_error: {first}"
+    );
+
+    let (status, _) = post_json(&control, "/har/load", r#"{"model":"bad2"}"#).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "second genuine failure");
+    let (_, doc) = get_json(&control, "/har/status").await;
+    let newest = doc["last_error"].as_str().unwrap_or_default();
+    assert!(
+        newest.contains("bad2@WORK"),
+        "newest failure wins: {newest}"
+    );
+
+    let (status, _) = post_json(&control, "/har/load", r#"{"model":"good"}"#).await;
+    assert_eq!(status, StatusCode::OK, "the good model loads");
+    let (_, doc) = get_json(&control, "/har/status").await;
+    assert!(
+        doc["last_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bad2@WORK"),
+        "an unrelated success must not mask a real fault: {:?}",
+        doc["last_error"]
+    );
 }
 
 #[tokio::test]

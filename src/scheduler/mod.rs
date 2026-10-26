@@ -159,6 +159,8 @@ pub struct SlotStatus {
 pub struct JobStatus {
     /// Job id.
     pub id: JobId,
+    /// Load or unload (A3: the headline fault only counts loads).
+    pub kind: JobKind,
     /// Model the job acts on.
     pub model: String,
     /// Category the job targets.
@@ -181,6 +183,34 @@ pub struct JobStatus {
     pub warnings: Vec<String>,
     /// Step timings (§0.3).
     pub timings: JobTimings,
+}
+
+/// The job that owns the sticky headline fault (A3) — the single derivation
+/// shared by the page header and the tray tooltip so the surfaces cannot drift.
+/// Rules: only LOAD jobs count (unload failures are visible in the jobs strip);
+/// deliberate cancels — `outcome == "cancelled"`, e.g. unload-during-load or a
+/// supersede — are operator policy, not faults (the API itself maps `Cancelled`
+/// to 409); a fault stays pinned until **that same model in that same category**
+/// completes a later load successfully, so unrelated loads and idle-sweep
+/// unloads never mask a real failure.
+#[must_use]
+pub fn headline_fault(jobs: &[JobStatus]) -> Option<&JobStatus> {
+    let fault = jobs.iter().rev().find(|job| {
+        job.terminal
+            && job.kind == JobKind::Load
+            && job.outcome.as_deref() != Some("cancelled")
+            && job.error.is_some()
+    })?;
+    let cleared = jobs.iter().any(|later| {
+        later.id > fault.id
+            && later.terminal
+            && later.kind == JobKind::Load
+            && later.outcome.as_deref() != Some("cancelled")
+            && later.model == fault.model
+            && later.category == fault.category
+            && later.error.is_none()
+    });
+    (!cleared).then_some(fault)
 }
 
 /// Per-job step timings in milliseconds (§0.3: measurable, not argued about).
@@ -456,8 +486,8 @@ struct Victim {
     evicted: bool,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum JobKind {
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize)]
+pub enum JobKind {
     Load,
     Unload,
 }
@@ -1906,6 +1936,7 @@ impl ActorState {
                 .iter()
                 .map(|(id, j)| JobStatus {
                     id: *id,
+                    kind: j.kind,
                     model: j.model.clone(),
                     category: j.category,
                     state: j.state,
@@ -1927,5 +1958,94 @@ impl Job {
     /// Whether a release task is in flight for this job's victim (Quiesce/Dispose).
     fn victim_release_pending(&self) -> bool {
         matches!(self.state, SwapState::Quiesce | SwapState::Dispose) && self.victim.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{headline_fault, JobId, JobKind, JobStatus, SwapState};
+    use crate::config::CategoryId;
+
+    fn job(id: u64, kind: JobKind, model: &str, error: Option<&str>, outcome: &str) -> JobStatus {
+        JobStatus {
+            id: JobId(id),
+            kind,
+            model: model.to_string(),
+            category: CategoryId::Work,
+            state: SwapState::Serving,
+            terminal: true,
+            outcome: Some(outcome.to_string()),
+            error: error.map(str::to_string),
+            need_gib: None,
+            free_at_admit_gib: None,
+            victims_released: Vec::new(),
+            warnings: Vec::new(),
+            timings: Default::default(),
+        }
+    }
+
+    fn failed(id: u64, model: &str) -> JobStatus {
+        job(
+            id,
+            JobKind::Load,
+            model,
+            Some("engine not ready"),
+            "engine not ready",
+        )
+    }
+
+    fn ok(id: u64, model: &str) -> JobStatus {
+        job(id, JobKind::Load, model, None, "loaded")
+    }
+
+    #[test]
+    fn newest_failure_wins() {
+        let jobs = vec![failed(1, "a"), failed(2, "b")];
+        assert_eq!(headline_fault(&jobs).expect("fault").id, JobId(2));
+    }
+
+    #[test]
+    fn cancels_and_unloads_are_not_faults() {
+        // Review findings 1/2: an operator cancel (T8 unload-during-load, supersede)
+        // and a failed unload never take the headline away from a real load failure.
+        let jobs = vec![
+            failed(1, "a"),
+            job(
+                2,
+                JobKind::Load,
+                "b",
+                Some("cancelled: superseded"),
+                "cancelled",
+            ),
+            job(3, JobKind::Unload, "c", Some("kill refused"), "unloaded"),
+        ];
+        assert_eq!(headline_fault(&jobs).expect("real fault").id, JobId(1));
+    }
+
+    #[test]
+    fn only_a_later_same_model_success_clears() {
+        assert!(headline_fault(&[failed(1, "a")]).is_some());
+        assert!(
+            headline_fault(&[failed(1, "a"), ok(2, "b")]).is_some(),
+            "a different model's success does not mask the fault"
+        );
+        assert!(
+            headline_fault(&[
+                failed(1, "a"),
+                job(2, JobKind::Unload, "a", None, "unloaded")
+            ])
+            .is_some(),
+            "an unload never clears"
+        );
+        assert!(
+            headline_fault(&[failed(1, "a"), ok(2, "a")]).is_none(),
+            "the same model+category loading successfully clears"
+        );
+        assert_eq!(
+            headline_fault(&[failed(1, "a"), ok(2, "a"), failed(3, "a")])
+                .expect("re-faulted")
+                .id,
+            JobId(3)
+        );
     }
 }

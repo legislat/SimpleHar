@@ -8,7 +8,7 @@ use simplehar_se::engine::mock::MockAdapter;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
 use simplehar_se::observability;
 use simplehar_se::process::{ProcessRuntime, SingleInstanceGuard};
-use simplehar_se::scheduler::Scheduler;
+use simplehar_se::scheduler::{Scheduler, SchedulerHandle};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -107,6 +107,17 @@ async fn main() -> ExitCode {
         }
     }
     let scan_ms = boot_started.elapsed().as_millis() as u64;
+    // A6: inventory is observability, never a boot gate (review finding 3): the
+    // per-model stat loop runs off the critical path so a sleeping or removed
+    // drive can never delay the listeners, the tray, or `/har/status`.
+    {
+        let handle = scheduler.clone();
+        let exe = config.llama_server_exe.clone();
+        let conf_dir = config.modelconf_dir.clone();
+        tokio::spawn(async move {
+            log_boot_banner(&handle, &exe, &conf_dir).await;
+        });
+    }
     let listeners = simplehar_se::listeners::ListenerRegistry::new();
     let boot = simplehar_se::api::BootTimings {
         config_ms,
@@ -147,6 +158,97 @@ async fn main() -> ExitCode {
 /// Pause between listener rebind attempts while a port is unavailable.
 const LISTENER_RETRY: Duration = Duration::from_secs(5);
 
+/// A6: v3.3-style boot inventory. Logs one line per catalog model (`marker/category/
+/// engine/path`) and warns up front if `llama-server.exe` is absent, so the operator
+/// sees load-time landmines at boot instead of at the first request. Spawned off the
+/// boot path (never gates bind); the stat loop runs on the blocking pool. Uses
+/// `tracing`, never console print (AGENTS.md).
+async fn log_boot_banner(
+    scheduler: &SchedulerHandle,
+    llama_server_exe: &std::path::Path,
+    modelconf_dir: &std::path::Path,
+) {
+    let exe_missing = {
+        let exe = llama_server_exe.to_path_buf();
+        tokio::task::spawn_blocking(move || !exe.exists())
+            .await
+            .unwrap_or(false)
+    };
+    if exe_missing {
+        tracing::warn!(
+            path = %llama_server_exe.display(),
+            "llama-server.exe not found; llama-engine loads will fail until llama_server_exe is configured"
+        );
+    }
+    let catalog = match scheduler.catalog().await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            tracing::warn!(error = %error, "catalog unreadable at boot; skipping model banner");
+            return;
+        }
+    };
+    let entries = catalog.models.clone();
+    let conf_dir = modelconf_dir.to_path_buf();
+    let markers = tokio::task::spawn_blocking(move || {
+        entries
+            .iter()
+            .map(|entry| banner_marker(entry, &conf_dir))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_else(|_| vec![" "; catalog.models.len()]);
+    for (entry, marker) in catalog.models.iter().zip(markers) {
+        let path = entry.model_ref.as_deref().unwrap_or("-");
+        tracing::info!(
+            target: "simplehar_se::boot",
+            "{}",
+            format!("{marker}/{}/{}/{path}", entry.category, entry.engine),
+        );
+    }
+    for error in &catalog.errors {
+        tracing::warn!(
+            target: "simplehar_se::boot",
+            "{}",
+            format!("! {}: {}", error.file, error.reason),
+        );
+    }
+}
+
+/// The banner's per-model marker: `!` when a load is certainly doomed —
+/// a plain path that does not exist (resolved against `modelconf_dir` when
+/// relative) or a `llama` entry with no `model:` at all (a launch-time
+/// `MissingField` refusal, engine/llama.rs). `scheme://` refs are engine-backed
+/// sentinels (model/mod.rs:57) and other engines may load file-less, so both
+/// print the neutral marker instead of a false alarm.
+fn banner_marker(
+    entry: &simplehar_se::model::ModelEntry,
+    modelconf_dir: &std::path::Path,
+) -> &'static str {
+    match entry.model_ref.as_deref() {
+        None => {
+            if entry.engine == "llama" {
+                "!"
+            } else {
+                " "
+            }
+        }
+        Some(p) if p.contains("://") => " ",
+        Some(p) => {
+            let path = std::path::Path::new(p);
+            let full = if path.is_relative() {
+                modelconf_dir.join(path)
+            } else {
+                path.to_path_buf()
+            };
+            if full.exists() {
+                " "
+            } else {
+                "!"
+            }
+        }
+    }
+}
+
 /// Runs one listener under a supervisor: bind, serve, and on any end try to rebind —
 /// a busy port marks the category `Down` (tray red, `/har/status` names the port)
 /// until a retry succeeds. No bind failure is fatal: partial availability beats a
@@ -162,24 +264,126 @@ async fn supervise_listener(
     } else {
         category_router(Arc::clone(&state), category.id)
     };
+    let mut hinted = false;
+    let mut hint: Option<String> = None;
     loop {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
                 listeners.mark_serving(category.id);
                 tracing::info!(%addr, category = %category.id, "listener serving");
+                hinted = false;
+                hint = None;
                 if let Err(error) = axum::serve(listener, router.clone()).await {
                     tracing::error!(%addr, category = %category.id, error = %error,
                         "listener stopped; attempting rebind");
                 }
             }
             Err(error) => {
-                listeners.mark_down(category.id, format!("cannot bind {addr}: {error}"));
+                // Publish the outage BEFORE any child process: a hung netsh must
+                // never leave the registry stale-Serving with the tray/UI green
+                // over a dead port (G11; review finding, 2026-10-26).
+                let mut reason = format!("cannot bind {addr}: {error}");
+                if let Some(h) = &hint {
+                    reason.push_str("; ");
+                    reason.push_str(h);
+                }
+                listeners.mark_down(category.id, reason);
                 tracing::error!(%addr, category = %category.id, error = %error,
                     "listener down (port busy?); retrying; harness continues (G11)");
+                // A4: the classic Windows "busy with nothing listening" cause is a
+                // Hyper-V/WinNAT-reserved port range — probe once per outage (the
+                // resolved hint persists for every retry until a successful bind).
+                if !hinted {
+                    hinted = true;
+                    match tokio::time::timeout(
+                        LISTENER_RETRY,
+                        reserved_range_hint(category.public_port),
+                    )
+                    .await
+                    {
+                        Ok(Some(h)) => {
+                            hint = Some(h.clone());
+                            tracing::warn!(%addr, category = %category.id, "{h}");
+                            listeners.mark_down(
+                                category.id,
+                                format!("cannot bind {addr}: {error}; {h}"),
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(_) => tracing::debug!(%addr, "netsh excludedportrange probe timed out"),
+                    }
+                }
             }
         }
         tokio::time::sleep(LISTENER_RETRY).await;
     }
+}
+
+/// `None`, or a hint naming the excluded range that swallows `port` — the
+/// Hyper-V/WSL2 dynamic-port-reservation foot-gun (v3.3-era lesson, item 35 A4).
+async fn reserved_range_hint(port: u16) -> Option<String> {
+    let output = tokio::process::Command::new("netsh")
+        .kill_on_drop(true)
+        .args([
+            "interface",
+            "ipv4",
+            "show",
+            "excludedportrange",
+            "protocol=tcp",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ranges = parse_excluded_ranges(&decode_console_output(&output.stdout));
+    ranges
+        .into_iter()
+        .find(|(start, end)| *start <= port && port <= *end)
+        .map(|(start, end)| {
+            format!(
+                "port {port} lies in the reserved range {start}-{end} \
+                 (netsh interface ipv4 show excludedportrange protocol=tcp)"
+            )
+        })
+}
+
+/// Decodes `netsh` output: console tools emit UTF-16LE (BOM) on some locales and
+/// UTF-8/OEM on others; numeric rows must survive either way.
+fn decode_console_output(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or_default()]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+}
+
+/// Extracts the `(start, end)` rows of `show excludedportrange` output. Headers and
+/// locale prose are ignored; a row qualifies when its first two columns are integers
+/// and any remaining columns are netsh's row markers (`*` administered, `!` invalid).
+/// Accepting those markers matters: the `50000-50059` Hyper-V range is administered,
+/// so it carries a `*` and would otherwise be missed.
+fn parse_excluded_ranges(text: &str) -> Vec<(u16, u16)> {
+    text.lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 2 || cols.len() > 3 {
+                return None;
+            }
+            if cols.len() == 3 && !["*", "!"].contains(&cols[2]) {
+                return None;
+            }
+            let (Ok(start), Ok(end)) = (cols[0].parse::<u16>(), cols[1].parse::<u16>()) else {
+                return None;
+            };
+            Some((start.min(end), start.max(end)))
+        })
+        .collect()
 }
 
 /// Starts one supervisor per category listener and waits for shutdown.
@@ -248,4 +452,105 @@ async fn run(
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_console_output, parse_excluded_ranges};
+
+    const SAMPLE: &str = "
+Protocol tcp Port Exclusion Ranges
+
+Start Port    End Port
+----------    --------
+      1024        1123
+      8081        8180
+     50000       50059
+
+* - Administered port (exclusion added by an administrator), ! - Invalid port.
+";
+
+    #[test]
+    fn parses_only_two_integer_rows() {
+        let ranges = parse_excluded_ranges(SAMPLE);
+        assert_eq!(ranges, vec![(1024, 1123), (8081, 8180), (50_000, 50_059)]);
+        assert!(
+            ranges.iter().any(|(s, e)| *s <= 8100 && 8100 <= *e),
+            "the hint fires for a swallowed port"
+        );
+        assert!(
+            !ranges.iter().any(|(s, e)| *s <= 8708 && 8708 <= *e),
+            "a free port must not produce a false hint"
+        );
+    }
+
+    #[test]
+    fn normalizes_reversed_range_columns() {
+        assert_eq!(parse_excluded_ranges("  9000  8000  "), vec![(8000, 9000)]);
+    }
+
+    #[test]
+    fn accepts_netsh_administered_and_invalid_markers() {
+        // Real netsh emits `50000 50059 *` (administered) and occasionally `!`.
+        let ranges = parse_excluded_ranges("50000 50059 *\n  6000 6099 !\n  80 90 x\n");
+        assert_eq!(ranges, vec![(50_000, 50_059), (6_000, 6_099)]);
+    }
+
+    #[test]
+    fn decodes_utf16le_netsh_output() {
+        let utf16: Vec<u16> = SAMPLE.encode_utf16().collect();
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in utf16 {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_console_output(&bytes), SAMPLE);
+        // Plain UTF-8 passes through untouched.
+        assert_eq!(decode_console_output(SAMPLE.as_bytes()), SAMPLE);
+    }
+
+    #[test]
+    fn banner_marker_is_honest_in_both_directions() {
+        use super::banner_marker;
+        use simplehar_se::config::CategoryId;
+        use simplehar_se::model::ModelEntry;
+        let entry = |engine: &str, model_ref: Option<&str>| ModelEntry {
+            name: "m".to_string(),
+            engine: engine.to_string(),
+            category: CategoryId::Work,
+            vram_gb: None,
+            model_ref: model_ref.map(str::to_string),
+            serve_model: None,
+            file: None,
+            raw: Default::default(),
+        };
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            banner_marker(&entry("llama", None), &dir),
+            "!",
+            "llama without model: is a launch-time refusal, must flag"
+        );
+        assert_eq!(
+            banner_marker(&entry("mock", None), &dir),
+            " ",
+            "file-less engines are neutral"
+        );
+        assert_eq!(
+            banner_marker(&entry("strata", Some("strata://models/x")), &dir),
+            " ",
+            "scheme sentinels are never 'missing'"
+        );
+        assert_eq!(
+            banner_marker(&entry("llama", Some("definitely-missing-se.gguf")), &dir),
+            "!",
+            "relative refs resolve against modelconf_dir"
+        );
+        let name = format!("se-banner-{}.gguf", std::process::id());
+        std::fs::write(dir.join(&name), b"x").expect("seed file");
+        assert_eq!(
+            banner_marker(&entry("llama", Some(name.as_str())), &dir),
+            " ",
+            "relative ref present under modelconf_dir is not missing"
+        );
+        let _ = std::fs::remove_file(dir.join(&name));
+    }
 }

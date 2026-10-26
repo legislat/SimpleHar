@@ -396,6 +396,14 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
         .read()
         .expect("boot timings lock poisoned by a writer panic")
         .clone();
+    // A3: the sticky headline fault, derived once by the scheduler crate
+    // (`headline_fault`: newest failed LOAD, cancels excluded, cleared only by a
+    // later successful load of the same model+category) — page and tray share it.
+    let last_error = crate::scheduler::headline_fault(&scheduler.jobs).and_then(|job| {
+        job.error
+            .as_ref()
+            .map(|reason| format!("{}@{}: {reason}", job.model, job.category))
+    });
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
@@ -405,6 +413,7 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
         "mem": mem_section(state).await,
         "slots": scheduler.slots,
         "jobs": scheduler.jobs,
+        "last_error": last_error,
         "catalog_errors": scheduler.catalog_errors,
         "config_errors": [],
     }))
@@ -486,24 +495,34 @@ async fn har_unload(
     })
 }
 
+/// The one harness-facing model-listing shape: OpenAI fields plus the extras the
+/// page's table renders (A5: `context`, `serve_model`, `model_ref`). Single
+/// builder for `merged_state` and `/har/models` so they cannot drift. The
+/// client-facing listener `/v1/models` is deliberately minimal — local file
+/// paths stay off the LAN-facing surface.
+fn model_json(entry: &ModelEntry) -> Value {
+    json!({
+        "id": entry.name,
+        "object": "model",
+        "owned_by": "simplehar",
+        "engine": entry.engine,
+        "category": entry.category,
+        "vram_gb": entry.vram_gb,
+        "cpu_offload": entry
+            .raw
+            .get("cpu_offload")
+            .is_some_and(|v| crate::engine::llama::jinja_on(v)),
+        "context": entry.raw.get("context"),
+        "serve_model": entry.serve_model,
+        "model_ref": entry.model_ref,
+    })
+}
+
 /// The merged document every `har_state` event carries: one push replaces the
 /// page's per-panel polling (Step 14).
 async fn merged_state(state: &ApiState) -> Result<Value, ApiError> {
     let catalog = state.catalog().await?;
-    let models: Vec<Value> = catalog
-        .iter()
-        .map(|entry| {
-            json!({
-                "id": entry.name,
-                "object": "model",
-                "owned_by": "simplehar",
-                "engine": entry.engine,
-                "category": entry.category,
-                "vram_gb": entry.vram_gb,
-                "cpu_offload": entry.raw.get("cpu_offload").is_some_and(|v| v == "true"),
-            })
-        })
-        .collect();
+    let models: Vec<Value> = catalog.iter().map(model_json).collect();
     let mut document = status_document(state).await?;
     document["models"] = Value::Array(models);
     Ok(document)
@@ -718,20 +737,7 @@ async fn har_log(
 /// per-listener `/v1/models` stays category-filtered).
 async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let catalog = state.catalog().await?;
-    let models: Vec<Value> = catalog
-        .iter()
-        .map(|entry| {
-            json!({
-                "id": entry.name,
-                "object": "model",
-                "owned_by": "simplehar",
-                "engine": entry.engine,
-                "category": entry.category,
-                "vram_gb": entry.vram_gb,
-                "cpu_offload": entry.raw.get("cpu_offload").is_some_and(|v| v == "true"),
-            })
-        })
-        .collect();
+    let models: Vec<Value> = catalog.iter().map(model_json).collect();
     Ok(Json(json!({ "object": "list", "data": models })))
 }
 
@@ -1221,6 +1227,37 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_json_cpu_offload_agrees_with_the_engine() {
+        // Review finding 6: one truth set — engine/llama::jinja_on — so the page
+        // checkbox can never disagree with whether `-ngl 0` was actually forced.
+        let entry = |cpu: &str| ModelEntry {
+            name: "m".to_string(),
+            engine: "llama".to_string(),
+            category: CategoryId::Work,
+            vram_gb: Some(4.0),
+            model_ref: Some(r"F:\m.gguf".to_string()),
+            serve_model: None,
+            file: None,
+            raw: BTreeMap::from([
+                ("cpu_offload".to_string(), cpu.to_string()),
+                ("context".to_string(), "262144".to_string()),
+            ]),
+        };
+        for truthy in ["true", "1", "on"] {
+            assert_eq!(
+                model_json(&entry(truthy))["cpu_offload"],
+                json!(true),
+                "`{truthy}` is engine-truthy"
+            );
+        }
+        assert_eq!(model_json(&entry("yes"))["cpu_offload"], json!(false));
+        assert_eq!(model_json(&entry("false"))["cpu_offload"], json!(false));
+        let body = model_json(&entry("true"));
+        assert_eq!(body["context"], json!("262144"));
+        assert_eq!(body["model_ref"], json!(r"F:\m.gguf"));
+    }
 
     #[test]
     fn error_body_carries_flat_and_openai_envelope() {

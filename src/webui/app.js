@@ -260,6 +260,9 @@ function renderHeader(status) {
     endpoints,
     slots,
     renderMemory(status),
+    status.last_error
+      ? el("div", { class: "sh-errline", role: "alert" }, text(`last fault: ${status.last_error}`))
+      : null,
     errors.length > 0
       ? el("div", { class: "sh-catalog-errors" }, text(errors.join(" · ")))
       : null,
@@ -285,7 +288,23 @@ function modelRow(status, model, category) {
     ),
   );
   row.append(el("td", {}, text(model.engine)));
+  row.append(el("td", {}, text(model.context ?? "—")));
   row.append(el("td", {}, text(model.vram_gb !== null ? `${model.vram_gb} GiB` : "est.")));
+  // A5 (v3.3 parity): the backing GGUF + serve_model id, basename on screen,
+  // full path in the tooltip.
+  const fileBits = [];
+  if (model.model_ref) {
+    const base = String(model.model_ref).replace(/\\/g, "/").split("/").pop();
+    fileBits.push(base);
+  }
+  if (model.serve_model) fileBits.push(`id:${model.serve_model}`);
+  row.append(
+    el(
+      "td",
+      { class: "sh-files", title: model.model_ref || "" },
+      text(fileBits.length > 0 ? fileBits.join(" · ") : "—"),
+    ),
+  );
 
   // Category select: page edits write back into the model yaml (Step 9).
   const select = el("select", { class: "sh-mini", "aria-label": "category" });
@@ -376,7 +395,9 @@ function renderTab(status, category) {
         {},
         el("th", {}, text("Model")),
         el("th", {}, text("Engine")),
+        el("th", {}, text("Ctx")),
         el("th", {}, text("Cost")),
+        el("th", {}, text("Files")),
         el("th", {}, text("Cat")),
         el("th", {}, text("CPU")),
         el("th", {}),
@@ -386,7 +407,7 @@ function renderTab(status, category) {
   const body = el("tbody", {});
   if (models.length === 0) {
     body.append(
-      el("tr", {}, el("td", { colspan: "6", class: "sh-empty" }, text("no models in this category — add a yaml to ModelConf and Rescan"))),
+      el("tr", {}, el("td", { colspan: "8", class: "sh-empty" }, text("no models in this category — add a yaml to ModelConf and Rescan"))),
     );
   }
   for (const model of models) body.append(modelRow(status, model, category));

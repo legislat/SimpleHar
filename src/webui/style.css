@@ -148,6 +148,15 @@ header.sh-header {
 .sh-bar[data-tone="reserve"] > i { background: var(--sh-warn); }
 .sh-bar[data-tone="observed"] > i { background: #4a7fb5; }
 .sh-bar[data-tone="ram"] > i { background: #7a5fb0; }
+.sh-errline { color: var(--sh-bad); font-size: 0.8rem; margin-top: 0.4rem; }
+.sh-files {
+  font-size: 0.75rem;
+  color: var(--pico-muted-color);
+  max-width: 20rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .sh-mem label { font-size: 0.75rem; color: var(--pico-muted-color); display: block; margin-bottom: 0.2rem; }
 
 /* Tabs: models live below the header (operator mockup). */
