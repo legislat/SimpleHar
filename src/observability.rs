@@ -18,6 +18,23 @@ use tracing_subscriber::{EnvFilter, Layer};
 /// without growing unbounded.
 pub const RING_CAPACITY: usize = 500;
 
+/// Runtime extended-logging switch (the page's "Extended Logging" checkbox,
+/// off at boot): gates the decision-level lines in the scheduler and keeps
+/// routine status polls in the request ring (operator, 2026-10-26). Process
+/// static so the stateless middleware and the actor read one truth.
+static EXTENDED_LOGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether extended logging is on.
+#[must_use]
+pub fn extended_logging() -> bool {
+    EXTENDED_LOGGING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Flips the switch (idempotent).
+pub fn set_extended_logging(on: bool) {
+    EXTENDED_LOGGING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One captured harness log event.
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {

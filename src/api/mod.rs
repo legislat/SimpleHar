@@ -435,6 +435,7 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
+        "extended_logging": crate::observability::extended_logging(),
         "boot": boot,
         "categories": categories,
         "listeners": state.listeners.snapshot(),
@@ -671,13 +672,19 @@ pub async fn guard(request: axum::extract::Request, next: axum::middleware::Next
     let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
     response = with_request_id(response, &request_id);
-    tracing::info!(
-        %request_id,
-        method = %method,
-        path = %path,
-        status = response.status().as_u16(),
-        "request complete"
-    );
+    // The page polls /har/status continuously; those lines would evict real
+    // evidence from the ring during long boots. Extended logging restores them
+    // (operator, 2026-10-26).
+    let routine_poll = path == "/har/status" && method == axum::http::Method::GET;
+    if !routine_poll || crate::observability::extended_logging() {
+        tracing::info!(
+            %request_id,
+            method = %method,
+            path = %path,
+            status = response.status().as_u16(),
+            "request complete"
+        );
+    }
     response
 }
 
@@ -928,6 +935,22 @@ async fn har_rescan(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
         "models": catalog.models.len(),
         "catalog_errors": catalog.errors,
     })))
+}
+
+/// `POST /har/config/logging {"enabled": bool}` — the page's "Extended Logging"
+/// switch: decision-level scheduler lines plus the full request ring. Runtime
+/// only; every boot starts with it off.
+async fn har_config_logging(
+    State(_state): State<Arc<ApiState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(enabled) = body.get("enabled").and_then(Value::as_bool) else {
+        return Err(ApiError::BadRequest {
+            reason: "enabled (boolean) is required".to_string(),
+        });
+    };
+    crate::observability::set_extended_logging(enabled);
+    Ok(Json(json!({ "status": "ok", "extended_logging": enabled })))
 }
 
 /// The `/har/status` memory block: declared config numbers plus what the witness
@@ -1249,6 +1272,7 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
         .route("/har/rescan", post(har_rescan))
         .route("/har/models", get(har_models))
         .route("/har/config/default", post(har_config_default))
+        .route("/har/config/logging", post(har_config_logging))
         .route("/har/config/model", post(har_config_model));
     Router::new()
         .merge(category_router(Arc::clone(&api), control_category))

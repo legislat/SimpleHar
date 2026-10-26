@@ -179,6 +179,15 @@ header.sh-header {
  * genuinely cramped (operator, 2026-10-26). */
 .sh-row-actions { display: flex; flex-wrap: wrap; gap: 0.3rem; }
 table.sh-models td.sh-row-actions { width: max-content; }
+.sh-extlog {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: 0.75rem;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+.sh-extlog input { margin: 0; }
 .sh-mem label { font-size: 0.75rem; color: var(--pico-muted-color); display: block; margin-bottom: 0.2rem; }
 
 /* Tabs: models live below the header (operator mockup). */

@@ -441,6 +441,16 @@ async fn greedy_replacement_clears_floor_after_victim_release() {
         model_of(&status, CategoryId::Work).as_deref(),
         Some("chonky")
     );
+    let job = status
+        .jobs
+        .iter()
+        .find(|job| job.model == "chonky")
+        .expect("job recorded");
+    assert_eq!(job.gate_target_gib, Some(65.0), "the floor was the gate");
+    assert!(
+        job.observed_at_admit_gib.is_some(),
+        "witness evidence recorded for post-checks"
+    );
 }
 
 #[tokio::test]

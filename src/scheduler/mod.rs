@@ -186,6 +186,11 @@ pub struct JobStatus {
     pub need_gib: Option<f64>,
     /// Free VRAM at admit time in GiB (the number that was used).
     pub free_at_admit_gib: Option<f64>,
+    /// Observed physical free (total - used) at admit; `None` when the witness
+    /// was down (rehearsal forensics, 2026-10-26).
+    pub observed_at_admit_gib: Option<f64>,
+    /// The gate this job had to satisfy before spawn: max(need, launch floor).
+    pub gate_target_gib: Option<f64>,
     /// Cross-category victims this job evicted (Step 6, G13 decision inputs).
     pub victims_released: Vec<String>,
     /// Non-fatal observations (serve_model mismatch, Step 10).
@@ -249,6 +254,17 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
+    /// Runtime switch for the decision-level log lines (page checkbox, off at
+    /// boot): admit comparisons, settle evidence, full request ring.
+    pub fn set_extended_logging(&self, on: bool) {
+        crate::observability::set_extended_logging(on);
+    }
+
+    /// Whether extended logging is currently on.
+    #[must_use]
+    pub fn extended_logging(&self) -> bool {
+        crate::observability::extended_logging()
+    }
     /// Loads `model` into `category` (supersede policy for same-category loads).
     ///
     /// # Errors
@@ -1397,6 +1413,25 @@ impl ActorState {
                 job.need = Some(Gibibytes(booked));
             }
         }
+        if crate::observability::extended_logging() {
+            // Decision-level evidence for rehearsal post-checks (operator,
+            // 2026-10-26): the exact numbers the gate compared on the pass path.
+            let job = &self.jobs[&job_id];
+            tracing::info!(
+                %job_id,
+                model = %job.model,
+                cost = ?job.cost,
+                need_gib = job.need.map(|n| n.0),
+                floor_gib = floor,
+                free_gib = free.0,
+                observed_at_admit_gib = job.observed_at_admit,
+                room_gib = room,
+                victim = ?job.victim.as_ref().map(|v| v.model.clone()),
+                victims = ?job.victims.iter().map(|v| v.model.clone()).collect::<Vec<_>>(),
+                gate_gib = gate_target,
+                "admission decision (extended)"
+            );
+        }
         self.step(job_id, SwapState::Quiesce);
         self.step(job_id, SwapState::Dispose);
         // Ensure a release target: the same-slot replacement first, else the first
@@ -1595,6 +1630,16 @@ impl ActorState {
                         let expected = baseline + external + tolerance;
                         let observed_free = (sample.total_gib - sample.used_gib).max(0.0);
                         if sample.used_gib <= expected && observed_free >= gate {
+                            if crate::observability::extended_logging() {
+                                tracing::info!(
+                                    used_gib = sample.used_gib,
+                                    total_gib = sample.total_gib,
+                                    expected_gib = expected,
+                                    free_gib = observed_free,
+                                    gate_gib = gate,
+                                    "settle evidence (extended)"
+                                );
+                            }
                             let _ = tx.send(ActorMsg::Event {
                                 job: job_id,
                                 event: Event::Settled(Ok(())),
@@ -2286,6 +2331,8 @@ impl ActorState {
                     error: j.error.as_ref().map(|e| e.to_string()),
                     need_gib: j.need.map(|n| n.0),
                     free_at_admit_gib: j.free_at_admit.map(|n| n.0),
+                    observed_at_admit_gib: j.observed_at_admit,
+                    gate_target_gib: j.gate_target,
                     victims_released: j.victims_released.clone(),
                     warnings: j.warnings.clone(),
                     timings: j.timings,
@@ -2319,6 +2366,8 @@ mod tests {
             error: error.map(str::to_string),
             need_gib: None,
             free_at_admit_gib: None,
+            observed_at_admit_gib: None,
+            gate_target_gib: None,
             victims_released: Vec::new(),
             warnings: Vec::new(),
             timings: Default::default(),

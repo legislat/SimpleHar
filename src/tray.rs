@@ -433,6 +433,8 @@ mod tests {
             error: error.map(str::to_string),
             need_gib: Some(4.0),
             free_at_admit_gib: Some(66.0),
+            observed_at_admit_gib: Some(64.0),
+            gate_target_gib: Some(4.0),
             victims_released: Vec::new(),
             warnings: Vec::new(),
             timings: Default::default(),

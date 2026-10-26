@@ -427,11 +427,28 @@ async fn default_model_endpoint_validates_and_takes_effect() {
         .find(|cat| cat["id"] == "WORK")
         .expect("WORK");
     assert_eq!(work_cat["default_model"], "qwen3");
-
     // The no-model fallback now loads it without touching the boot config file.
     let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["body"]["model"], "mock-model");
+}
+
+#[tokio::test]
+async fn extended_logging_toggle_round_trips_and_validates() {
+    let (control, _, _, _, _) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let (status, body) = post_json(&control, "/har/config/logging", r#"{"enabled":"yes"}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    let (status, _) = post_json(&control, "/har/config/logging", r#"{"enabled":true}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, doc) = get_json(&control, "/har/status").await;
+    assert_eq!(doc["extended_logging"], true);
+    let (status, _) = post_json(&control, "/har/config/logging", r#"{"enabled":false}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, doc) = get_json(&control, "/har/status").await;
+    assert_eq!(doc["extended_logging"], false);
 }
 
 #[tokio::test]

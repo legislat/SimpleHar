@@ -242,6 +242,20 @@ function renderHeader(status) {
       },
       text("Rescan"),
     ),
+    el(
+      "label",
+      { class: "sh-extlog" },
+      el("input", {
+        type: "checkbox",
+        "aria-label": "extended logging",
+        ...(status.extended_logging ? { checked: "" } : {}),
+        onchange: (event) =>
+          postJson("/har/config/logging", { enabled: event.target.checked }).catch(
+            (error) => flashError(error),
+          ),
+      }),
+      text("Extended Logging"),
+    ),
   );
   const slots = el(
     "div",
