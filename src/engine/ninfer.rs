@@ -9,9 +9,9 @@
 //! chains `/health` then `/v1/models` (v3.3 `wait_ready`; SE's `Then` probes
 //! both, unlike v3.3's first-step-only unwrap).
 //!
-//! Entries marked `external: true` in v3.3 are NOT ported: this harness never
-//! registers, monitors, or manages manual servers (operator decree 2026-10-24)
-//! — it only accounts for their VRAM through the witness.
+//! Every ninfer model the catalog carries is managed: the operator's 2026-10-26
+//! call scrapped v3.3's `external: true` so the former bonsai servers are loaded
+//! and reaped here like any other, on harness-assigned publish ports.
 
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
@@ -81,21 +81,6 @@ impl EngineAdapter for NinferAdapter {
             model: model.name.clone(),
             reason,
         };
-        // External entries are never managed (operator decree 2026-10-24): gate
-        // it in code, not only in the module docs — a copied-back v3.3 yaml must
-        // not spawn over, or reap, the operator's manual containers (review).
-        if model
-            .raw
-            .get("external")
-            .map(String::as_str)
-            .is_some_and(crate::model::truthy)
-        {
-            return Err(rejected(
-                "external entries are never started or stopped by the harness; \
-                 run the autostart script outside it, or drop the key to manage it here"
-                    .to_string(),
-            ));
-        }
         // Both required, exactly as v3.3 refused them at launch; the script path
         // lives inside WSL and cannot be existence-checked from here.
         let missing = |field: &str| EngineError::MissingField {
@@ -274,10 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn external_entries_are_gated_not_spawned() {
-        // A copied-back v3.3 bonsai entry must never let the harness spawn over,
-        // or reap, the operator's manual container (review, 2026-10-26).
-        let err = NinferAdapter::new("Ubuntu", "legislat")
+    fn external_key_is_inert_now() {
+        // Operator call 2026-10-26 scrapped `external: true`: a copied-back v3.3
+        // yaml must be managed, not refused — the key carries no meaning here.
+        let spec = NinferAdapter::new("Ubuntu", "legislat")
             .spec(
                 &entry(&[
                     ("ninfer_autostart", "/s.sh"),
@@ -286,11 +271,8 @@ mod tests {
                 ]),
                 18109,
             )
-            .expect_err("must refuse");
-        assert!(
-            matches!(&err, EngineError::Rejected { reason, .. } if reason.contains("external")),
-            "{err}"
-        );
+            .expect("managed");
+        assert_eq!(spec.container.as_deref(), Some("c"));
     }
 
     #[test]

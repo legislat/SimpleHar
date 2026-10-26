@@ -106,10 +106,11 @@ short-lived `wsl.exe -d <wsl_distro> -u <wsl_user> -- bash <ninfer_autostart>
 <profile> <key|nokey> <assigned-port>` client, then waits for `/health` 200
 **then** `/v1/models` 200. Because the container outlives the client, unload
 reaps it by name (`docker rm -f <ninfer_container>`); the release evidence is
-the port closing after the reaping, not the client's exit. v3.3 `external: true`
-entries are gated out: such an entry is **refused at load** — the harness never
-registers, monitors, or manages manual servers, it only subtracts their VRAM via
-the witness. A harness crash can orphan a container (the job object only reaps
+the port closing after the reaping, not the client's exit. Every ninfer model the
+catalog carries is managed — v3.3 `external: true` was scrapped (operator,
+2026-10-26), so the key is inert and such an entry loads like any other; manual
+servers the harness did not spawn are never registered or monitored, only
+subtracted from VRAM via the witness. A harness crash can orphan a container (the job object only reaps
 the client); the next load of that name reconciles by removing the stale
 container before autostart runs. Duplicate `ninfer_container` names across
 models are refused at scan — reaping is by name. As with strata: no preload,
