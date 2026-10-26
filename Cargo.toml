@@ -10,8 +10,7 @@ license = "Apache-2.0"
 axum = "0.8"
 # Async runtime; full features for signal handling, fs, process, rt-multi-thread.
 tokio = { version = "1", features = ["full"] }
-# Middleware: ServiceExt for tests; HTTP layers below.
-tower = "0.5"
+# HTTP layers: tracing, compression, timeouts (AGENTS.md observability rule).
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "timeout"] }
 # Structured logging; no println!/eprintln! on production paths (AGENTS.md).
 tracing = "0.1"
@@ -44,6 +43,10 @@ windows = { version = "0.62", features = [
 tokio-stream = "0.1"
 # NVML in-process witness with a graceful `nvidia-smi` fallback (Step 4, item 5).
 nvml-wrapper = "0.10"
+
+[dev-dependencies]
+# `tower::ServiceExt::oneshot` drives the router in tests without binding a port.
+tower = "0.5"
 
 # Approved but deliberately absent until its module lands (no unused deps):
 # - yaml crate    -> Step 9 ModelConf write-back (flat key: value round-trip)
