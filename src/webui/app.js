@@ -186,6 +186,25 @@ function renderMemory(status) {
       ),
     );
   }
+  // A1: host RAM context (informational; admission budgets VRAM, never RAM). Omit
+  // the whole bar when the platform cannot sample it, rather than show zeros.
+  if (mem.ram_total_gb) {
+    const ramPct = Math.min(100, (mem.ram_used_gb / mem.ram_total_gb) * 100);
+    bars.push(
+      el(
+        "div",
+        {},
+        el(
+          "label",
+          {},
+          text(
+            `RAM ${mem.ram_used_gb.toFixed(1)} / ${mem.ram_total_gb.toFixed(0)} GiB (host, informational)`,
+          ),
+        ),
+        el("div", { class: "sh-bar", "data-tone": "ram" }, el("i", { style: `width:${ramPct}%` })),
+      ),
+    );
+  }
   return el("div", { class: "sh-mem" }, ...bars);
 }
 
@@ -489,14 +508,25 @@ function applyState(doc) {
 }
 
 async function refresh() {
-  // Polling fallback and the rescan button both use the plain endpoints.
+  // Polling fallback and the rescan button both use the plain endpoints. The
+  // catches are split on purpose: a TypeError from the fetches means the browser
+  // never reached the harness, while a render-time error is a contract bug worth
+  // seeing raw (same handling as applyState on the SSE path).
+  let status;
+  let catalog;
   try {
-    const [status, catalog] = await Promise.all([
-      getJson("/har/status"),
-      getJson("/har/models"),
-    ]);
-    state.status = status;
-    state.models = catalog.data;
+    [status, catalog] = await Promise.all([getJson("/har/status"), getJson("/har/models")]);
+  } catch (error) {
+    flashError(
+      error instanceof TypeError
+        ? new Error(`cannot reach the harness at ${location.host} — is it running?`)
+        : error,
+    );
+    return;
+  }
+  state.status = status;
+  state.models = catalog.data;
+  try {
     render();
   } catch (error) {
     flashError(error);

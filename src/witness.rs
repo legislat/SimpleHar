@@ -146,3 +146,56 @@ async fn smi(args: &[&str]) -> Result<String, String> {
     .await
     .map_err(|_| "nvidia-smi timed out".to_string())?
 }
+
+/// Host RAM numbers for the header bar (A1, the v3.3 `GlobalMemoryStatusEx` source).
+/// Display only — admission budgets VRAM, never RAM (§0.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RamSample {
+    /// Installed physical memory in GiB.
+    pub total_gib: f64,
+    /// In-use physical memory in GiB (total minus available).
+    pub used_gib: f64,
+}
+
+/// Samples host RAM via `GlobalMemoryStatusEx`; `None` when the call is nonsense
+/// (zero total), so the page omits the bar rather than lying.
+#[must_use]
+pub fn ram_sample() -> Option<RamSample> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let status = unsafe {
+        let mut status = MEMORYSTATUSEX {
+            dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>())
+                .expect("invariant: MEMORYSTATUSEX fits u32"),
+            ..Default::default()
+        };
+        // Safety: the struct is initialized with its own size, as the API requires.
+        GlobalMemoryStatusEx(&mut status).ok()?;
+        status
+    };
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let total_gib = gib(status.ullTotalPhys);
+    if total_gib <= 0.0 {
+        return None;
+    }
+    Some(RamSample {
+        total_gib,
+        used_gib: total_gib - gib(status.ullAvailPhys),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ram_sample_reports_plausible_numbers() {
+        let sample = ram_sample().expect("GlobalMemoryStatusEx works on Windows");
+        assert!(sample.total_gib > 0.0, "total: {}", sample.total_gib);
+        assert!(
+            sample.used_gib >= 0.0 && sample.used_gib <= sample.total_gib,
+            "used {} vs total {}",
+            sample.used_gib,
+            sample.total_gib
+        );
+    }
+}

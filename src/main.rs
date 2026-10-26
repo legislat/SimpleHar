@@ -31,13 +31,17 @@ fn boot_config() -> Result<AppConfig, Vec<ConfigError>> {
                 .ok()
                 .and_then(|exe| exe.parent().map(|dir| dir.join("simplehar.json")))
         });
-    let config = match &path {
+    let mut config = match &path {
         Some(path) if path.exists() => AppConfig::load(path).map_err(|e| vec![e])?,
         _ => {
             tracing::info!("no simplehar.json found; using built-in defaults");
             AppConfig::default()
         }
     };
+    // Stamp where the config came from (or where it will live) so `default_model`
+    // write-back targets the same file boot read — a `SIMPLEHAR_CONFIG` run must not
+    // persist defaults into a file it never loads (operator finding, 2026-10-26).
+    config.source_path = path;
     let errors = config.validate();
     if errors.is_empty() {
         Ok(config)

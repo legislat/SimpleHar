@@ -515,6 +515,110 @@ async fn config_model_writes_back_to_the_yaml_file() {
 }
 
 #[tokio::test]
+async fn moving_the_default_model_clears_its_old_category_default() {
+    // Operator finding #1 (2026-10-26): moving the default model out of a category
+    // must not leave the old listener defaulting to a model it no longer serves.
+    let (control, _, _, _, _) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"WORK","model":"qwen3"}"#,
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","category":"RP"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (_, status_body) = get_json(&control, "/har/status").await;
+    let work_cat = status_body["categories"]
+        .as_array()
+        .expect("categories")
+        .iter()
+        .find(|cat| cat["id"] == "WORK")
+        .expect("WORK");
+    assert!(
+        work_cat["default_model"].is_null(),
+        "the old category must not keep a default that moved away: {status_body}"
+    );
+}
+
+#[tokio::test]
+async fn defaults_persist_to_the_config_boot_loaded_even_under_a_custom_path() {
+    // Operator finding #2 (2026-10-26): write-back must hit the file boot read
+    // (`SIMPLEHAR_CONFIG` aware), and a partial config with no `categories` key
+    // must still accept the patch instead of silently staying in memory.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "se-api-config-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, r#"{"modelconf_dir": "unused"}"#).expect("seed config");
+    let mut config =
+        AppConfig::parse(&std::fs::read_to_string(&path).expect("read")).expect("parses");
+    config.source_path = Some(path.clone());
+
+    let (control, _, _, _, _) = app(config, &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
+    let (status, body) = post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"WORK","model":"qwen3"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["persisted"].as_bool().unwrap_or(false),
+        "custom-path config must accept the write: {body}"
+    );
+
+    let on_disk: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).expect("persisted file must exist at the boot path"),
+    )
+    .expect("valid json");
+    assert!(
+        on_disk.get("source_path").is_none(),
+        "the internal path marker must never be serialized"
+    );
+    // The written file must survive a full boot reload — the class of bug that
+    // dropped `control: true` on the first rebuild-through-to_value.
+    let reloaded =
+        AppConfig::parse(&std::fs::read_to_string(&path).expect("read back persisted config"))
+            .expect("persisted config parses");
+    let reload_errors = reloaded.validate();
+    assert!(
+        reload_errors.is_empty(),
+        "persisted config must validate: {reload_errors:?}"
+    );
+    let work = reloaded
+        .categories
+        .iter()
+        .find(|cat| cat.id == CategoryId::Work)
+        .expect("WORK");
+    assert_eq!(work.default_model.as_deref(), Some("qwen3"));
+    assert!(
+        reloaded.categories.iter().any(|cat| cat.control),
+        "the control flag must survive the persist reload"
+    );
+    let work_json = on_disk["categories"]
+        .as_array()
+        .expect("categories rebuilt from boot config")
+        .iter()
+        .find(|cat| cat["id"] == "WORK")
+        .expect("WORK");
+    assert_eq!(work_json["default_model"], "qwen3");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
     let (control, _, _, _, _) = app(AppConfig::default(), &[]);
 

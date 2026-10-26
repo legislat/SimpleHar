@@ -147,6 +147,7 @@ header.sh-header {
 .sh-bar > i { display: block; height: 100%; background: var(--sh-accent-solid); }
 .sh-bar[data-tone="reserve"] > i { background: var(--sh-warn); }
 .sh-bar[data-tone="observed"] > i { background: #4a7fb5; }
+.sh-bar[data-tone="ram"] > i { background: #7a5fb0; }
 .sh-mem label { font-size: 0.75rem; color: var(--pico-muted-color); display: block; margin-bottom: 0.2rem; }
 
 /* Tabs: models live below the header (operator mockup). */
@@ -155,12 +156,17 @@ header.sh-header {
   gap: 0.3rem;
   margin: 0.6rem 0 0.8rem;
   flex-wrap: wrap;
+  /* Pico redefines --pico-color (to #fff) on every button element, so tab ink is
+   * captured here, on a non-button ancestor, where --pico-color is the real text
+   * color of the current theme. */
+  --sh-tab-ink: var(--pico-color);
 }
 
 .sh-tab {
   border: 1px solid var(--pico-card-border-color);
   border-radius: var(--sh-radius) var(--sh-radius) 0 0;
   background: transparent;
+  color: var(--sh-tab-ink);
   padding: 0.45rem 0.9rem;
   cursor: pointer;
   font-weight: 600;
@@ -229,7 +235,9 @@ table.sh-models td, table.sh-models th { padding: 0.45rem 0.6rem; }
   width: auto;
 }
 
-.sh-theme-toggle { position: absolute; right: 1rem; top: 0.7rem; }
+/* Above the sticky header (z-index 10) so its own corner is clickable: the header
+ * subtree otherwise intercepts the toggle's pointer events (Playwright-found). */
+.sh-theme-toggle { position: absolute; right: 1rem; top: 0.7rem; z-index: 11; }
 
 footer.sh-footer {
   color: var(--pico-muted-color);

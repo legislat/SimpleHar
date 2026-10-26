@@ -82,10 +82,6 @@ impl std::str::FromStr for CategoryId {
     }
 }
 
-fn is_true(flag: &bool) -> bool {
-    *flag
-}
-
 fn one() -> usize {
     1
 }
@@ -166,8 +162,11 @@ pub struct CategoryConfig {
     #[serde(default)]
     pub idle_timeout_s: u64,
     /// This category's listener also serves `/har/*` and the control page;
-    /// exactly one category sets this (Step 11).
-    #[serde(default, skip_serializing_if = "is_true")]
+    /// exactly one category sets this (Step 11). Always serialized: the old
+    /// `skip_serializing_if = "is_true"` was inverted (skipped the only value
+    /// that matters), so a config rebuilt through `to_value` lost its control
+    /// category and refused to boot (found by the live restart test, 2026-10-26).
+    #[serde(default)]
     pub control: bool,
     /// Internal engine ports for this category's slots (loopback only). When empty
     /// or short, ports are assigned sequentially from 18109 in category order
@@ -278,6 +277,13 @@ pub struct AppConfig {
     /// trigger, and settle accepts `baseline + tolerance` (Step 4 rule 4).
     #[serde(default = "default_witness_tolerance")]
     pub witness_tolerance_gb: f64,
+    /// The file this config was loaded from (`SIMPLEHAR_CONFIG` or beside the exe),
+    /// stamped by the boot loader. `#[serde(skip)]` so it never enters the persisted
+    /// JSON. `default_model` write-back targets this exact path — read and write must
+    /// be the same file, or a `SIMPLEHAR_CONFIG` run silently loses its defaults on
+    /// restart (operator finding, 2026-10-26).
+    #[serde(skip, default)]
+    pub source_path: Option<std::path::PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -295,6 +301,7 @@ impl Default for AppConfig {
             modelconf_dir: default_modelconf_dir(),
             settle_timeout_s: default_settle_timeout(),
             witness_tolerance_gb: default_witness_tolerance(),
+            source_path: None,
         }
     }
 }

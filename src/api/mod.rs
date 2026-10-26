@@ -94,10 +94,21 @@ impl ApiError {
     }
 }
 
+/// The single JSON error body (A2): SE-native flat `code`/`message` plus the
+/// OpenAI-compatible `error` envelope with the same values.
+fn error_body(error: &ApiError) -> Value {
+    let message = error.to_string();
+    let code = error.code();
+    json!({
+        "code": code,
+        "message": message,
+        "error": { "message": message, "type": "simplehar_error", "code": code },
+    })
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = json!({ "code": self.code(), "message": self.to_string() });
-        (self.status(), Json(body)).into_response()
+        (self.status(), Json(error_body(&self))).into_response()
     }
 }
 
@@ -291,10 +302,14 @@ async fn health() -> Json<Value> {
 /// Writes `category.default_model` into `simplehar.json` atomically: parse the
 /// on-disk file (or the boot config when absent), patch the one field, temp+rename.
 fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option<&str>) -> bool {
-    let path = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("simplehar.json")))
-        .unwrap_or_else(|| std::path::PathBuf::from("simplehar.json"));
+    // Write-back must target the file boot actually loaded (`SIMPLEHAR_CONFIG`
+    // included), or a test/LAN config silently loses its defaults (finding #2).
+    let path = config.source_path.clone().unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("simplehar.json")))
+            .unwrap_or_else(|| std::path::PathBuf::from("simplehar.json"))
+    });
     let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
             tracing::warn!(error = %error, "simplehar.json unreadable; rewriting from boot config");
@@ -303,6 +318,15 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
         Err(_) => serde_json::to_value(config).expect("invariant: config serializes"),
     };
     let id = category.to_string();
+    // A partial config file (e.g. only `modelconf_dir` set) has no categories to
+    // patch — rebuild the tree from the boot config, which carries all four.
+    if root
+        .get("categories")
+        .and_then(serde_json::Value::as_array)
+        .is_none()
+    {
+        root = serde_json::to_value(config).expect("invariant: config serializes");
+    }
     let Some(categories) = root.get_mut("categories").and_then(|c| c.as_array_mut()) else {
         tracing::error!("cannot persist default_model: no categories in simplehar.json");
         return false;
@@ -578,14 +602,7 @@ pub async fn guard(request: axum::extract::Request, next: axum::middleware::Next
         .unwrap_or_else(next_request_id);
 
     if let Some(reason) = reject_reason(&request) {
-        let response = (
-            reason.status(),
-            Json(json!({
-                "code": reason.code(),
-                "message": reason.to_string(),
-            })),
-        )
-            .into_response();
+        let response = (reason.status(), Json(error_body(&reason))).into_response();
         return with_request_id(response, &request_id);
     }
 
@@ -791,10 +808,12 @@ async fn har_config_model(
     let old_category = entry.category;
 
     let mut edits: Vec<(&str, Option<String>)> = Vec::new();
+    let mut requested_category: Option<CategoryId> = None;
     if let Some(raw) = body.get("category").and_then(Value::as_str) {
         let category: CategoryId = raw.parse().map_err(|_| ApiError::BadRequest {
             reason: format!("unknown category `{raw}` (WORK|RP|AUX|EMB)"),
         })?;
+        requested_category = Some(category);
         edits.push(("category", Some(category.to_string())));
     }
     if let Some(cpu) = body.get("cpu").and_then(Value::as_bool) {
@@ -812,15 +831,28 @@ async fn har_config_model(
     // The catalog must reflect the file the moment the operator looks again.
     state.scheduler.reload().await.map_err(ApiError::from)?;
 
-    // A loaded model whose category changed must move slots, not lie in place.
-    let category_changed = edits.iter().any(|(key, _)| *key == "category");
-    if category_changed && old_category != entry.category {
-        // old_category was the entry's category before the edit; the fresh entry
-        // (post-reload) holds the new one, resolved below from the new catalog.
+    // A model whose category actually changed must move slots, not lie in place
+    // (v3.3 §-behavior, kept). The old guard compared `entry.category` against
+    // itself and never fired. If the moved model was its old category's default,
+    // that default now dangles — clear it too (operator finding #1, 2026-10-26).
+    if let Some(new_cat) = requested_category.filter(|c| *c != old_category) {
         let catalog = state.catalog().await?;
-        if let Some(fresh) = catalog.iter().find(|m| m.name == entry.name) {
-            if fresh.category != old_category {
-                let _ = state.scheduler.unload(old_category).await;
+        if catalog
+            .iter()
+            .any(|m| m.name == entry.name && m.category != old_category)
+        {
+            let _ = state.scheduler.unload(old_category).await;
+            if let Some(default) = state.default_model(old_category) {
+                if crate::catalog::resolve(&default, &catalog).is_some_and(|d| d.name == entry.name)
+                {
+                    state.set_default_model(old_category, None);
+                    tracing::info!(
+                        model = %entry.name,
+                        from = %old_category,
+                        to = %new_cat,
+                        "cleared dangling category default"
+                    );
+                }
             }
         }
     }
@@ -860,7 +892,8 @@ async fn mem_section(state: &ApiState) -> Value {
         .await
         .map(|status| status.slots.iter().filter_map(|slot| slot.need_gib).sum())
         .unwrap_or_default();
-    match state.witness.sample().await {
+    let ram = crate::witness::ram_sample();
+    let mut section = match state.witness.sample().await {
         Ok(sample) => json!({
             "total_gb": sample.total_gib,
             "reserve_gb": state.config.vram_reserve_gb,
@@ -877,7 +910,14 @@ async fn mem_section(state: &ApiState) -> Value {
             "external_gb": null,
             "source": format!("unavailable ({reason})"),
         }),
+    };
+    // A1: host RAM is informational context next to the VRAM bars (§0.4 keeps it
+    // out of admission).
+    if let Value::Object(fields) = &mut section {
+        fields.insert("ram_total_gb".to_string(), json!(ram.map(|r| r.total_gib)));
+        fields.insert("ram_used_gb".to_string(), json!(ram.map(|r| r.used_gib)));
     }
+    section
 }
 
 /// `GET /har/jobs` — the ledger this timekeeping always pretended to be (F-5 fix).
@@ -1181,6 +1221,20 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_body_carries_flat_and_openai_envelope() {
+        // A2: both shapes present and consistent.
+        let err = ApiError::NotFound {
+            what: "model `x`".to_string(),
+        };
+        let body = error_body(&err);
+        assert_eq!(body["code"], "not_found");
+        assert_eq!(body["message"], "not found: model `x`");
+        assert_eq!(body["error"]["type"], "simplehar_error");
+        assert_eq!(body["error"]["code"], "not_found");
+        assert_eq!(body["error"]["message"], body["message"]);
+    }
 
     #[test]
     fn status_codes_come_from_types_not_text() {

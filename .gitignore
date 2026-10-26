@@ -2,6 +2,8 @@
 /base-archive
 /logs
 /.env
+# Local model configs (absolute machine paths), same local-only rationale.
+/ModelConf
 # Governing docs are local-only per operator decision (2026-10-25).
 /AGENTS.md
 /AUX-RULES.md
