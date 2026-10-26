@@ -506,6 +506,8 @@ struct Job {
     cost: crate::model::CostClass,
     /// Model's `launch_only_with_at_least_vram_free` in GiB, if set.
     launch_floor: Option<f64>,
+    /// Model's per-load readiness deadline (`load_timeout:`); `None` = config default.
+    load_timeout_s: Option<u64>,
     /// The `available` value (free_at_admit + released) the release-minimality
     /// re-check must reach before spawning: `max(need, floor)` at plan time
     /// (floor alone for greedy). Without it, a greedy job whose booked need was
@@ -945,6 +947,7 @@ impl ActorState {
             need: None,
             cost: crate::model::CostClass::Fixed,
             launch_floor: None,
+            load_timeout_s: None,
             gate_target: None,
             free_at_admit: None,
             external_at_admit: None,
@@ -1045,6 +1048,7 @@ impl ActorState {
             slot: Some(slot),
             cost: entry.cost,
             launch_floor: entry.launch_floor_gb,
+            load_timeout_s: entry.load_timeout_s,
             gate_target: None,
         };
         let need = match entry.cost {
@@ -1570,7 +1574,11 @@ impl ActorState {
             .expect("invariant: readiness is set when a spawn exists");
         let tx = self.tx.clone();
         let runtime = Arc::clone(&self.runtime);
-        let deadline = Duration::from_secs(self.cfg.load_timeout_s);
+        let deadline = Duration::from_secs(
+            self.jobs[&job_id]
+                .load_timeout_s
+                .unwrap_or(self.cfg.load_timeout_s),
+        );
         let handle = tokio::spawn(async move {
             let started = Instant::now();
             let mut discovered = None;

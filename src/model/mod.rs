@@ -90,6 +90,10 @@ pub struct ModelEntry {
     /// unless VRAM free at decision time reaches this floor in GiB. The guard for
     /// greedy offloaders: launching a huge quant onto a busy card thrashes RAM/SSD.
     pub launch_floor_gb: Option<f64>,
+    /// Per-model readiness deadline in seconds (`load_timeout:`); `None` uses the
+    /// config default. Strata-class cold starts run for many minutes and would
+    /// otherwise be cut off by the global gate (v3.3 parity).
+    pub load_timeout_s: Option<u64>,
     /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
     /// Informational for managed models; used for stem/path aliases (Step 10).
     pub model_ref: Option<String>,
@@ -187,6 +191,27 @@ impl ModelEntry {
             Some(raw) => Some(parse_gib("launch_only_with_at_least_vram_free", raw)?),
             None => None,
         };
+        // u64 parse rejects nan/inf/1e400 outright; the ceiling guards a typo that
+        // would park a load job in readiness forever.
+        let load_timeout_s = match keys.get("load_timeout") {
+            Some(raw) => {
+                let v = raw
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| ModelError::BadNumber {
+                        field: "load_timeout".to_string(),
+                        value: raw.to_string(),
+                    })?;
+                if v == 0 || v > 86_400 {
+                    return Err(ModelError::BadNumber {
+                        field: "load_timeout".to_string(),
+                        value: raw.to_string(),
+                    });
+                }
+                Some(v)
+            }
+            None => None,
+        };
         Ok(ModelEntry {
             name: name.trim().to_string(),
             engine: keys
@@ -198,6 +223,7 @@ impl ModelEntry {
             gguf_size_gb: None,
             cost,
             launch_floor_gb,
+            load_timeout_s,
             model_ref: keys.get("model").cloned(),
             serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
             file: None,
@@ -224,6 +250,21 @@ mod tests {
         assert_eq!(entry.category, CategoryId::Work);
         assert_eq!(entry.engine, "llama");
         assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
+    }
+
+    #[test]
+    fn load_timeout_parses_and_bounds() {
+        let entry = ModelEntry::from_flat(&flat(&[("name", "s"), ("load_timeout", "1200")]))
+            .expect("valid entry");
+        assert_eq!(entry.load_timeout_s, Some(1200));
+        for bad in ["0", "86401", "abc", "-5", "nan", "1e400"] {
+            let err = ModelEntry::from_flat(&flat(&[("name", "s"), ("load_timeout", bad)]))
+                .expect_err("{bad} must be refused");
+            assert!(
+                matches!(err, ModelError::BadNumber { ref field, .. } if field == "load_timeout"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

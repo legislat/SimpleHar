@@ -80,6 +80,9 @@ async fn main() -> ExitCode {
         config.internal_host.to_string(),
     ));
     adapters.insert("llama".to_string(), llama);
+    let strata: Arc<dyn EngineAdapter> =
+        Arc::new(simplehar_se::engine::strata::StrataAdapter::default());
+    adapters.insert("strata".to_string(), strata);
     let runtime: Arc<dyn EngineRuntime> = Arc::new(ProcessRuntime::new());
     let witness: Arc<dyn simplehar_se::budget::VramWitness> =
         Arc::new(simplehar_se::witness::NvmlWitness::new());
@@ -521,6 +524,7 @@ Start Port    End Port
             gguf_size_gb: None,
             cost: simplehar_se::model::CostClass::Fixed,
             launch_floor_gb: None,
+            load_timeout_s: None,
             model_ref: model_ref.map(str::to_string),
             serve_model: None,
             file: None,

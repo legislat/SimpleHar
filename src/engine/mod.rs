@@ -7,6 +7,7 @@
 
 pub mod llama;
 pub mod mock;
+pub mod strata;
 
 use crate::model::ModelEntry;
 use crate::ownership::SpawnTicket;
@@ -46,6 +47,19 @@ pub enum EngineError {
 pub enum ReadinessSpec {
     /// `GET path` must answer `expect_status`.
     Http { path: String, expect_status: u16 },
+    /// `GET path` must answer `expect_status` **and** the JSON body's `field` must
+    /// not be an explicit `false`. A missing field, `null`, a non-bool, or a body
+    /// that is not JSON at all counts as ready — the flag is honored only when the
+    /// server actually reports it (strata `/health` answers 200 before the weights
+    /// finish loading; v3.3 `engine.rs` parity, fail-open on unparseable bodies).
+    HttpFlag {
+        /// Probe path.
+        path: String,
+        /// Required status code.
+        expect_status: u16,
+        /// Top-level JSON boolean that must not be `false`.
+        field: String,
+    },
     /// Both specs in order (e.g. `/health` then `/v1/models` for ninfer).
     Then(Box<ReadinessSpec>, Box<ReadinessSpec>),
 }
@@ -96,32 +110,64 @@ pub trait EngineAdapter: Send + Sync {
 ///
 /// `Then` chains probe steps in order: the first non-`Ready` step short-circuits.
 pub async fn http_probe(client: &reqwest::Client, port: u16, readiness: &ReadinessSpec) -> Probe {
-    let (path, expect) = match readiness {
+    match readiness {
+        ReadinessSpec::Http { .. } | ReadinessSpec::HttpFlag { .. } => {
+            probe_one(client, port, readiness).await
+        }
+        ReadinessSpec::Then(first, second) => {
+            let first = probe_one(client, port, first).await;
+            if first != Probe::Ready {
+                return first;
+            }
+            probe_one(client, port, second).await
+        }
+    }
+}
+
+/// One leaf expectation (`Http` or `HttpFlag`); a nested `Then` is a contract bug.
+async fn probe_one(client: &reqwest::Client, port: u16, spec: &ReadinessSpec) -> Probe {
+    let (path, expect) = match spec {
         ReadinessSpec::Http {
             path,
             expect_status,
+        }
+        | ReadinessSpec::HttpFlag {
+            path,
+            expect_status,
+            ..
         } => (path.clone(), *expect_status),
-        ReadinessSpec::Then(first, _) => match first.as_ref() {
-            ReadinessSpec::Http {
-                path,
-                expect_status,
-            } => (path.clone(), *expect_status),
-            other => {
-                return Probe::Failed {
-                    reason: format!("cannot probe nested spec {other:?}"),
-                }
-            }
-        },
+        ReadinessSpec::Then(_, _) => {
+            return Probe::Failed {
+                reason: "cannot probe a nested Then as a leaf".to_string(),
+            };
+        }
     };
     let url = format!("http://127.0.0.1:{port}{path}");
-    match client.get(&url).send().await {
-        Ok(response) if response.status().as_u16() == expect => Probe::Ready,
-        Ok(response) => Probe::NotYet {
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return Probe::NotYet {
+                reason: format!("no answer yet: {error}"),
+            };
+        }
+    };
+    if response.status().as_u16() != expect {
+        return Probe::NotYet {
             reason: format!("health answered {}", response.status()),
-        },
-        Err(error) => Probe::NotYet {
-            reason: format!("no answer yet: {error}"),
-        },
+        };
+    }
+    let ReadinessSpec::HttpFlag { field, .. } = spec else {
+        return Probe::Ready;
+    };
+    // Status matched and a flag is required: honor `field` only when the body is
+    // JSON with `field == false` (v3.3 fail-open on anything else).
+    match response.json::<serde_json::Value>().await {
+        Ok(body) if matches!(body.get(field), Some(serde_json::Value::Bool(false))) => {
+            Probe::NotYet {
+                reason: format!("engine reports `{field}: false`"),
+            }
+        }
+        _ => Probe::Ready,
     }
 }
 
@@ -191,4 +237,153 @@ pub trait EngineRuntime: Send + Sync {
     /// `None` when the engine does not answer or reports nothing: callers fall
     /// back to the harness name.
     async fn discover_model_id(&self, port: u16) -> Option<String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::Arc;
+
+    /// One-shot HTTP server on an ephemeral port answering `/health` with a fixed
+    /// status and body; returns the bound port (kept alive by the spawned task).
+    async fn serve_health(status: u16, body: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        let code = Arc::new(AtomicU16::new(status));
+        let app = {
+            let code = Arc::clone(&code);
+            axum::Router::new().route(
+                "/health",
+                axum::routing::get(move || async move {
+                    (
+                        axum::http::StatusCode::from_u16(code.load(Ordering::Relaxed))
+                            .unwrap_or(axum::http::StatusCode::OK),
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                        .into_response()
+                }),
+            )
+        };
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        port
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .expect("client")
+    }
+
+    #[tokio::test]
+    async fn http_flag_false_is_not_ready() {
+        let port = serve_health(200, r#"{"loaded":false}"#).await;
+        let spec = ReadinessSpec::HttpFlag {
+            path: "/health".to_string(),
+            expect_status: 200,
+            field: "loaded".to_string(),
+        };
+        assert!(matches!(
+            http_probe(&client(), port, &spec).await,
+            Probe::NotYet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_flag_true_is_ready() {
+        let port = serve_health(200, r#"{"loaded":true}"#).await;
+        let spec = ReadinessSpec::HttpFlag {
+            path: "/health".to_string(),
+            expect_status: 200,
+            field: "loaded".to_string(),
+        };
+        assert_eq!(http_probe(&client(), port, &spec).await, Probe::Ready);
+    }
+
+    #[tokio::test]
+    async fn http_flag_missing_or_null_or_nonbool_is_ready_v33_parity() {
+        let spec = ReadinessSpec::HttpFlag {
+            path: "/health".to_string(),
+            expect_status: 200,
+            field: "loaded".to_string(),
+        };
+        for body in [
+            r#"{"status":"ok"}"#,
+            r#"{"loaded":null}"#,
+            r#"{"loaded":"true"}"#,
+            "not json at all",
+        ] {
+            let port = serve_health(200, body).await;
+            assert_eq!(
+                http_probe(&client(), port, &spec).await,
+                Probe::Ready,
+                "body `{body}` must count as ready"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_flag_wrong_status_is_not_ready() {
+        let port = serve_health(503, r#"{"loaded":true}"#).await;
+        let spec = ReadinessSpec::HttpFlag {
+            path: "/health".to_string(),
+            expect_status: 200,
+            field: "loaded".to_string(),
+        };
+        assert!(matches!(
+            http_probe(&client(), port, &spec).await,
+            Probe::NotYet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn then_chains_in_order() {
+        let port = serve_health(200, r#"{"loaded":false}"#).await;
+        let spec = ReadinessSpec::Then(
+            Box::new(ReadinessSpec::Http {
+                path: "/health".to_string(),
+                expect_status: 200,
+            }),
+            Box::new(ReadinessSpec::HttpFlag {
+                path: "/health".to_string(),
+                expect_status: 200,
+                field: "loaded".to_string(),
+            }),
+        );
+        assert!(matches!(
+            http_probe(&client(), port, &spec).await,
+            Probe::NotYet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn nested_then_as_leaf_is_a_failed_contract_bug() {
+        let spec = ReadinessSpec::Then(
+            Box::new(ReadinessSpec::Then(
+                Box::new(ReadinessSpec::Http {
+                    path: "/health".to_string(),
+                    expect_status: 200,
+                }),
+                Box::new(ReadinessSpec::Http {
+                    path: "/health".to_string(),
+                    expect_status: 200,
+                }),
+            )),
+            Box::new(ReadinessSpec::Http {
+                path: "/health".to_string(),
+                expect_status: 200,
+            }),
+        );
+        assert!(matches!(
+            http_probe(&client(), 1, &spec).await,
+            Probe::Failed { .. }
+        ));
+    }
 }

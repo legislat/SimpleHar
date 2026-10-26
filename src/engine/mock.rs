@@ -53,6 +53,7 @@ mod tests {
             gguf_size_gb: None,
             cost: crate::model::CostClass::Fixed,
             launch_floor_gb: None,
+            load_timeout_s: None,
             model_ref: None,
             serve_model: None,
             file: None,

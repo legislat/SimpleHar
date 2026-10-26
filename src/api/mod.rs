@@ -538,6 +538,7 @@ fn model_json(entry: &ModelEntry) -> Value {
         "vram_gb": entry.vram_gb,
         "cost": entry.cost,
         "launch_floor_gb": entry.launch_floor_gb,
+        "load_timeout_s": entry.load_timeout_s,
         "cpu_offload": entry
             .raw
             .get("cpu_offload")
@@ -1270,6 +1271,7 @@ mod tests {
             gguf_size_gb: None,
             cost: crate::model::CostClass::Fixed,
             launch_floor_gb: None,
+            load_timeout_s: None,
             model_ref: Some(r"F:\m.gguf".to_string()),
             serve_model: None,
             file: None,
@@ -1292,6 +1294,7 @@ mod tests {
         assert_eq!(body["model_ref"], json!(r"F:\m.gguf"));
         assert_eq!(body["cost"], json!("fixed"));
         assert!(body["launch_floor_gb"].is_null());
+        assert!(body["load_timeout_s"].is_null());
     }
 
     #[test]

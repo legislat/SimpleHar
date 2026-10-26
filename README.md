@@ -61,7 +61,7 @@ partial files are completed, an invalid file is fatal with every problem logged
 | `vram_reserve_gb` | `2.0` | Kept unreachable by admission |
 | `witness_tolerance_gb` | `2.0` | NVML/ledger disagreement band; also the settle allowance |
 | `greedy_launch_min_free_gb` | `4.0` | Launch floor applied to `cost: greedy` models without their own `launch_only_with_at_least_vram_free` |
-| `load_timeout_s` | `120` | Readiness deadline per load |
+| `load_timeout_s` | `120` | Readiness deadline per load; per-model override via the `load_timeout:` yaml key |
 | `release_timeout_s` | `60` | Kill-confirmation deadline (G12) |
 | `settle_timeout_s` | `30` | Memory-settle deadline after release |
 | `protected_ports` | v3.3 ecosystem set | Ports the harness must never bind or touch |
@@ -77,7 +77,7 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 |---|---|
 | `name` | Canonical harness name; also matched by file-stem/path aliases |
 | `model` | GGUF path (or `scheme://` engine sentinel). **Required for llama** |
-| `engine` | `llama` (default) or `mock` |
+| `engine` | `llama` (default), `strata`, or `mock` |
 | `category` | `WORK`/`RP`/`AUX`/`EMB` |
 | `vram_gb` | Declared admission cost in GiB; `fixed` falls back to `file size × 1.15 + 2`, `exact` refuses without it |
 | `cost` | `fixed` (default): size binds admission · `greedy`: offloads to RAM/SSD, size never refuses but a launch floor is mandatory · `exact`: engine-computed number, required and binding |
@@ -87,15 +87,30 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `sticky` | Legacy alias → `AUX` |
 | `context`, `batch`, `flash_attn`, … | Mapped to llama flags per the start.ps1 parity table |
+| `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata cold starts use 600–1200) |
+| `strata_config` | **Required for strata.** Profile JSON path; existence-checked before spawn. Weights/quant/context all live in this file, never in argv |
+| `strata_python` | Interpreter (default `C:\Strata\.venv\Scripts\python.exe`); existence-checked before spawn |
+| `strata_cwd` | Working directory (default `C:\Strata`) |
 | `extra_args` | The **only** key whose text reaches argv verbatim (whitespace-split); all other unknown keys are preserved in the catalog for reference but never launched |
+
+### Strata engines
+
+Strata models (`engine: strata`) launch `python -m serve.server --engine strata
+--config <strata_config> --port <assigned>` in `strata_cwd`; the harness-assigned
+engine port always wins over anything in the profile. Readiness requires `/health`
+200 **and** the JSON `loaded` flag not being `false` (strata answers 200 while
+weights stream in). There is no preload anywhere in this harness: a strata engine
+starts only when an operator loads it (or a client request names it through the
+proxy); booting the harness spawns nothing.
 
 After editing files, press **Rescan** (or `POST /har/rescan`).
 
 ## Control page
 
-`http://127.0.0.1:8708/` — slot cards + memory bars (VRAM ledger/reserve/observed,
-host RAM), category tabs, per-model rows (state dot, Ctx, Cost, Files, category
-select, CPU checkbox, Load / Set default), recent jobs, collapsible harness log.
+`http://127.0.0.1:8708/` — slot cards + memory bars (VRAM ledger with the reserve
+marked as a hatched band, observed, host RAM), category tabs, per-model rows
+(Load / Set default, state dot + name, category select, CPU checkbox, Engine,
+Ctx, Cost, Files), recent jobs, collapsible harness log.
 Updates push over SSE (`/har/events`) and degrade to polling; adaptive light/dark
 theme with a toggle.
 
