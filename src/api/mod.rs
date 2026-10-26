@@ -536,10 +536,9 @@ fn model_json(entry: &ModelEntry) -> Value {
         "engine": entry.engine,
         "category": entry.category,
         "vram_gb": entry.vram_gb,
-        // The number admission actually books when `vram_gb` is undeclared
-        // (GGUF size x 1.15 + 2), so the page's Cost column never reads bare
-        // "est." for a model whose cost the harness already knows.
-        "est_vram_gb": entry.vram_gb.is_none().then(|| {
+        // The number admission books only when BOTH declared and measured are
+        // absent (GGUF size x 1.15 + 2) — the page's last-resort Cost figure.
+        "est_vram_gb": (entry.vram_gb.is_none() && entry.measured_gb.is_none()).then(|| {
             crate::budget::need_gb(
                 None,
                 entry.gguf_size_gb.map(crate::budget::Gibibytes),
@@ -547,6 +546,7 @@ fn model_json(entry: &ModelEntry) -> Value {
             .ok()
             .map(|n| n.0)
         }).flatten(),
+        "measured_gb": entry.measured_gb,
         "cost": entry.cost,
         "launch_floor_gb": entry.launch_floor_gb,
         "load_timeout_s": entry.load_timeout_s,
@@ -1283,6 +1283,7 @@ mod tests {
             cost: crate::model::CostClass::Fixed,
             launch_floor_gb: None,
             load_timeout_s: None,
+            measured_gb: None,
             model_ref: Some(r"F:\m.gguf".to_string()),
             serve_model: None,
             file: None,
@@ -1306,6 +1307,35 @@ mod tests {
         assert_eq!(body["cost"], json!("fixed"));
         assert!(body["launch_floor_gb"].is_null());
         assert!(body["load_timeout_s"].is_null());
+        assert!(body["measured_gb"].is_null());
+    }
+
+    #[test]
+    fn est_vram_gb_only_when_declared_and_measured_are_absent() {
+        let mut entry = ModelEntry {
+            name: "m".to_string(),
+            engine: "llama".to_string(),
+            category: CategoryId::Work,
+            vram_gb: None,
+            gguf_size_gb: Some(23.0),
+            cost: crate::model::CostClass::Fixed,
+            launch_floor_gb: None,
+            load_timeout_s: None,
+            measured_gb: None,
+            model_ref: Some(r"F:\m.gguf".to_string()),
+            serve_model: None,
+            file: None,
+            raw: BTreeMap::new(),
+        };
+        let body = model_json(&entry);
+        assert_eq!(body["est_vram_gb"], json!(23.0 * 1.15 + 2.0));
+        entry.measured_gb = Some(70.5);
+        let body = model_json(&entry);
+        assert_eq!(body["measured_gb"], json!(70.5));
+        assert!(
+            body["est_vram_gb"].is_null(),
+            "admission books the measurement, not the estimate"
+        );
     }
 
     #[test]

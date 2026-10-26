@@ -13,6 +13,7 @@ use serde_json::json;
 use simplehar_se::engine::{EngineRuntime, LaunchSpec, Probe, ReadinessSpec, SpawnError, Spawned};
 use simplehar_se::ownership::SpawnTicket;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -64,6 +65,8 @@ async fn models() -> Json<serde_json::Value> {
 pub struct MockRuntime {
     servers: Arc<Mutex<HashMap<u16, MockServer>>>,
     client: reqwest::Client,
+    pid_base: Arc<Mutex<Option<u32>>>,
+    spawn_counter: Arc<AtomicU32>,
 }
 
 impl Default for MockRuntime {
@@ -83,14 +86,27 @@ impl MockRuntime {
         MockRuntime {
             servers: Arc::new(Mutex::new(HashMap::new())),
             client,
+            pid_base: Arc::new(Mutex::new(None)),
+            spawn_counter: Arc::new(AtomicU32::new(0)),
         }
     }
 
     /// Number of live engines (leak-check helper for F-1 / F-6). Used by the
-    /// scheduler_actor test binary; other binaries sharing this module may not.
+    /// scheduler_actor test binary; other binaries sharing this module may not call it.
     #[allow(dead_code)]
     pub fn server_count(&self) -> usize {
         self.servers.lock().expect("mock runtime lock").len()
+    }
+
+    /// Report unique pids (base, base+1, ...) per spawn instead of the default
+    /// pid 0: witness scripts attribute own-engine usage by pid, so the
+    /// measured-footprint tests pin attribution with a per-test runtime. Used
+    /// by the scheduler_eviction binary only; other binaries see it as dead.
+    #[allow(dead_code)]
+    pub fn with_unique_pids(base: u32) -> Self {
+        let runtime = MockRuntime::new();
+        *runtime.pid_base.lock().expect("pid base lock") = Some(base);
+        runtime
     }
 
     /// Whether nothing accepts on `port` anymore (release evidence, G12). Used by the
@@ -183,7 +199,11 @@ impl EngineRuntime for MockRuntime {
             .lock()
             .expect("mock runtime lock")
             .insert(port, MockServer { mode, handle });
-        Ok(Spawned { port, pid: 0 })
+        let pid = match *self.pid_base.lock().expect("pid base lock") {
+            Some(base) => base + self.spawn_counter.fetch_add(1, Ordering::Relaxed),
+            None => 0,
+        };
+        Ok(Spawned { port, pid })
     }
 
     async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError> {

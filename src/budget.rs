@@ -189,14 +189,34 @@ pub struct MemorySample {
 }
 
 impl MemorySample {
+    /// Shared per-process aggregation: count and sum of entries whose pid is
+    /// in (`include` true) or out of (false) `pids`.
+    fn attributed(&self, pids: &[u32], include: bool) -> (usize, f64) {
+        self.processes
+            .iter()
+            .filter(|(pid, _)| pids.contains(pid) == include)
+            .map(|(_, used)| *used)
+            .fold((0usize, 0f64), |(n, s), used| (n + 1, s + used))
+    }
+
     /// Usage not attributable to `own_pids` — the external reservation the budget
     /// must subtract (Step 4 rule 2).
     pub fn external_gib(&self, own_pids: &[u32]) -> f64 {
-        self.processes
-            .iter()
-            .filter(|(pid, _)| !own_pids.contains(pid))
-            .map(|(_, used)| *used)
-            .sum()
+        self.attributed(own_pids, false).1
+    }
+
+    /// Sum of ALL per-process figures (display: what NVML accounted in total),
+    /// distinct from `external_gib` — never pass an empty list to mean "all".
+    pub fn process_total_gib(&self) -> f64 {
+        self.attributed(&[], false).1
+    }
+
+    /// Footprint attributable to `own_pids` — the harness-measured engine usage.
+    /// `None` when per-process attribution is unavailable (no entries, or all
+    /// zeros under WDDM degradation): absence is reported, never a fake zero.
+    pub fn own_gib(&self, own_pids: &[u32]) -> Option<f64> {
+        let (count, total) = self.attributed(own_pids, true);
+        (count > 0 && total > 0.0).then_some(total)
     }
 
     /// Whether memory settled to `baseline + tolerance` after a release (§0.3: the
@@ -270,6 +290,23 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn own_gib_reports_attribution_or_none() {
+        let s = |procs: Vec<(u32, f64)>| MemorySample {
+            total_gib: 72.0,
+            used_gib: 40.0,
+            processes: procs,
+        };
+        assert_eq!(s(vec![]).own_gib(&[7]), None, "no attribution is not zero");
+        assert_eq!(
+            s(vec![(7, 0.0), (8, 0.0)]).own_gib(&[7]),
+            None,
+            "WDDM-degraded zeros are never a measurement"
+        );
+        assert_eq!(s(vec![(7, 30.0), (8, 10.0)]).own_gib(&[7]), Some(30.0));
+        assert_eq!(s(vec![(7, 30.0), (8, 10.0)]).own_gib(&[7, 8]), Some(40.0));
     }
 
     #[test]

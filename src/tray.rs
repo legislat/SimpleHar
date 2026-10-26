@@ -409,6 +409,7 @@ mod tests {
             index: 0,
             model: model.map(str::to_string),
             port: model.map(|_| 12345),
+            pid: model.map(|_| 1),
             need_gib: model.map(|_| 4.0),
             idle_s: model.map(|_| 0),
             serve_id: None,

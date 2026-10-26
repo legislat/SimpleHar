@@ -84,6 +84,7 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `launch_only_with_at_least_vram_free` | GiB. Refuse the load **before spawn** unless the physically free card reaches this floor (reserve deducted; foreign processes counted whenever per-process attribution is available) — the thrash guard for big/greedy quants. Greedy models without it inherit `greedy_launch_min_free_gb`; set `0` per-model to opt out explicitly |
 | `cpu_offload` | `true`/`1`/`on` → forces `-ngl 0` |
 | `serve_model` | Expected engine-reported id; mismatch = recorded warning, never trusted |
+| `measured_gb` | Written back by the harness after a successful load: the engine's witness-measured VRAM footprint, attributed to that engine's pid alone. The page shows it as truth for every cost class; admission consults it only for `fixed` models that lack `vram_gb` (greedy keeps nominal semantics, exact refuses without its declaration); a large divergence from `vram_gb` logs a verification warning |
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `sticky` | Legacy alias → `AUX` |
 | `context`, `batch`, `flash_attn`, … | Mapped to llama flags per the start.ps1 parity table |

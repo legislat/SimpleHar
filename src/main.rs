@@ -525,6 +525,7 @@ Start Port    End Port
             cost: simplehar_se::model::CostClass::Fixed,
             launch_floor_gb: None,
             load_timeout_s: None,
+            measured_gb: None,
             model_ref: model_ref.map(str::to_string),
             serve_model: None,
             file: None,

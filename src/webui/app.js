@@ -367,11 +367,19 @@ function modelRow(status, model, category) {
       "td",
       {},
       text(
-        model.vram_gb !== null
-          ? `${model.vram_gb} GiB`
-          : model.est_vram_gb !== null && model.est_vram_gb !== undefined
-            ? `${model.est_vram_gb.toFixed(1)} GiB (est.)`
-            : "est.",
+        // Cost honesty (operator 2026-10-26): a greedy model's nominal size is a
+        // model-size claim, not a VRAM footprint — measured or floor, never 55.
+        model.measured_gb !== null && model.measured_gb !== undefined
+          ? `measured ${model.measured_gb.toFixed(1)} GiB${model.cost === "greedy" ? " (greedy)" : ""}`
+          : model.cost === "greedy"
+            ? model.launch_floor_gb !== null && model.launch_floor_gb !== undefined
+              ? `greedy · floor ${model.launch_floor_gb} GiB`
+              : "greedy"
+            : model.vram_gb !== null
+              ? `${model.vram_gb} GiB`
+              : model.est_vram_gb !== null && model.est_vram_gb !== undefined
+                ? `${model.est_vram_gb.toFixed(1)} GiB (est.)`
+                : "est.",
       ),
     ),
   );

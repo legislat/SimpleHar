@@ -54,6 +54,7 @@ mod tests {
             cost: crate::model::CostClass::Fixed,
             launch_floor_gb: None,
             load_timeout_s: None,
+            measured_gb: None,
             model_ref: None,
             serve_model: None,
             file: None,

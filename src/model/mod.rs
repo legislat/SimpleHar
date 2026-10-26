@@ -63,8 +63,9 @@ pub enum CostClass {
     /// The engine's computed requirement (ninfer-style): binding like `fixed`,
     /// but never estimated — a missing `vram_gb` is refused rather than guessed
     /// (the size×1.15+2 fallback would be a precision claim with no source).
-    /// When the measured-cost ledger lands, measurement VERIFIES this class
-    /// (mismatch → warning) instead of overriding it as it does for `fixed`.
+    /// A harness measurement VERIFIES this class at install time (a diverging
+    /// `measured_gb` logs a warning) instead of overriding it as it does for
+    /// `fixed`.
     Exact,
 }
 
@@ -94,6 +95,12 @@ pub struct ModelEntry {
     /// config default. Strata-class cold starts run for many minutes and would
     /// otherwise be cut off by the global gate (v3.3 parity).
     pub load_timeout_s: Option<u64>,
+    /// Engine footprint measured by the harness at its last successful load
+    /// (`measured_gb:`, written back after Install). The page shows it as truth
+    /// for every cost class; admission consults it only for `fixed` models with
+    /// no declared `vram_gb` (greedy keeps nominal semantics; exact refuses
+    /// without its declared precision claim).
+    pub measured_gb: Option<f64>,
     /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
     /// Informational for managed models; used for stem/path aliases (Step 10).
     pub model_ref: Option<String>,
@@ -224,6 +231,21 @@ impl ModelEntry {
             cost,
             launch_floor_gb,
             load_timeout_s,
+            measured_gb: match keys.get("measured_gb") {
+                Some(raw) => {
+                    let v = parse_gib("measured_gb", raw)?;
+                    if v < 0.05 {
+                        // Below the writer's 0.1 quantum: a footprint this small
+                        // means nothing was attributed — absence, not a measurement.
+                        return Err(ModelError::BadNumber {
+                            field: "measured_gb".to_string(),
+                            value: raw.to_string(),
+                        });
+                    }
+                    Some(v)
+                }
+                None => None,
+            },
             model_ref: keys.get("model").cloned(),
             serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
             file: None,
@@ -250,6 +272,34 @@ mod tests {
         assert_eq!(entry.category, CategoryId::Work);
         assert_eq!(entry.engine, "llama");
         assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
+    }
+
+    #[test]
+    fn measured_gb_parses_and_rejects_garbage() {
+        let e = ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "70.5")]))
+            .expect("valid entry");
+        assert_eq!(e.measured_gb, Some(70.5));
+        assert!(matches!(
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "abc")]))
+                .expect_err("garbage"),
+            ModelError::BadNumber { .. }
+        ));
+        assert!(matches!(
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0")]))
+                .expect_err("zero is not a measurement"),
+            ModelError::BadNumber { .. }
+        ));
+        assert!(matches!(
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0.04")]))
+                .expect_err("sub-quantum is not a measurement"),
+            ModelError::BadNumber { .. }
+        ));
+        assert_eq!(
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0.05")]))
+                .expect("one quantum is")
+                .measured_gb,
+            Some(0.05)
+        );
     }
 
     #[test]

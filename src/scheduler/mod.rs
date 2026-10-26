@@ -151,6 +151,8 @@ pub struct SlotStatus {
     pub model: Option<String>,
     /// Engine port, if occupied.
     pub port: Option<u16>,
+    /// Child pid of the occupying engine (0 when the runtime reports none).
+    pub pid: Option<u32>,
     /// Admission cost of the occupant in GiB.
     pub need_gib: Option<f64>,
     /// Seconds since the occupant was last used (None when empty; Step 5).
@@ -437,6 +439,15 @@ enum ActorMsg {
     Touch {
         model: String,
     },
+    /// Witness-measured engine footprint from the install task (fire-and-forget):
+    /// displayed as truth and persisted to the model yaml for later reference
+    /// (operator 2026-10-26). `pid` binds the sample to the exact engine it was
+    /// taken for; a late message for a swapped-out model is dropped.
+    Measured {
+        model: String,
+        pid: u32,
+        gib: f64,
+    },
     /// Periodic sweep from the tick task: idles out occupants per category policy.
     Tick,
     Event {
@@ -634,6 +645,7 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
         match msg {
             ActorMsg::Command { cmd, reply } => state.on_command(cmd, reply),
             ActorMsg::Touch { model } => state.touch_model(&model),
+            ActorMsg::Measured { model, pid, gib } => state.on_measured(&model, pid, gib),
             ActorMsg::Tick => {
                 state.on_tick();
                 state.publish();
@@ -1048,6 +1060,64 @@ impl ActorState {
     fn touch_model(&mut self, model: &str) {
         self.last_used.insert(model.to_string(), Instant::now());
     }
+
+    /// Records the install-time witness footprint: on the catalog entry (page
+    /// shows it without a rescan) and — when it changed — in the model yaml
+    /// (`measured_gb`, byte-preserving write-back) so the number is referenced
+    /// on later boots (operator 2026-10-26). The pid must still be the serving
+    /// engine's own (late samples for swapped-out models are dropped) and a
+    /// value far from the declared size verifies the declaration with a warning
+    /// (design: measurement verifies, never silently overrides).
+    fn on_measured(&mut self, model: &str, pid: u32, gib: f64) {
+        let live = self.slots.iter().any(|slot| {
+            slot.occupant
+                .as_ref()
+                .is_some_and(|o| o.model == model && o.ticket.pid == pid)
+        });
+        if !live {
+            return;
+        }
+        let rounded = (gib * 10.0).round() / 10.0;
+        if rounded < 0.05 {
+            // Sub-quantum attribution is absence, not a measurement: persisting
+            // it would write the exact token the scanner's reader rule rejects.
+            return;
+        }
+        let mut persist: Option<std::path::PathBuf> = None;
+        let mut changed = false;
+        if let Some(entry) = self.catalog.iter_mut().find(|m| m.name == model) {
+            if entry.measured_gb != Some(rounded) {
+                if let Some(declared) = entry.vram_gb {
+                    let drift = (rounded - declared).abs();
+                    if drift > (declared * 0.25).max(2.0) {
+                        tracing::warn!(
+                            model,
+                            declared,
+                            measured = rounded,
+                            "measured footprint diverges from the declared vram_gb"
+                        );
+                    }
+                }
+                entry.measured_gb = Some(rounded);
+                persist = entry.file.clone();
+                changed = true;
+            }
+        }
+        if let Some(path) = persist {
+            let text = format!("{rounded:.1}");
+            let name = model.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) =
+                    crate::model::writeback::set_flag_on_file(&path, "measured_gb", Some(&text))
+                {
+                    tracing::warn!(error = %error, model = %name, "cannot persist measured_gb");
+                }
+            });
+        }
+        if changed {
+            self.publish();
+        }
+    }
     fn begin_load(&mut self, slot: usize, entry: ModelEntry, waiters: Vec<Waiter>) {
         let job_id = JobId(self.next_job);
         self.next_job += 1;
@@ -1090,7 +1160,18 @@ impl ActorState {
                 Err(AdmissionError::ExactUndeclared)
             }
             _ => budget::need_gb(
-                entry.vram_gb.map(Gibibytes),
+                entry
+                    .vram_gb
+                    .map(Gibibytes)
+                    // Fixed models consult the harness-measured footprint of an
+                    // earlier run before the size estimate. Greedy keeps nominal
+                    // semantics: a post-spill measurement is not a nominal size
+                    // and must not shrink the booking (review, 2026-10-26).
+                    .or_else(|| {
+                        (entry.cost == crate::model::CostClass::Fixed)
+                            .then(|| entry.measured_gb.map(Gibibytes))
+                            .flatten()
+                    }),
                 entry.gguf_size_gb.map(Gibibytes),
             ),
         };
@@ -1955,6 +2036,47 @@ impl ActorState {
                 serve_id: serve_id.clone(),
             });
         }
+        // Measured footprint (review, 2026-10-26): attributed to THIS engine's
+        // pid only — a co-resident tenant's memory must never be charged to this
+        // model. The witness caches ~2 s, so a pre-spawn sample simply lacks the
+        // pid: retry briefly, and on continued absence persist nothing.
+        if slot.is_some() {
+            let witness = Arc::clone(&self.witness);
+            let tx = self.tx.clone();
+            let measured_model = model.clone();
+            let child_pid = self.jobs[&job_id]
+                .spawned
+                .as_ref()
+                .map(|ticket| ticket.pid)
+                .unwrap_or(0);
+            tokio::spawn(async move {
+                for attempt in 0..4u32 {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                    match witness.sample().await {
+                        Ok(sample) => {
+                            if let Some(gib) = sample.own_gib(&[child_pid]) {
+                                let _ = tx.send(ActorMsg::Measured {
+                                    model: measured_model,
+                                    pid: child_pid,
+                                    gib,
+                                });
+                                return;
+                            }
+                            // A cached pre-spawn sample (2 s TTL) can lack the new
+                            // pid while attribution otherwise works: retry briefly.
+                            // No per-process data at all is degraded attribution —
+                            // absence — retrying cannot help.
+                            if sample.processes.is_empty() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
         self.set_timing(job_id, |t| &mut t.install_ms);
         self.step(job_id, SwapState::Serving);
         self.finish(
@@ -2125,6 +2247,7 @@ impl ActorState {
                     index: s.index,
                     model: s.occupant.as_ref().map(|o| o.model.clone()),
                     port: s.occupant.as_ref().map(|o| o.port),
+                    pid: s.occupant.as_ref().map(|o| o.ticket.pid),
                     need_gib: s.occupant.as_ref().map(|o| o.need.0),
                     idle_s: s.occupant.as_ref().map(|o| {
                         let last = state_last_used(o, &self.last_used);

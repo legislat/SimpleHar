@@ -9,6 +9,24 @@
 
 use crate::model::scan::parse_flat_yaml;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// Serializes every model-file rewrite process-wide. The harness is now a writer
+/// too (install-time `measured_gb` persist races the operator-initiated flag
+/// edits), and `with_extension` would also collapse `model.yaml` and `model.yml`
+/// onto one temp name — a global lock plus a unique temp forecloses both the
+/// lost-update race and the cross-file rename (review, 2026-10-26).
+fn write_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
+/// Monotonic suffix so two temp files can never collide.
+fn next_temp_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One editable flag: the yaml key it maps to.
 pub const EDITABLE_FLAGS: &[(&str, &str)] = &[("category", "category"), ("cpu", "cpu_offload")];
@@ -78,6 +96,10 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
 /// Read/parse/write failures as strings; the on-disk file is never left broken —
 /// a failed re-parse restores the original bytes before returning.
 pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(), String> {
+    // One writer at a time, and a unique temp name (see `write_gate`).
+    let _gate = write_gate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let original = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let updated = set_key_in_text(&original, key, value)?;
@@ -93,7 +115,11 @@ pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(
     if map.is_empty() {
         return Err("edit would produce an empty model file".to_string());
     }
-    let tmp = path.with_extension("yaml.sh.tmp");
+    let tmp = path.with_extension(format!(
+        "yaml.{}.{}.sh.tmp",
+        std::process::id(),
+        next_temp_seq()
+    ));
     std::fs::write(&tmp, updated.as_bytes())
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     if let Err(error) = std::fs::rename(&tmp, path) {

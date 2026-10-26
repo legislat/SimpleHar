@@ -152,6 +152,7 @@ mod tests {
             cost: crate::model::CostClass::Fixed,
             launch_floor_gb: None,
             load_timeout_s: None,
+            measured_gb: None,
             model_ref: Some("strata://test".to_string()),
             serve_model: Some("qwen3.8-flash-next".to_string()),
             file: None,
