@@ -40,6 +40,32 @@ pub enum ModelError {
         /// Raw value.
         value: String,
     },
+    /// `cost:` is not one of fixed|greedy|exact.
+    #[error("bad `cost` value `{value}` (fixed|greedy|exact)")]
+    BadCost {
+        /// The unparsable value as it appeared in the file.
+        value: String,
+    },
+}
+
+/// How a model's declared size participates in admission (operator design note,
+/// 2026-10-26: engines grade differently — some load everything into VRAM,
+/// some offload shards to RAM/SSD greedily).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CostClass {
+    /// Nominal size is binding: `need > free` evicts or refuses (the classic gate).
+    Fixed,
+    /// Greedy offloader (strata-style): nominal size never refuses — the engine
+    /// spills to RAM/SSD. Protected at launch by the VRAM floor gate: spawning a
+    /// huge quant onto an already-busy card thrashes RAM/SSD for minutes (G-admission note).
+    Greedy,
+    /// The engine's computed requirement (ninfer-style): binding like `fixed`,
+    /// but never estimated — a missing `vram_gb` is refused rather than guessed
+    /// (the size×1.15+2 fallback would be a precision claim with no source).
+    /// When the measured-cost ledger lands, measurement VERIFIES this class
+    /// (mismatch → warning) instead of overriding it as it does for `fixed`.
+    Exact,
 }
 
 /// One model from `ModelConf/`, typed (Step 10: harness name is canonical).
@@ -54,6 +80,16 @@ pub struct ModelEntry {
     /// Declared admission cost in GiB (Step 4 rule 1); `None` falls back to the
     /// GGUF-size formula.
     pub vram_gb: Option<f64>,
+    /// GiB size of the backing GGUF file, recorded by the scanner (None for
+    /// sentinels, missing files, and synthetic entries) — the estimate input at
+    /// admission (DESIGN Step 4 rule 1).
+    pub gguf_size_gb: Option<f64>,
+    /// How `vram_gb` participates in admission (`cost:` key, default `fixed`).
+    pub cost: CostClass,
+    /// `launch_only_with_at_least_vram_free:` — refuse the load **before spawn**
+    /// unless VRAM free at decision time reaches this floor in GiB. The guard for
+    /// greedy offloaders: launching a huge quant onto a busy card thrashes RAM/SSD.
+    pub launch_floor_gb: Option<f64>,
     /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
     /// Informational for managed models; used for stem/path aliases (Step 10).
     pub model_ref: Option<String>,
@@ -75,6 +111,27 @@ fn truthy(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "true" | "1" | "yes" | "on"
     )
+}
+
+/// The one GiB parser for every size-valued yaml key. Rust's `f64` parse accepts
+/// `nan`/`inf`/`1e400`, and every NaN comparison is false — an unchecked value
+/// would sail through `< 0.0` guards and silently disable the gates it feeds
+/// (review, 2026-10-26). Finite and non-negative, or it is a scan error.
+fn parse_gib(field: &str, raw: &str) -> Result<f64, ModelError> {
+    let v = raw
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| ModelError::BadNumber {
+            field: field.to_string(),
+            value: raw.to_string(),
+        })?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(ModelError::BadNumber {
+            field: field.to_string(),
+            value: raw.to_string(),
+        });
+    }
+    Ok(v)
 }
 
 impl ModelEntry {
@@ -110,10 +167,24 @@ impl ModelEntry {
             None => CategoryId::Work,
         };
         let vram_gb = match keys.get("vram_gb") {
-            Some(raw) => Some(raw.parse::<f64>().map_err(|_| ModelError::BadNumber {
-                field: "vram_gb".to_string(),
-                value: raw.clone(),
-            })?),
+            Some(raw) => Some(parse_gib("vram_gb", raw)?),
+            None => None,
+        };
+        let cost = match keys.get("cost") {
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "fixed" => CostClass::Fixed,
+                "greedy" => CostClass::Greedy,
+                "exact" => CostClass::Exact,
+                other => {
+                    return Err(ModelError::BadCost {
+                        value: other.to_string(),
+                    })
+                }
+            },
+            None => CostClass::Fixed,
+        };
+        let launch_floor_gb = match keys.get("launch_only_with_at_least_vram_free") {
+            Some(raw) => Some(parse_gib("launch_only_with_at_least_vram_free", raw)?),
             None => None,
         };
         Ok(ModelEntry {
@@ -124,6 +195,9 @@ impl ModelEntry {
                 .unwrap_or_else(|| "llama".to_string()),
             category,
             vram_gb,
+            gguf_size_gb: None,
+            cost,
+            launch_floor_gb,
             model_ref: keys.get("model").cloned(),
             serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
             file: None,
@@ -187,5 +261,42 @@ mod tests {
         let err = ModelEntry::from_flat(&flat(&[("name", "a"), ("vram_gb", "big")]))
             .expect_err("vram_gb must be numeric");
         assert!(matches!(err, ModelError::BadNumber { .. }));
+    }
+
+    #[test]
+    fn cost_classes_and_launch_floor_parse() {
+        // Operator design note 2026-10-26: graded admission per engine kind.
+        let entry = ModelEntry::from_flat(&flat(&[
+            ("name", "g"),
+            ("cost", "Greedy"),
+            ("launch_only_with_at_least_vram_free", "6"),
+        ]))
+        .expect("greedy parses");
+        assert_eq!(entry.cost, CostClass::Greedy);
+        assert_eq!(entry.launch_floor_gb, Some(6.0));
+
+        let exact = ModelEntry::from_flat(&flat(&[("name", "e"), ("cost", "exact")]))
+            .expect("exact parses");
+        assert_eq!(exact.cost, CostClass::Exact);
+
+        let fixed = ModelEntry::from_flat(&flat(&[("name", "f")])).expect("default cost");
+        assert_eq!(fixed.cost, CostClass::Fixed);
+        assert_eq!(fixed.launch_floor_gb, None);
+
+        let bad = ModelEntry::from_flat(&flat(&[("name", "x"), ("cost", "hoarder")]))
+            .expect_err("unknown cost class is a scan error, never a silent default");
+        assert!(matches!(bad, ModelError::BadCost { .. }), "{bad}");
+
+        for value in ["eight", "-2", "nan", "inf", "1e400"] {
+            let err = ModelEntry::from_flat(&flat(&[
+                ("name", "x"),
+                ("launch_only_with_at_least_vram_free", value),
+            ]))
+            .expect_err("floor must be a finite non-negative number");
+            assert!(matches!(err, ModelError::BadNumber { .. }), "{err}");
+            let err = ModelEntry::from_flat(&flat(&[("name", "x"), ("vram_gb", value)]))
+                .expect_err("vram_gb must be a finite non-negative number");
+            assert!(matches!(err, ModelError::BadNumber { .. }), "{err}");
+        }
     }
 }

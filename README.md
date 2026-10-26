@@ -60,6 +60,7 @@ partial files are completed, an invalid file is fatal with every problem logged
 | `vram_total_gb` | `72.0` | Admission ceiling |
 | `vram_reserve_gb` | `2.0` | Kept unreachable by admission |
 | `witness_tolerance_gb` | `2.0` | NVML/ledger disagreement band; also the settle allowance |
+| `greedy_launch_min_free_gb` | `4.0` | Launch floor applied to `cost: greedy` models without their own `launch_only_with_at_least_vram_free` |
 | `load_timeout_s` | `120` | Readiness deadline per load |
 | `release_timeout_s` | `60` | Kill-confirmation deadline (G12) |
 | `settle_timeout_s` | `30` | Memory-settle deadline after release |
@@ -78,12 +79,15 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `model` | GGUF path (or `scheme://` engine sentinel). **Required for llama** |
 | `engine` | `llama` (default) or `mock` |
 | `category` | `WORK`/`RP`/`AUX`/`EMB` |
-| `vram_gb` | Declared admission cost; falls back to `file size × 1.15 + 2` |
+| `vram_gb` | Declared admission cost in GiB; `fixed` falls back to `file size × 1.15 + 2`, `exact` refuses without it |
+| `cost` | `fixed` (default): size binds admission · `greedy`: offloads to RAM/SSD, size never refuses but a launch floor is mandatory · `exact`: engine-computed number, required and binding |
+| `launch_only_with_at_least_vram_free` | GiB. Refuse the load **before spawn** unless the physically free card reaches this floor (reserve deducted; foreign processes counted whenever per-process attribution is available) — the thrash guard for big/greedy quants. Greedy models without it inherit `greedy_launch_min_free_gb`; set `0` per-model to opt out explicitly |
 | `cpu_offload` | `true`/`1`/`on` → forces `-ngl 0` |
 | `serve_model` | Expected engine-reported id; mismatch = recorded warning, never trusted |
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `sticky` | Legacy alias → `AUX` |
-| `context`, `extra_args`, … | Unknown keys pass through verbatim into the llama argv |
+| `context`, `batch`, `flash_attn`, … | Mapped to llama flags per the start.ps1 parity table |
+| `extra_args` | The **only** key whose text reaches argv verbatim (whitespace-split); all other unknown keys are preserved in the catalog for reference but never launched |
 
 After editing files, press **Rescan** (or `POST /har/rescan`).
 
@@ -157,6 +161,12 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
 - **Refusals** — every rejection names the blockers and the numbers
   (`/har/status` jobs + `last_error`); nothing over-admits, so a refusal means
   unload something or raise nothing — the ledger is the truth.
+- **`launch floor not met`** (code `below_launch_floor`) — the card holds too
+  little physically free VRAM for that model to launch sanely (foreign
+  processes). The load was refused **before spawn**, so nothing thrashed; free
+  VRAM or lower the model's `launch_only_with_at_least_vram_free` (the printed
+  `free` is the number the gate compared — reserve deducted, same-slot
+  replacement credited).
 - **Second instance** — a single-instance guard exits duplicates immediately.
 - Logs: `logs/` next to the exe (harness + captured engine logs, pruned).
 

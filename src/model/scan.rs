@@ -165,6 +165,7 @@ pub fn scan_dir(dir: &Path) -> Catalog {
         match ModelEntry::from_flat(&map) {
             Ok(mut entry) => {
                 entry.file = Some(path.clone());
+                entry.gguf_size_gb = gguf_size_gb(entry.model_ref.as_deref(), dir);
                 catalog.models.push(entry);
             }
             Err(error) => {
@@ -177,6 +178,26 @@ pub fn scan_dir(dir: &Path) -> Catalog {
     }
     catalog.models.sort_by(|a, b| a.name.cmp(&b.name));
     catalog
+}
+
+/// GiB size of the backing GGUF for the admission estimate (DESIGN Step 4 rule 1):
+/// recorded at scan (already-blocking file I/O), so the actor never stats during
+/// admit. `scheme://` sentinels and unreadable paths yield `None` — the same
+/// UnderSpecified refusal as before, never a guessed size.
+fn gguf_size_gb(model_ref: Option<&str>, dir: &Path) -> Option<f64> {
+    let raw = model_ref?;
+    if raw.contains("://") {
+        return None;
+    }
+    let path = Path::new(raw);
+    let full = if path.is_relative() {
+        dir.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::metadata(full)
+        .ok()
+        .map(|meta| meta.len() as f64 / (1024.0_f64).powi(3))
 }
 
 #[cfg(test)]

@@ -672,6 +672,39 @@ async fn last_error_is_the_newest_failed_load_and_survives_unrelated_success() {
 }
 
 #[tokio::test]
+async fn below_launch_floor_gets_its_own_error_code() {
+    // 503 with a distinct code: clients can tell "card busy with foreign work,
+    // refused before spawn" (greedy guard) from plain admission over-commit.
+    let config = AppConfig {
+        vram_total_gb: 10.0,
+        vram_reserve_gb: 2.0,
+        load_timeout_s: 5,
+        ..AppConfig::default()
+    };
+    let (control, _, _, _, dir) = app(config, &[("filler", "mock", CategoryId::Work, Some(4.0))]);
+    std::fs::write(
+        dir.join("guarded.yaml"),
+        "name: guarded\nengine: mock\ncategory: RP\nvram_gb: 2\n\
+         launch_only_with_at_least_vram_free: 40\n",
+    )
+    .expect("seed guarded model");
+    let (status, _) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"guarded"}"#).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert_eq!(body["code"], "below_launch_floor");
+    assert_eq!(body["error"]["code"], "below_launch_floor");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("launch floor"),
+        "message explains the floor: {body}"
+    );
+}
+
+#[tokio::test]
 async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
     let (control, _, _, _, _) = app(AppConfig::default(), &[]);
 

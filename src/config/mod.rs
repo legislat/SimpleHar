@@ -114,6 +114,10 @@ fn default_witness_tolerance() -> f64 {
     2.0
 }
 
+fn default_greedy_min_free() -> f64 {
+    4.0
+}
+
 fn default_modelconf_dir() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
@@ -277,6 +281,11 @@ pub struct AppConfig {
     /// trigger, and settle accepts `baseline + tolerance` (Step 4 rule 4).
     #[serde(default = "default_witness_tolerance")]
     pub witness_tolerance_gb: f64,
+    /// Launch floor applied to `cost: greedy` models that carry no explicit
+    /// `launch_only_with_at_least_vram_free`: greedy loads are never unguarded
+    /// (operator design note, 2026-10-26).
+    #[serde(default = "default_greedy_min_free")]
+    pub greedy_launch_min_free_gb: f64,
     /// The file this config was loaded from (`SIMPLEHAR_CONFIG` or beside the exe),
     /// stamped by the boot loader. `#[serde(skip)]` so it never enters the persisted
     /// JSON. `default_model` write-back targets this exact path — read and write must
@@ -301,6 +310,7 @@ impl Default for AppConfig {
             modelconf_dir: default_modelconf_dir(),
             settle_timeout_s: default_settle_timeout(),
             witness_tolerance_gb: default_witness_tolerance(),
+            greedy_launch_min_free_gb: default_greedy_min_free(),
             source_path: None,
         }
     }
@@ -432,6 +442,15 @@ impl AppConfig {
             }
         }
         let control_count = self.categories.iter().filter(|c| c.control).count();
+        if !(self.greedy_launch_min_free_gb.is_finite() && self.greedy_launch_min_free_gb > 0.0) {
+            errors.push(ConfigError::Invalid {
+                field: "greedy_launch_min_free_gb".to_string(),
+                reason:
+                    "must be a finite number greater than 0 (greedy loads are never unguarded; \
+                         opt out per-model with launch_only_with_at_least_vram_free: 0)"
+                        .to_string(),
+            });
+        }
         if control_count != 1 {
             errors.push(ConfigError::Invalid {
                 field: "categories.control".to_string(),
@@ -619,5 +638,43 @@ mod tests {
         assert!("WORK".parse::<CategoryId>().is_ok());
         assert!("work".parse::<CategoryId>().is_ok());
         assert!("BONSAI".parse::<CategoryId>().is_err());
+    }
+
+    #[test]
+    fn greedy_launch_floor_defaults_and_validates() {
+        // Greedy loads are never unguarded: the global default gives every
+        // `cost: greedy` model a launch floor unless its yaml overrides it.
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.greedy_launch_min_free_gb, 4.0);
+        let bad = AppConfig {
+            greedy_launch_min_free_gb: -1.0,
+            ..AppConfig::default()
+        };
+        assert!(
+            bad.validate()
+                .iter()
+                .any(|e| e.to_string().contains("greedy_launch_min_free_gb")),
+            "negative floor is refused at boot"
+        );
+        let zero = AppConfig {
+            greedy_launch_min_free_gb: 0.0,
+            ..AppConfig::default()
+        };
+        assert!(
+            zero.validate()
+                .iter()
+                .any(|e| e.to_string().contains("greedy_launch_min_free_gb")),
+            "a zero global default would leave every greedy load unguarded"
+        );
+        let huge = AppConfig {
+            greedy_launch_min_free_gb: f64::INFINITY,
+            ..AppConfig::default()
+        };
+        assert!(
+            huge.validate()
+                .iter()
+                .any(|e| e.to_string().contains("greedy_launch_min_free_gb")),
+            "inf must be refused, not locked in as a permanent refusal generator"
+        );
     }
 }

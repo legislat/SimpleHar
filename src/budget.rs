@@ -46,6 +46,11 @@ pub enum AdmissionError {
     /// (v3.3's F-7 lied about the reason).
     #[error("under-specified model: no `vram_gb` and no GGUF size to estimate from")]
     UnderSpecified,
+    /// `cost: exact` with no `vram_gb`: the class asserts the engine's precise
+    /// requirement, so falling back to a size estimate would be a guess (refused
+    /// rather than booked on faith).
+    #[error("cost `exact` requires an explicit `vram_gb` (the engine's computed requirement)")]
+    ExactUndeclared,
     /// The gate rejected the load and no sufficient eviction set exists; the
     /// numbers, the candidates considered, and the named blockers all travel with
     /// the refusal (Step 6 contract, G6).
@@ -53,6 +58,23 @@ pub enum AdmissionError {
     Insufficient {
         /// Declared or estimated cost of the wanted load.
         need: Gibibytes,
+        /// Budget remaining at decision time.
+        free: Gibibytes,
+        /// Reserve subtracted before the gate.
+        reserve: Gibibytes,
+        /// Candidates the planner considered (may be empty when none exist).
+        victims_considered: Vec<VictimInfo>,
+        /// Models that cannot be evicted, with reasons.
+        blockers: Vec<BlockerInfo>,
+    },
+    /// The model's launch floor was not met: actual free VRAM (externals counted)
+    /// at decision time sits below `launch_only_with_at_least_vram_free`, so the
+    /// load is refused BEFORE spawn — launching a greedy-offload quant onto a
+    /// busy card thrashes RAM/SSD for minutes (operator design note 2026-10-26).
+    #[error("launch floor not met: at least {min_free} GiB free required, free {free}, reserve {reserve}{tail}", tail = insufficient_tail(.victims_considered, .blockers))]
+    BelowLaunchFloor {
+        /// Configured floor in GiB (model key, or the greedy global default).
+        min_free: Gibibytes,
         /// Budget remaining at decision time.
         free: Gibibytes,
         /// Reserve subtracted before the gate.
@@ -265,6 +287,26 @@ mod tests {
     #[test]
     fn unknown_cost_refuses_as_under_specified() {
         assert_eq!(need_gb(None, None), Err(AdmissionError::UnderSpecified));
+    }
+
+    #[test]
+    fn launch_floor_and_exact_refusals_explain_themselves() {
+        // G13/G6: every refusal carries its numbers and names its reason.
+        let floor = AdmissionError::BelowLaunchFloor {
+            min_free: Gibibytes(6.0),
+            free: Gibibytes(4.0),
+            reserve: Gibibytes(2.0),
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            floor.contains("launch floor") && floor.contains('6') && floor.contains('4'),
+            "{floor}"
+        );
+        assert!(AdmissionError::ExactUndeclared
+            .to_string()
+            .contains("exact"));
     }
 
     #[test]

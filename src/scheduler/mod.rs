@@ -502,6 +502,16 @@ struct Job {
     outcome: Option<String>,
     error: Option<SchedulerError>,
     need: Option<Gibibytes>,
+    /// Cost class from the model yaml (fixed|greedy|exact) — drives the gate shape.
+    cost: crate::model::CostClass,
+    /// Model's `launch_only_with_at_least_vram_free` in GiB, if set.
+    launch_floor: Option<f64>,
+    /// The `available` value (free_at_admit + released) the release-minimality
+    /// re-check must reach before spawning: `max(need, floor)` at plan time
+    /// (floor alone for greedy). Without it, a greedy job whose booked need was
+    /// clamped small would skip floor victims after the first release (review
+    /// CRITICAL, 2026-10-26).
+    gate_target: Option<f64>,
     free_at_admit: Option<Gibibytes>,
     /// External VRAM observed at admit (victim still owned); the settle gate holds
     /// this constant so a dead own engine's leftover memory cannot masquerade as a
@@ -933,6 +943,9 @@ impl ActorState {
             outcome: None,
             error: None,
             need: None,
+            cost: crate::model::CostClass::Fixed,
+            launch_floor: None,
+            gate_target: None,
             free_at_admit: None,
             external_at_admit: None,
             timings: JobTimings::default(),
@@ -1030,13 +1043,29 @@ impl ActorState {
             note: None,
             warnings: Vec::new(),
             slot: Some(slot),
+            cost: entry.cost,
+            launch_floor: entry.launch_floor_gb,
+            gate_target: None,
         };
-        let need = budget::need_gb(entry.vram_gb.map(Gibibytes), None);
+        let need = match entry.cost {
+            // `exact` is a precision claim: the engine's number, not an estimate.
+            // No `vram_gb`, no load — the size×1.15+2 fallback would be a guess.
+            crate::model::CostClass::Exact if entry.vram_gb.is_none() => {
+                Err(AdmissionError::ExactUndeclared)
+            }
+            _ => budget::need_gb(
+                entry.vram_gb.map(Gibibytes),
+                entry.gguf_size_gb.map(Gibibytes),
+            ),
+        };
         let error = match need {
             Ok(need) => {
                 job.need = Some(need);
                 None
             }
+            // A greedy load's nominal size never binds — it offloads instead —
+            // so an unknown size is allowed (booking uses the room at admit).
+            Err(_) if entry.cost == crate::model::CostClass::Greedy => None,
             Err(error) => Some(SchedulerError::Admission(error)),
         };
         if let Some(error) = error {
@@ -1088,7 +1117,8 @@ impl ActorState {
                 (self.cfg.vram_total_gb, 0.0)
             }
         };
-        let need = self.jobs[&job_id].need.unwrap_or_default();
+        let declared = self.jobs[&job_id].need;
+        let need = declared.unwrap_or_default();
         let victim_need = self.jobs[&job_id]
             .slot
             .map(|slot| self.slots[slot].occupant.as_ref().map_or(0.0, |o| o.need.0))
@@ -1109,10 +1139,64 @@ impl ActorState {
             job.external_at_admit = external_at_admit;
         }
         self.set_timing(job_id, |t| &mut t.admit_ms);
-        if need.0 > free.0 + victim_need {
+        let (greedy, model_floor) = {
+            let job = &self.jobs[&job_id];
+            (
+                job.cost == crate::model::CostClass::Greedy,
+                job.launch_floor,
+            )
+        };
+        // Launch floor: the model's key, else the global greedy default — a
+        // greedy quant spawned onto a card already busy with foreign processes
+        // thrashes RAM/SSD for minutes before serving (operator note 2026-10-26).
+        let floor = model_floor.or(if greedy {
+            Some(self.cfg.greedy_launch_min_free_gb)
+        } else {
+            None
+        });
+        // Defense in depth (review, 2026-10-26): the scan parser rejects
+        // non-finite sizes, but no value may ever *silently* pass the gate —
+        // every NaN comparison is false, which would read as "fits".
+        if need.0.is_nan() || floor.is_some_and(|f| !f.is_finite()) {
+            self.step(job_id, SwapState::AdmitFail);
+            self.finish(
+                job_id,
+                Err(SchedulerError::Admission(AdmissionError::UnderSpecified)),
+                "under-specified",
+            );
+            return;
+        }
+        let budget_room = free.0 + victim_need;
+        let need_deficit = if greedy {
+            0.0
+        } else {
+            (need.0 - budget_room).max(0.0)
+        };
+        // The floor guards physical idle silicon (review, 2026-10-26): when the
+        // witness answered, never trust a budget-room flattered by missing
+        // per-process attribution — take the more conservative figure. With the
+        // witness down there is no physical evidence, so the budget stands.
+        let floor_room = match &sample {
+            Ok(s) => budget_room.min((total_gib - s.used_gib).max(0.0)),
+            Err(_) => budget_room,
+        };
+        let floor_deficit = floor.map(|f| (f - floor_room).max(0.0)).unwrap_or(0.0);
+        let deficit = need_deficit.max(floor_deficit);
+        // What `available` (free_at_admit + released) must reach before spawn.
+        // Comparing only `need` re-admits the bug this review caught: greedy
+        // books a clamped-small need, so the re-check would skip the very floor
+        // victims the planner queued.
+        let gate_target = if greedy {
+            floor.unwrap_or(0.0)
+        } else {
+            need.0.max(floor.unwrap_or(0.0))
+        };
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.gate_target = Some(gate_target);
+        }
+        if deficit > 0.0 {
             // Step 6: try to cover the deficit with evictable cross-category
             // victims before refusing — cheapest sufficient set, hard filters.
-            let deficit = need.0 - free.0 - victim_need;
             match self.plan_victims(job_id, deficit) {
                 Ok(victims) => {
                     if let Some(job) = self.jobs.get_mut(&job_id) {
@@ -1127,19 +1211,54 @@ impl ActorState {
                 }
                 Err((considered, blockers)) => {
                     self.step(job_id, SwapState::AdmitFail);
+                    let reserve = Gibibytes(self.cfg.vram_reserve_gb);
+                    let error =
+                        if floor_deficit > 0.0 && floor_deficit >= need_deficit {
+                            AdmissionError::BelowLaunchFloor {
+                                min_free: Gibibytes(floor.expect(
+                                    "invariant: floor_deficit > 0 implies a configured floor",
+                                )),
+                                // G13: print the number the gate actually compared.
+                                free: Gibibytes(floor_room),
+                                reserve,
+                                victims_considered: considered,
+                                blockers,
+                            }
+                        } else {
+                            AdmissionError::Insufficient {
+                                need,
+                                free,
+                                reserve,
+                                victims_considered: considered,
+                                blockers,
+                            }
+                        };
                     self.finish(
                         job_id,
-                        Err(SchedulerError::Admission(AdmissionError::Insufficient {
-                            need,
-                            free,
-                            reserve: Gibibytes(self.cfg.vram_reserve_gb),
-                            victims_considered: considered,
-                            blockers,
-                        })),
+                        Err(SchedulerError::Admission(error)),
                         "admission refused",
                     );
                     return;
                 }
+            }
+        }
+        // A greedy tenant books what it will actually grab — its nominal size if
+        // that fits, else the room available *including* the victims this very
+        // admit queued for release (they are not in `free` yet but will be gone
+        // before spawn). Never its offload-able nominal size (starves the card)
+        // and never zero when it will hold real VRAM (under-books the ledger).
+        if greedy {
+            let planned_room = budget_room
+                + self.jobs[&job_id]
+                    .victims
+                    .iter()
+                    .map(|v| v.cost)
+                    .sum::<f64>();
+            let booked = declared
+                .map_or(planned_room, |n| n.0.min(planned_room))
+                .max(0.0);
+            if let Some(job) = self.jobs.get_mut(&job_id) {
+                job.need = Some(Gibibytes(booked));
             }
         }
         self.step(job_id, SwapState::Quiesce);
@@ -1590,12 +1709,18 @@ impl ActorState {
                     // release re-check the gate and stop as soon as it is satisfied
                     // (minimality — never kill more than the load needs).
                     if self.dequeue_victim(job_id) {
-                        let need = self.jobs[&job_id].need.unwrap_or_default().0;
+                        // The planned gate value from finish_admit — max(need, floor),
+                        // never the (greedy-clamped) booking alone, or the floor
+                        // victims would be skipped after the first release
+                        // (review CRITICAL, 2026-10-26).
+                        let target = self.jobs[&job_id]
+                            .gate_target
+                            .unwrap_or_else(|| self.jobs[&job_id].need.map_or(0.0, |n| n.0));
                         // free_at_admit was computed with everything still in the
                         // ledger; every confirmed release has since freed its cost.
                         let available = self.jobs[&job_id].free_at_admit.map_or(0.0, |f| f.0)
                             + self.jobs[&job_id].released_cost;
-                        if need <= available {
+                        if target <= available {
                             if let Some(job) = self.jobs.get_mut(&job_id) {
                                 job.victims.clear();
                             }

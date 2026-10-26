@@ -47,6 +47,11 @@ pub enum ApiError {
     /// Admission refusal or under-specified model; the message carries the numbers.
     #[error("service unavailable: {reason}")]
     Unavailable { reason: String },
+    /// The model's `launch_only_with_at_least_vram_free` floor was not met — the
+    /// load is refused before spawn (greedy-offload thrash guard). Distinct code
+    /// so clients can tell "card busy with foreigners" from plain over-commit.
+    #[error("service unavailable: {reason}")]
+    BelowLaunchFloor { reason: String },
     /// The engine could not be started or never became ready — `502`.
     #[error("upstream failure: {reason}")]
     Upstream { reason: String },
@@ -71,6 +76,7 @@ impl ApiError {
             ApiError::NotFound { .. } => "not_found",
             ApiError::BadRequest { .. } => "bad_request",
             ApiError::Unavailable { .. } => "unavailable",
+            ApiError::BelowLaunchFloor { .. } => "below_launch_floor",
             ApiError::Upstream { .. } => "upstream",
             ApiError::Conflict { .. } => "conflict",
             ApiError::UnsupportedMedia { .. } => "unsupported_media_type",
@@ -84,7 +90,9 @@ impl ApiError {
         match self {
             ApiError::NotFound { .. } => StatusCode::NOT_FOUND,
             ApiError::BadRequest { .. } => StatusCode::BAD_REQUEST,
-            ApiError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::Unavailable { .. } | ApiError::BelowLaunchFloor { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             ApiError::Upstream { .. } => StatusCode::BAD_GATEWAY,
             ApiError::Conflict { .. } => StatusCode::CONFLICT,
             ApiError::UnsupportedMedia { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -121,9 +129,20 @@ impl From<SchedulerError> for ApiError {
             SchedulerError::UnknownJob(job) => ApiError::NotFound {
                 what: format!("job {job}"),
             },
-            SchedulerError::Admission(reason) => ApiError::Unavailable {
-                reason: reason.to_string(),
-            },
+            SchedulerError::Admission(reason) => {
+                if matches!(
+                    reason,
+                    crate::budget::AdmissionError::BelowLaunchFloor { .. }
+                ) {
+                    ApiError::BelowLaunchFloor {
+                        reason: reason.to_string(),
+                    }
+                } else {
+                    ApiError::Unavailable {
+                        reason: reason.to_string(),
+                    }
+                }
+            }
             SchedulerError::Engine(reason) => ApiError::Unavailable {
                 reason: reason.to_string(),
             },
@@ -360,6 +379,15 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
         tracing::error!(error = %error, "cannot persist default_model: write failed");
         return false;
     }
+    // Keep the previous version beside the live file: schema additions are a
+    // one-way door for `deny_unknown_fields` (an old binary refuses a file a new
+    // one wrote), so rollback needs the pre-write copy (review, 2026-10-26).
+    if path.exists() {
+        let bak = path.with_extension("json.bak");
+        if let Err(error) = std::fs::copy(&path, &bak) {
+            tracing::warn!(error = %error, "could not write config backup; continuing");
+        }
+    }
     if let Err(error) = std::fs::rename(&tmp, &path) {
         tracing::error!(error = %error, "cannot persist default_model: rename failed");
         return false;
@@ -508,6 +536,8 @@ fn model_json(entry: &ModelEntry) -> Value {
         "engine": entry.engine,
         "category": entry.category,
         "vram_gb": entry.vram_gb,
+        "cost": entry.cost,
+        "launch_floor_gb": entry.launch_floor_gb,
         "cpu_offload": entry
             .raw
             .get("cpu_offload")
@@ -1237,6 +1267,9 @@ mod tests {
             engine: "llama".to_string(),
             category: CategoryId::Work,
             vram_gb: Some(4.0),
+            gguf_size_gb: None,
+            cost: crate::model::CostClass::Fixed,
+            launch_floor_gb: None,
             model_ref: Some(r"F:\m.gguf".to_string()),
             serve_model: None,
             file: None,
@@ -1257,6 +1290,8 @@ mod tests {
         let body = model_json(&entry("true"));
         assert_eq!(body["context"], json!("262144"));
         assert_eq!(body["model_ref"], json!(r"F:\m.gguf"));
+        assert_eq!(body["cost"], json!("fixed"));
+        assert!(body["launch_floor_gb"].is_null());
     }
 
     #[test]

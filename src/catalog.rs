@@ -28,7 +28,7 @@ fn ref_aliases(model_ref: &str) -> Vec<String> {
 ///
 /// # Returns
 ///
-/// `Some(&ModelEntry)` for the first match, `None` when no entry matches — the caller
+/// `Some(&ModelEntry)` for the first match, `None` when no entry matches вЂ” the caller
 /// owes the caller a `404` listing that listener's ids (Step 11).
 pub fn resolve<'a>(query: &str, models: &'a [ModelEntry]) -> Option<&'a ModelEntry> {
     let lower = query.trim().to_ascii_lowercase();
@@ -58,6 +58,9 @@ mod tests {
                 engine: "llama".to_string(),
                 category: CategoryId::Aux,
                 vram_gb: Some(2.0),
+                gguf_size_gb: None,
+                cost: crate::model::CostClass::Fixed,
+                launch_floor_gb: None,
                 model_ref: Some("F:/MODELS/qwen3-0.6b.gguf".to_string()),
                 serve_model: None,
                 file: None,
@@ -68,6 +71,9 @@ mod tests {
                 engine: "llama".to_string(),
                 category: CategoryId::Emb,
                 vram_gb: Some(2.0),
+                gguf_size_gb: None,
+                cost: crate::model::CostClass::Fixed,
+                launch_floor_gb: None,
                 model_ref: Some("F:/MODELS/embeddinggemma-2.gguf".to_string()),
                 serve_model: None,
                 file: None,
