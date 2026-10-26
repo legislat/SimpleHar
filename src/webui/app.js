@@ -279,30 +279,38 @@ function modelRow(status, model, category) {
   );
   const dotState = serving ? "serving" : loading ? "loading" : failed ? "failed" : "idle";
   const row = el("tr", {});
-  row.append(
+  // Operator layout (2026-10-26): actions first, then the name, then the rest —
+  // the buttons stay in view at any width without scrolling.
+  const actions = el("td", { class: "sh-row-actions" });
+  actions.append(
     el(
-      "td",
-      {},
-      el("span", { class: "sh-dot", "data-state": dotState }),
-      el("strong", {}, text(model.id)),
+      "button",
+      {
+        class: "sh-mini",
+        onclick: () =>
+          postJson("/har/load", { model: model.id }).catch((error) => flashError(error)),
+      },
+      text("Load"),
     ),
   );
-  row.append(el("td", {}, text(model.engine)));
-  row.append(el("td", {}, text(model.context ?? "—")));
-  row.append(el("td", {}, text(model.vram_gb !== null ? `${model.vram_gb} GiB` : "est.")));
-  // A5 (v3.3 parity): the backing GGUF + serve_model id, basename on screen,
-  // full path in the tooltip.
-  const fileBits = [];
-  if (model.model_ref) {
-    const base = String(model.model_ref).replace(/\\/g, "/").split("/").pop();
-    fileBits.push(base);
-  }
-  if (model.serve_model) fileBits.push(`id:${model.serve_model}`);
+  actions.append(
+    el(
+      "button",
+      {
+        class: "sh-mini",
+        onclick: () =>
+          postJson("/har/config/default", { category, model: model.id }).catch(() => {}),
+      },
+      text("Set default"),
+    ),
+  );
+  row.append(actions);
   row.append(
     el(
       "td",
-      { class: "sh-files", title: model.model_ref || "" },
-      text(fileBits.length > 0 ? fileBits.join(" · ") : "—"),
+      { class: "sh-name" },
+      el("span", { class: "sh-dot", "data-state": dotState }),
+      el("strong", {}, text(model.id)),
     ),
   );
 
@@ -336,30 +344,25 @@ function modelRow(status, model, category) {
   );
   row.append(el("td", {}, cpu));
 
-  const actions = el("td", { class: "sh-row-actions" });
-  actions.append(
+  row.append(el("td", {}, text(model.engine)));
+  row.append(el("td", {}, text(model.context ?? "—")));
+  row.append(el("td", {}, text(model.vram_gb !== null ? `${model.vram_gb} GiB` : "est.")));
+  // A5 (v3.3 parity): the backing GGUF + serve_model id, basename on screen,
+  // full path in the tooltip. Least-important column, so it sits rightmost.
+  const fileBits = [];
+  if (model.model_ref) {
+    const base = String(model.model_ref).replace(/\\/g, "/").split("/").pop();
+    fileBits.push(base);
+  }
+  if (model.serve_model) fileBits.push(`id:${model.serve_model}`);
+  row.append(
     el(
-      "button",
-      {
-        class: "sh-mini",
-        onclick: () =>
-          postJson("/har/load", { model: model.id }).catch((error) => flashError(error)),
-      },
-      text("Load"),
+      "td",
+      { class: "sh-files", title: model.model_ref || "" },
+      text(fileBits.length > 0 ? fileBits.join(" · ") : "—"),
     ),
   );
-  actions.append(
-    el(
-      "button",
-      {
-        class: "sh-mini",
-        onclick: () =>
-          postJson("/har/config/default", { category, model: model.id }).catch(() => {}),
-      },
-      text("Set default"),
-    ),
-  );
-  row.append(actions);
+
   return row;
 }
 
@@ -393,14 +396,14 @@ function renderTab(status, category) {
       el(
         "tr",
         {},
+        el("th", {}),
         el("th", {}, text("Model")),
+        el("th", {}, text("Cat")),
+        el("th", {}, text("CPU")),
         el("th", {}, text("Engine")),
         el("th", {}, text("Ctx")),
         el("th", {}, text("Cost")),
         el("th", {}, text("Files")),
-        el("th", {}, text("Cat")),
-        el("th", {}, text("CPU")),
-        el("th", {}),
       ),
     ),
   );
@@ -412,7 +415,9 @@ function renderTab(status, category) {
   }
   for (const model of models) body.append(modelRow(status, model, category));
   table.append(body);
-  return el("div", { class: "sh-tabpanel" }, panel, table);
+  // Small windows: the table scrolls inside its own wrapper — the page itself
+  // never overflows and the action buttons stay reachable (review, 2026-10-26).
+  return el("div", { class: "sh-tabpanel" }, panel, el("div", { class: "sh-tablewrap" }, table));
 }
 
 function renderTabs() {

@@ -33,6 +33,14 @@ body {
   font-size: 0.92rem;
 }
 
+/* Operator (2026-10-26): the Pico container caps content at 1080px and centers
+ * it, leaving wide dead margins on big displays — use nearly the full width,
+ * capped for readability, with tight gutters. */
+body > main.container {
+  max-width: min(1680px, 100% - 2rem);
+  --pico-inline-spacing: 0.75rem;
+}
+
 h1, h2, h3, .sh-title {
   font-family: "Sora", "Inter", system-ui, sans-serif;
   letter-spacing: -0.01em;
@@ -157,6 +165,13 @@ header.sh-header {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sh-tablewrap { overflow-x: auto; }
+.sh-models { min-width: 56rem; }
+.sh-models .sh-name { white-space: nowrap; }
+/* Buttons sit side by side and only slide under each other when the column is
+ * genuinely cramped (operator, 2026-10-26). */
+.sh-row-actions { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+table.sh-models td.sh-row-actions { width: max-content; }
 .sh-mem label { font-size: 0.75rem; color: var(--pico-muted-color); display: block; margin-bottom: 0.2rem; }
 
 /* Tabs: models live below the header (operator mockup). */
@@ -189,7 +204,7 @@ header.sh-header {
 .sh-tabpanel {
   border: 1px solid var(--pico-card-border-color);
   border-radius: 0 var(--sh-radius) var(--sh-radius) var(--sh-radius);
-  padding: 0.9rem 1rem;
+  padding: 0.7rem 0.75rem;
   background: var(--pico-card-background-color);
 }
 
@@ -205,6 +220,9 @@ header.sh-header {
 
 table.sh-models { margin-bottom: 0; }
 table.sh-models td, table.sh-models th { padding: 0.45rem 0.6rem; }
+/* Edge cells hug the panel (operator: margins too large, 2026-10-26). */
+table.sh-models th:first-child, table.sh-models td:first-child { padding-left: 0.25rem; }
+table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.25rem; }
 
 .sh-dot {
   display: inline-block;
