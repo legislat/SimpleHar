@@ -126,6 +126,7 @@ impl EngineAdapter for StrataAdapter {
                     field: "loaded".to_string(),
                 }),
             ),
+            container: None,
         })
     }
 }

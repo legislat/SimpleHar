@@ -11,8 +11,9 @@
 pub enum ResourceKind {
     /// A Windows child process tree supervised by a Job Object (Step 8 C).
     ChildProcess,
-    /// A docker container started through the operator's WSL scripts, labeled for
-    /// reap-by-label at startup (Step 8 D).
+    /// A docker container started through the operator's WSL scripts. The label
+    /// is the reap authority: the runtime removes exactly this name on release
+    /// and reconciles it pre-spawn (Step 8 D, ninfer port 2026-10-26).
     Container { name: String },
 }
 
@@ -38,7 +39,7 @@ pub enum Provenance {
     Owned(SpawnTicket),
     /// A manual server shown in the display list (Step 13); never touched.
     External,
-    /// A protected container (e.g. `mara-lab`); never touched, even on request.
+    /// A resource the harness must never touch, even on request.
     Protected,
 }
 

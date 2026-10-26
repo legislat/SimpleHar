@@ -83,7 +83,15 @@ async fn main() -> ExitCode {
     let strata: Arc<dyn EngineAdapter> =
         Arc::new(simplehar_se::engine::strata::StrataAdapter::default());
     adapters.insert("strata".to_string(), strata);
-    let runtime: Arc<dyn EngineRuntime> = Arc::new(ProcessRuntime::new());
+    let ninfer: Arc<dyn EngineAdapter> =
+        Arc::new(simplehar_se::engine::ninfer::NinferAdapter::new(
+            config.wsl_distro.clone(),
+            config.wsl_user.clone(),
+        ));
+    adapters.insert("ninfer".to_string(), ninfer);
+    let runtime: Arc<dyn EngineRuntime> = Arc::new(
+        ProcessRuntime::new().with_wsl(config.wsl_distro.clone(), config.wsl_user.clone()),
+    );
     let witness: Arc<dyn simplehar_se::budget::VramWitness> =
         Arc::new(simplehar_se::witness::NvmlWitness::new());
     let scheduler = Scheduler::start(

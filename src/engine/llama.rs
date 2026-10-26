@@ -139,6 +139,7 @@ impl EngineAdapter for LlamaAdapter {
                 path: "/health".to_string(),
                 expect_status: 200,
             },
+            container: None,
         })
     }
 }

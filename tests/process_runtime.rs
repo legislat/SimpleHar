@@ -39,6 +39,7 @@ fn spec() -> LaunchSpec {
             path: "/health".to_string(),
             expect_status: 200,
         },
+        container: None,
     }
 }
 
@@ -189,6 +190,7 @@ async fn probe_fails_fast_when_the_child_already_exited() {
             path: "/health".to_string(),
             expect_status: 200,
         },
+        container: None,
     };
     let ticket = ticket(TEST_PORT + 1);
     if runtime.spawn(&spec, ticket.clone()).await.is_err() {

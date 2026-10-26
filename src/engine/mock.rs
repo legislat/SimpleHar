@@ -35,6 +35,7 @@ impl EngineAdapter for MockAdapter {
                 path: "/health".to_string(),
                 expect_status: 200,
             },
+            container: None,
         })
     }
 }

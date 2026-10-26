@@ -117,7 +117,7 @@ pub struct ModelEntry {
 
 /// v3.3-compatible boolean-ish reading of a flat yaml value. Exact parity with the
 /// baseline `truthy` table is pinned by a unit test when the scan milestone ports it.
-fn truthy(value: &str) -> bool {
+pub(crate) fn truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "true" | "1" | "yes" | "on"

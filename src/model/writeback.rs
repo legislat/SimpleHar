@@ -49,7 +49,8 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut out: Vec<String> = body.split('\n').map(str::to_string).collect();
     let mut replaced = false;
-    for line in out.iter_mut() {
+    let mut removed_line: Option<usize> = None;
+    for (index, line) in out.iter_mut().enumerate() {
         let trimmed = line.trim();
         // Only a real `key:` line matches; comments are passed through untouched.
         if !replaced && !trimmed.starts_with('#') && !trimmed.is_empty() {
@@ -61,7 +62,7 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
                             let ending = if line.ends_with('\r') { "\r" } else { "" };
                             *line = format!("{key}: {value}{ending}");
                         }
-                        None => *line = String::new(),
+                        None => removed_line = Some(index),
                     }
                     replaced = true;
                     break;
@@ -71,7 +72,14 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
     }
     match (replaced, value) {
         (true, Some(_)) => {}
-        (true, None) => out.retain(|line| !line.is_empty()),
+        (true, None) => {
+            // Drop exactly the key's own line — blanking-then-filtering would
+            // also delete unrelated blank lines the operator authored (review,
+            // 2026-10-26, byte-preservation promise).
+            if let Some(index) = removed_line {
+                out.remove(index);
+            }
+        }
         (false, Some(value)) => {
             // Match the file's dominant line ending so a CRLF file gets a CRLF line.
             let ending = if text.contains("\r\n") { "\r" } else { "" };
@@ -184,6 +192,20 @@ mod tests {
         let updated = set_key_in_text(SAMPLE, "category", None).expect("edit");
         assert!(!updated.contains("category:"));
         assert!(set_key_in_text(SAMPLE, "cpu_offload", None).is_err());
+    }
+
+    #[test]
+    fn removal_never_touches_unrelated_blank_lines() {
+        // Byte-preservation promise (review, 2026-10-26): removing one key must
+        // not delete the operator's paragraph breaks.
+        let text = "name: qwen\n\ncategory: WORK\n\nengine: llama\n";
+        let updated = set_key_in_text(text, "category", None).expect("edit");
+        assert!(!updated.contains("category:"));
+        assert_eq!(updated, "name: qwen\n\n\nengine: llama\n");
+        assert!(
+            updated.contains("name: qwen\n\n\nengine"),
+            "blanks survive: {updated:?}"
+        );
     }
 
     #[test]

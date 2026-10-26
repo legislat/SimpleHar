@@ -7,6 +7,7 @@
 
 pub mod llama;
 pub mod mock;
+pub mod ninfer;
 pub mod strata;
 
 use crate::model::ModelEntry;
@@ -77,6 +78,25 @@ pub struct LaunchSpec {
     pub log_name: String,
     /// Readiness contract.
     pub readiness: ReadinessSpec,
+    /// Detached WSL container backing this engine (ninfer): the job object kills
+    /// only the `wsl.exe` client, so the runtime must additionally `docker rm -f`
+    /// this name (Step 8 extension, 2026-10-26). `None` for process engines.
+    pub container: Option<String>,
+}
+
+/// The shared WSL client prefix: `wsl.exe -d <distro> -u <user> --`. Launch
+/// (ninfer autostart) and teardown (`docker rm -f`) must address the same
+/// distro/user or unload reaps the wrong place (review, 2026-10-26).
+#[must_use]
+pub fn wsl_prefix(distro: &str, user: &str) -> Vec<String> {
+    vec![
+        "wsl.exe".to_string(),
+        "-d".to_string(),
+        distro.to_string(),
+        "-u".to_string(),
+        user.to_string(),
+        "--".to_string(),
+    ]
 }
 
 /// Tri-state probe outcome (Step 7): the scheduler decides what a missing field means

@@ -118,6 +118,14 @@ fn default_greedy_min_free() -> f64 {
     4.0
 }
 
+fn default_wsl_distro() -> String {
+    "Ubuntu".to_string()
+}
+
+fn default_wsl_user() -> String {
+    "legislat".to_string()
+}
+
 fn default_modelconf_dir() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
@@ -286,6 +294,12 @@ pub struct AppConfig {
     /// (operator design note, 2026-10-26).
     #[serde(default = "default_greedy_min_free")]
     pub greedy_launch_min_free_gb: f64,
+    /// WSL distro hosting ninfer containers (`wsl.exe -d <this>`; v3.3 parity).
+    #[serde(default = "default_wsl_distro")]
+    pub wsl_distro: String,
+    /// WSL user owning the ninfer containers and their autostart scripts.
+    #[serde(default = "default_wsl_user")]
+    pub wsl_user: String,
     /// The file this config was loaded from (`SIMPLEHAR_CONFIG` or beside the exe),
     /// stamped by the boot loader. `#[serde(skip)]` so it never enters the persisted
     /// JSON. `default_model` write-back targets this exact path — read and write must
@@ -311,6 +325,8 @@ impl Default for AppConfig {
             settle_timeout_s: default_settle_timeout(),
             witness_tolerance_gb: default_witness_tolerance(),
             greedy_launch_min_free_gb: default_greedy_min_free(),
+            wsl_distro: default_wsl_distro(),
+            wsl_user: default_wsl_user(),
             source_path: None,
         }
     }
@@ -481,6 +497,21 @@ impl AppConfig {
             errors.push(ConfigError::Invalid {
                 field: "vram_total_gb".to_string(),
                 reason: "must be positive (the ledger ceiling, Step 4)".to_string(),
+            });
+        }
+        // WSL coordinates are load-bearing for ninfer spawn AND container reap
+        // (review, 2026-10-26): a blank distro/user must be a boot error, not a
+        // silently ineffective string.
+        if self.wsl_distro.trim().is_empty() {
+            errors.push(ConfigError::Invalid {
+                field: "wsl_distro".to_string(),
+                reason: "must not be blank (ninfer spawn and reap both address it)".to_string(),
+            });
+        }
+        if self.wsl_user.trim().is_empty() {
+            errors.push(ConfigError::Invalid {
+                field: "wsl_user".to_string(),
+                reason: "must not be blank (ninfer spawn and reap both address it)".to_string(),
             });
         }
         if self.load_timeout_s == 0 {

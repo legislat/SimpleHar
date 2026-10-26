@@ -65,6 +65,7 @@ partial files are completed, an invalid file is fatal with every problem logged
 | `release_timeout_s` | `60` | Kill-confirmation deadline (G12) |
 | `settle_timeout_s` | `30` | Memory-settle deadline after release |
 | `protected_ports` | v3.3 ecosystem set | Ports the harness must never bind or touch |
+| `wsl_distro` / `wsl_user` | `Ubuntu` / `legislat` | WSL coordinates for ninfer containers |
 | `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary |
 | `modelconf_dir` | `<exe dir>\ModelConf` | Catalog directory |
 | `tray_enabled` | `true` | Tray icon at boot |
@@ -77,7 +78,7 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 |---|---|
 | `name` | Canonical harness name; also matched by file-stem/path aliases |
 | `model` | GGUF path (or `scheme://` engine sentinel). **Required for llama** |
-| `engine` | `llama` (default), `strata`, or `mock` |
+| `engine` | `llama` (default), `strata`, `ninfer`, or `mock` |
 | `category` | `WORK`/`RP`/`AUX`/`EMB` |
 | `vram_gb` | Declared admission cost in GiB; `fixed` falls back to `file size × 1.15 + 2`, `exact` refuses without it |
 | `cost` | `fixed` (default): size binds admission · `greedy`: offloads to RAM/SSD, size never refuses but a launch floor is mandatory · `exact`: engine-computed number, required and binding |
@@ -88,11 +89,31 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `sticky` | Legacy alias → `AUX` |
 | `context`, `batch`, `flash_attn`, … | Mapped to llama flags per the start.ps1 parity table |
-| `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata cold starts use 600–1200) |
+| `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata/ninfer cold starts use 600–1200) |
 | `strata_config` | **Required for strata.** Profile JSON path; existence-checked before spawn. Weights/quant/context all live in this file, never in argv |
 | `strata_python` | Interpreter (default `C:\Strata\.venv\Scripts\python.exe`); existence-checked before spawn |
 | `strata_cwd` | Working directory (default `C:\Strata`) |
 | `extra_args` | The **only** key whose text reaches argv verbatim (whitespace-split); all other unknown keys are preserved in the catalog for reference but never launched |
+| `ninfer_autostart` | **Required for ninfer.** Path (inside WSL) of the operator's autostart script; invoked as `bash <script> <profile> <key\|nokey> <port>` via `wsl.exe` |
+| `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload — strictly scoped to the name this harness claimed at spawn |
+| `ninfer_profile` | Profile passed as the script's `$1` (default `b`) |
+| `ninfer_key` | `true` sends `key` as `$2`; anything else sends `nokey` |
+
+### Ninfer engines
+
+Ninfer models (`engine: ninfer`) are GPU containers in WSL: the harness spawns a
+short-lived `wsl.exe -d <wsl_distro> -u <wsl_user> -- bash <ninfer_autostart>
+<profile> <key|nokey> <assigned-port>` client, then waits for `/health` 200
+**then** `/v1/models` 200. Because the container outlives the client, unload
+reaps it by name (`docker rm -f <ninfer_container>`); the release evidence is
+the port closing after the reaping, not the client's exit. v3.3 `external: true`
+entries are gated out: such an entry is **refused at load** — the harness never
+registers, monitors, or manages manual servers, it only subtracts their VRAM via
+the witness. A harness crash can orphan a container (the job object only reaps
+the client); the next load of that name reconciles by removing the stale
+container before autostart runs. Duplicate `ninfer_container` names across
+models are refused at scan — reaping is by name. As with strata: no preload,
+booting spawns nothing.
 
 ### Strata engines
 

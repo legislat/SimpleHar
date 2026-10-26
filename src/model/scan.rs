@@ -137,6 +137,8 @@ pub fn scan_dir(dir: &Path) -> Catalog {
         })
         .collect();
     files.sort();
+    let mut seen_containers: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for path in files {
         let file_name = path
             .file_name()
@@ -164,6 +166,26 @@ pub fn scan_dir(dir: &Path) -> Catalog {
         }
         match ModelEntry::from_flat(&map) {
             Ok(mut entry) => {
+                // One container name may back exactly one model: unload reaps by
+                // name, so a duplicate would let either model's release destroy
+                // the other's live engine (review, 2026-10-26).
+                if entry.engine == "ninfer" {
+                    if let Some(name) = map.get("ninfer_container").map(|v| v.trim()) {
+                        if !name.is_empty() {
+                            if let Some(first) =
+                                seen_containers.insert(name.to_string(), file_name.clone())
+                            {
+                                catalog.errors.push(ScanError {
+                                    file: file_name.clone(),
+                                    reason: format!(
+                                        "duplicate ninfer_container `{name}` (also in {first})"
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
                 entry.file = Some(path.clone());
                 entry.gguf_size_gb = gguf_size_gb(entry.model_ref.as_deref(), dir);
                 catalog.models.push(entry);
@@ -259,6 +281,49 @@ mod tests {
         );
         assert_eq!(catalog.errors.len(), 1);
         assert!(catalog.errors[0].file.contains("bad.yaml"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_ninfer_container_names_are_refused() {
+        // Unload reaps by name: one container may back exactly one model
+        // (review, 2026-10-26).
+        let dir = std::env::temp_dir().join(format!("se-scan-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("a.yaml"),
+            "name: a\nengine: ninfer\nninfer_autostart: /s.sh\nninfer_container: shared\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join("b.yaml"),
+            "name: b\nengine: ninfer\nninfer_autostart: /t.sh\nninfer_container: shared\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join("c.yaml"),
+            "name: c\nengine: ninfer\nninfer_autostart: /u.sh\nninfer_container: other\n",
+        )
+        .expect("write");
+
+        let catalog = scan_dir(&dir);
+        let names: Vec<&str> = catalog.models.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"a") && names.contains(&"c"), "{names:?}");
+        assert!(
+            !names.contains(&"b"),
+            "the duplicate must be refused: {names:?}"
+        );
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .any(|e| e.file.contains("b.yaml")
+                    && e.reason.contains("duplicate ninfer_container")),
+            "{:?}",
+            catalog.errors
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

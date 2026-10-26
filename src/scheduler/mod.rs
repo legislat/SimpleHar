@@ -537,6 +537,10 @@ struct Job {
     /// was down. The release re-check and the settle gate take the more
     /// conservative figure against this (operator 2026-10-26).
     observed_at_admit: Option<f64>,
+    /// Detached WSL container backing the spawn (ninfer): suppresses the
+    /// pid-attributed measured footprint, which is meaningless for a client
+    /// process that exits before the container is ready (review, 2026-10-26).
+    container: Option<String>,
     /// External VRAM observed at admit (victim still owned); the settle gate holds
     /// this constant so a dead own engine's leftover memory cannot masquerade as a
     /// foreign holder (§0.3).
@@ -993,6 +997,7 @@ impl ActorState {
             gate_target: None,
             free_at_admit: None,
             observed_at_admit: None,
+            container: None,
             external_at_admit: None,
             timings: JobTimings::default(),
             t0: Instant::now(),
@@ -1134,6 +1139,7 @@ impl ActorState {
             need: None,
             free_at_admit: None,
             observed_at_admit: None,
+            container: None,
             external_at_admit: None,
             timings: JobTimings::default(),
             t0,
@@ -1677,9 +1683,15 @@ impl ActorState {
                 return;
             }
         };
+        // The provenance type carries the container identity (review, 2026-10-26):
+        // the runtime reaps by the ticket's label, never by re-reading the spec.
+        let kind = match &spec.container {
+            Some(name) => ResourceKind::Container { name: name.clone() },
+            None => ResourceKind::ChildProcess,
+        };
         let ticket = SpawnTicket {
             generation: self.next_gen,
-            kind: ResourceKind::ChildProcess,
+            kind,
             pid: 0,
             port: engine_port,
         };
@@ -1691,6 +1703,7 @@ impl ActorState {
                 .expect("invariant: caller holds a live job id");
             job.spawned = Some(ticket.clone());
             job.readiness = Some(spec.readiness.clone());
+            job.container = spec.container.clone();
         }
         let tx = self.tx.clone();
         let runtime = Arc::clone(&self.runtime);
@@ -2040,7 +2053,9 @@ impl ActorState {
         // pid only — a co-resident tenant's memory must never be charged to this
         // model. The witness caches ~2 s, so a pre-spawn sample simply lacks the
         // pid: retry briefly, and on continued absence persist nothing.
-        if slot.is_some() {
+        // Container-backed engines are skipped outright: the ticket pid is a
+        // short-lived wsl.exe client whose memory is never the GPU footprint.
+        if slot.is_some() && self.jobs[&job_id].container.is_none() {
             let witness = Arc::clone(&self.witness);
             let tx = self.tx.clone();
             let measured_model = model.clone();
