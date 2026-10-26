@@ -114,12 +114,13 @@ async fn main() -> ExitCode {
     let ninfer: Arc<dyn EngineAdapter> =
         Arc::new(simplehar_se::engine::ninfer::NinferAdapter::new(
             config.wsl_distro.clone(),
-            config.wsl_user.clone(),
+            config.wsl_account().unwrap_or_default(),
         ));
     adapters.insert("ninfer".to_string(), ninfer);
-    let runtime: Arc<dyn EngineRuntime> = Arc::new(
-        ProcessRuntime::new().with_wsl(config.wsl_distro.clone(), config.wsl_user.clone()),
-    );
+    let runtime: Arc<dyn EngineRuntime> = Arc::new(ProcessRuntime::new().with_wsl(
+        config.wsl_distro.clone(),
+        config.wsl_account().unwrap_or_default(),
+    ));
     let witness: Arc<dyn simplehar_se::budget::VramWitness> =
         Arc::new(simplehar_se::witness::NvmlWitness::new());
     let scheduler = Scheduler::start(
@@ -153,8 +154,9 @@ async fn main() -> ExitCode {
         let handle = scheduler.clone();
         let exe = config.llama_server_exe.clone();
         let conf_dir = config.modelconf_dir.clone();
+        let wsl_account = config.wsl_account().map(str::to_string);
         tokio::spawn(async move {
-            log_boot_banner(&handle, &exe, &conf_dir).await;
+            log_boot_banner(&handle, &exe, &conf_dir, wsl_account.as_deref()).await;
         });
     }
     let listeners = simplehar_se::listeners::ListenerRegistry::new();
@@ -198,14 +200,19 @@ async fn main() -> ExitCode {
 const LISTENER_RETRY: Duration = Duration::from_secs(5);
 
 /// A6: v3.3-style boot inventory. Logs one line per catalog model (`marker/category/
-/// engine/path`) and warns up front if `llama-server.exe` is absent, so the operator
-/// sees load-time landmines at boot instead of at the first request. Spawned off the
+/// engine/path`) and warns up front if `llama-server.exe` is absent or if the catalog
+/// holds ninfer models while no WSL account is configured, so the operator sees
+/// load-time landmines at boot instead of at the first request. Spawned off the
 /// boot path (never gates bind); the stat loop runs on the blocking pool. Uses
 /// `tracing`, never console print (AGENTS.md).
+///
+/// `wsl_account` is [`AppConfig::wsl_account`] resolved at boot: `None` means no
+/// ninfer load can be addressed in WSL.
 async fn log_boot_banner(
     scheduler: &SchedulerHandle,
     llama_server_exe: &std::path::Path,
     modelconf_dir: &std::path::Path,
+    wsl_account: Option<&str>,
 ) {
     let exe_missing = {
         let exe = llama_server_exe.to_path_buf();
@@ -227,6 +234,15 @@ async fn log_boot_banner(
         }
     };
     let entries = catalog.models.clone();
+    // Same landmine pattern as the missing-exe warn above: an ninfer catalog with no
+    // WSL account can never load, and that must be visible at boot rather than only
+    // when the operator clicks Load (review, 2026-10-26).
+    if wsl_account.is_none() && entries.iter().any(|entry| entry.engine == "ninfer") {
+        tracing::warn!(
+            "the catalog holds ninfer models but `wsl_user` is not set: those loads will \
+             refuse until the config names the WSL account that owns them"
+        );
+    }
     let conf_dir = modelconf_dir.to_path_buf();
     let markers = tokio::task::spawn_blocking(move || {
         entries
@@ -497,7 +513,7 @@ async fn run(
     {
         let handle = state.scheduler.clone();
         let distro = state.config.wsl_distro.clone();
-        let user = state.config.wsl_user.clone();
+        let user = state.config.wsl_account().unwrap_or_default().to_string();
         tokio::spawn(async move {
             let Ok(catalog) = handle.catalog().await else {
                 return;

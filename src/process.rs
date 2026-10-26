@@ -159,6 +159,17 @@ fn excerpt(bytes: &[u8]) -> String {
 /// caller proceed (the release poll is the arbiter). `kill_on_drop` so a timed-out
 /// client cannot accumulate as an orphan (review, 2026-10-26).
 async fn reap_container(distro: &str, user: &str, name: &str) {
+    if user.trim().is_empty() || distro.trim().is_empty() {
+        // Neither coordinate has a shipped default (`wsl_user` names a personal account);
+        // never hand `wsl.exe` an empty `-d`/`-u` and call the result a reaping.
+        tracing::warn!(
+            container = name,
+            distro = distro,
+            user = user,
+            "WSL coordinates missing from the config: refusing to address this container"
+        );
+        return;
+    }
     let (program, args) = container_rm(distro, user, name);
     let command = Command::new(&program)
         .args(&args)
@@ -189,6 +200,19 @@ async fn reap_container(distro: &str, user: &str, name: &str) {
 /// Best-effort: any failure logs and boot proceeds.
 pub async fn reclaim_owned_containers(distro: &str, user: &str, owned: &[String]) {
     if owned.is_empty() {
+        return;
+    }
+    if user.trim().is_empty() || distro.trim().is_empty() {
+        // Name the containers the catalog declares: without them the operator's next
+        // load only says "insufficient VRAM", and this line is the sole pointer to the
+        // orphan holding the card (review, 2026-10-26).
+        tracing::warn!(
+            declared = ?owned,
+            distro = distro,
+            user = user,
+            "WSL coordinates missing from the config: boot reclaim stands down, an orphaned \
+             container keeps the card occupied"
+        );
         return;
     }
     let Some(present) = docker_ps(distro, user).await else {
@@ -271,10 +295,12 @@ impl ProcessRuntime {
                 .build()
                 .expect("invariant: plain-HTTP client with a timeout needs no configuration"),
             logs_dir,
-            // WSL coordinates come from config defaults; boot always overrides
-            // them via `with_wsl`, so there is exactly one source of the literals.
-            wsl_distro: crate::config::AppConfig::default().wsl_distro,
-            wsl_user: crate::config::AppConfig::default().wsl_user,
+            // No WSL coordinates before boot: they name a machine-specific distro and a
+            // personal account, so nothing is assumed. Boot wires both through `with_wsl`,
+            // and the reaping guards refuse loudly rather than invoke `wsl.exe` without
+            // them (review, 2026-10-26).
+            wsl_distro: String::new(),
+            wsl_user: String::new(),
         }
     }
 
@@ -578,14 +604,11 @@ mod tests {
 
     #[test]
     fn container_rm_uses_the_shared_wsl_prefix() {
-        let (program, args) = container_rm("Ubuntu", "legislat", "ninfer-x");
+        let (program, args) = container_rm("Ubuntu", "ops", "ninfer-x");
         assert_eq!(program, "wsl.exe");
         assert_eq!(
             [vec![program], args].concat(),
-            vec![
-                "wsl.exe", "-d", "Ubuntu", "-u", "legislat", "--", "docker", "rm", "-f",
-                "ninfer-x",
-            ]
+            vec!["wsl.exe", "-d", "Ubuntu", "-u", "ops", "--", "docker", "rm", "-f", "ninfer-x",]
         );
     }
 

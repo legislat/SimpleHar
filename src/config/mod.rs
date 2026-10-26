@@ -127,8 +127,24 @@ fn default_wsl_distro() -> String {
     "Ubuntu".to_string()
 }
 
-fn default_wsl_user() -> String {
-    "legislat".to_string()
+/// Strips surrounding whitespace from a WSL coordinate at parse time. A stray space
+/// would otherwise reach `wsl.exe` as part of its own argument and fail as "distribution
+/// not found" — and both coordinates address the same container, so they must be
+/// normalized the same way (review, 2026-10-26).
+fn trimmed<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(|raw| raw.trim().to_string())
+}
+
+/// [`trimmed`] for an optional coordinate. A blank spelling survives as `Some("")`, so
+/// [`AppConfig::validate`] can still tell a typo from an absent key.
+fn trimmed_opt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.map(|raw| raw.trim().to_string()))
 }
 
 fn default_modelconf_dir() -> std::path::PathBuf {
@@ -311,11 +327,19 @@ pub struct AppConfig {
     #[serde(default = "default_greedy_min_free")]
     pub greedy_launch_min_free_gb: f64,
     /// WSL distro hosting ninfer containers (`wsl.exe -d <this>`; v3.3 parity).
-    #[serde(default = "default_wsl_distro")]
+    #[serde(default = "default_wsl_distro", deserialize_with = "trimmed")]
     pub wsl_distro: String,
-    /// WSL user owning the ninfer containers and their autostart scripts.
-    #[serde(default = "default_wsl_user")]
-    pub wsl_user: String,
+    /// WSL user owning the ninfer containers and their autostart scripts. **No
+    /// default**: it names a personal account, so a value shipped in code would be
+    /// wrong for everyone but its author. Omit it when no ninfer model is used; while
+    /// it is unset the `ninfer` adapter refuses to launch and boot reclaim stands
+    /// down, both by name rather than by a silent empty `-u` argument.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "trimmed_opt"
+    )]
+    pub wsl_user: Option<String>,
     /// The file this config was loaded from (`SIMPLEHAR_CONFIG` or beside the exe),
     /// stamped by the boot loader. `#[serde(skip)]` so it never enters the persisted
     /// JSON. `default_model` write-back targets this exact path — read and write must
@@ -350,7 +374,7 @@ impl Default for AppConfig {
             witness_tolerance_gb: default_witness_tolerance(),
             greedy_launch_min_free_gb: default_greedy_min_free(),
             wsl_distro: default_wsl_distro(),
-            wsl_user: default_wsl_user(),
+            wsl_user: None,
             control_token: None,
             source_path: None,
         }
@@ -431,6 +455,17 @@ impl AppConfig {
             .iter()
             .find(|c| c.control)
             .expect("invariant: validate() enforces exactly one control category")
+    }
+
+    /// The WSL account to address containers with: `None` when the key is absent or
+    /// blank, so callers branch on "unset" instead of passing an empty `-u` to
+    /// `wsl.exe`. [`AppConfig::validate`] rejects the blank-but-present spelling.
+    #[must_use]
+    pub fn wsl_account(&self) -> Option<&str> {
+        self.wsl_user
+            .as_deref()
+            .map(str::trim)
+            .filter(|user| !user.is_empty())
     }
 
     /// Cross-field validation (§0.2 step 2 namespace check). Returns every problem.
@@ -548,10 +583,16 @@ impl AppConfig {
                 reason: "must not be blank (ninfer spawn and reap both address it)".to_string(),
             });
         }
-        if self.wsl_user.trim().is_empty() {
+        if self
+            .wsl_user
+            .as_deref()
+            .is_some_and(|user| user.trim().is_empty())
+        {
             errors.push(ConfigError::Invalid {
                 field: "wsl_user".to_string(),
-                reason: "must not be blank (ninfer spawn and reap both address it)".to_string(),
+                reason: "must not be blank (ninfer spawn and reap both address it); omit the \
+                         key when no ninfer model is used"
+                    .to_string(),
             });
         }
         if self.load_timeout_s == 0 {
@@ -692,6 +733,48 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(cfg.validate().is_empty(), "0.0.0.0 must validate");
+    }
+
+    #[test]
+    fn wsl_coordinates_are_trimmed_at_parse_so_a_stray_space_cannot_reach_wsl() {
+        // Both halves address the same container, so a typo that survives in one and is
+        // corrected in the other is a launch-vs-teardown divergence.
+        let cfg = AppConfig::parse("{\"wsl_distro\": \" Ubuntu \", \"wsl_user\": \"  ops  \"}")
+            .expect("parses");
+        assert_eq!(cfg.wsl_distro, "Ubuntu", "the distro is normalized too");
+        assert_eq!(cfg.wsl_user.as_deref(), Some("ops"));
+        assert_eq!(cfg.wsl_account(), Some("ops"));
+        assert!(cfg.validate().is_empty());
+    }
+
+    #[test]
+    fn wsl_user_ships_no_default_and_is_only_rejected_when_blank() {
+        // It names a personal account, so a shipped default would be wrong for every
+        // other machine: absent is legal (the adapter refuses by name), blank is a typo.
+        let absent = AppConfig::parse("{}").expect("defaults parse");
+        assert_eq!(absent.wsl_user, None);
+        assert_eq!(absent.wsl_account(), None);
+        assert!(absent.validate().is_empty());
+        assert!(
+            !serde_json::to_string(&absent)
+                .expect("serializes")
+                .contains("wsl_user"),
+            "an unconfigured coordinate must not be stamped into the operator's file"
+        );
+        let set = AppConfig::parse("{\"wsl_user\": \"  ops  \"}").expect("parses");
+        assert_eq!(
+            set.wsl_account(),
+            Some("ops"),
+            "surrounding space is not part of an account"
+        );
+        assert!(set.validate().is_empty());
+        let blank = AppConfig::parse("{\"wsl_user\": \"   \"}")
+            .expect("parses as json")
+            .validate();
+        assert!(
+            blank.iter().any(|e| e.to_string().contains("wsl_user")),
+            "a blank spelling must fail closed, not disable reaping silently"
+        );
     }
 
     #[test]

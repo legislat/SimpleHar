@@ -93,6 +93,16 @@ impl EngineAdapter for NinferAdapter {
             model: model.name.clone(),
             reason,
         };
+        // The WSL account is operator-specific and has no shipped default (config
+        // review, 2026-10-26): refuse with the field named rather than hand `wsl.exe`
+        // an empty `-u` and let the spawn fail obscurely.
+        if self.defaults.wsl_user.trim().is_empty() {
+            return Err(rejected(
+                "`wsl_user` is not set in the config file: name the WSL account that owns \
+                 these containers"
+                    .to_string(),
+            ));
+        }
         // Both required, exactly as v3.3 refused them at launch; the script path
         // lives inside WSL and cannot be existence-checked from here.
         let missing = |field: &str| EngineError::MissingField {
@@ -197,8 +207,24 @@ mod tests {
     }
 
     #[test]
+    fn spec_refuses_by_naming_wsl_user_when_the_account_is_unset() {
+        // No username ships as a default, so the load has to explain the fix rather
+        // than hand `wsl.exe` an empty `-u` and fail obscurely.
+        let err = NinferAdapter::new("Ubuntu", "")
+            .spec(
+                &entry(&[
+                    ("ninfer_autostart", "/home/u/guide/ninfer-x/autostart.sh"),
+                    ("ninfer_container", "ninfer-x"),
+                ]),
+                18109,
+            )
+            .expect_err("a blank account cannot launch");
+        assert!(err.to_string().contains("wsl_user"), "was: {err}");
+    }
+
+    #[test]
     fn argv_matches_the_v33_positional_contract() {
-        let spec = NinferAdapter::new("Ubuntu", "legislat")
+        let spec = NinferAdapter::new("Ubuntu", "ops")
             .spec(
                 &entry(&[
                     ("ninfer_autostart", "/home/u/guide/ninfer-x/autostart.sh"),
@@ -214,7 +240,7 @@ mod tests {
                 "-d",
                 "Ubuntu",
                 "-u",
-                "legislat",
+                "ops",
                 "--",
                 "bash",
                 "/home/u/guide/ninfer-x/autostart.sh",
@@ -261,13 +287,13 @@ mod tests {
 
     #[test]
     fn missing_required_keys_are_refusals_not_panic() {
-        let err = NinferAdapter::new("Ubuntu", "legislat")
+        let err = NinferAdapter::new("Ubuntu", "ops")
             .spec(&entry(&[("ninfer_container", "c")]), 18109)
             .expect_err("must refuse");
         assert!(
             matches!(err, EngineError::MissingField { ref field, .. } if field == "ninfer_autostart")
         );
-        let err = NinferAdapter::new("Ubuntu", "legislat")
+        let err = NinferAdapter::new("Ubuntu", "ops")
             .spec(&entry(&[("ninfer_autostart", "/s.sh")]), 18109)
             .expect_err("must refuse");
         assert!(
@@ -279,7 +305,7 @@ mod tests {
     fn external_key_is_inert_now() {
         // Operator call 2026-10-26 scrapped `external: true`: a copied-back v3.3
         // yaml must be managed, not refused — the key carries no meaning here.
-        let spec = NinferAdapter::new("Ubuntu", "legislat")
+        let spec = NinferAdapter::new("Ubuntu", "ops")
             .spec(
                 &entry(&[
                     ("ninfer_autostart", "/s.sh"),
@@ -298,7 +324,7 @@ mod tests {
         // distro, so a yaml value is only safe as a plain word (security review,
         // 2026-10-26): option-shaped, spaced and metacharacter-bearing values die here.
         for bad in ["-c", "/s.sh; id", "/s$(id).sh", "/s.sh|sh", "/a b.sh"] {
-            let err = NinferAdapter::new("Ubuntu", "legislat")
+            let err = NinferAdapter::new("Ubuntu", "ops")
                 .spec(
                     &entry(&[("ninfer_autostart", bad), ("ninfer_container", "c")]),
                     18109,
@@ -310,7 +336,7 @@ mod tests {
                 "{bad}: {err}"
             );
         }
-        let err = NinferAdapter::new("Ubuntu", "legislat")
+        let err = NinferAdapter::new("Ubuntu", "ops")
             .spec(
                 &entry(&[
                     ("ninfer_autostart", "/s.sh"),
@@ -326,7 +352,7 @@ mod tests {
             "{err}"
         );
         for name in ["-v", "_x", "a b"] {
-            let err = NinferAdapter::new("Ubuntu", "legislat")
+            let err = NinferAdapter::new("Ubuntu", "ops")
                 .spec(
                     &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", name)]),
                     18109,
@@ -342,7 +368,7 @@ mod tests {
     #[test]
     fn key_flag_uses_the_shared_truthy_table() {
         for value in ["true", "1", "yes", "on"] {
-            let spec = NinferAdapter::new("Ubuntu", "legislat")
+            let spec = NinferAdapter::new("Ubuntu", "ops")
                 .spec(
                     &entry(&[
                         ("ninfer_autostart", "/s.sh"),
@@ -354,7 +380,7 @@ mod tests {
                 .expect("valid spec");
             assert_eq!(spec.argv[9], "key", "ninfer_key: {value}");
         }
-        let spec = NinferAdapter::new("Ubuntu", "legislat")
+        let spec = NinferAdapter::new("Ubuntu", "ops")
             .spec(
                 &entry(&[
                     ("ninfer_autostart", "/s.sh"),
