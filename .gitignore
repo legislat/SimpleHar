@@ -1,5 +1,7 @@
 /target
 /base-archive
+# Verbatim archives of superseded governing-doc revisions (local-only, like the docs).
+/archive
 /logs
 /.env
 # Local model configs (absolute machine paths), same local-only rationale.
