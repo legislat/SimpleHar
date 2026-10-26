@@ -50,7 +50,7 @@ pub enum Command {
 pub enum SwapState {
     /// No job on the slot.
     Idle,
-    /// Budget gate against the ledger (Step 4).
+    /// Budget gate against the card's own reading (Step 4, as amended 2026-10-26).
     Admit,
     /// Admission refused; terminal until the slot returns to `Idle`.
     AdmitFail,
@@ -73,6 +73,21 @@ pub enum SwapState {
     Reap,
     /// Cancel observed; finish the current step, then `Reap` (Step 3).
     CancelRequested,
+}
+
+impl SwapState {
+    /// Whether a job parked here has GiB committed to it that the card cannot have
+    /// accounted for yet — its engine is admitted but not installed. The admission
+    /// gate debits exactly this set and the page's "booked" figure reports it, so the
+    /// predicate lives once, next to the graph it describes (review, 2026-10-26: two
+    /// copies of this list drifted within the same commit).
+    #[must_use]
+    pub fn reserves_vram(self) -> bool {
+        matches!(
+            self,
+            Self::Admit | Self::Quiesce | Self::Dispose | Self::Spawn | Self::Ready | Self::Install
+        )
+    }
 }
 
 /// Whether the `from -> to` edge exists in the Step 3 graph.

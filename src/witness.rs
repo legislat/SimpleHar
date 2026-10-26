@@ -1,10 +1,11 @@
-//! The NVML witness (DESIGN Step 4, choice D, item 5 approved).
+//! The NVML witness (DESIGN Step 4, item 5 approved).
 //!
 //! NVML in-process is the primary source (no process spawn per sample, per-process
-//! attribution for external reservations). When the NVML library is unavailable the
-//! witness falls back to spawning `nvidia-smi` — logged loudly, once — and when
-//! neither answers, `sample()` errors and the caller runs ledger-only rather than
-//! deciding on a stale guess (F-3/F-7 lesson).
+//! attribution where the driver offers it). When the NVML library or a sample fails,
+//! the witness falls back to spawning `nvidia-smi` — logged once, and labelled as a
+//! fallback by `source()` (F-7). When neither answers, `sample()` errors and the
+//! caller **refuses** rather than deciding on a stale guess or a bookkeeping fallback
+//! (F-3/F-7 lesson); only `LedgerOnlyWitness` budgets from the ledger instead.
 
 use crate::budget::{parse_smi_sample, MemorySample, VramWitness};
 use async_trait::async_trait;
@@ -14,13 +15,23 @@ use std::time::{Duration, Instant};
 /// How long a sample stays fresh: status polls every 2 s must not spawn a process
 /// storm in the smi fallback.
 const SAMPLE_TTL: Duration = Duration::from_secs(2);
+/// How long a *failed* sample is remembered. Without this the failure path had no
+/// cache at all, so a wedged driver was re-spawned by every 250 ms settle poll and
+/// every status refresh — while admission was busy refusing on each of those
+/// failures (review, 2026-10-26).
+const FAILURE_TTL: Duration = Duration::from_secs(1);
 /// Timeout for one `nvidia-smi` invocation.
 const SMI_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// NVML-first witness with `nvidia-smi` fallback and a TTL cache.
+/// NVML-first witness with `nvidia-smi` fallback, a TTL cache for successes *and*
+/// failures, and a refill lock so concurrent callers share one sampling round.
 pub struct NvmlWitness {
     nvml: Option<nvml_wrapper::Nvml>,
     cache: Mutex<Option<(Instant, MemorySample)>>,
+    failure: Mutex<Option<(Instant, String)>>,
+    /// Held across a refill: the TTL check and the store straddle an `await`, so
+    /// without this N concurrent misses each spawned their own `nvidia-smi` pair.
+    refill: tokio::sync::Mutex<()>,
     fell_back: Mutex<bool>,
 }
 
@@ -38,6 +49,8 @@ impl NvmlWitness {
         NvmlWitness {
             nvml,
             cache: Mutex::new(None),
+            failure: Mutex::new(None),
+            refill: tokio::sync::Mutex::new(()),
             fell_back: Mutex::new(false),
         }
     }
@@ -56,7 +69,8 @@ impl NvmlWitness {
             .memory_info()
             .map_err(|e| format!("memory_info: {e}"))?;
         let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        // Per-process attribution for external reservations (Step 4 rule 2).
+        // Per-process figures: display (`attributed_gb`) and the measured footprint.
+        // The budget reads totals, so these never subtract a second time.
         let mut processes = Vec::new();
         match device.running_compute_processes() {
             Ok(list) => {
@@ -71,9 +85,9 @@ impl NvmlWitness {
                 }
             }
             Err(error) => {
-                // Not fatal: totals still work; external accounting degrades to
-                // ledger-only and is logged.
-                tracing::warn!(error = %error, "per-process VRAM unavailable; external accounting degraded");
+                // Not fatal: totals still gate. Only the per-process display is
+                // lost, and that is reported as absence (`attributed_gb: null`).
+                tracing::warn!(error = %error, "per-process VRAM figures unavailable");
             }
         }
         Ok(MemorySample {
@@ -102,6 +116,19 @@ impl NvmlWitness {
         }
         parse_smi_sample(&gpu, &apps)
     }
+
+    /// Cached success within its TTL, if any.
+    fn fresh_sample(&self) -> Option<MemorySample> {
+        let (at, sample) = self.cache.lock().expect("witness cache lock").clone()?;
+        (at.elapsed() < SAMPLE_TTL).then_some(sample)
+    }
+
+    /// Cached failure within its TTL, if any — the reason a wedged driver is sampled
+    /// once per second, not once per poll.
+    fn fresh_failure(&self) -> Option<String> {
+        let (at, reason) = self.failure.lock().expect("witness failure lock").clone()?;
+        (at.elapsed() < FAILURE_TTL).then_some(reason)
+    }
 }
 
 impl Default for NvmlWitness {
@@ -123,20 +150,41 @@ impl VramWitness for NvmlWitness {
     }
 
     async fn sample(&self) -> Result<MemorySample, String> {
-        if let Some((at, sample)) = self.cache.lock().expect("witness lock").as_ref() {
-            if at.elapsed() < SAMPLE_TTL {
-                return Ok(sample.clone());
-            }
+        if let Some(sample) = self.fresh_sample() {
+            return Ok(sample);
         }
-        let sample = match self.sample_nvml() {
-            Ok(sample) => sample,
+        if let Some(reason) = self.fresh_failure() {
+            return Err(reason);
+        }
+        // One caller refills; the others block here and then read its result instead
+        // of each spawning their own `nvidia-smi` pair.
+        let _refill = self.refill.lock().await;
+        if let Some(sample) = self.fresh_sample() {
+            return Ok(sample);
+        }
+        if let Some(reason) = self.fresh_failure() {
+            return Err(reason);
+        }
+        let result = match self.sample_nvml() {
+            Ok(sample) => Ok(sample),
             Err(reason) => {
                 tracing::debug!(reason = %reason, "nvml sample failed; trying nvidia-smi");
-                self.sample_smi().await?
+                self.sample_smi().await
             }
         };
-        *self.cache.lock().expect("witness lock") = Some((Instant::now(), sample.clone()));
-        Ok(sample)
+        match result {
+            Ok(sample) => {
+                *self.cache.lock().expect("witness cache lock") =
+                    Some((Instant::now(), sample.clone()));
+                *self.failure.lock().expect("witness failure lock") = None;
+                Ok(sample)
+            }
+            Err(reason) => {
+                *self.failure.lock().expect("witness failure lock") =
+                    Some((Instant::now(), reason.clone()));
+                Err(reason)
+            }
+        }
     }
 }
 
@@ -145,6 +193,9 @@ async fn smi(args: &[&str]) -> Result<String, String> {
     tokio::time::timeout(SMI_TIMEOUT, async {
         let output = tokio::process::Command::new("nvidia-smi")
             .args(args)
+            // A timed-out `nvidia-smi` would otherwise be dropped and keep running:
+            // a wedged driver then accumulates stuck children (review, 2026-10-26).
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| format!("spawn nvidia-smi: {e}"))?;
@@ -207,5 +258,20 @@ mod tests {
             sample.used_gib,
             sample.total_gib
         );
+    }
+
+    #[test]
+    fn source_labels_nvml_and_the_fallback_apart() {
+        // F-7: a fallback reading must never be displayed as an in-process NVML one,
+        // so the two cases cannot collapse into one label.
+        let witness = NvmlWitness::new();
+        let expected = if witness.nvml.is_some() {
+            "NVML"
+        } else {
+            "nvidia-smi (fallback)"
+        };
+        assert_eq!(witness.source(), expected);
+        *witness.fell_back.lock().expect("witness lock") = true;
+        assert_eq!(witness.source(), "nvidia-smi (fallback)");
     }
 }

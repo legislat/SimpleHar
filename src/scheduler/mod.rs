@@ -45,7 +45,8 @@ pub enum SchedulerError {
     /// No catalog entry for the requested name.
     #[error("unknown model `{0}`")]
     UnknownModel(String),
-    /// No job with this id (already finished and pruned, or never existed).
+    /// No job with this id: the job ledger lives only for this process's lifetime
+    /// (it is never persisted), so a restart or a mistyped id both land here.
     #[error("unknown job {0}")]
     UnknownJob(JobId),
     /// The budget gate refused the load; carries need/free/reserve (Step 6 contract).
@@ -217,6 +218,17 @@ pub fn headline_fault(jobs: &[JobStatus]) -> Option<&JobStatus> {
             && later.error.is_none()
     });
     (!cleared).then_some(fault)
+}
+
+/// GiB committed to loads that are admitted but not yet installed — the same set the
+/// admission gate debits, so the page's "booked" figure can never disagree with the
+/// number a refusal quotes (review, 2026-10-26).
+#[must_use]
+pub fn booking_gibs(jobs: &[JobStatus]) -> f64 {
+    jobs.iter()
+        .filter(|job| job.kind == JobKind::Load && !job.terminal && job.state.reserves_vram())
+        .map(|job| job.need_gib.unwrap_or(0.0))
+        .sum()
 }
 
 /// Per-job step timings in milliseconds (§0.3: measurable, not argued about).
@@ -480,7 +492,8 @@ enum Event {
     /// Readiness loop finished (terminal tri-state only) plus the engine's
     /// self-reported model id when ready and discoverable (Step 10, F-4).
     Probed(Probe, Option<String>),
-    /// Witness sample for admission returned (Err = unavailable, ledger-only).
+    /// Witness sample for admission returned (Err = no reading, which refuses unless
+    /// the witness declares `ledger_only`).
     Admitted(Result<crate::budget::MemorySample, String>),
     /// Post-release memory settle finished (Err carries the numbers).
     Settled(Result<(), String>),
@@ -1129,22 +1142,22 @@ impl ActorState {
             load_timeout_s: entry.load_timeout_s,
             gate_target: None,
         };
-        let need = match entry.cost {
+        // One decision (`ModelEntry::cost_source`) drives the gate; the page's Cost
+        // column reads the same one, so the two cannot drift.
+        let need = match entry.cost_source() {
             // `exact` is a precision claim: the engine's number, not an estimate.
             // No `vram_gb`, no load — the size×1.15+2 fallback would be a guess.
-            crate::model::CostClass::Exact if entry.vram_gb.is_none() => {
-                Err(AdmissionError::ExactUndeclared)
-            }
-            _ => budget::need_gb(
+            crate::model::CostSource::Undeclared => Err(AdmissionError::ExactUndeclared),
+            source => budget::need_gb(
                 entry
                     .vram_gb
                     .map(Gibibytes)
-                    // Fixed models consult the harness-measured footprint of an
-                    // earlier run before the size estimate. Greedy keeps nominal
-                    // semantics: a post-spill measurement is not a nominal size
-                    // and must not shrink the booking (review, 2026-10-26).
+                    // `fixed` consults the harness-measured footprint of an earlier
+                    // run before the size estimate. Greedy keeps nominal semantics: a
+                    // post-spill measurement is not a nominal size and must not shrink
+                    // the booking (review, 2026-10-26).
                     .or_else(|| {
-                        (entry.cost == crate::model::CostClass::Fixed)
+                        (source == crate::model::CostSource::Measured)
                             .then(|| entry.measured_gb.map(Gibibytes))
                             .flatten()
                     }),
@@ -1183,8 +1196,9 @@ impl ActorState {
         self.slots[slot].job = Some(job_id);
         self.set_timing(job_id, |t| &mut t.queue_ms);
         self.step(job_id, SwapState::Admit);
-        // Step 4: the gate is evaluated against the ledger with the witness as a
-        // fresh, reconciling sample — sampled on a task, never inline in the actor.
+        // Step 4 (as amended 2026-10-26): the gate is evaluated against the card's own
+        // reading, sampled on a task — never inline in the actor, which must not stall
+        // behind a witness call.
         let witness = Arc::clone(&self.witness);
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
@@ -1220,11 +1234,7 @@ impl ActorState {
             return;
         }
         let (total_gib, occupied, observed_free) = match &sample {
-            Ok(sample) => (
-                sample.total_gib,
-                sample.used_gib,
-                Some((sample.total_gib - sample.used_gib).max(0.0)),
-            ),
+            Ok(sample) => (sample.total_gib, sample.used_gib, Some(sample.free_gib())),
             Err(_) => {
                 // The declared mode of a witness that never answers (tests, a box
                 // without a GPU): the ledger is then the only truth there is.
@@ -1272,6 +1282,18 @@ impl ActorState {
         } else {
             None
         });
+        // The card itself can be misread: `nvidia-smi` parses `NaN` as a number, and
+        // every comparison against NaN is false, which would silently read as
+        // "fits". An unreadable reading is named as one (fail closed, §0.3).
+        if !free.0.is_finite() {
+            self.step(job_id, SwapState::AdmitFail);
+            let error = SchedulerError::Admission(AdmissionError::WitnessUnavailable {
+                reason: format!("unreadable witness reading: {} GiB free", free.0),
+            });
+            self.log_refusal(job_id, &error, "witness");
+            self.finish(job_id, Err(error), "witness unreadable");
+            return;
+        }
         // Defense in depth (review, 2026-10-26): the scan parser rejects
         // non-finite sizes, but no value may ever *silently* pass the gate —
         // every NaN comparison is false, which would read as "fits".
@@ -1557,11 +1579,18 @@ impl ActorState {
     /// proves the card truly emptied (operator 2026-10-26: the stopper is observed
     /// VRAM, judged after release). No ledger baseline is consulted — an
     /// unattributable desktop floor is not a leak.
+    ///
+    /// A witness that dies mid-window fails **closed**, exactly as at admission: a
+    /// confirmed release proves the port closed, never that the VRAM came back, and
+    /// for a same-slot replacement this window is the only physical check the load
+    /// ever gets. Only a deliberately silent (`ledger_only`) witness is waved
+    /// through (review, 2026-10-26).
     fn spawn_settle_task(&mut self, job_id: JobId) {
         let tolerance = self.cfg.witness_tolerance_gb;
         let gate = self.jobs[&job_id].gate_target.unwrap_or(0.0);
         let model = self.jobs[&job_id].model.clone();
         let deadline = Duration::from_secs(self.cfg.settle_timeout_s);
+        let ledger_only = self.witness.ledger_only();
         let witness = Arc::clone(&self.witness);
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
@@ -1569,7 +1598,7 @@ impl ActorState {
             loop {
                 match witness.sample().await {
                     Ok(sample) => {
-                        let observed_free = (sample.total_gib - sample.used_gib).max(0.0);
+                        let observed_free = sample.free_gib();
                         if sample.freed_for(gate, tolerance) {
                             if crate::observability::extended_logging() {
                                 tracing::info!(
@@ -1588,19 +1617,23 @@ impl ActorState {
                         }
                     }
                     Err(reason) => {
+                        if ledger_only {
+                            tracing::debug!(reason = %reason,
+                                "no reading to settle against (ledger-only witness); proceeding");
+                            let _ = tx.send(ActorMsg::Event {
+                                job: job_id,
+                                event: Event::Settled(Ok(())),
+                            });
+                            return;
+                        }
                         tracing::warn!(reason = %reason,
-                            "witness unavailable during settle; proceeding (release was confirmed)");
-                        let _ = tx.send(ActorMsg::Event {
-                            job: job_id,
-                            event: Event::Settled(Ok(())),
-                        });
-                        return;
+                            "witness lost during settle; holding the spawn until it answers");
                     }
                 }
                 if started.elapsed() >= deadline {
                     let numbers = match witness.sample().await {
                         Ok(sample) => {
-                            let observed_free = (sample.total_gib - sample.used_gib).max(0.0);
+                            let observed_free = sample.free_gib();
                             let msg = format!(
                                 "{:.1} GiB free after release, {:.1} GiB required (used {:.1} of {:.1})",
                                 observed_free, gate, sample.used_gib, sample.total_gib
@@ -1618,7 +1651,11 @@ impl ActorState {
                             );
                             msg
                         }
-                        Err(_) => "no witness sample".to_string(),
+                        Err(reason) => {
+                            tracing::warn!(%job_id, %model, reason = %reason, gate_gib = gate,
+                                "settle timeout: the witness never answered again");
+                            format!("witness lost during settle: {reason}")
+                        }
                     };
                     let _ = tx.send(ActorMsg::Event {
                         job: job_id,
@@ -2232,6 +2269,10 @@ impl ActorState {
     /// still spawning), so without this debit two concurrent loads in different
     /// categories both spend the same free bytes — the retired ledger never covered
     /// it either, it summed installed occupants only (operator 2026-10-26).
+    ///
+    /// A `greedy` load still in `Admit` has no `need` yet and contributes 0; it is
+    /// protected by its launch floor, and once the greedy booking is recorded it is
+    /// debited like any other.
     fn in_flight_need(&self, except: JobId) -> f64 {
         self.jobs
             .iter()
@@ -2239,15 +2280,7 @@ impl ActorState {
                 **id != except
                     && job.kind == JobKind::Load
                     && !job.terminal
-                    && matches!(
-                        job.state,
-                        SwapState::Admit
-                            | SwapState::Quiesce
-                            | SwapState::Dispose
-                            | SwapState::Spawn
-                            | SwapState::Ready
-                            | SwapState::Install
-                    )
+                    && job.state.reserves_vram()
             })
             .map(|(_, job)| job.need.map_or(0.0, |need| need.0))
             .sum()

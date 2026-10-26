@@ -15,6 +15,7 @@ use simplehar_se::engine::mock::MockAdapter;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
 use simplehar_se::scheduler::{Reply, Scheduler, SchedulerHandle};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,8 @@ use std::time::{Duration, Instant};
 struct FakeWitness {
     queue: Arc<Mutex<VecDeque<MemorySample>>>,
     override_now: Arc<Mutex<Option<MemorySample>>>,
+    /// Once set, every sample errors: models a driver wedging mid-window (§0.3).
+    dead: Arc<AtomicBool>,
 }
 
 impl FakeWitness {
@@ -32,11 +35,16 @@ impl FakeWitness {
         FakeWitness {
             queue: Arc::new(Mutex::new(samples.into())),
             override_now: Arc::new(Mutex::new(None)),
+            dead: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn set(&self, sample: MemorySample) {
         *self.override_now.lock().expect("witness override lock") = Some(sample);
+    }
+
+    fn kill(&self) {
+        self.dead.store(true, Ordering::Relaxed);
     }
 }
 
@@ -47,6 +55,9 @@ impl VramWitness for FakeWitness {
     }
 
     async fn sample(&self) -> Result<MemorySample, String> {
+        if self.dead.load(Ordering::Relaxed) {
+            return Err("nvml died".to_string());
+        }
         if let Some(sample) = self
             .override_now
             .lock()
@@ -230,6 +241,85 @@ async fn settle_passes_once_the_card_frees() {
     assert!(matches!(reply, Reply::Loaded(_)), "got {reply:?}");
 }
 
+#[tokio::test]
+async fn settle_fails_closed_when_the_witness_dies_mid_window() {
+    // The card is held full so the settle window is genuinely waiting, then the
+    // witness dies. A confirmed release proves the port closed, never that the VRAM
+    // came back — and for a same-slot replacement this window is the load's only
+    // physical check — so the spawn must not fire blind (review, 2026-10-26).
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
+    let cfg = AppConfig {
+        settle_timeout_s: 1,
+        ..AppConfig::default()
+    };
+    let handle = harness_models(
+        cfg,
+        &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 8.0)],
+        Arc::new(witness.clone()),
+    );
+
+    let Reply::Loaded(_) = handle.swap("a", CategoryId::Work).await.expect("a loads") else {
+        panic!("expected Loaded");
+    };
+    witness.set(sample(72.0, 68.0, vec![]));
+    let awaiting_b = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("b", CategoryId::Work).await })
+    };
+    wait_until(&handle, 5, |status| {
+        status
+            .jobs
+            .iter()
+            .any(|job| job.model == "b" && job.state == simplehar_se::scheduler::SwapState::Dispose)
+    })
+    .await;
+    witness.kill();
+
+    let error = awaiting_b
+        .await
+        .expect("task alive")
+        .expect_err("a dead witness must not spawn blind");
+    let message = error.to_string();
+    assert!(message.contains("settle timeout"), "was: {message}");
+    assert!(
+        message.contains("nvml died"),
+        "the lost witness must be named: {message}"
+    );
+    let status = handle.status().await.expect("actor alive");
+    assert!(
+        status.slots.iter().all(|slot| slot.model.is_none()),
+        "b was never installed"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_card_reading_refuses_rather_than_silently_fitting() {
+    // `nvidia-smi` can hand back `NaN`, which parses as a number; every comparison
+    // against NaN is false, so a gate that just compares would read "fits".
+    let witness = FakeWitness::with(vec![sample(f64::NAN, f64::NAN, vec![])]);
+    let cfg = AppConfig {
+        settle_timeout_s: 1,
+        ..AppConfig::default()
+    };
+    let handle = harness(cfg, &[("qwen3", CategoryId::Work)], Arc::new(witness));
+
+    let error = handle
+        .swap("qwen3", CategoryId::Work)
+        .await
+        .expect_err("NaN is not a reading");
+    let message = error.to_string();
+    assert!(message.contains("witness unavailable"), "was: {message}");
+    assert!(
+        message.contains("unreadable witness reading"),
+        "was: {message}"
+    );
+    let status = handle.status().await.expect("actor alive");
+    assert!(
+        status.slots.iter().all(|slot| slot.model.is_none()),
+        "refused before spawn"
+    );
+}
+
 /// `harness` with a per-model `vram_gb` (the shared one pins 4 GiB for everything).
 fn harness_models(
     cfg: AppConfig,
@@ -324,7 +414,7 @@ async fn concurrent_loads_cannot_double_spend_the_same_bytes() {
             ("a1", CategoryId::Work, 18.0),
             ("b", CategoryId::Rp, 4.0),
         ],
-        Arc::new(witness),
+        Arc::new(witness.clone()),
     );
 
     handle
@@ -349,7 +439,25 @@ async fn concurrent_loads_cannot_double_spend_the_same_bytes() {
     let message = error.to_string();
     assert!(message.contains("insufficient VRAM"), "was: {message}");
     assert!(message.contains("need 4.0 GiB"), "was: {message}");
-    parked.abort();
+    // The debit must not become a permanent lockout: once the card frees, a1
+    // installs, and b then fits what a1's victim released.
+    witness.set(sample(72.0, 40.0, vec![]));
+    let Reply::Loaded(receipt) = parked
+        .await
+        .expect("task alive")
+        .expect("a1 loads once the card frees")
+    else {
+        panic!("expected Loaded");
+    };
+    assert_eq!(receipt.model, "a1");
+    let Reply::Loaded(receipt) = handle
+        .swap("b", CategoryId::Rp)
+        .await
+        .expect("b loads after a1 installed")
+    else {
+        panic!("expected Loaded");
+    };
+    assert_eq!(receipt.model, "b");
 }
 
 #[test]
@@ -360,7 +468,13 @@ fn smi_parser_handles_csv_shapes() {
     assert!((parsed.used_gib - 67.5).abs() < 1e-9);
     assert_eq!(parsed.processes.len(), 2);
     assert_eq!(parsed.processes[0], (900, 2.0));
-    assert_eq!(parsed.external_gib(&[900]), 0.5);
+    assert_eq!(parsed.own_gib(&[900]), Some(2.0));
+    assert_eq!(parsed.process_total_gib(), 2.5);
+    assert_eq!(
+        parsed.free_gib(),
+        0.0,
+        "used (67.5) above total (24) still reads as zero free, never negative"
+    );
     // The settle gate is *physical free*, not a baseline: this sample (total 24,
     // used 67.5) has nothing free, so only a zero target clears the tolerance.
     assert!(parsed.freed_for(0.0, 0.1));

@@ -1,8 +1,9 @@
-//! VRAM admission arithmetic (DESIGN Step 4, choice D — ledger authoritative, NVML a
-//! reconciling witness).
+//! VRAM admission arithmetic (DESIGN Step 4, as amended by the operator
+//! 2026-10-26: the **card** is authoritative, and the ledger survives only as the
+//! declared source of truth for a `ledger_only` witness).
 //!
 //! This module owns the need formula and the budget arithmetic. The NVML witness and
-//! the settle-only-after-release gate land with the scheduler milestone; item 5 is
+//! the settle-only-after-release gate live with the scheduler milestone; item 5 is
 //! approved (`nvml-wrapper` in-process, `nvidia-smi` fallback when the DLL is absent).
 
 use thiserror::Error;
@@ -44,8 +45,9 @@ pub struct BlockerInfo {
 /// are the inputs behind it, each printed only where it disagrees (G13).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct BudgetFacts {
-    /// Ledger budget at decision time: total - reserve - ledger - attributed
-    /// external. `None` in tests that assert the compared figure alone.
+    /// Ledger budget at decision time: `total - reserve - Σ(occupant need)`. Quoted
+    /// in refusals so an operator can see when the card and the bookings disagree.
+    /// `None` in tests that assert the compared figure alone.
     pub budget: Option<Gibibytes>,
     /// Physical free the witness saw at decision time; `None` when it was down.
     pub observed_free: Option<Gibibytes>,
@@ -125,8 +127,8 @@ pub enum AdmissionError {
         /// Models that cannot be evicted, with reasons.
         blockers: Vec<BlockerInfo>,
     },
-    /// The model's launch floor was not met: actual free VRAM (externals counted)
-    /// at decision time sits below `launch_only_with_at_least_vram_free`, so the
+    /// The model's launch floor was not met: the physical free VRAM seen at decision
+    /// time sits below `launch_only_with_at_least_vram_free`, so the
     /// load is refused BEFORE spawn — launching a greedy-offload quant onto a
     /// busy card thrashes RAM/SSD for minutes (operator design note 2026-10-26).
     #[error("launch floor not met: at least {min_free} free required, free {free}, reserve {reserve}{detail}{tail}",
@@ -215,35 +217,6 @@ pub fn free_gb(total: Gibibytes, reserve: Gibibytes, occupied: Gibibytes) -> Gib
     Gibibytes(total.0 - reserve.0 - occupied.0)
 }
 
-/// Decides a load against the budget.
-///
-/// # Errors
-///
-/// - [`AdmissionError::UnderSpecified`] / [`AdmissionError::Insufficient`] as above.
-pub fn admit(
-    need: Gibibytes,
-    total: Gibibytes,
-    reserve: Gibibytes,
-    occupied: Gibibytes,
-) -> Result<(), AdmissionError> {
-    let free = free_gb(total, reserve, occupied);
-    if need.0 <= free.0 {
-        Ok(())
-    } else {
-        Err(AdmissionError::Insufficient {
-            need,
-            free,
-            reserve,
-            facts: BudgetFacts {
-                budget: Some(free),
-                observed_free: None,
-            },
-            victims_considered: Vec::new(),
-            blockers: Vec::new(),
-        })
-    }
-}
-
 /// One witness observation of the card (Step 4 rules 2-4).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemorySample {
@@ -266,15 +239,10 @@ impl MemorySample {
             .fold((0usize, 0f64), |(n, s), used| (n + 1, s + used))
     }
 
-    /// Usage not attributable to `own_pids`. Display/diagnostic only since the
-    /// ledger left the gate: the physical `used_gib` already accounts for foreign
-    /// holders, so the budget never subtracts this a second time.
-    pub fn external_gib(&self, own_pids: &[u32]) -> f64 {
-        self.attributed(own_pids, false).1
-    }
-
-    /// Sum of ALL per-process figures (display: what NVML accounted in total),
-    /// distinct from `external_gib` — never pass an empty list to mean "all".
+    /// Sum of ALL per-process figures (display: what NVML accounted in total).
+    /// Foreign holders need no separate subtraction: the physical `used_gib` already
+    /// includes them, so the budget would double-count them (and never pass an empty
+    /// list to `attributed` meaning "all" — this accessor exists for that reason).
     pub fn process_total_gib(&self) -> f64 {
         self.attributed(&[], false).1
     }
@@ -287,23 +255,33 @@ impl MemorySample {
         (count > 0 && total > 0.0).then_some(total)
     }
 
+    /// Physical free space the card reports, never negative.
+    #[must_use]
+    pub fn free_gib(&self) -> f64 {
+        (self.total_gib - self.used_gib).max(0.0)
+    }
+
     /// Whether the card has physically freed to `target_gib` of free space, within
-    /// tolerance (§0.3: the settle window is only legal after a release).
+    /// tolerance (§0.3: the settle window is only legal after a release). The
+    /// tolerance absorbs driver lag after a kill, so a load may spawn up to
+    /// `witness_tolerance_gb` under the gate — accepted by the operator 2026-10-26
+    /// for greedy launch floors as well as plain need.
     ///
     /// This replaced the ledger-era form (`used <= ledger + external + tolerance`).
     /// On a box where per-process attribution reports nothing, that form compared a
     /// 2.0 GiB tolerance against a ~3.3 GiB desktop floor and timed out every swap
-    /// that had anything else resident — a phantom leak, never a real one
-    /// (operator 2026-10-26).
+    /// that had anything else resident — a phantom leak, never a real one.
     #[must_use]
     pub fn freed_for(&self, target_gib: f64, tolerance_gib: f64) -> bool {
-        (self.total_gib - self.used_gib).max(0.0) + tolerance_gib >= target_gib
+        self.free_gib() + tolerance_gib >= target_gib
     }
 }
 
 /// The VRAM witness: NVML in-process when the driver library is present,
-/// `nvidia-smi` as the fallback, and a caller-visible error when neither answers
-/// (the admission gate then runs ledger-only, logged loudly — never a stale guess).
+/// `nvidia-smi` as the fallback, and a caller-visible error when neither answers —
+/// which the admission gate treats as a **refusal** ([`AdmissionError::
+/// WitnessUnavailable`]), never a stale guess or a silent ledger fallback
+/// (F-3/F-7).
 #[async_trait::async_trait]
 pub trait VramWitness: Send + Sync {
     /// Samples the card. Implementations may cache briefly (status polling must
@@ -324,8 +302,10 @@ pub trait VramWitness: Send + Sync {
     }
 }
 
-/// A witness that never answers: admission runs ledger-only and settle is skipped
-/// (tests and machines without a GPU — the actor treats Err as "unavailable").
+/// The only witness for which the **ledger is authoritative**: it never answers, and
+/// `ledger_only` tells the gate that this silence is deliberate (tests, a machine
+/// without a GPU) rather than an outage to refuse on. Its settle window is skipped,
+/// since there is nothing to measure.
 pub struct LedgerOnlyWitness;
 
 #[async_trait::async_trait]
@@ -479,25 +459,16 @@ mod tests {
     }
 
     #[test]
-    fn accepted_never_exceeds_budget_and_refusal_carries_numbers() {
-        let total = Gibibytes(72.0);
-        let reserve = Gibibytes(2.0);
-        // 26 need, 30 already on the card -> 40 free: accept.
-        assert!(admit(Gibibytes(26.0), total, reserve, Gibibytes(30.0)).is_ok());
-        // 50 need against the same state: refuse with need/free/reserve in the error.
-        let err = admit(Gibibytes(50.0), total, reserve, Gibibytes(30.0)).expect_err("must refuse");
-        match err {
-            AdmissionError::Insufficient {
-                need,
-                free,
-                reserve,
-                ..
-            } => {
-                assert!(close(need.0, 50.0));
-                assert!(close(free.0, 40.0));
-                assert!(close(reserve.0, 2.0));
-            }
-            other => panic!("expected Insufficient, got {other:?}"),
-        }
+    fn free_gb_subtracts_reserve_and_occupancy() {
+        // The budget arithmetic the gate compares against. Negative is information
+        // (over-commit already), not an error — the gate refuses with both numbers.
+        assert!(close(
+            free_gb(Gibibytes(72.0), Gibibytes(2.0), Gibibytes(30.0)).0,
+            40.0
+        ));
+        assert!(close(
+            free_gb(Gibibytes(72.0), Gibibytes(2.0), Gibibytes(80.0)).0,
+            -10.0
+        ));
     }
 }
