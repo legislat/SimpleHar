@@ -109,6 +109,75 @@ async fn get_json(app: &Router, path: &str) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+async fn control_token_gates_api_routes_but_never_the_page_itself() {
+    // The optional shared secret (`control_token` / `SIMPLEHAR_TOKEN`) is what makes
+    // publishing `internal_host` to a segment defensible: without it any LAN host can
+    // load, unload, reconfigure and read logs (deploy review, 2026-10-26).
+    let config = AppConfig {
+        control_token: Some("s3cret".to_string()),
+        ..AppConfig::default()
+    };
+    let (control, work, _rp, _runtime, _modelconf) =
+        app(config, &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
+
+    let (status, body) = get_json(&control, "/har/status").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_eq!(body["code"], "unauthorized");
+
+    let wrong = control
+        .clone()
+        .oneshot(
+            Request::get("/har/models")
+                .header("x-har-token", "nope")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let right = control
+        .clone()
+        .oneshot(
+            Request::get("/har/status")
+                .header("x-har-token", "s3cret")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(right.status(), StatusCode::OK);
+
+    let bearer = control
+        .clone()
+        .oneshot(
+            Request::get("/har/models")
+                .header("authorization", "Bearer s3cret")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(bearer.status(), StatusCode::OK);
+
+    // A mutating proxy route is gated as well...
+    let (status, _body) = post_json(&work, "/v1/chat/completions", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // ...while the static page is not: it has to load before it can ask for a token.
+    let page = control
+        .clone()
+        .oneshot(
+            Request::get("/")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(page.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn load_flow_populates_jobs_and_status() {
     let (control, _work, _rp, runtime, _modelconf) = app(
         AppConfig::default(),

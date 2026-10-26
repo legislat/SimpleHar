@@ -145,6 +145,39 @@ fn parse_gib(field: &str, raw: &str) -> Result<f64, ModelError> {
     Ok(v)
 }
 
+/// Which figure admission will book for an entry. Decided once, here, and read by
+/// both the gate and the page's Cost column — two derivations of this precedence is
+/// how the page could show a number the gate ignored (duplication review, 2026-10-26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostSource {
+    /// The declared `vram_gb`.
+    Declared,
+    /// The harness-measured footprint of an earlier run (`fixed` only).
+    Measured,
+    /// GGUF size × 1.15 + 2.
+    Estimate,
+    /// `exact` with nothing declared: refused, never guessed.
+    Undeclared,
+}
+
+impl ModelEntry {
+    /// The booking precedence: declared → measured (`fixed` only) → GGUF estimate,
+    /// with `exact`-without-`vram_gb` refused.
+    #[must_use]
+    pub fn cost_source(&self) -> CostSource {
+        if self.vram_gb.is_some() {
+            return CostSource::Declared;
+        }
+        if self.cost == CostClass::Exact {
+            return CostSource::Undeclared;
+        }
+        if self.cost == CostClass::Fixed && self.measured_gb.is_some() {
+            return CostSource::Measured;
+        }
+        CostSource::Estimate
+    }
+}
+
 impl ModelEntry {
     /// Builds an entry from a flat `key: value` map (the v3.3 yaml shape), applying the
     /// documented aliases: `is_embedding_model: true` forces EMB, `sticky: true` maps
@@ -249,7 +282,15 @@ impl ModelEntry {
             model_ref: keys.get("model").cloned(),
             serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
             file: None,
-            raw: keys.clone(),
+            // v3.3's `external: true` is scrapped (operator 2026-10-26): skipped here
+            // so a copied-back v3.3 yaml cannot keep advertising a meaning nothing has,
+            // and cannot resurrect it through the raw passthrough on write-back. The
+            // operator's file bytes are left alone — only the parsed entry drops it.
+            raw: keys
+                .iter()
+                .filter(|(key, _)| key.as_str() != "external")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
         })
     }
 }
@@ -272,6 +313,46 @@ mod tests {
         assert_eq!(entry.category, CategoryId::Work);
         assert_eq!(entry.engine, "llama");
         assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
+    }
+
+    #[test]
+    fn cost_source_mirrors_the_booking_precedence() {
+        let declared =
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("vram_gb", "10")])).expect("valid");
+        assert_eq!(declared.cost_source(), CostSource::Declared);
+        // `fixed` honours a measured footprint; `greedy` never does (a post-spill
+        // measurement is not a nominal size).
+        let measured = ModelEntry::from_flat(&flat(&[
+            ("name", "m"),
+            ("cost", "fixed"),
+            ("measured_gb", "7"),
+        ]))
+        .expect("valid");
+        assert_eq!(measured.cost_source(), CostSource::Measured);
+        let greedy = ModelEntry::from_flat(&flat(&[
+            ("name", "m"),
+            ("cost", "greedy"),
+            ("measured_gb", "7"),
+        ]))
+        .expect("valid");
+        assert_eq!(greedy.cost_source(), CostSource::Estimate);
+        // `exact` without a declared number is refused, never estimated.
+        let exact =
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("cost", "exact")])).expect("valid");
+        assert_eq!(exact.cost_source(), CostSource::Undeclared);
+    }
+
+    #[test]
+    fn retired_external_key_is_skipped_from_the_raw_map() {
+        // v3.3 `external: true` is scrapped: it must not survive into the raw
+        // passthrough, where it would advertise a meaning nothing has and be written
+        // back out as if it were live config. Every other key still passes through.
+        let entry = ModelEntry::from_flat(&flat(&[("name", "m"), ("external", "true")]))
+            .expect("valid entry");
+        assert!(!entry.raw.contains_key("external"));
+        let kept =
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("custom", "x")])).expect("valid entry");
+        assert_eq!(kept.raw.get("custom").map(String::as_str), Some("x"));
     }
 
     #[test]

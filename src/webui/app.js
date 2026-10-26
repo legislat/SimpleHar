@@ -18,8 +18,48 @@ let state = {
 
 // ---------- tiny helpers ----------
 
+// Optional control token (server: `control_token` / `SIMPLEHAR_TOKEN`). Stored in
+// localStorage so a reload does not re-prompt, and sent as a header only — never in a
+// URL, where it would land in the harness request log.
+const TOKEN_KEY = "sh-control-token";
+
+function controlToken() {
+  try {
+    return window.localStorage.getItem(TOKEN_KEY) || "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function authHeaders(extra) {
+  const headers = { ...(extra || {}) };
+  const token = controlToken();
+  if (token) headers["x-har-token"] = token;
+  return headers;
+}
+
+// True when the operator supplied a token, so the caller may retry once.
+function promptForToken() {
+  let entered = null;
+  try {
+    entered = window.prompt("SE control token");
+  } catch (error) {
+    return false;
+  }
+  if (!entered) return false;
+  try {
+    window.localStorage.setItem(TOKEN_KEY, entered.trim());
+  } catch (error) {
+    return false;
+  }
+  return true;
+}
+
 async function getJson(path) {
-  const response = await fetch(path);
+  let response = await fetch(path, { headers: authHeaders() });
+  if (response.status === 401 && promptForToken()) {
+    response = await fetch(path, { headers: authHeaders() });
+  }
   if (!response.ok) {
     throw new Error(`${path} -> ${response.status}`);
   }
@@ -27,11 +67,15 @@ async function getJson(path) {
 }
 
 async function postJson(path, body) {
-  const response = await fetch(path, {
+  const init = {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authHeaders({ "content-type": "application/json" }),
     body: JSON.stringify(body),
-  });
+  };
+  let response = await fetch(path, init);
+  if (response.status === 401 && promptForToken()) {
+    response = await fetch(path, { ...init, headers: authHeaders({ "content-type": "application/json" }) });
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.message || `${path} -> ${response.status}`);
@@ -620,6 +664,12 @@ function stopPolling() {
 
 function connectEvents() {
   stopPolling();
+  if (controlToken()) {
+    // `EventSource` cannot send headers, and the token must never travel in a URL
+    // (it would be logged): a token-protected harness runs on polling alone.
+    startPolling();
+    return;
+  }
   sse = new EventSource("/har/events");
   sse.addEventListener("har_state", (message) => {
     try {

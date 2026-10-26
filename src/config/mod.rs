@@ -1,4 +1,5 @@
-//! Typed `simplehar.json` schema, defaults, and per-field validation (DESIGN Step 9/11).
+//! Typed config schema (`simplehar-se.json`), defaults, and per-field validation
+//! (DESIGN Step 9/11).
 //!
 //! Boot rule (§0.2 step 1): a present-but-invalid file is reported per field and fails
 //! the boot — never silently replaced by defaults (v3.3 defect D1 discarded the whole
@@ -28,6 +29,10 @@ pub enum ConfigError {
         reason: String,
     },
 }
+
+/// The accepted category spellings, quoted wherever a message asks for one — the
+/// vocabulary lives with the type, not in copies of it (duplication review).
+pub const CATEGORY_HINT: &str = "WORK|RP|AUX|EMB";
 
 /// The four slot categories (operator decision 2026-10-24; DESIGN Step 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -77,7 +82,7 @@ impl std::str::FromStr for CategoryId {
             "RP" => Ok(CategoryId::Rp),
             "AUX" => Ok(CategoryId::Aux),
             "EMB" => Ok(CategoryId::Emb),
-            other => Err(format!("unknown category `{other}` (WORK|RP|AUX|EMB)")),
+            other => Err(format!("unknown category `{other}` ({CATEGORY_HINT})")),
         }
     }
 }
@@ -243,7 +248,17 @@ fn default_categories() -> Vec<CategoryConfig> {
     CategoryConfig::four_defaults()
 }
 
-/// Root of `simplehar.json`.
+/// The file SE boots by default, beside the executable. Deliberately *not* v3.3's
+/// name: SE re-serializes the whole struct on every persist, and sharing a file
+/// means our write can strand the old exe — v3.3 reads `protected_ports` and exits
+/// when it clashes with its port bases (deploy review, 2026-10-26).
+pub const CONFIG_FILE: &str = "simplehar-se.json";
+
+/// v3.3's config name. Read once, to migrate; **never** written by SE, so the
+/// rollback path keeps the file it expects.
+pub const LEGACY_CONFIG_FILE: &str = "simplehar.json";
+
+/// Root of [`CONFIG_FILE`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -259,7 +274,8 @@ pub struct AppConfig {
     /// GiB kept unreachable by admission (Step 4 rule 2).
     #[serde(default = "default_vram_reserve")]
     pub vram_reserve_gb: f64,
-    /// Total VRAM of the card in GiB; the ledger's ceiling (Step 4).
+    /// Total VRAM of the card in GiB; the ceiling the budget is measured against
+    /// (Step 4).
     #[serde(default = "default_vram_total")]
     pub vram_total_gb: f64,
     /// Ports the harness must never bind or touch — the manual namespace (Step 1).
@@ -307,6 +323,14 @@ pub struct AppConfig {
     /// restart (operator finding, 2026-10-26).
     #[serde(skip, default)]
     pub source_path: Option<std::path::PathBuf>,
+    /// Optional shared secret for the API and proxy routes, enforced by the guard via
+    /// `X-Har-Token` or `Authorization: Bearer`. Absent means open — safe only on
+    /// loopback, because publishing `internal_host` to a segment otherwise hands every
+    /// machine there load/unload/config power (deploy review, 2026-10-26).
+    /// `SIMPLEHAR_TOKEN` overrides it so the secret can stay out of the file entirely;
+    /// the value is never logged and never accepted in a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_token: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -327,13 +351,15 @@ impl Default for AppConfig {
             greedy_launch_min_free_gb: default_greedy_min_free(),
             wsl_distro: default_wsl_distro(),
             wsl_user: default_wsl_user(),
+            control_token: None,
             source_path: None,
         }
     }
 }
 
 impl AppConfig {
-    /// Parses `simplehar.json` text.
+    /// Parses config text: either [`CONFIG_FILE`] or a legacy [`LEGACY_CONFIG_FILE`]
+    /// read for the one-time migration.
     ///
     /// # Errors
     ///
@@ -342,12 +368,12 @@ impl AppConfig {
     /// problems are *not* raised here; call [`AppConfig::validate`] for those.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         serde_json::from_str(text).map_err(|e| ConfigError::Invalid {
-            field: "simplehar.json".to_string(),
+            field: CONFIG_FILE.to_string(),
             reason: e.to_string(),
         })
     }
 
-    /// Loads `simplehar.json` from `path`.
+    /// Loads a config from `path`.
     ///
     /// # Errors
     ///
@@ -355,7 +381,7 @@ impl AppConfig {
     ///   is not an error at this layer — callers decide policy (boot uses defaults).
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Invalid {
-            field: "simplehar.json".to_string(),
+            field: CONFIG_FILE.to_string(),
             reason: format!("cannot read {}: {e}", path.display()),
         })?;
         AppConfig::parse(&text)
@@ -416,6 +442,20 @@ impl AppConfig {
     /// catalog scan (Step 9) and is out of scope here.
     pub fn validate(&self) -> Vec<ConfigError> {
         let mut errors = Vec::new();
+        // A blank token must not silently disable auth: the guard reads an empty value
+        // as "no token", which would fail open on a published listener. Refuse to boot
+        // instead (fail closed).
+        if self
+            .control_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            errors.push(ConfigError::Invalid {
+                field: "control_token".to_string(),
+                reason: "must not be blank; omit the key for an open (loopback-only) control plane"
+                    .to_string(),
+            });
+        }
         let mut seen = BTreeSet::new();
         for cat in &self.categories {
             if !seen.insert(cat.id) {
@@ -655,9 +695,34 @@ mod tests {
     }
 
     #[test]
+    fn control_token_is_optional_never_stamped_when_absent_and_never_blank() {
+        let absent = AppConfig::parse("{}").expect("defaults parse");
+        assert_eq!(absent.control_token, None);
+        assert!(absent.validate().is_empty());
+        assert!(
+            !serde_json::to_string(&absent)
+                .expect("serializes")
+                .contains("control_token"),
+            "an unconfigured secret must not be stamped into the operator's file"
+        );
+        let set = AppConfig::parse("{\"control_token\": \"s3cret\"}").expect("token parses");
+        assert_eq!(set.control_token.as_deref(), Some("s3cret"));
+        assert!(set.validate().is_empty());
+        let blank = AppConfig::parse("{\"control_token\": \"   \"}")
+            .expect("parses as json")
+            .validate();
+        assert!(
+            blank
+                .iter()
+                .any(|e| e.to_string().contains("control_token")),
+            "a blank token would fail open: {blank:?}"
+        );
+    }
+
+    #[test]
     fn unknown_field_is_an_error_not_a_silent_default() {
         let err = AppConfig::parse("{\"wrok_port\": 9}").expect_err("deny_unknown_fields");
-        assert!(err.to_string().contains("simplehar.json"));
+        assert!(err.to_string().contains(CONFIG_FILE));
     }
 
     #[test]

@@ -63,6 +63,10 @@ pub enum ApiError {
     /// The request conflicts with live state (cancelled, superseded, holder on port).
     #[error("conflict: {reason}")]
     Conflict { reason: String },
+    /// A configured control token is missing or wrong — `401` (deploy review,
+    /// 2026-10-26: publishing the control plane to a segment without a secret).
+    #[error("unauthorized: {reason}")]
+    Unauthorized { reason: String },
     /// A POST body lacks the required `application/json` content type — `415`.
     #[error("unsupported media type: {reason}")]
     UnsupportedMedia { reason: String },
@@ -85,6 +89,7 @@ impl ApiError {
             ApiError::WitnessUnavailable { .. } => "witness_unavailable",
             ApiError::Upstream { .. } => "upstream",
             ApiError::Conflict { .. } => "conflict",
+            ApiError::Unauthorized { .. } => "unauthorized",
             ApiError::UnsupportedMedia { .. } => "unsupported_media_type",
             ApiError::NotImplemented { .. } => "not_implemented",
             ApiError::Internal { .. } => "internal",
@@ -101,6 +106,7 @@ impl ApiError {
             | ApiError::WitnessUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Upstream { .. } => StatusCode::BAD_GATEWAY,
             ApiError::Conflict { .. } => StatusCode::CONFLICT,
+            ApiError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             ApiError::UnsupportedMedia { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ApiError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             ApiError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -219,6 +225,9 @@ pub struct ApiState {
     default_overrides: Arc<Mutex<BTreeMap<CategoryId, Option<String>>>>,
     /// Last-use hints per model (fallback MRU for AUX x N; eviction LRU later).
     usage: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Shared secret for API/proxy routes when configured (`control_token` or
+    /// `SIMPLEHAR_TOKEN`). Private: only the guard reads it, and it is never logged.
+    control_token: Option<String>,
     proxy: reqwest::Client,
 }
 
@@ -240,6 +249,7 @@ impl ApiState {
             config.internal_host
         };
         let control_addr = format!("{}:{}", display_host, config.control_category().public_port);
+        let control_token = resolve_control_token(&config);
         ApiState {
             control_addr,
             scheduler,
@@ -248,12 +258,20 @@ impl ApiState {
             boot: Arc::new(std::sync::RwLock::new(boot)),
             default_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
+            control_token,
             proxy: reqwest::Client::builder()
                 .timeout(Duration::from_secs(600))
                 .build()
                 .expect("invariant: plain-HTTP client with a timeout needs no configuration"),
             config,
         }
+    }
+
+    /// Whether API/proxy routes demand the control token (boot messaging; the secret
+    /// itself stays private and is never logged).
+    #[must_use]
+    pub fn requires_token(&self) -> bool {
+        self.control_token.is_some()
     }
 
     /// Catalog snapshot from the actor (Step 2: one writer, snapshot reads).
@@ -452,7 +470,7 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
         "boot": boot,
         "categories": categories,
         "listeners": state.listeners.snapshot(),
-        "mem": mem_section(state).await,
+        "mem": mem_section(state, &scheduler).await,
         "slots": scheduler.slots,
         "jobs": scheduler.jobs,
         "last_error": last_error,
@@ -510,9 +528,9 @@ async fn har_unload(
         reason: format!("body must be JSON: {rejection}"),
     })?;
     if let Some(raw) = body.get("category").and_then(Value::as_str) {
-        let category: CategoryId = raw.parse().map_err(|_| ApiError::BadRequest {
-            reason: format!("unknown category `{raw}` (WORK|RP|AUX|EMB)"),
-        })?;
+        let category: CategoryId = raw
+            .parse()
+            .map_err(|reason| ApiError::BadRequest { reason })?;
         state
             .scheduler
             .unload(category)
@@ -550,9 +568,10 @@ fn model_json(entry: &ModelEntry) -> Value {
         "engine": entry.engine,
         "category": entry.category,
         "vram_gb": entry.vram_gb,
-        // The number admission books only when BOTH declared and measured are
-        // absent (GGUF size x 1.15 + 2) — the page's last-resort Cost figure.
-        "est_vram_gb": (entry.vram_gb.is_none() && entry.measured_gb.is_none()).then(|| {
+        // Shown only when `cost_source` says admission really books the GGUF estimate
+        // (x1.15 + 2) — the page can no longer display a cost the gate ignores
+        // (duplication review, 2026-10-26).
+        "est_vram_gb": (entry.cost_source() == crate::model::CostSource::Estimate).then(|| {
             crate::budget::need_gb(
                 None,
                 entry.gguf_size_gb.map(crate::budget::Gibibytes),
@@ -658,6 +677,55 @@ fn next_request_id() -> String {
     format!("req-{epoch:x}-{counter:x}")
 }
 
+/// Routes that must answer before a token exists, so the page can load and ask for
+/// one. Exact matches only — never a prefix, which would re-open `/har/*`-adjacent
+/// paths.
+const PUBLIC_PATHS: [&str; 4] = ["/", "/index.html", "/app.js", "/style.css"];
+
+/// The control token, if any: the environment wins so the secret can stay out of the
+/// config file entirely (AGENTS.md — secrets live in the environment, not in
+/// code/config). Whitespace-only values mean "no token" at read time; `validate`
+/// rejects them in the file, so a typo can never silently disable auth.
+fn resolve_control_token(config: &AppConfig) -> Option<String> {
+    std::env::var("SIMPLEHAR_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            config
+                .control_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// Whether a request may pass without the control token. The token travels only in a
+/// header — never in a URL, where it would land in the request log (review,
+/// 2026-10-26).
+fn auth_reason(state: &ApiState, request: &axum::extract::Request) -> Option<ApiError> {
+    let expected = state.control_token.as_deref()?;
+    if PUBLIC_PATHS.contains(&request.uri().path()) {
+        return None;
+    }
+    let headers = request.headers();
+    let presented = headers
+        .get("x-har-token")
+        .or_else(|| headers.get(axum::http::header::AUTHORIZATION))
+        .and_then(|value| value.to_str().ok())
+        .map(|raw| raw.strip_prefix("Bearer ").unwrap_or(raw).trim());
+    match presented {
+        Some(given) if given == expected => None,
+        _ => Some(ApiError::Unauthorized {
+            reason: format!(
+                "{} requires the control token (X-Har-Token or Authorization: Bearer)",
+                request.uri().path()
+            ),
+        }),
+    }
+}
+
 /// The guard + correlation middleware (Step 11 "kept regardless", Step 12):
 /// - **Host** must be loopback-shaped (an IP literal or `localhost`) — a hostname
 ///   means a DNS-rebinding attempt, refused `400` before any handler runs;
@@ -668,7 +736,11 @@ fn next_request_id() -> String {
 ///   echoed in the response header, and logged at request completion (G6).
 ///
 /// Applied in `main` on every listener router, so guards wrap uniformly.
-pub async fn guard(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+pub async fn guard(
+    State(state): State<Arc<ApiState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
     let request_id = request
         .headers()
         .get(&X_REQUEST_ID)
@@ -677,6 +749,10 @@ pub async fn guard(request: axum::extract::Request, next: axum::middleware::Next
         .unwrap_or_else(next_request_id);
 
     if let Some(reason) = reject_reason(&request) {
+        let response = (reason.status(), Json(error_body(&reason))).into_response();
+        return with_request_id(response, &request_id);
+    }
+    if let Some(reason) = auth_reason(&state, &request) {
         let response = (reason.status(), Json(error_body(&reason))).into_response();
         return with_request_id(response, &request_id);
     }
@@ -815,7 +891,10 @@ async fn har_config_default(
     })?;
     let Some(raw_category) = body.get("category").and_then(Value::as_str) else {
         return Err(ApiError::BadRequest {
-            reason: "missing required field `category` (WORK|RP|AUX|EMB)".to_string(),
+            reason: format!(
+                "missing required field `category` ({})",
+                crate::config::CATEGORY_HINT
+            ),
         });
     };
     let category: CategoryId = raw_category.parse().map_err(|_| ApiError::BadRequest {
@@ -878,9 +957,9 @@ async fn har_config_model(
     let mut edits: Vec<(&str, Option<String>)> = Vec::new();
     let mut requested_category: Option<CategoryId> = None;
     if let Some(raw) = body.get("category").and_then(Value::as_str) {
-        let category: CategoryId = raw.parse().map_err(|_| ApiError::BadRequest {
-            reason: format!("unknown category `{raw}` (WORK|RP|AUX|EMB)"),
-        })?;
+        let category: CategoryId = raw
+            .parse()
+            .map_err(|reason| ApiError::BadRequest { reason })?;
         requested_category = Some(category);
         edits.push(("category", Some(category.to_string())));
     }
@@ -969,34 +1048,12 @@ async fn har_config_logging(
 /// The `/har/status` memory block: declared config numbers plus what the witness
 /// actually sees, labeled with its source (F-7 lesson: never present a number
 /// without saying whose number it is).
-async fn mem_section(state: &ApiState) -> Value {
-    // Loads committed but not yet installed: their bytes are not on the card yet,
-    // so admission debits them and the bar shows the same debit (the retired ledger
-    // bar could not express this — it counted installed occupants only).
-    let booked_gb: f64 = state
-        .scheduler
-        .status()
-        .await
-        .map(|status| {
-            status
-                .jobs
-                .iter()
-                .filter(|job| {
-                    job.kind == crate::scheduler::JobKind::Load
-                        && matches!(
-                            job.state,
-                            crate::scheduler::SwapState::Admit
-                                | crate::scheduler::SwapState::Quiesce
-                                | crate::scheduler::SwapState::Dispose
-                                | crate::scheduler::SwapState::Spawn
-                                | crate::scheduler::SwapState::Ready
-                                | crate::scheduler::SwapState::Install
-                        )
-                })
-                .filter_map(|job| job.need_gib)
-                .sum()
-        })
-        .unwrap_or_default();
+async fn mem_section(state: &ApiState, scheduler: &crate::scheduler::SchedulerStatus) -> Value {
+    // Loads committed but not yet installed: the very set the admission gate debits
+    // (`booking_gibs`), so the bar and a refusal can never quote two numbers
+    // (review, 2026-10-26). The caller already holds this snapshot — asking the
+    // actor for a second one per poll was a duplicated round-trip.
+    let booked_gb = crate::scheduler::booking_gibs(&scheduler.jobs);
     let ram = crate::witness::ram_sample();
     let mut section = match state.witness.sample().await {
         Ok(sample) => {
@@ -1272,6 +1329,7 @@ async fn proxy(
 /// A router serving exactly `category`'s models; `/har/*` is *not* included (that is
 /// [`control_router`], on the designated control listener only).
 pub fn category_router(api: Arc<ApiState>, category: CategoryId) -> Router {
+    let guard_state = Arc::clone(&api);
     let listener = Arc::new(ListenerState { api, category });
     Router::new()
         .route("/health", get(health))
@@ -1293,7 +1351,7 @@ pub fn category_router(api: Arc<ApiState>, category: CategoryId) -> Router {
             CompressionLayer::new(),
             DefaultBodyLimit::max(PROXY_BODY_LIMIT),
         ))
-        .layer(axum::middleware::from_fn(guard))
+        .layer(axum::middleware::from_fn_with_state(guard_state, guard))
 }
 
 /// Builds the control listener: its own category's surface plus `/har/*`.
@@ -1318,9 +1376,17 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
         .merge(category_router(Arc::clone(&api), control_category))
         .merge(
             har.with_state(Arc::clone(&api))
-                .layer(axum::middleware::from_fn(guard)),
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&api),
+                    guard,
+                )),
         )
-        .merge(crate::webui::router(Arc::clone(&api)).layer(axum::middleware::from_fn(guard)))
+        .merge(
+            crate::webui::router(Arc::clone(&api)).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&api),
+                guard,
+            )),
+        )
         .layer((
             TraceLayer::new_for_http(),
             CompressionLayer::new(),
@@ -1494,6 +1560,19 @@ mod tests {
         assert_eq!(
             ApiError::from(SchedulerError::Spawn("boom".to_string())).status(),
             StatusCode::BAD_GATEWAY
+        );
+        // A dead witness is its own client-visible class: "the card is unreadable"
+        // must not be mistaken for "the card is full".
+        let witness_down =
+            SchedulerError::Admission(crate::budget::AdmissionError::WitnessUnavailable {
+                reason: "nvidia-smi timed out".to_string(),
+            });
+        let mapped = ApiError::from(witness_down);
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code(), "witness_unavailable");
+        assert!(
+            mapped.to_string().contains("nvidia-smi timed out"),
+            "the witness's reason must travel: {mapped}"
         );
     }
 }

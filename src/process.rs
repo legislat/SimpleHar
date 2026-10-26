@@ -181,6 +181,81 @@ async fn reap_container(distro: &str, user: &str, name: &str) {
     }
 }
 
+/// Boot reconcile (deploy review, 2026-10-26): a container this harness started in an
+/// earlier lifetime survives a crash holding tens of GiB, and observed-VRAM admission
+/// then refuses every later load with no pointer to the culprit. Only names the
+/// operator's own catalog declares (`ninfer_container`) are candidates — never a
+/// wildcard, never a hardcoded prefix — so reaping stays ownership-scoped (§5).
+/// Best-effort: any failure logs and boot proceeds.
+pub async fn reclaim_owned_containers(distro: &str, user: &str, owned: &[String]) {
+    if owned.is_empty() {
+        return;
+    }
+    let Some(present) = docker_ps(distro, user).await else {
+        return;
+    };
+    for name in to_reclaim(&present, owned) {
+        tracing::warn!(container = %name, "reclaiming a container left behind by an earlier run");
+        reap_container(distro, user, &name).await;
+    }
+}
+
+/// Running containers that the catalog claims we own. Pure, so the ownership rule is
+/// testable without WSL.
+fn to_reclaim(present: &[String], owned: &[String]) -> Vec<String> {
+    present
+        .iter()
+        .filter(|name| owned.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// `wsl.exe … docker ps --format {{.Names}}`; `None` when the call cannot run or
+/// reports failure (the reconcile is advisory, never fatal).
+async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
+    let mut argv = wsl_prefix(distro, user);
+    argv.extend([
+        "docker".to_string(),
+        "ps".to_string(),
+        "--format".to_string(),
+        "{{.Names}}".to_string(),
+    ]);
+    let (program, args) = argv
+        .split_first()
+        .unwrap_or_else(|| unreachable!("invariant: wsl_prefix is never empty"));
+    let command = Command::new(program)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(Duration::from_secs(10), command).await {
+        Ok(Ok(output)) if output.status.success() => output,
+        Ok(Ok(output)) => {
+            tracing::warn!(
+                stderr = %excerpt(&output.stderr),
+                "docker ps failed; skipping the boot container reconcile"
+            );
+            return None;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "docker ps cannot run; skipping the boot reconcile");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("docker ps timed out; skipping the boot reconcile");
+            return None;
+        }
+    };
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+    )
+}
+
 impl ProcessRuntime {
     /// Creates the runtime; log files land under `logs/` next to the current exe
     /// (falling back to the working directory).
@@ -574,5 +649,20 @@ mod tests {
             .collect();
         assert_eq!(remaining.len(), 3, "cap enforced: {remaining:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn boot_reclaim_touches_only_catalog_owned_names() {
+        // Reaping stays ownership-scoped (§5): a running container is reclaimed only
+        // when the operator's own ModelConf declares that exact name — never by
+        // prefix, never by wildcard.
+        let present: Vec<String> = ["SE-nin-bonsai", "ninfer-bonsai", "someone-elses-container"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            to_reclaim(&present, &["SE-nin-bonsai".to_string()]),
+            vec!["SE-nin-bonsai".to_string()]
+        );
+        assert!(to_reclaim(&present, &[]).is_empty());
     }
 }

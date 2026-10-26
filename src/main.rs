@@ -2,7 +2,7 @@
 //! engine work (there is none: preload is scrapped), zero engine spawns at boot.
 
 use simplehar_se::api::{category_router, control_router, ApiState};
-use simplehar_se::config::{AppConfig, ConfigError};
+use simplehar_se::config::{self, AppConfig, ConfigError};
 use simplehar_se::engine::llama::LlamaAdapter;
 use simplehar_se::engine::mock::MockAdapter;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
@@ -29,12 +29,40 @@ fn boot_config() -> Result<AppConfig, Vec<ConfigError>> {
         .or_else(|| {
             std::env::current_exe()
                 .ok()
-                .and_then(|exe| exe.parent().map(|dir| dir.join("simplehar.json")))
+                .and_then(|exe| exe.parent().map(|dir| dir.join(config::CONFIG_FILE)))
         });
+    // One-time migration from the shared v3.3 name. The legacy file is copied, never
+    // moved or rewritten: the rollback exe must still find what it expects there
+    // (deploy review, 2026-10-26 — SE's full-struct persist writes `protected_ports`,
+    // which makes v3.3 exit on its own port-namespace check).
+    if let Some(path) = path.as_ref() {
+        if !path.exists()
+            && path
+                .file_name()
+                .is_some_and(|name| name == config::CONFIG_FILE)
+        {
+            let legacy = path.with_file_name(config::LEGACY_CONFIG_FILE);
+            if legacy.is_file() {
+                match std::fs::copy(&legacy, path) {
+                    Ok(_) => tracing::warn!(
+                        "migrated {} -> {} (the legacy file is left untouched for rollback)",
+                        legacy.display(),
+                        path.display()
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "could not copy {} to {}; booting defaults",
+                        legacy.display(),
+                        path.display()
+                    ),
+                }
+            }
+        }
+    }
     let mut config = match &path {
         Some(path) if path.exists() => AppConfig::load(path).map_err(|e| vec![e])?,
         _ => {
-            tracing::info!("no simplehar.json found; using built-in defaults");
+            tracing::info!("no {} found; using built-in defaults", config::CONFIG_FILE);
             AppConfig::default()
         }
     };
@@ -409,12 +437,20 @@ async fn run(
     );
     let host = state.config.internal_host;
     if !host.is_loopback() {
-        // §0.4, adjusted by the operator note: publishing to the local net trusts
-        // every machine on the segment; there is no auth, only the guards.
-        tracing::warn!(
-            %host,
-            "publishing to the local network: the harness has NO authentication; every device on the segment can load models and drive the GPUs"
-        );
+        // §0.4, adjusted by the operator note: publishing to the local net is a
+        // deliberate trust decision; the guard is the floor, the optional
+        // `control_token` is the door (deploy review, 2026-10-26).
+        if state.requires_token() {
+            tracing::warn!(
+                %host,
+                "publishing to the local network: API and proxy routes require the control token (static page exempt; SSE is disabled while a token is in use)"
+            );
+        } else {
+            tracing::warn!(
+                %host,
+                "publishing to the local network with NO authentication: every device on the segment can load models and drive the GPUs — set `control_token` or `SIMPLEHAR_TOKEN`"
+            );
+        }
     }
     let listeners = state.listeners.clone();
     let mut supervisors = Vec::new();
@@ -452,6 +488,29 @@ async fn run(
                 .count(),
             "boot ready (0.2): config validated, catalog scanned, listeners resolved"
         );
+    }
+    // Boot reconcile (deploy review, 2026-10-26): a container left by a crashed run
+    // keeps the card occupied, and observed-VRAM admission then refuses every load
+    // with no pointer to the culprit. Runs after `boot ready` so it can never delay
+    // binding (§0.2), and only for container names the operator's own catalog
+    // declares — ownership stays name-scoped, never a wildcard.
+    {
+        let handle = state.scheduler.clone();
+        let distro = state.config.wsl_distro.clone();
+        let user = state.config.wsl_user.clone();
+        tokio::spawn(async move {
+            let Ok(catalog) = handle.catalog().await else {
+                return;
+            };
+            let owned: Vec<String> = catalog
+                .models
+                .iter()
+                .filter_map(|entry| entry.raw.get("ninfer_container"))
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect();
+            simplehar_se::process::reclaim_owned_containers(&distro, &user, &owned).await;
+        });
     }
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},

