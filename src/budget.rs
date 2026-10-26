@@ -71,7 +71,7 @@ pub enum AdmissionError {
     /// at decision time sits below `launch_only_with_at_least_vram_free`, so the
     /// load is refused BEFORE spawn — launching a greedy-offload quant onto a
     /// busy card thrashes RAM/SSD for minutes (operator design note 2026-10-26).
-    #[error("launch floor not met: at least {min_free} GiB free required, free {free}, reserve {reserve}{tail}", tail = insufficient_tail(.victims_considered, .blockers))]
+    #[error("launch floor not met: at least {min_free} free required, free {free}, reserve {reserve}{tail}", tail = insufficient_tail(.victims_considered, .blockers))]
     BelowLaunchFloor {
         /// Configured floor in GiB (model key, or the greedy global default).
         min_free: Gibibytes,

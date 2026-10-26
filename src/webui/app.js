@@ -272,25 +272,43 @@ function modelRow(status, model, category) {
     (slot) => slot.category === category && slot.model === model.id,
   );
   const loading = slotJobsFor(status, category).some((job) => job.model === model.id);
-  const failed = status.jobs.some(
-    (job) => job.terminal && job.model === model.id && job.error,
-  );
+  // The dot follows the newest job for this model only: a fail that a later
+  // load+unload superseded must not keep the row red (operator 2026-10-26).
+  const last = status.jobs.filter((job) => job.model === model.id).at(-1);
+  const failed = !!last && last.terminal && last.kind === "Load" && !!last.error;
   const dotState = serving ? "serving" : loading ? "loading" : failed ? "failed" : "idle";
   const row = el("tr", {});
   // Operator layout (2026-10-26): actions first, then the name, then the rest —
-  // the buttons stay in view at any width without scrolling.
+  // the buttons stay in view at any width without scrolling. The primary button
+  // is state-aware: a serving row offers Unload, a loading row is parked.
   const actions = el("td", { class: "sh-row-actions" });
-  actions.append(
-    el(
-      "button",
-      {
-        class: "sh-mini",
-        onclick: () =>
-          postJson("/har/load", { model: model.id }).catch((error) => flashError(error)),
-      },
-      text("Load"),
-    ),
-  );
+  if (dotState === "serving") {
+    actions.append(
+      el(
+        "button",
+        {
+          class: "sh-mini",
+          onclick: () =>
+            postJson("/har/unload", { model: model.id }).catch((error) => flashError(error)),
+        },
+        text("Unload"),
+      ),
+    );
+  } else if (dotState === "loading") {
+    actions.append(el("button", { class: "sh-mini", disabled: "" }, text("Loading…")));
+  } else {
+    actions.append(
+      el(
+        "button",
+        {
+          class: "sh-mini",
+          onclick: () =>
+            postJson("/har/load", { model: model.id }).catch((error) => flashError(error)),
+        },
+        text("Load"),
+      ),
+    );
+  }
   actions.append(
     el(
       "button",
@@ -344,7 +362,19 @@ function modelRow(status, model, category) {
 
   row.append(el("td", {}, text(model.engine)));
   row.append(el("td", {}, text(model.context ?? "—")));
-  row.append(el("td", {}, text(model.vram_gb !== null ? `${model.vram_gb} GiB` : "est.")));
+  row.append(
+    el(
+      "td",
+      {},
+      text(
+        model.vram_gb !== null
+          ? `${model.vram_gb} GiB`
+          : model.est_vram_gb !== null && model.est_vram_gb !== undefined
+            ? `${model.est_vram_gb.toFixed(1)} GiB (est.)`
+            : "est.",
+      ),
+    ),
+  );
   // A5 (v3.3 parity): the backing GGUF + serve_model id, basename on screen,
   // full path in the tooltip. Least-important column, so it sits rightmost.
   const fileBits = [];

@@ -536,6 +536,17 @@ fn model_json(entry: &ModelEntry) -> Value {
         "engine": entry.engine,
         "category": entry.category,
         "vram_gb": entry.vram_gb,
+        // The number admission actually books when `vram_gb` is undeclared
+        // (GGUF size x 1.15 + 2), so the page's Cost column never reads bare
+        // "est." for a model whose cost the harness already knows.
+        "est_vram_gb": entry.vram_gb.is_none().then(|| {
+            crate::budget::need_gb(
+                None,
+                entry.gguf_size_gb.map(crate::budget::Gibibytes),
+            )
+            .ok()
+            .map(|n| n.0)
+        }).flatten(),
         "cost": entry.cost,
         "launch_floor_gb": entry.launch_floor_gb,
         "load_timeout_s": entry.load_timeout_s,

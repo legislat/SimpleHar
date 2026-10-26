@@ -68,15 +68,22 @@ pub enum SchedulerError {
     #[error("cancelled: {0}")]
     Cancelled(String),
     /// Memory did not settle to the expected baseline within `settle_timeout_s`
-    /// after a confirmed release; nothing was double-spawned (§0.3).
+    /// after a confirmed release; nothing was double-spawned (§0.3). When the
+    /// failure is the observed gate (launch floor / need), the clause names the
+    /// free vs required the card actually showed (operator 2026-10-26).
     #[error(
-        "settle timeout: {used_gib:.1} GiB used vs {expected_gib:.1} GiB expected after release"
+        "settle timeout: {used_gib:.1} GiB used vs {expected_gib:.1} GiB expected after release{tail}",
+        tail = settle_tail(*free_gib, *required_gib)
     )]
     SettleTimeout {
         /// Witness-used at the timeout, in GiB.
         used_gib: f64,
         /// Baseline (remaining ledger + externals + tolerance), in GiB.
         expected_gib: f64,
+        /// Observed free at the timeout, when the gate (not the baseline) failed.
+        free_gib: Option<f64>,
+        /// The gate target that free failed to reach.
+        required_gib: Option<f64>,
     },
     /// The actor task is gone (shutting down).
     #[error("scheduler is not running")]
@@ -515,6 +522,10 @@ struct Job {
     /// CRITICAL, 2026-10-26).
     gate_target: Option<f64>,
     free_at_admit: Option<Gibibytes>,
+    /// Observed physical free (total - used) at admit; `None` when the witness
+    /// was down. The release re-check and the settle gate take the more
+    /// conservative figure against this (operator 2026-10-26).
+    observed_at_admit: Option<f64>,
     /// External VRAM observed at admit (victim still owned); the settle gate holds
     /// this constant so a dead own engine's leftover memory cannot masquerade as a
     /// foreign holder (§0.3).
@@ -588,6 +599,25 @@ fn parse_settle_numbers(numbers: &str) -> (f64, f64) {
         values.first().copied().unwrap_or(f64::NAN),
         values.get(1).copied().unwrap_or(f64::NAN),
     )
+}
+
+/// The gate clause of the settle task's timeout text (emit site:
+/// `spawn_settle_task`), recovered for the typed error.
+fn parse_settle_gate(numbers: &str) -> Option<(f64, f64)> {
+    let rest = numbers.split_once("observed free ")?.1;
+    let (free, required) = rest.split_once(" GiB below the required ")?;
+    let required = required.split_once(" GiB").map_or(required, |(r, _)| r);
+    Some((free.parse().ok()?, required.parse().ok()?))
+}
+
+/// Optional trailing clause of [`SchedulerError::SettleTimeout`].
+fn settle_tail(free_gib: Option<f64>, required_gib: Option<f64>) -> String {
+    match (free_gib, required_gib) {
+        (Some(free), Some(required)) => {
+            format!("; observed free {free:.1} GiB below the required {required:.1} GiB")
+        }
+        _ => String::new(),
+    }
 }
 
 /// The occupant's last use: the proxy-side hint when present, else load time.
@@ -950,6 +980,7 @@ impl ActorState {
             load_timeout_s: None,
             gate_target: None,
             free_at_admit: None,
+            observed_at_admit: None,
             external_at_admit: None,
             timings: JobTimings::default(),
             t0: Instant::now(),
@@ -1032,6 +1063,7 @@ impl ActorState {
             error: None,
             need: None,
             free_at_admit: None,
+            observed_at_admit: None,
             external_at_admit: None,
             timings: JobTimings::default(),
             t0,
@@ -1171,20 +1203,33 @@ impl ActorState {
             return;
         }
         let budget_room = free.0 + victim_need;
+        // Observed physical truth (operator 2026-10-26): the stopper is OBSERVED
+        // VRAM, not a ledger flattered by missing per-process attribution — a
+        // greedy engine can sit on the card using far more than it booked. When a
+        // same-slot victim is about to be released, the pre-release reading would
+        // double-count the victim's own memory and make replacement impossible;
+        // the clamp is then deferred to the settle gate, which samples AFTER the
+        // release has landed.
+        let observed_clamp = match &sample {
+            Ok(s) if self.jobs[&job_id].victim.is_none() => Some((total_gib - s.used_gib).max(0.0)),
+            _ => None,
+        };
+        let room = observed_clamp.map_or(budget_room, |o| budget_room.min(o));
+        if let (Some(obs), Some(job)) = (
+            sample
+                .as_ref()
+                .ok()
+                .map(|s| (s.total_gib - s.used_gib).max(0.0)),
+            self.jobs.get_mut(&job_id),
+        ) {
+            job.observed_at_admit = Some(obs);
+        }
         let need_deficit = if greedy {
             0.0
         } else {
-            (need.0 - budget_room).max(0.0)
+            (need.0 - room).max(0.0)
         };
-        // The floor guards physical idle silicon (review, 2026-10-26): when the
-        // witness answered, never trust a budget-room flattered by missing
-        // per-process attribution — take the more conservative figure. With the
-        // witness down there is no physical evidence, so the budget stands.
-        let floor_room = match &sample {
-            Ok(s) => budget_room.min((total_gib - s.used_gib).max(0.0)),
-            Err(_) => budget_room,
-        };
-        let floor_deficit = floor.map(|f| (f - floor_room).max(0.0)).unwrap_or(0.0);
+        let floor_deficit = floor.map(|f| (f - room).max(0.0)).unwrap_or(0.0);
         let deficit = need_deficit.max(floor_deficit);
         // What `available` (free_at_admit + released) must reach before spawn.
         // Comparing only `need` re-admits the bug this review caught: greedy
@@ -1223,7 +1268,7 @@ impl ActorState {
                                     "invariant: floor_deficit > 0 implies a configured floor",
                                 )),
                                 // G13: print the number the gate actually compared.
-                                free: Gibibytes(floor_room),
+                                free: Gibibytes(room),
                                 reserve,
                                 victims_considered: considered,
                                 blockers,
@@ -1441,10 +1486,14 @@ impl ActorState {
     }
 
     /// §0.3 memory evidence: after a confirmed release, wait until the witness sees
-    /// `remaining ledger + externals + tolerance` before the spawn fires.
+    /// `remaining ledger + externals + tolerance` before the spawn fires. The gate
+    /// target (max(need, launch floor)) must also be met by the FRESH observed free
+    /// — this is where a replacement load proves the card truly emptied
+    /// (operator 2026-10-26: the stopper is observed VRAM, judged after release).
     fn spawn_settle_task(&mut self, job_id: JobId) {
         let baseline = self.ledger_sum().0;
         let tolerance = self.cfg.witness_tolerance_gb;
+        let gate = self.jobs[&job_id].gate_target.unwrap_or(0.0);
         // Externals are frozen at admit: a leftover from our own dead engine must
         // show up as "used above expected", not as a foreign holder.
         let external = self.jobs[&job_id].external_at_admit.unwrap_or(0.0);
@@ -1457,7 +1506,8 @@ impl ActorState {
                 match witness.sample().await {
                     Ok(sample) => {
                         let expected = baseline + external + tolerance;
-                        if sample.used_gib <= expected {
+                        let observed_free = (sample.total_gib - sample.used_gib).max(0.0);
+                        if sample.used_gib <= expected && observed_free >= gate {
                             let _ = tx.send(ActorMsg::Event {
                                 job: job_id,
                                 event: Event::Settled(Ok(())),
@@ -1477,11 +1527,21 @@ impl ActorState {
                 }
                 if started.elapsed() >= deadline {
                     let numbers = match witness.sample().await {
-                        Ok(sample) => format!(
-                            "{:.1} GiB used vs {:.1} GiB expected",
-                            sample.used_gib,
-                            baseline + external + tolerance
-                        ),
+                        Ok(sample) => {
+                            let observed_free = (sample.total_gib - sample.used_gib).max(0.0);
+                            let mut msg = format!(
+                                "{:.1} GiB used vs {:.1} GiB expected",
+                                sample.used_gib,
+                                baseline + external + tolerance
+                            );
+                            if gate > 0.0 && observed_free < gate {
+                                msg.push_str(&format!(
+                                    "; observed free {:.1} GiB below the required {:.1} GiB",
+                                    observed_free, gate
+                                ));
+                            }
+                            msg
+                        }
                         Err(_) => "no witness sample".to_string(),
                     };
                     let _ = tx.send(ActorMsg::Event {
@@ -1726,8 +1786,15 @@ impl ActorState {
                             .unwrap_or_else(|| self.jobs[&job_id].need.map_or(0.0, |n| n.0));
                         // free_at_admit was computed with everything still in the
                         // ledger; every confirmed release has since freed its cost.
+                        // The observed figure is the same arithmetic against the
+                        // card as physically sampled at admit (never ledger-only).
                         let available = self.jobs[&job_id].free_at_admit.map_or(0.0, |f| f.0)
                             + self.jobs[&job_id].released_cost;
+                        let available = self.jobs[&job_id]
+                            .observed_at_admit
+                            .map_or(available, |obs| {
+                                available.min(obs + self.jobs[&job_id].released_cost)
+                            });
                         if target <= available {
                             if let Some(job) = self.jobs.get_mut(&job_id) {
                                 job.victims.clear();
@@ -1816,11 +1883,14 @@ impl ActorState {
             }
             (SwapState::Dispose, Event::Settled(Err(numbers))) => {
                 let (used, expected) = parse_settle_numbers(&numbers);
+                let gate = parse_settle_gate(&numbers);
                 self.fail_job(
                     job_id,
                     SchedulerError::SettleTimeout {
                         used_gib: used,
                         expected_gib: expected,
+                        free_gib: gate.map(|(f, _)| f),
+                        required_gib: gate.map(|(_, r)| r),
                     },
                     "memory did not settle after release",
                 );
