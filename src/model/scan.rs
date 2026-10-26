@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn scan_dir_collects_models_and_names_bad_files() {
-        let dir = std::env::temp_dir().join(format!("se-scan-test-{}", std::process::id()));
+        let dir = crate::testutil::temp_dir("scan-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("good.yaml"), "name: a\nengine: mock\nvram_gb: 4\n")
@@ -289,7 +289,7 @@ mod tests {
     fn duplicate_ninfer_container_names_are_refused() {
         // Unload reaps by name: one container may back exactly one model
         // (review, 2026-10-26).
-        let dir = std::env::temp_dir().join(format!("se-scan-dup-{}", std::process::id()));
+        let dir = crate::testutil::temp_dir("scan-dup");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn aliases_survive_the_round_trip() {
-        let dir = std::env::temp_dir().join(format!("se-scan-alias-{}", std::process::id()));
+        let dir = crate::testutil::temp_dir("scan-alias");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("a.yaml"), "name: a\nis_embedding_model: true\n").expect("write");

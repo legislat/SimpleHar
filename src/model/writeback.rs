@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn set_flag_on_file_edits_and_is_atomic_in_effect() {
-        let dir = std::env::temp_dir().join(format!("se-writeback-{}", std::process::id()));
+        let dir = crate::testutil::temp_dir("writeback");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("m.yaml");
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn an_edit_that_would_break_the_file_is_refused_before_writing() {
-        let dir = std::env::temp_dir().join(format!("se-writeback-bad-{}", std::process::id()));
+        let dir = crate::testutil::temp_dir("writeback-bad");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("m.yaml");

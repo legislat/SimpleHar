@@ -539,7 +539,7 @@ Start Port    End Port
             file: None,
             raw: Default::default(),
         };
-        let dir = std::env::temp_dir();
+        let dir = simplehar_se::testutil::temp_dir("banner");
         assert_eq!(
             banner_marker(&entry("llama", None), &dir),
             "!",
@@ -560,7 +560,7 @@ Start Port    End Port
             "!",
             "relative refs resolve against modelconf_dir"
         );
-        let name = format!("se-banner-{}.gguf", std::process::id());
+        let name = "se-banner.gguf".to_string();
         std::fs::write(dir.join(&name), b"x").expect("seed file");
         assert_eq!(
             banner_marker(&entry("llama", Some(name.as_str())), &dir),

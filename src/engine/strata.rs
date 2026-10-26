@@ -164,8 +164,7 @@ mod tests {
     /// A real file on disk stands in for the profile JSON and the interpreter:
     /// the adapter existence-checks both before handing a spec to the runtime.
     fn real_file(tag: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("se-strata-{tag}-{}.json", std::process::id()));
+        let path = crate::testutil::temp_dir("strata").join(format!("{tag}.json"));
         std::fs::write(&path, b"{}").expect("temp profile");
         path
     }

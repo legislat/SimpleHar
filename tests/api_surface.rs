@@ -21,14 +21,7 @@ use tower::ServiceExt;
 type Spec = (&'static str, &'static str, CategoryId, Option<f64>);
 
 fn write_modelconf(specs: &[Spec]) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "se-api-modelconf-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("temp ModelConf dir");
+    let dir = simplehar_se::testutil::temp_dir("api-modelconf");
     for (name, engine, category, vram_gb) in specs {
         let mut yaml = format!(
             "name: {name}
@@ -574,13 +567,7 @@ async fn defaults_persist_to_the_config_boot_loaded_even_under_a_custom_path() {
     // Operator finding #2 (2026-10-26): write-back must hit the file boot read
     // (`SIMPLEHAR_CONFIG` aware), and a partial config with no `categories` key
     // must still accept the patch instead of silently staying in memory.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "se-api-config-{}-{}.json",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let path = simplehar_se::testutil::temp_dir("api-config").join("simplehar-se.json");
     std::fs::write(&path, r#"{"modelconf_dir": "unused"}"#).expect("seed config");
     let mut config =
         AppConfig::parse(&std::fs::read_to_string(&path).expect("read")).expect("parses");

@@ -92,15 +92,7 @@ type Spec = (&'static str, &'static str, CategoryId, f64);
 
 /// Writes model yamls into a fresh temp ModelConf dir (with per-model VRAM).
 fn write_modelconf(specs: &[Spec]) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "se-evict-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp ModelConf dir");
+    let dir = simplehar_se::testutil::temp_dir("evict");
     for (name, engine, category, vram) in specs {
         std::fs::write(
             dir.join(format!("{name}.yaml")),
@@ -392,15 +384,7 @@ async fn aux_load_cannot_evict_anything_cross_category() {
 
 /// ModelConf writer with raw extra lines per model (cost/floor keys).
 fn write_modelconf_ext(entries: &[(&str, &[&str])]) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "se-observed-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp ModelConf dir");
+    let dir = simplehar_se::testutil::temp_dir("observed");
     for (name, lines) in entries {
         std::fs::write(dir.join(format!("{name}.yaml")), lines.join("\n")).expect("model yaml");
     }

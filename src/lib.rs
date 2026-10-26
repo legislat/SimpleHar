@@ -16,6 +16,7 @@ pub mod observability;
 pub mod ownership;
 pub mod process;
 pub mod scheduler;
+pub mod testutil;
 pub mod tray;
 pub mod webui;
 pub mod witness;

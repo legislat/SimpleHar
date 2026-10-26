@@ -20,15 +20,7 @@ use std::time::Duration;
 fn write_modelconf(
     specs: &[(&'static str, &'static str, CategoryId, f64, Option<&str>)],
 ) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "se-discover-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp ModelConf dir");
+    let dir = simplehar_se::testutil::temp_dir("discover");
     for (name, engine, category, vram, serve_model) in specs {
         let mut yaml =
             format!("name: {name}\nengine: {engine}\ncategory: {category}\nvram_gb: {vram}\n");

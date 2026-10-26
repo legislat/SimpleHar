@@ -41,14 +41,7 @@ fn to5(specs: &[Spec]) -> Vec<Spec5> {
 /// Writes flat model yamls into a fresh temp ModelConf dir; returns its path.
 /// The 5th spec element appends raw extra lines (cost:, floor keys...).
 fn write_modelconf5(specs: &[Spec5]) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "se-modelconf-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("temp ModelConf dir");
+    let dir = simplehar_se::testutil::temp_dir("modelconf");
     for (name, engine, category, vram_gb, extra) in specs {
         let mut yaml = format!(
             "name: {name}

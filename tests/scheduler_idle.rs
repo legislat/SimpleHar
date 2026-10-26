@@ -18,9 +18,7 @@ fn harness(config: AppConfig) -> SchedulerHandle {
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let dir = std::env::temp_dir().join(format!("se-idle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp ModelConf dir");
+    let dir = simplehar_se::testutil::temp_dir("idle");
     for (name, category) in [("idle-me", CategoryId::Rp), ("stayer", CategoryId::Work)] {
         std::fs::write(
             dir.join(format!("{name}.yaml")),

@@ -82,8 +82,7 @@ struct Harness {
 impl Harness {
     /// Spawns the real exe with a temp config + ModelConf, waits for readiness.
     fn spawn(tag: &str) -> Harness {
-        let work_dir = std::env::temp_dir().join(format!("se-t14-{}-{}", std::process::id(), tag));
-        let _ = std::fs::remove_dir_all(&work_dir);
+        let work_dir = simplehar_se::testutil::temp_dir(&format!("t14-{tag}"));
         let modelconf = work_dir.join("ModelConf");
         std::fs::create_dir_all(&modelconf).expect("temp ModelConf");
 

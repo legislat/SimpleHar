@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn log_pruning_keeps_the_newest_files() {
-        let dir = std::env::temp_dir().join(format!("se-logprune-{}", std::process::id()));
+        let dir = crate::testutil::temp_dir("logprune");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp logs dir");
         for i in 0..6 {

@@ -17,8 +17,7 @@ fn app() -> axum::Router {
     let config = AppConfig::default();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let modelconf = std::env::temp_dir().join(format!("se-smoke-{}", std::process::id()));
-    std::fs::create_dir_all(&modelconf).expect("temp ModelConf dir");
+    let modelconf = simplehar_se::testutil::temp_dir("smoke");
     let scheduler = Scheduler::start(
         config.clone(),
         modelconf,

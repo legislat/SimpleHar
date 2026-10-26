@@ -84,9 +84,7 @@ fn harness(
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let dir = std::env::temp_dir().join(format!("se-wit-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = simplehar_se::testutil::temp_dir("wit");
     for (name, category) in specs {
         std::fs::write(
             dir.join(format!("{name}.yaml")),
@@ -241,13 +239,7 @@ fn harness_models(
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let dir = std::env::temp_dir().join(format!(
-        "se-wit-{}-{}",
-        std::process::id(),
-        specs.first().map_or("x", |(name, _, _)| *name)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = simplehar_se::testutil::temp_dir("wit-models");
     for (name, category, vram) in specs {
         std::fs::write(
             dir.join(format!("{name}.yaml")),
