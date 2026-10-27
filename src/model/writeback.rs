@@ -10,7 +10,7 @@
 use crate::model::scan::parse_flat_yaml;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Serializes every model-file rewrite process-wide. The harness is now a writer
 /// too (install-time `measured_gb` persist races the operator-initiated flag
@@ -22,8 +22,21 @@ fn write_gate() -> &'static Mutex<()> {
     GATE.get_or_init(|| Mutex::new(()))
 }
 
-/// Monotonic suffix so two temp files can never collide.
-fn next_temp_seq() -> u64 {
+/// Takes [`write_gate`] for the whole of a caller's read-modify-write, so another
+/// file writer joins this module's critical section instead of racing it — the
+/// config write-back in `api` is such a writer (FINDINGS-07 [3]). The gate is
+/// exposed as a guard rather than as the `Mutex` so no caller can pick its own
+/// poisoning policy: a poisoned gate is the residue of a failed write, never a
+/// broken invariant, so it is taken as-is exactly as every internal caller does.
+pub(crate) fn acquire_write_gate() -> MutexGuard<'static, ()> {
+    write_gate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Monotonic suffix so two temp files can never collide. Also used by the config
+/// write-back, so every temp this process ever creates is unique process-wide.
+pub(crate) fn next_temp_seq() -> u64 {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
@@ -97,10 +110,8 @@ fn find_key_line<'a>(mut lines: impl Iterator<Item = &'a str>, key: &str) -> Opt
 /// Read/parse/write failures as strings; the on-disk file is never left broken —
 /// a failed re-parse restores the original bytes before returning.
 pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(), String> {
-    // One writer at a time, and a unique temp name (see `write_gate`).
-    let _gate = write_gate()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // One writer at a time, and a unique temp name (see `acquire_write_gate`).
+    let _gate = acquire_write_gate();
     let original = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let updated = set_key_in_text(&original, key, value)?;
@@ -128,9 +139,7 @@ pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(
 /// As [`set_flag_on_file`]. Nothing reaches the disk unless every edit applied and the
 /// result parsed, so the file keeps its previous complete state.
 pub fn set_flags_on_file(path: &Path, edits: &[(&str, Option<&str>)]) -> Result<(), String> {
-    let _gate = write_gate()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _gate = acquire_write_gate();
     let original = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut updated = original.clone();

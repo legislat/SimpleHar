@@ -378,14 +378,31 @@ fn config_write_path(config: &AppConfig) -> std::path::PathBuf {
 
 /// Writes `category.default_model` into the config file atomically: parse the
 /// on-disk file (or the boot config when absent), patch the one field, temp+rename.
+///
+/// The whole read-patch-write-rename runs inside the model write-back's gate and onto
+/// a per-process unique temp: two handlers reach this function (`/har/config/default`
+/// and `/har/config/model`'s dangling-default clear) on separate workers, and an
+/// ungated read-modify-write onto one fixed temp lost one of their fields while both
+/// answered `persisted: true` (FINDINGS-07 [3]).
 fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option<&str>) -> bool {
+    // One critical section with every yaml rewrite (FINDINGS-07 [3]): the second
+    // writer can no longer read the ORIGINAL while the first one is between its
+    // patch and its rename, which is how a persisted field used to vanish from disk.
+    let _gate = crate::model::writeback::acquire_write_gate();
     let path = config_write_path(config);
     let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
             tracing::warn!(error = %error, path = %path.display(), "config unreadable; rewriting from boot config");
             serde_json::to_value(&*config).expect("invariant: config serializes")
         }),
-        Err(_) => serde_json::to_value(config).expect("invariant: config serializes"),
+        Err(error) => {
+            // Silent before: the only difference between this arm and the one above
+            // is that the file could not be read at all, and both rewrite the whole
+            // file from the boot snapshot, so both must say so (FINDINGS-07 [2]'s
+            // unlogged arm).
+            tracing::warn!(error = %error, path = %path.display(), "config file missing or unreadable; writing from boot config");
+            serde_json::to_value(config).expect("invariant: config serializes")
+        }
     };
     let id = category.to_string();
     // A partial config file (e.g. only `modelconf_dir` set) has no categories to
@@ -425,7 +442,14 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
         return false;
     }
     let text = serde_json::to_string_pretty(&root).expect("invariant: JSON serializes");
-    let tmp = path.with_extension("json.tmp");
+    // Unique per (process, sequence), mirroring the yaml temp in `model::writeback`:
+    // on the fixed name a second writer truncated the first one's temp, so one
+    // rename failed while the other's content landed (FINDINGS-07 [3]).
+    let tmp = path.with_extension(format!(
+        "json.{}.{}.sh.tmp",
+        std::process::id(),
+        crate::model::writeback::next_temp_seq()
+    ));
     if let Err(error) = std::fs::write(&tmp, text.as_bytes()) {
         tracing::error!(error = %error, "cannot persist default_model: write failed");
         return false;
@@ -440,6 +464,9 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
         }
     }
     if let Err(error) = std::fs::rename(&tmp, &path) {
+        // The temp is ours alone; leaving it behind turned a failed write into
+        // permanent litter (writeback does the same on its rename failure).
+        let _ = std::fs::remove_file(&tmp);
         tracing::error!(error = %error, "cannot persist default_model: rename failed");
         return false;
     }
@@ -1091,39 +1118,42 @@ async fn har_config_model(
     state.scheduler.reload().await.map_err(ApiError::from)?;
 
     // A model whose category actually changed must move slots, not lie in place
-    // (v3.3 §-behavior, kept). The old guard compared `entry.category` against
-    // itself and never fired. If the moved model was its old category's default,
-    // that default now dangles — clear it too (operator finding #1, 2026-10-26).
+    // (v3.3 §-behavior, kept). Only ITS OWN slot: `unload(old_category)` freed every
+    // occupant of the old category, so retagging one AUX model killed the other
+    // five's engines and whatever WORK held, in-flight generations included
+    // (FINDINGS-07 [1]). A retag of a never-loaded model is the idempotent `Done`
+    // the actor already guarantees for `unload_model` (pinned by scheduler_actor's
+    // T12.2 test), which is why the old inner catalog-name test — meant to skip
+    // that no-op — is gone: it never asked whether the moved model was loaded, only
+    // whether SOME entry shared its name in a different category, so the duplicate
+    // name of chunk 7 [9] was enough to trigger the collateral kill. If the moved
+    // model was its old category's default, that default now dangles — clear it too
+    // (operator finding #1, 2026-10-26).
     if let Some(new_cat) = requested_category.filter(|c| *c != old_category) {
+        let _ = state.scheduler.unload_model(&entry.name).await;
         let catalog = state.catalog().await?;
-        if catalog
-            .iter()
-            .any(|m| m.name == entry.name && m.category != old_category)
-        {
-            let _ = state.scheduler.unload(old_category).await;
-            if let Some(default) = state.default_model(old_category) {
-                // Only an UNAMBIGUOUS resolution proves the category's default is the
-                // model that just moved. An ambiguous one is refused here rather than
-                // accepted on a guess: clearing the wrong default would rewrite the
-                // operator's config file for a model that never moved.
-                match crate::catalog::resolve(&default, &catalog) {
-                    crate::catalog::Resolution::Found(d) if d.name == entry.name => {
-                        state.set_default_model(old_category, None);
-                        tracing::info!(
-                            model = %entry.name,
-                            from = %old_category,
-                            to = %new_cat,
-                            "cleared dangling category default"
-                        );
-                    }
-                    crate::catalog::Resolution::Ambiguous(clients) => tracing::warn!(
+        if let Some(default) = state.default_model(old_category) {
+            // Only an UNAMBIGUOUS resolution proves the category's default is the
+            // model that just moved. An ambiguous one is refused here rather than
+            // accepted on a guess: clearing the wrong default would rewrite the
+            // operator's config file for a model that never moved.
+            match crate::catalog::resolve(&default, &catalog) {
+                crate::catalog::Resolution::Found(d) if d.name == entry.name => {
+                    state.set_default_model(old_category, None);
+                    tracing::info!(
                         model = %entry.name,
-                        category = %old_category,
-                        entries = clients.len(),
-                        "left the category default alone: its name is ambiguous in the catalog"
-                    ),
-                    crate::catalog::Resolution::Found(_) | crate::catalog::Resolution::None => {}
+                        from = %old_category,
+                        to = %new_cat,
+                        "cleared dangling category default"
+                    );
                 }
+                crate::catalog::Resolution::Ambiguous(clients) => tracing::warn!(
+                    model = %entry.name,
+                    category = %old_category,
+                    entries = clients.len(),
+                    "left the category default alone: its name is ambiguous in the catalog"
+                ),
+                crate::catalog::Resolution::Found(_) | crate::catalog::Resolution::None => {}
             }
         }
     }
@@ -2056,5 +2086,109 @@ mod tests {
             other => panic!("expected Upstream, got {other:?}"),
         }
         server.abort();
+    }
+
+    #[test]
+    fn concurrent_default_writes_never_lose_a_field_or_leave_a_temp() {
+        // FINDINGS-07 [3]: the config write-back was an UNGATED read-modify-write onto
+        // one FIXED temp name, and two handlers reach it (`/har/config/default` and
+        // `/har/config/model`'s dangling-default clear) on separate workers. Interleaved,
+        // the second writer renamed its copy of the ORIGINAL, so the first writer's
+        // `default_model` vanished from disk while both responses said `persisted: true`;
+        // the shared temp added a second failure mode — one writer truncating the other's
+        // tmp made its rename fail although the other's content had landed. Six threads
+        // over the four categories, a fresh value per round: under the gate plus the
+        // unique temp every write answers true and no category can fall back to its seed.
+        const ROUNDS: usize = 24;
+        let dir = crate::testutil::temp_dir("api-persist-race");
+        let path = dir.join("simplehar-se.json");
+        let mut config = AppConfig::default();
+        for category in &mut config.categories {
+            category.default_model = Some(format!("seed-{}", category.id));
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&config).expect("seed serializes"),
+        )
+        .expect("seed config");
+        config.source_path = Some(path.clone());
+
+        let plan: [(CategoryId, &str); 6] = [
+            (CategoryId::Work, "work"),
+            (CategoryId::Work, "work"),
+            (CategoryId::Rp, "rp"),
+            (CategoryId::Rp, "rp"),
+            (CategoryId::Aux, "aux"),
+            (CategoryId::Emb, "emb"),
+        ];
+        let writers = plan
+            .into_iter()
+            .enumerate()
+            .map(|(index, (category, prefix))| {
+                let per_writer = config.clone();
+                std::thread::spawn(move || {
+                    (0..ROUNDS)
+                        .map(|round| {
+                            let name = format!("{prefix}-t{index}-r{round}");
+                            persist_default_model(&per_writer, category, Some(&name))
+                        })
+                        .collect::<Vec<bool>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let outcomes = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("a writer thread never panics"))
+            .collect::<Vec<_>>();
+        assert!(
+            outcomes.iter().flatten().all(|persisted| *persisted),
+            "every writer must be able to answer honestly, not `persisted: true` \
+             for bytes that a concurrent rename undid: {outcomes:?}"
+        );
+
+        let text = std::fs::read_to_string(&path).expect("the config file is always present");
+        let on_disk: Value =
+            serde_json::from_str(&text).expect("temp + rename never expose a partial file");
+        let categories = on_disk["categories"].as_array().expect("categories array");
+        let persisted_default = |category: CategoryId| -> String {
+            let id = category.to_string();
+            categories
+                .iter()
+                .find(|entry| entry["id"].as_str() == Some(id.as_str()))
+                .and_then(|entry| entry["default_model"].as_str())
+                .unwrap_or_else(|| panic!("category {id} lost its default_model: {on_disk}"))
+                .to_string()
+        };
+        for &(category, prefix) in &plan {
+            let value = persisted_default(category);
+            assert!(
+                value.starts_with(prefix),
+                "{}'s default is a lost update — no writer ever named {value:?}: {on_disk}",
+                category
+            );
+        }
+        // A single-writer category is deterministic under the gate: every later commit
+        // re-reads the committed file, so its last round can never be rolled back.
+        assert_eq!(
+            persisted_default(CategoryId::Aux),
+            format!("aux-t4-r{}", ROUNDS - 1),
+            "the last AUX write must still be on disk"
+        );
+        assert_eq!(
+            persisted_default(CategoryId::Emb),
+            format!("emb-t5-r{}", ROUNDS - 1),
+            "the last EMB write must still be on disk"
+        );
+
+        let leftovers = std::fs::read_dir(&dir)
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "a failed rename must not leave its temp behind: {leftovers:?}"
+        );
     }
 }

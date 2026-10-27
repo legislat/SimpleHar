@@ -1517,3 +1517,142 @@ async fn dead_engine_connect_failure_restarts_exactly_once() {
         "initial spawn + exactly one restart for the connect class"
     );
 }
+
+/// An `AppConfig` whose AUX category holds `slots` occupants (WORK/RP/EMB stay at 1).
+fn aux_slots(slots: usize) -> AppConfig {
+    let mut config = AppConfig::default();
+    config
+        .category_mut(CategoryId::Aux)
+        .expect("default config has AUX")
+        .max_models = slots;
+    config
+}
+
+/// Polls until `runtime` reports exactly `want` live engines, and returns the count it
+/// ended on. An unload answers `Done` when its job is STARTED, not when the kill lands
+/// (`unload_slots` sends the reply before the spawned release completes), so the live
+/// count settles shortly after the handler returns.
+async fn await_server_count(runtime: &MockRuntime, want: usize) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while runtime.server_count() != want && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    runtime.server_count()
+}
+
+#[tokio::test]
+async fn retagging_one_loaded_aux_model_never_touches_the_other_aux_occupant() {
+    // FINDINGS-07 [1]: `/har/config/model` is a single-model edit, but its retag branch
+    // called `scheduler.unload(old_CATEGORY)` — "unloads every occupant of `category`".
+    // With AUX at max_models 2..6, retagging one AUX model killed the others: in-flight
+    // generations lost, VRAM dumped, cold reload for the operator's next request.
+    let (control, _, _, aux_router, runtime, _) = app(
+        aux_slots(2),
+        &[
+            ("aux1", "mock", CategoryId::Aux, Some(3.0)),
+            ("aux2", "mock", CategoryId::Aux, Some(3.0)),
+        ],
+    );
+    for name in ["aux1", "aux2"] {
+        let body = format!(r#"{{"model":"{name}"}}"#);
+        let (status, body) = post_json(&control, "/har/load", &body).await;
+        assert_eq!(status, StatusCode::OK, "load {name}: {body}");
+    }
+    assert_eq!(await_server_count(&runtime, 2).await, 2, "both slots serve");
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"aux1","category":"WORK"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a retag never 500s: {body}");
+    assert_eq!(body["status"], "edited", "response shape kept: {body}");
+    assert_eq!(body["model"], "aux1", "response shape kept: {body}");
+    assert_eq!(body["category"], "WORK", "response shape kept: {body}");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (_, loaded) = get_json(&control, "/har/status").await;
+        let slots = loaded["slots"].as_array().expect("slots");
+        let survivor = slots
+            .iter()
+            .any(|slot| slot["model"] == "aux2" && slot["category"] == "AUX");
+        let moved_away = !slots.iter().any(|slot| slot["model"] == "aux1");
+        if survivor && moved_away {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("aux2 must keep its AUX slot while aux1's leaves it: {loaded}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        await_server_count(&runtime, 1).await,
+        1,
+        "only the retagged model's engine may die"
+    );
+    assert_eq!(runtime.spawn_count(), 2, "the survivor was never restarted");
+
+    // The surviving engine is really alive, not merely listed: its listener answers.
+    let (status, body) = post_json(
+        &aux_router,
+        "/v1/chat/completions",
+        r#"{"model":"aux2","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the untouched AUX serves: {body}");
+    assert_eq!(body["echo"], true);
+}
+
+#[tokio::test]
+async fn retagging_an_unloaded_aux_model_leaves_the_loaded_aux_occupant_alive() {
+    // FINDINGS-07 [1], second half: the collateral unload fired on the CATEGORY CHANGE,
+    // not on the model being loaded, so retagging a third AUX model that was never
+    // loaded wiped the AUX occupants that were serving "for nothing".
+    let (control, _, _, aux_router, runtime, _) = app(
+        aux_slots(2),
+        &[
+            ("aux1", "mock", CategoryId::Aux, Some(3.0)),
+            ("aux2", "mock", CategoryId::Aux, Some(3.0)),
+            ("aux3", "mock", CategoryId::Aux, Some(3.0)),
+        ],
+    );
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"aux1"}"#).await;
+    assert_eq!(status, StatusCode::OK, "load aux1: {body}");
+    assert_eq!(await_server_count(&runtime, 1).await, 1, "one occupant");
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"aux3","category":"WORK"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a retag never 500s: {body}");
+    assert_eq!(body["status"], "edited");
+    assert_eq!(body["category"], "WORK");
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let (_, loaded) = get_json(&control, "/har/status").await;
+    let slots = loaded["slots"].as_array().expect("slots");
+    assert!(
+        slots
+            .iter()
+            .any(|slot| slot["model"] == "aux1" && slot["category"] == "AUX"),
+        "an edit to aux3 must not disturb the loaded aux1: {loaded}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "the never-loaded retag kills nothing"
+    );
+    assert_eq!(runtime.spawn_count(), 1, "and restarts nothing");
+
+    let (status, body) = post_json(
+        &aux_router,
+        "/v1/chat/completions",
+        r#"{"model":"aux1","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "aux1 is still answering: {body}");
+}
