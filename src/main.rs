@@ -99,10 +99,8 @@ async fn main() -> ExitCode {
     let mut adapters = std::collections::BTreeMap::new();
     let mock: Arc<dyn EngineAdapter> = Arc::new(MockAdapter);
     adapters.insert("mock".to_string(), mock);
-    let llama: Arc<dyn EngineAdapter> = Arc::new(LlamaAdapter::new(
-        config.llama_server_exe.clone(),
-        config.internal_host.to_string(),
-    ));
+    let llama: Arc<dyn EngineAdapter> =
+        Arc::new(LlamaAdapter::new(config.llama_server_exe.clone()));
     adapters.insert("llama".to_string(), llama);
     let strata: Arc<dyn EngineAdapter> =
         Arc::new(simplehar_se::engine::strata::StrataAdapter::default());

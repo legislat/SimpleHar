@@ -5,11 +5,57 @@
 //! the parity test below re-reads it so the harness cannot drift. Two harness-level
 //! special cases are documented extensions: `cpu_offload` (forces `-ngl 0`,
 //! suppressing `ngl`) and the forced `--host`/`--port` pair.
+//!
+//! Harness-owned decisions are enforced twice (FINDINGS-09 [1]/[2]): any
+//! whitespace-separated `extra_args` word naming a harness-owned flag is refused
+//! with [`EngineError::Rejected`], and the forced flags (`--host`, `--port`, and
+//! `-ngl 0` under `cpu_offload`) are appended at the *tail* of the argv so they win
+//! under any parser that honors last occurrence. `--host` is always the
+//! [`LLAMA_ENGINE_HOST`] literal, never the config's `internal_host`.
 
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+/// IPv4 loopback address the harness forces as the engine bind address (`--host`).
+///
+/// Engines are launched with this literal, never with config `internal_host`:
+/// `internal_host` governs only the harness's own public listeners, so a
+/// `0.0.0.0` control page never exposes unauthenticated `llama-server` ports on
+/// the segment, and the IPv4-only readiness probe always dials what the engine
+/// actually bound (FINDINGS-09 [1]).
+pub const LLAMA_ENGINE_HOST: &str = "127.0.0.1";
+
+/// Flags the harness owns; an `extra_args` word equal to one of these, or equal to
+/// one of them followed by `=` (e.g. `--port=8080`), is a refused launch rather
+/// than a silent override (FINDINGS-09 [2]). Case-sensitive exact matching, no
+/// heuristics.
+const HARNESS_OWNED_FLAGS: &[&str] = &[
+    "-m", "--model", "--host", "--port", "-ngl", "--jinja", "--mmproj",
+];
+
+/// Rejects any `extra_args` word that names a harness-owned flag.
+///
+/// # Errors
+///
+/// [`EngineError::Rejected`] naming the offending token.
+fn check_extra_args(extra: &str, model_name: &str) -> Result<(), EngineError> {
+    for word in extra.split_whitespace() {
+        let owned = HARNESS_OWNED_FLAGS.iter().any(|flag| {
+            word == *flag
+                || word.starts_with(*flag) && word.as_bytes().get(flag.len()) == Some(&b'=')
+        });
+        if owned {
+            return Err(EngineError::Rejected {
+                engine: "llama".to_string(),
+                model: model_name.to_string(),
+                reason: format!("extra_args may not override harness-owned flag `{word}`"),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// yaml key -> llama-server flag, in `start.ps1` order. Empty values are skipped,
 /// exactly like the script's `if ($v)`.
@@ -39,13 +85,19 @@ pub fn jinja_on(value: &str) -> bool {
 }
 
 /// Builds the llama-server argv from the raw yaml map, mirroring `start.ps1:45-63`:
-/// `-m` first (required), mapped flags with non-empty values, the forced
-/// `--host`/`--port`, `--jinja` when truthy, then `extra_args` split on whitespace.
+/// `-m` first (required), `--mmproj`, the remaining mapped flags with non-empty
+/// values, `--jinja` when truthy, then `extra_args` split on whitespace, and the
+/// harness-forced flags at the tail (`--host`, `--port`, and `-ngl 0` when
+/// `cpu_offload` is on) so forced values win under any parser that honors last
+/// occurrence. Any `extra_args` word naming a harness-owned flag is refused
+/// outright (see [`HARNESS_OWNED_FLAGS`]).
 ///
 /// # Errors
 ///
 /// - [`EngineError::MissingField`] when `model` is absent or empty — the script
 ///   refuses to launch without it too.
+/// - [`EngineError::Rejected`] when an `extra_args` word matches a harness-owned
+///   flag, naming the offending token.
 pub fn build_args(
     raw: &BTreeMap<String, String>,
     host: &str,
@@ -63,24 +115,14 @@ pub fn build_args(
         });
     };
     let value = |key: &str| raw.get(key).map(String::as_str).filter(|v| !v.is_empty());
-    let mut args = vec!["-m".to_string(), model.to_string()];
-    // Script order (start.ps1:45-63): mmproj, then the forced host/port, then the
-    // rest of the table, then the two special flags, then extra_args.
-    for (key, flag) in FLAG_TABLE {
-        if *key != "mmproj" {
-            continue;
-        }
-        if let Some(v) = value(key) {
-            args.extend([flag.to_string(), v.to_string()]);
-        }
+    if let Some(extra) = value("extra_args") {
+        check_extra_args(extra, model_name)?;
     }
-    args.extend(["--host".to_string(), host.to_string()]);
-    args.extend(["--port".to_string(), port.to_string()]);
     let cpu_offload = raw.get("cpu_offload").is_some_and(|v| jinja_on(v));
+    let mut args = vec!["-m".to_string(), model.to_string()];
+    // Script order (start.ps1:45-63): mmproj leads the table, then the rest of the
+    // table, then --jinja, then extra_args; the forced flags come last of all.
     for (key, flag) in FLAG_TABLE {
-        if *key == "mmproj" {
-            continue;
-        }
         if *key == "ngl" && cpu_offload {
             continue; // A.7: cpu_offload forces -ngl 0 and suppresses the yaml ngl.
         }
@@ -88,31 +130,35 @@ pub fn build_args(
             args.extend([flag.to_string(), v.to_string()]);
         }
     }
-    if cpu_offload {
-        args.extend(["-ngl".to_string(), "0".to_string()]);
-    }
     if raw.get("jinja").is_some_and(|v| jinja_on(v)) {
         args.push("--jinja".to_string());
     }
     if let Some(extra) = value("extra_args") {
         args.extend(extra.split_whitespace().map(str::to_string));
     }
+    args.extend(["--host".to_string(), host.to_string()]);
+    args.extend(["--port".to_string(), port.to_string()]);
+    if cpu_offload {
+        args.extend(["-ngl".to_string(), "0".to_string()]);
+    }
     Ok(args)
 }
 
 /// llama.cpp adapter: argv from data (A.7), readiness `/health` 200 (v3.3 contract).
+///
+/// Engines are forced to `--host` [`LLAMA_ENGINE_HOST`]; config `internal_host`
+/// governs only the harness's own public listeners, never the engine bind address.
 #[derive(Debug, Clone)]
 pub struct LlamaAdapter {
     /// Path to `llama-server.exe` (config `llama_server_exe`).
     pub exe: PathBuf,
-    /// Loopback address engines are forced to (`--host`).
-    pub host: String,
 }
 
 impl LlamaAdapter {
-    /// Creates the adapter for the configured binary and host.
-    pub fn new(exe: PathBuf, host: String) -> Self {
-        LlamaAdapter { exe, host }
+    /// Creates the adapter for the configured binary. The engine bind address is
+    /// not configurable: [`LLAMA_ENGINE_HOST`] is forced into every argv.
+    pub fn new(exe: PathBuf) -> Self {
+        LlamaAdapter { exe }
     }
 }
 
@@ -122,7 +168,7 @@ impl EngineAdapter for LlamaAdapter {
     }
 
     fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
-        let argv = build_args(&model.raw, &self.host, port, &model.name)?;
+        let argv = build_args(&model.raw, LLAMA_ENGINE_HOST, port, &model.name)?;
         Ok(LaunchSpec {
             argv: [self.exe.to_string_lossy().into_owned()]
                 .into_iter()
@@ -178,10 +224,6 @@ mod tests {
                 "F:/m.gguf",
                 "--mmproj",
                 "F:/mmproj.gguf",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "18109",
                 "-c",
                 "4096",
                 "-ngl",
@@ -190,6 +232,10 @@ mod tests {
                 "1",
                 "--foo",
                 "--bar=2",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "18109",
             ]
         );
     }
@@ -198,6 +244,123 @@ mod tests {
     fn missing_model_refuses_to_launch() {
         let error = build_args(&raw(&[]), "127.0.0.1", 18109, "ghost").expect_err("must refuse");
         assert!(matches!(error, EngineError::MissingField { .. }));
+    }
+
+    fn entry(raw_pairs: &[(&str, &str)]) -> ModelEntry {
+        ModelEntry {
+            name: "t".to_string(),
+            engine: "llama".to_string(),
+            category: crate::config::CategoryId::Work,
+            vram_gb: None,
+            gguf_size_gb: None,
+            cost: crate::model::CostClass::Fixed,
+            launch_floor_gb: None,
+            load_timeout_s: None,
+            measured_gb: None,
+            measured_min_gb: None,
+            measured_offload: None,
+            model_ref: None,
+            serve_model: None,
+            file: None,
+            raw: raw(raw_pairs),
+        }
+    }
+
+    #[test]
+    fn spec_always_binds_the_forced_ipv4_loopback_host() {
+        let adapter = LlamaAdapter::new(PathBuf::from("llama-server.exe"));
+        // Nothing in the yaml can move --host off the loopback const: a `host`
+        // key is not in FLAG_TABLE, and an extra_args override is refused.
+        let model = entry(&[("model", "F:/m.gguf"), ("host", "0.0.0.0")]);
+        let spec = adapter.spec(&model, 18109).expect("valid");
+        let window = spec
+            .argv
+            .windows(2)
+            .filter(|w| w[0] == "--host")
+            .collect::<Vec<_>>();
+        assert_eq!(window.len(), 1, "exactly one --host: {:?}", spec.argv);
+        assert_eq!(window[0], ["--host", "127.0.0.1"]);
+        assert!(!spec.argv.iter().any(|a| a == "0.0.0.0"));
+    }
+
+    #[test]
+    fn extra_args_naming_a_harness_owned_flag_is_refused() {
+        for (extra, token) in [
+            ("--port 8080", "--port"),
+            ("--host 0.0.0.0", "--host"),
+            ("-ngl 99", "-ngl"),
+            ("--model D:/evil.gguf", "--model"),
+            ("--port=8080", "--port"),
+        ] {
+            let error = build_args(
+                &raw(&[("model", "m"), ("extra_args", extra)]),
+                "127.0.0.1",
+                18109,
+                "t",
+            )
+            .expect_err("harness-owned flag must be refused");
+            let EngineError::Rejected {
+                engine,
+                model,
+                reason,
+            } = &error
+            else {
+                panic!("expected Rejected for {extra}, got {error:?}");
+            };
+            assert_eq!(engine, "llama");
+            assert_eq!(model, "t");
+            assert!(reason.contains(token), "reason must name {token}: {reason}");
+            assert!(
+                error.to_string().contains(token),
+                "Display must name {token}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_extra_args_still_pass_through() {
+        // The only real usage in the catalog (ModelConf/embeddinggemma-2-GGUF.yaml).
+        let args = build_args(
+            &raw(&[("model", "m"), ("extra_args", "--embedding --pooling last")]),
+            "127.0.0.1",
+            18109,
+            "t",
+        )
+        .expect("benign extra_args must be accepted");
+        let window = args
+            .windows(3)
+            .any(|w| w == ["--embedding", "--pooling", "last"]);
+        assert!(window, "extra_args missing from {args:?}");
+    }
+
+    #[test]
+    fn cpu_offload_forced_ngl_zero_lands_after_extra_args() {
+        let args = build_args(
+            &raw(&[
+                ("model", "m"),
+                ("ngl", "99"),
+                ("cpu_offload", "true"),
+                ("extra_args", "--embedding --pooling last"),
+            ]),
+            "127.0.0.1",
+            18109,
+            "t",
+        )
+        .expect("valid");
+        let last_ngl = args
+            .iter()
+            .rposition(|a| a == "-ngl")
+            .expect("forced -ngl present");
+        assert_eq!(args[last_ngl + 1], "0");
+        let extra_pos = args
+            .iter()
+            .rposition(|a| a == "--pooling")
+            .expect("extra_args words present");
+        assert!(
+            last_ngl > extra_pos,
+            "forced -ngl 0 must come after extra_args: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "99"), "yaml ngl suppressed");
     }
 
     #[test]

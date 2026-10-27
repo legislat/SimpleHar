@@ -87,10 +87,7 @@ fn harness5(cfg: AppConfig, specs: &[Spec5]) -> (SchedulerHandle, MockRuntime) {
     let reals: Vec<Arc<dyn EngineAdapter>> = vec![
         Arc::new(StrataAdapter::default()),
         Arc::new(NinferAdapter::new("Ubuntu", "ops")),
-        Arc::new(LlamaAdapter::new(
-            PathBuf::from("llama-server.exe"),
-            "127.0.0.1".to_string(),
-        )),
+        Arc::new(LlamaAdapter::new(PathBuf::from("llama-server.exe"))),
     ];
     for adapter in reals {
         adapters.insert(adapter.engine_id().to_string(), adapter);
