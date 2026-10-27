@@ -76,7 +76,7 @@ fn harness5(cfg: AppConfig, specs: &[Spec5]) -> (SchedulerHandle, MockRuntime) {
     let mut adapters = BTreeMap::new();
     let adapter: Arc<dyn simplehar_se::engine::EngineAdapter> = Arc::new(MockAdapter);
     adapters.insert("mock".to_string(), adapter);
-    for engine in ["mock-slow", "mock-dies", "mock-never"] {
+    for engine in ["mock-slow", "mock-dies", "mock-never", "mock-hold-kill"] {
         adapters.insert(
             engine.to_string(),
             Arc::new(MockAdapter) as Arc<dyn simplehar_se::engine::EngineAdapter>,
@@ -462,6 +462,260 @@ async fn unload_model_during_load_cancels_and_kills_engine() {
         handle.unload_model("ghost").await.expect("idempotent"),
         Reply::Done
     ));
+}
+
+// --- cancel while a victim release is in flight (chunk 4 [1], 2026-10-27) ---------
+
+/// The resident model of the cancel-mid-release scenarios: its engine parks inside
+/// `kill` until the test releases it, so the swap's Dispose release is genuinely still
+/// in flight when the operator's cancel lands.
+const HOLD_MODEL: &str = "hold-a";
+/// The model being swapped in over it.
+const INCOMING_MODEL: &str = "model-b";
+
+fn hold_kill_harness(cfg: AppConfig) -> (SchedulerHandle, MockRuntime) {
+    harness5(
+        cfg,
+        &[
+            (
+                HOLD_MODEL,
+                "mock-hold-kill",
+                CategoryId::Work,
+                Some(4.0),
+                "",
+            ),
+            (INCOMING_MODEL, "mock", CategoryId::Work, Some(4.0), ""),
+        ],
+    )
+}
+
+/// Loads [`HOLD_MODEL`] into WORK and returns its engine's receipt.
+async fn serve_hold_model(handle: &SchedulerHandle) -> simplehar_se::scheduler::SwapReceipt {
+    let Reply::Loaded(receipt) = handle
+        .swap(HOLD_MODEL, CategoryId::Work)
+        .await
+        .expect("the resident model loads")
+    else {
+        panic!("expected Loaded, got the resident load")
+    };
+    receipt
+}
+
+/// Drives the same-slot swap of [`INCOMING_MODEL`] over [`HOLD_MODEL`] until the job
+/// sits in `Dispose` with the victim's kill unconfirmed, and returns the swap's job id.
+async fn swap_parked_in_dispose_over_a_victim(handle: &SchedulerHandle) -> JobId {
+    submit_and_vanish(handle, INCOMING_MODEL, CategoryId::Work).await;
+    wait_until(handle, 5, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.model == INCOMING_MODEL && j.state == SwapState::Dispose)
+    })
+    .await;
+    handle
+        .status()
+        .await
+        .expect("actor alive")
+        .jobs
+        .iter()
+        .find(|j| j.model == INCOMING_MODEL)
+        .map(|j| j.id)
+        .expect("invariant: wait_until established the swap job")
+}
+
+#[tokio::test]
+async fn cancel_of_a_swap_mid_victim_release_kills_the_victim_and_empties_its_slot() {
+    // FINDINGS-04 [1]: Unload during a hung swap is the operator's commonest recovery
+    // gesture. Cancelling there must still kill the victim and confirm it: a job that
+    // terminalizes over an unconfirmed release leaves a dead-but-installed occupant,
+    // which debits the ledger forever and blocks reload with 200 `already`.
+    let (handle, runtime) = hold_kill_harness(config(10));
+    let victim = serve_hold_model(&handle).await;
+    assert_eq!(runtime.server_count(), 1, "the victim engine is live");
+    swap_parked_in_dispose_over_a_victim(&handle).await;
+
+    assert!(matches!(
+        handle
+            .unload(CategoryId::Work)
+            .await
+            .expect("cancel accepted"),
+        Reply::Done
+    ));
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "nothing may die behind the operator's back before the cancel's own reap runs"
+    );
+    runtime.release_held_kills();
+
+    wait_until(&handle, 8, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let job = status
+        .jobs
+        .iter()
+        .find(|j| j.model == INCOMING_MODEL)
+        .expect("the cancelled swap is in the ledger");
+    assert_eq!(job.outcome.as_deref(), Some("cancelled"), "{job:?}");
+    assert!(
+        job.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unloaded by request"),
+        "{job:?}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "the victim engine must not survive the cancelled swap"
+    );
+    assert!(
+        runtime.is_dead(victim.port).await,
+        "the victim's port must stop answering (G12)"
+    );
+    assert_eq!(
+        runtime.spawn_count(),
+        1,
+        "a swap cancelled in Dispose must never spawn its replacement"
+    );
+}
+
+#[tokio::test]
+async fn second_unload_of_a_slow_unload_kills_the_victim_and_empties_its_slot() {
+    // The mirror case of chunk 4 [1]: `begin_unload_slot` sets `victim`, never
+    // `spawned`, so the second /har/unload of a slow unload cancels the first while
+    // its kill is in flight — and must still finish the job it cancels.
+    let (handle, runtime) = hold_kill_harness(config(10));
+    let victim = serve_hold_model(&handle).await;
+
+    handle
+        .unload(CategoryId::Work)
+        .await
+        .expect("first unload accepted");
+    wait_until(&handle, 5, |s| {
+        s.jobs.iter().any(|j| {
+            j.model == HOLD_MODEL
+                && j.kind == simplehar_se::scheduler::JobKind::Unload
+                && j.state == SwapState::Dispose
+        })
+    })
+    .await;
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "the engine is still live when the second unload lands"
+    );
+
+    handle
+        .unload(CategoryId::Work)
+        .await
+        .expect("second unload accepted");
+    runtime.release_held_kills();
+
+    wait_until(&handle, 8, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let job = status
+        .jobs
+        .iter()
+        .find(|j| j.model == HOLD_MODEL && j.kind == simplehar_se::scheduler::JobKind::Unload)
+        .expect("the cancelled unload is in the ledger");
+    assert_eq!(job.outcome.as_deref(), Some("cancelled"), "{job:?}");
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "a cancelled unload must leave no live engine"
+    );
+    assert!(runtime.is_dead(victim.port).await, "and no answering port");
+}
+
+#[tokio::test]
+async fn cancel_with_an_unconfirmed_release_keeps_the_occupant_and_says_cancelled() {
+    // The half the fix must NOT touch: a release that timed out was never confirmed,
+    // so the harness may not claim the engine is gone. The slot keeps its occupant (and
+    // its ledger debit) and the row stays a plain cancel.
+    let cfg = AppConfig {
+        release_timeout_s: 2,
+        ..config(10)
+    };
+    let (handle, runtime) = hold_kill_harness(cfg);
+    let victim = serve_hold_model(&handle).await;
+    swap_parked_in_dispose_over_a_victim(&handle).await;
+
+    handle
+        .unload(CategoryId::Work)
+        .await
+        .expect("cancel accepted");
+    wait_until(&handle, 10, |s| s.jobs.iter().all(|j| j.terminal)).await;
+
+    let status = handle.status().await.expect("actor alive");
+    let job = status
+        .jobs
+        .iter()
+        .find(|j| j.model == INCOMING_MODEL)
+        .expect("the cancelled swap is in the ledger");
+    assert_eq!(job.outcome.as_deref(), Some("cancelled"), "{job:?}");
+    assert!(
+        job.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unloaded by request"),
+        "{job:?}"
+    );
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![Some(HOLD_MODEL.to_string())],
+        "an unconfirmed release may not clear the slot of an engine nobody proved dead"
+    );
+    assert_eq!(runtime.server_count(), 1, "the engine was never killed");
+    assert!(
+        !runtime.is_dead(victim.port).await,
+        "and it is still answering on its port"
+    );
+}
+
+#[tokio::test]
+async fn a_second_cancel_of_the_same_swap_still_reaps_the_victim() {
+    // The reap decision must not key off the state the cancel itself writes: pressing
+    // Unload twice (or Unload then loading a third model) cancels a job that is already
+    // `CancelRequested` with its re-issued kill still parked.
+    let (handle, runtime) = hold_kill_harness(config(10));
+    let victim = serve_hold_model(&handle).await;
+    let job = swap_parked_in_dispose_over_a_victim(&handle).await;
+
+    handle
+        .unload(CategoryId::Work)
+        .await
+        .expect("first cancel accepted");
+    wait_until(&handle, 5, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.id == job && j.state == SwapState::CancelRequested)
+    })
+    .await;
+
+    assert!(matches!(
+        handle.cancel(job).await.expect("second cancel accepted"),
+        Reply::Done
+    ));
+    runtime.release_held_kills();
+
+    wait_until(&handle, 8, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "the second cancel must not abandon the victim's reap"
+    );
+    assert!(runtime.is_dead(victim.port).await, "and no answering port");
 }
 
 #[tokio::test]

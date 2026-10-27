@@ -3,7 +3,10 @@
 //! GPU. Behavior modes are selected by the `engine:` id the model carries: `mock`
 //! (instant ready), `mock-slow` (3 s readiness delay), `mock-dies` (server stops
 //! 300 ms after start), `mock-dies-once` (only the FIRST engine this runtime starts
-//! stops, so a crash-retry can be observed end to end), `mock-never` (never ready).
+//! stops, so a crash-retry can be observed end to end), `mock-never` (never ready),
+//! `mock-hold-kill` (instant ready, but a kill request parks until the test calls
+//! [`MockRuntime::release_held_kills`] — an engine whose terminate has not landed yet,
+//! which is what makes a release in flight observable).
 
 use async_trait::async_trait;
 use axum::extract::State;
@@ -36,6 +39,10 @@ pub enum MockMode {
     /// Every proxy target answers 500 (A9: a genuine upstream error is never
     /// retried).
     AlwaysError,
+    /// The engine answers normally but a `kill` request parks until the test releases
+    /// it: a terminate that has not landed yet, so a release still in flight is
+    /// observable rather than a race.
+    HoldKill,
 }
 
 fn mode_for(engine: &str) -> MockMode {
@@ -45,12 +52,12 @@ fn mode_for(engine: &str) -> MockMode {
         "mock-dies-once" => MockMode::DiesOnce,
         "mock-never" => MockMode::Never,
         "mock-error" => MockMode::AlwaysError,
+        "mock-hold-kill" => MockMode::HoldKill,
         _ => MockMode::Instant,
     }
 }
 
 struct MockServer {
-    #[allow(dead_code)]
     mode: MockMode,
     handle: tokio::task::JoinHandle<()>,
 }
@@ -75,6 +82,8 @@ pub struct MockRuntime {
     spawn_counter: Arc<AtomicU32>,
     /// Latched by the first `DiesOnce` engine, so only the corpse is real.
     dies_once_used: Arc<AtomicBool>,
+    /// Zero-permit gate every `HoldKill` kill waits on (see [`MockRuntime::release_held_kills`]).
+    kill_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for MockRuntime {
@@ -97,7 +106,15 @@ impl MockRuntime {
             pid_base: Arc::new(Mutex::new(None)),
             spawn_counter: Arc::new(AtomicU32::new(0)),
             dies_once_used: Arc::new(AtomicBool::new(false)),
+            kill_gate: Arc::new(tokio::sync::Semaphore::new(0)),
         }
+    }
+
+    /// Lets every `HoldKill` engine parked inside `kill` actually die, so a test can
+    /// hold a release in flight for exactly as long as it needs to observe it.
+    #[allow(dead_code)]
+    pub fn release_held_kills(&self) {
+        self.kill_gate.add_permits(64);
     }
 
     /// Number of live engines (leak-check helper for F-1 / F-6). Used by the
@@ -241,6 +258,19 @@ impl EngineRuntime for MockRuntime {
     }
 
     async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError> {
+        let held = self
+            .servers
+            .lock()
+            .expect("mock runtime lock")
+            .get(&ticket.port)
+            .is_some_and(|server| server.mode == MockMode::HoldKill);
+        if held {
+            let _permit = self
+                .kill_gate
+                .acquire()
+                .await
+                .expect("invariant: the kill gate is never closed");
+        }
         if let Some(server) = self
             .servers
             .lock()

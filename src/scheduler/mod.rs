@@ -1127,6 +1127,28 @@ impl ActorState {
         }
     }
 
+    /// Clears a victim's own slot once its release is confirmed (same-slot replacement or
+    /// a cross-category evictee — never the job's slot blindly), and only while the
+    /// occupant there is still the one this ticket owns. Shared by the two arms that
+    /// accept a confirmed release, so a cancelled swap cannot leave a reaped engine
+    /// installed (chunk 4 [1]).
+    ///
+    /// # Arguments
+    ///
+    /// * `job_id` - the job whose `victim` has just been released.
+    fn clear_released_victim_slot(&mut self, job_id: JobId) {
+        let Some(victim) = self.jobs.get(&job_id).and_then(|job| job.victim.clone()) else {
+            return;
+        };
+        if self.slots[victim.slot]
+            .occupant
+            .as_ref()
+            .is_some_and(|o| o.ticket == victim.ticket)
+        {
+            self.clear_occupant(victim.slot);
+        }
+    }
+
     /// Folds one serving-window reading into the model's measured range and writes it
     /// back to the yaml (§0.4): `measured_gb` keeps the high end — what `fixed`
     /// admission consults — and `measured_gb_min` the low end the page shows, with the
@@ -2132,18 +2154,8 @@ impl ActorState {
         match (state, event) {
             (SwapState::Dispose, Event::Released(Ok(()))) => {
                 self.set_timing(job_id, |t| &mut t.release_ms);
-                // Clear the released victim's own slot (same-slot replacement or a
-                // cross-category evictee — never the job's slot blindly).
-                let released = self.jobs[&job_id].victim.clone();
-                if let Some(victim) = &released {
-                    if self.slots[victim.slot]
-                        .occupant
-                        .as_ref()
-                        .map(|o| o.ticket.clone())
-                        == Some(victim.ticket.clone())
-                    {
-                        self.clear_occupant(victim.slot);
-                    }
+                self.clear_released_victim_slot(job_id);
+                if let Some(victim) = self.jobs[&job_id].victim.clone() {
                     if let Some(job) = self.jobs.get_mut(&job_id) {
                         job.released_cost += victim.cost;
                         if victim.evicted {
@@ -2248,14 +2260,17 @@ impl ActorState {
                     .unwrap_or_else(|| SchedulerError::Spawn("unknown failure".to_string()));
                 self.finish(job_id, Err(error), "failed");
             }
-            (SwapState::CancelRequested, Event::Released(_)) => {
-                self.step(job_id, SwapState::Reap);
-                self.step(job_id, SwapState::Idle);
-                let error = self.jobs[&job_id]
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| SchedulerError::Cancelled("cancelled".to_string()));
-                self.finish(job_id, Err(error), "cancelled");
+            (SwapState::CancelRequested, Event::Released(Ok(()))) => {
+                // The release this job's own (aborted) reap task never proved: now the
+                // victim's engine is gone, so its slot must go the way a completed
+                // Dispose release takes it, or the ledger debits a corpse forever.
+                self.clear_released_victim_slot(job_id);
+                self.finish_cancelled(job_id);
+            }
+            (SwapState::CancelRequested, Event::Released(Err(_))) => {
+                // An unconfirmed release leaves the engine possibly alive: the slot
+                // stays installed rather than claiming a death nobody proved.
+                self.finish_cancelled(job_id);
             }
             (SwapState::Dispose, Event::Settled(Ok(()))) => {
                 self.begin_spawn(job_id);
@@ -2389,9 +2404,6 @@ impl ActorState {
                             // `free_gib()` clamps, so a NaN or nonsense reading would
                             // otherwise arrive as "the model took the whole card" and
                             // be persisted to the operator's file forever.
-                            // `free_gib()` clamps, so a NaN or nonsense reading would
-                            // otherwise arrive as "the model took the whole card" and
-                            // be persisted to the operator's file forever.
                             if !sample.total_gib.is_finite()
                                 || !sample.used_gib.is_finite()
                                 || sample.total_gib <= 0.0
@@ -2455,18 +2467,20 @@ impl ActorState {
                 task.abort();
             }
             job.error = Some(error.clone());
+            // The reap decision belongs to the job as it was when the cancel landed,
+            // so it is taken before the state moves: this abort just destroyed the only
+            // task that could confirm the victim's release, and an unconfirmed victim
+            // stays installed in its slot (chunk 4 [1]).
+            spawned = job.spawned.is_some() || job.victim_release_pending();
             if vocab::transition_allowed(job.state, SwapState::CancelRequested) {
                 job.state = SwapState::CancelRequested;
             }
-            spawned = job.spawned.is_some() || job.victim_release_pending();
         }
         if spawned {
             // Kill what this job spawned (or was releasing), confirm, then Idle.
             self.spawn_kill_confirm(job_id);
         } else {
-            self.step(job_id, SwapState::Reap);
-            self.step(job_id, SwapState::Idle);
-            self.finish(job_id, Err(error), "cancelled");
+            self.finish_cancelled(job_id);
         }
     }
 
@@ -2483,6 +2497,18 @@ impl ActorState {
             self.step(job_id, SwapState::Idle);
             self.finish(job_id, Err(error), note);
         }
+    }
+
+    /// Reap -> Idle -> `finish(Cancelled)`, keeping the error the cancel carried: the
+    /// one shape every cancel exit takes, whether or not a release was confirmed first.
+    fn finish_cancelled(&mut self, job_id: JobId) {
+        self.step(job_id, SwapState::Reap);
+        self.step(job_id, SwapState::Idle);
+        let error = self.jobs[&job_id]
+            .error
+            .clone()
+            .unwrap_or_else(|| SchedulerError::Cancelled("cancelled".to_string()));
+        self.finish(job_id, Err(error), "cancelled");
     }
 
     /// Terminal funnel: every exit path funnels through here exactly once (Step 3).
@@ -2677,9 +2703,15 @@ impl ActorState {
 }
 
 impl Job {
-    /// Whether a release task is in flight for this job's victim (Quiesce/Dispose).
+    /// Whether this job still owes a confirmed release for its victim.
+    ///
+    /// `victim` is only ever assigned and never cleared (see `spawn_kill_confirm`), so
+    /// this answers "a reap target exists", not "a task is parked on it". It is
+    /// deliberately independent of `state`: its only caller (`cancel_job`) asks it while
+    /// it is moving the job out of that state, and a cancel that arrives in `Dispose`
+    /// must still kill and confirm the victim (chunk 4 [1]).
     fn victim_release_pending(&self) -> bool {
-        matches!(self.state, SwapState::Quiesce | SwapState::Dispose) && self.victim.is_some()
+        self.victim.is_some()
     }
 }
 
