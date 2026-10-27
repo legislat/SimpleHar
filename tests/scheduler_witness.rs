@@ -342,33 +342,12 @@ async fn serving_window_folds_total_diff_into_the_yaml_measured_range() {
     let Reply::Loaded(_) = handle.swap("a", CategoryId::Work).await.expect("a loads") else {
         panic!("expected Loaded");
     };
-
     // The card filling by 10 then 20 GiB is this model's own footprint growing — the
     // KV cache spread the range exists to record.
-    let await_range = |high: f64, low: Option<f64>| {
-        let handle = handle.clone();
-        async move {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let catalog = handle.catalog().await.expect("actor alive");
-                let entry = catalog.models.iter().find(|m| m.name == "a");
-                if entry.is_some_and(|m| m.measured_gb == Some(high) && m.measured_min_gb == low) {
-                    return;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "range never reached {high}/{low:?}: {:?}",
-                    entry.map(|m| (m.measured_gb, m.measured_min_gb, m.measured_offload))
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    };
-
     witness.set(sample(72.0, 40.0, vec![]));
-    await_range(10.0, Some(10.0)).await;
+    await_measured(&handle, "a", (Some(10.0), Some(10.0))).await;
     witness.set(sample(72.0, 50.0, vec![]));
-    await_range(20.0, Some(10.0)).await;
+    await_measured(&handle, "a", (Some(20.0), Some(10.0))).await;
 
     let yaml = std::fs::read_to_string(dir.join("a.yaml")).expect("yaml readable");
     assert!(yaml.contains("measured_gb: 20.0"), "was: {yaml}");
@@ -380,6 +359,168 @@ async fn serving_window_folds_total_diff_into_the_yaml_measured_range() {
     assert!(
         yaml.contains("engine: mock") && yaml.contains("vram_gb: 8"),
         "the write-back preserves the rest of the file: {yaml}"
+    );
+}
+
+/// The measured pair currently on a catalog entry.
+async fn measured_of(handle: &SchedulerHandle, model: &str) -> (Option<f64>, Option<f64>) {
+    let catalog = handle.catalog().await.expect("actor alive");
+    catalog
+        .models
+        .iter()
+        .find(|m| m.name == model)
+        .map_or((None, None), |m| (m.measured_gb, m.measured_min_gb))
+}
+
+async fn await_measured(handle: &SchedulerHandle, model: &str, want: (Option<f64>, Option<f64>)) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = measured_of(handle, model).await;
+        if got == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "range for {model} never reached {want:?}: got {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Asserts the pair holds for `hold` — long enough for several sampler ticks — so a
+/// later contaminating reading cannot slip in unnoticed.
+async fn await_stable(
+    handle: &SchedulerHandle,
+    model: &str,
+    want: (Option<f64>, Option<f64>),
+    hold: Duration,
+) {
+    let until = Instant::now() + hold;
+    while Instant::now() < until {
+        assert_eq!(
+            measured_of(handle, model).await,
+            want,
+            "{model}'s measured range moved when nothing of its own changed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn replacement_is_measured_against_the_post_release_baseline() {
+    // The admit reading still counts the victim's memory as occupied. Using it as the
+    // baseline would measure a replacement short by the victim's whole footprint — and
+    // once that diff goes negative, never measure it at all (review, 2026-10-27).
+    let witness = FakeWitness::with(vec![sample(72.0, 30.0, vec![])]);
+    let mut cfg = AppConfig {
+        measured_sample_s: 1,
+        ..AppConfig::default()
+    };
+    cfg.categories[0].max_models = 1; // one slot: the second load must have a victim
+    let (handle, dir) = harness_models(
+        cfg,
+        &[
+            ("victim", CategoryId::Work, 30.0),
+            ("next", CategoryId::Work, 20.0),
+        ],
+        Arc::new(witness.clone()),
+    );
+    handle
+        .swap("victim", CategoryId::Work)
+        .await
+        .expect("victim loads on a card showing its own 30 GiB");
+    let Reply::Loaded(_) = handle
+        .swap("next", CategoryId::Work)
+        .await
+        .expect("next replaces it")
+    else {
+        panic!("expected Loaded");
+    };
+
+    // The card now holds only the new engine: 10 GiB of 72, with the victim gone. The
+    // baseline must be the free memory *after* the release (72), so the reading gives
+    // the engine's true 10 GiB rather than a negative diff that is never recorded.
+    witness.set(sample(72.0, 10.0, vec![]));
+    await_measured(&handle, "next", (Some(10.0), Some(10.0))).await;
+    let yaml = std::fs::read_to_string(dir.join("next.yaml")).expect("yaml readable");
+    assert!(yaml.contains("measured_gb: 10.0"), "was: {yaml}");
+}
+
+#[tokio::test]
+async fn a_tenant_that_loaded_later_is_not_charged_to_the_model() {
+    // The regression behind the deleted `measured_charges_only_the_installed_engine`:
+    // another category's engine coming up mid-window must not land on this model's
+    // high end, which only ever grows (review, 2026-10-27).
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
+    let cfg = AppConfig {
+        measured_sample_s: 1,
+        ..AppConfig::default()
+    };
+    let (handle, _dir) = harness_models(
+        cfg,
+        &[
+            ("target", CategoryId::Work, 10.0),
+            ("decoy", CategoryId::Aux, 20.0),
+        ],
+        Arc::new(witness.clone()),
+    );
+    handle
+        .swap("target", CategoryId::Work)
+        .await
+        .expect("target loads on an idle card");
+    witness.set(sample(72.0, 10.0, vec![]));
+    await_measured(&handle, "target", (Some(10.0), Some(10.0))).await;
+
+    // The decoy comes up alongside: the card now shows 30 GiB used, 20 of it someone
+    // else's. The total-diff sees all of it, so the ledger's booking is what keeps the
+    // target's range honest.
+    witness.set(sample(72.0, 30.0, vec![]));
+    handle
+        .swap("decoy", CategoryId::Aux)
+        .await
+        .expect("decoy loads alongside");
+    await_stable(
+        &handle,
+        "target",
+        (Some(10.0), Some(10.0)),
+        Duration::from_secs(3),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_nonsense_witness_reading_is_never_persisted() {
+    // `free_gib()` clamps, so a NaN reading would otherwise arrive as "this model took
+    // the whole card" and, because the high end only grows, be written forever.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
+    let cfg = AppConfig {
+        measured_sample_s: 1,
+        ..AppConfig::default()
+    };
+    let (handle, dir) = harness_models(
+        cfg,
+        &[("model", CategoryId::Work, 10.0)],
+        Arc::new(witness.clone()),
+    );
+    handle
+        .swap("model", CategoryId::Work)
+        .await
+        .expect("model loads");
+    witness.set(sample(72.0, 10.0, vec![]));
+    await_measured(&handle, "model", (Some(10.0), Some(10.0))).await;
+
+    witness.set(sample(72.0, f64::NAN, vec![]));
+    await_stable(
+        &handle,
+        "model",
+        (Some(10.0), Some(10.0)),
+        Duration::from_secs(3),
+    )
+    .await;
+    let yaml = std::fs::read_to_string(dir.join("model.yaml")).expect("yaml readable");
+    assert!(
+        !yaml.contains("measured_gb: 72"),
+        "a wedged driver must not become the model's footprint: {yaml}"
     );
 }
 

@@ -111,9 +111,42 @@ pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(
     let original = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let updated = set_key_in_text(&original, key, value)?;
+    commit_verified(path, &original, &updated)
+}
+
+/// Applies several edits in **one** atomic rewrite, for keys that must never be
+/// observed half-applied: the measured range's high end, low end and offload stamp
+/// are such a triple, because the scanner rejects an orphan or inverted pair and would
+/// otherwise drop the whole model after a failure between two writes (review,
+/// 2026-10-27).
+///
+/// # Arguments
+///
+/// * `edits` - `(key, value)` pairs to set, applied in order to the same buffer.
+///
+/// # Errors
+///
+/// As [`set_flag_on_file`]. Nothing reaches the disk unless every edit applied and the
+/// result parsed, so the file keeps its previous complete state.
+pub fn set_flags_on_file(path: &Path, edits: &[(&str, &str)]) -> Result<(), String> {
+    let _gate = write_gate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let original = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut updated = original.clone();
+    for (key, value) in edits {
+        updated = set_key_in_text(&updated, key, Some(value))?;
+    }
+    commit_verified(path, &original, &updated)
+}
+
+/// Publishes `updated` over `path` only if it still parses; restores `original` if the
+/// renamed file turns out unreadable. Called with [`write_gate`] already held.
+fn commit_verified(path: &Path, original: &str, updated: &str) -> Result<(), String> {
     // Validate before touching the file: the result must still parse, and an edit
     // of an "identity" key must leave a parseable, non-empty map.
-    let (map, problems) = parse_flat_yaml(&updated);
+    let (map, problems) = parse_flat_yaml(updated);
     if !problems.is_empty() {
         return Err(format!(
             "edit would break the file: {}",
@@ -206,6 +239,38 @@ mod tests {
             updated.contains("name: qwen\n\n\nengine"),
             "blanks survive: {updated:?}"
         );
+    }
+
+    #[test]
+    fn several_keys_land_in_one_rewrite_and_keep_the_operators_bytes() {
+        // The measured triple must never be observable half-applied: an orphan or
+        // inverted pair is hard-rejected by the scanner, which would drop the model.
+        let dir = crate::testutil::temp_dir("writeback-batch");
+        let path = dir.join("m.yaml");
+        std::fs::write(
+            &path,
+            "# operator note\nname: m\nengine: llama\ncost: greedy\n",
+        )
+        .expect("seed");
+        set_flags_on_file(
+            &path,
+            &[
+                ("measured_gb", "20.0"),
+                ("measured_gb_min", "10.0"),
+                ("measured_offload", "false"),
+            ],
+        )
+        .expect("batch edit");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.starts_with("# operator note\n"), "header lost: {text}");
+        assert!(text.contains("cost: greedy"), "unrelated key lost: {text}");
+        for key in [
+            "measured_gb: 20.0",
+            "measured_gb_min: 10.0",
+            "measured_offload: false",
+        ] {
+            assert!(text.contains(key), "missing `{key}`: {text}");
+        }
     }
 
     #[test]
