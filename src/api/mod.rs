@@ -499,6 +499,70 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
     }))
 }
 
+/// The `409` for a catalog that claims one identity twice (FINDINGS-11 [4]).
+///
+/// Names every colliding entry's yaml so the operator can fix the catalog without
+/// guessing which file the harness picked: a wrong-quantization serve, a 404 pointing
+/// at another category's port, and a write-back landing on the first match are all the
+/// same defect, and none of them is the client's to resolve.
+///
+/// # Arguments
+///
+/// * `query` - the `model` string as the client sent it
+/// * `entries` - every entry that matched the same resolution tier
+fn ambiguous_catalog_error(query: &str, entries: &[&ModelEntry]) -> ApiError {
+    let files = entries
+        .iter()
+        .map(|entry| match entry.file.as_deref() {
+            Some(path) => path.display().to_string(),
+            None => format!("<synthetic entry named `{}`>", entry.name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    ApiError::Conflict {
+        reason: format!(
+            "model `{query}` is ambiguous: {} catalog entries claim it ({files}); \
+             rename one or remove the duplicate",
+            entries.len()
+        ),
+    }
+}
+
+/// Resolves a client-supplied model name, refusing an ambiguous catalog instead of
+/// picking the first match.
+///
+/// `Found` returns the entry the caller was always given; `None` is mapped through
+/// `not_found` so each route keeps its exact error text and status; `Ambiguous` becomes
+/// the named-entries `409`. There is deliberately no convenience that hands out
+/// `Ambiguous`'s first entry — a caller that must not guess cannot be written.
+///
+/// # Arguments
+///
+/// * `query` - the `model` string as the client sent it
+/// * `catalog` - the catalog to resolve against
+/// * `not_found` - builds the caller's own error for the no-match case
+///
+/// # Errors
+///
+/// [`ApiError::Conflict`] (`409`) for an ambiguous query, else whatever `not_found`
+/// returns for an unknown one.
+fn resolve_unique<'a, F>(
+    query: &str,
+    catalog: &'a [ModelEntry],
+    not_found: F,
+) -> Result<&'a ModelEntry, ApiError>
+where
+    F: FnOnce(&str) -> ApiError,
+{
+    match crate::catalog::resolve(query, catalog) {
+        crate::catalog::Resolution::Found(entry) => Ok(entry),
+        crate::catalog::Resolution::None => Err(not_found(query)),
+        crate::catalog::Resolution::Ambiguous(entries) => {
+            Err(ambiguous_catalog_error(query, &entries))
+        }
+    }
+}
+
 /// `POST /har/load {"model": name}` — waits through the load and returns the receipt;
 /// a repeat while in flight attaches to the same job (Step 12 idempotency).
 async fn har_load(
@@ -514,8 +578,8 @@ async fn har_load(
         });
     };
     let catalog = state.catalog().await?;
-    let entry = crate::catalog::resolve(model, &catalog).ok_or_else(|| ApiError::NotFound {
-        what: format!("model `{model}`; known models are listed at each listener's /v1/models"),
+    let entry = resolve_unique(model, &catalog, |query| ApiError::NotFound {
+        what: format!("model `{query}`; known models are listed at each listener's /v1/models"),
     })?;
     let reply = state
         .scheduler
@@ -938,10 +1002,9 @@ async fn har_config_default(
     let requested = body.get("model").and_then(Value::as_str);
     if let Some(model) = requested {
         let catalog = state.catalog().await?;
-        let entry =
-            crate::catalog::resolve(model, &catalog).ok_or_else(|| ApiError::BadRequest {
-                reason: format!("unknown model `{model}`"),
-            })?;
+        let entry = resolve_unique(model, &catalog, |query| ApiError::BadRequest {
+            reason: format!("unknown model `{query}`"),
+        })?;
         if entry.category != category {
             return Err(ApiError::BadRequest {
                 reason: format!(
@@ -977,10 +1040,9 @@ async fn har_config_model(
         });
     };
     let catalog = state.catalog().await?;
-    let entry =
-        crate::catalog::resolve(model_name, &catalog).ok_or_else(|| ApiError::NotFound {
-            what: format!("model `{model_name}`"),
-        })?;
+    let entry = resolve_unique(model_name, &catalog, |query| ApiError::NotFound {
+        what: format!("model `{query}`"),
+    })?;
     let path = entry.file.clone().ok_or_else(|| ApiError::BadRequest {
         reason: format!(
             "model `{}` has no backing file (synthetic entry)",
@@ -1025,15 +1087,27 @@ async fn har_config_model(
         {
             let _ = state.scheduler.unload(old_category).await;
             if let Some(default) = state.default_model(old_category) {
-                if crate::catalog::resolve(&default, &catalog).is_some_and(|d| d.name == entry.name)
-                {
-                    state.set_default_model(old_category, None);
-                    tracing::info!(
+                // Only an UNAMBIGUOUS resolution proves the category's default is the
+                // model that just moved. An ambiguous one is refused here rather than
+                // accepted on a guess: clearing the wrong default would rewrite the
+                // operator's config file for a model that never moved.
+                match crate::catalog::resolve(&default, &catalog) {
+                    crate::catalog::Resolution::Found(d) if d.name == entry.name => {
+                        state.set_default_model(old_category, None);
+                        tracing::info!(
+                            model = %entry.name,
+                            from = %old_category,
+                            to = %new_cat,
+                            "cleared dangling category default"
+                        );
+                    }
+                    crate::catalog::Resolution::Ambiguous(clients) => tracing::warn!(
                         model = %entry.name,
-                        from = %old_category,
-                        to = %new_cat,
-                        "cleared dangling category default"
-                    );
+                        category = %old_category,
+                        entries = clients.len(),
+                        "left the category default alone: its name is ambiguous in the catalog"
+                    ),
+                    crate::catalog::Resolution::Found(_) | crate::catalog::Resolution::None => {}
                 }
             }
         }
@@ -1179,16 +1253,17 @@ async fn v1_models(State(listener): State<Arc<ListenerState>>) -> Result<Json<Va
 ///
 /// # Errors
 ///
-/// [`ApiError::NotFound`] for an unknown model or one belonging to another category.
+/// [`ApiError::NotFound`] for an unknown model or one belonging to another category,
+/// [`ApiError::Conflict`] for a name more than one catalog entry claims.
 async fn ensure_named(
     listener: &ListenerState,
     model: &str,
 ) -> Result<(String, u16, Option<String>), ApiError> {
     let api = &listener.api;
     let catalog = api.catalog().await?;
-    let entry = crate::catalog::resolve(model, &catalog).ok_or_else(|| ApiError::NotFound {
+    let entry = resolve_unique(model, &catalog, |query| ApiError::NotFound {
         what: format!(
-            "model `{model}` on the {} listener; its /v1/models lists the ids it serves",
+            "model `{query}` on the {} listener; its /v1/models lists the ids it serves",
             listener.category
         ),
     })?;

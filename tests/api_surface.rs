@@ -703,6 +703,197 @@ async fn moving_the_default_model_clears_its_old_category_default() {
     );
 }
 
+/// Two yamls that both claim `name: twin` — the FINDINGS-11 [4] shape: distinct
+/// models, distinct categories, distinct ggufs, one identity. Neither file may win.
+fn seed_duplicate_name(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let work = dir.join("twin-work.yaml");
+    let aux = dir.join("twin-aux.yaml");
+    std::fs::write(
+        &work,
+        "name: twin\nengine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_MID/twin-q4.gguf\n",
+    )
+    .expect("seed twin-work");
+    std::fs::write(
+        &aux,
+        "name: twin\nengine: mock\ncategory: AUX\nvram_gb: 4\nmodel: F:/MODELS_BIG/twin-q8.gguf\n",
+    )
+    .expect("seed twin-aux");
+    (work, aux)
+}
+
+async fn ambiguous_app() -> (
+    Router,
+    Router,
+    Router,
+    Router,
+    MockRuntime,
+    std::path::PathBuf,
+) {
+    let routers = app(
+        AppConfig::default(),
+        &[("filler", "mock", CategoryId::Work, Some(4.0))],
+    );
+    seed_duplicate_name(&routers.5);
+    let (status, _) = post_json(&routers.0, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "both twins must be in the catalog");
+    routers
+}
+
+#[tokio::test]
+async fn load_of_a_duplicate_name_is_409_naming_both_yamls() {
+    // FINDINGS-11 [4]: before the fix this answered 200 having spawned whichever
+    // quantization sorted first, under the identity the client asked for.
+    let (control, _, _, _, runtime, _) = ambiguous_app().await;
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"twin"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["code"], "conflict", "flat code: {body}");
+    assert_eq!(body["error"]["code"], "conflict", "envelope code: {body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("ambiguous") && message.contains("`twin`") && message.contains('2'),
+        "names the query and the count: {message}"
+    );
+    assert!(
+        message.contains("twin-work.yaml") && message.contains("twin-aux.yaml"),
+        "the operator must see BOTH colliding files, not the one that would have won: {message}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "an ambiguous name spawns nothing"
+    );
+}
+
+#[tokio::test]
+async fn named_proxy_on_a_duplicate_name_is_the_same_409_not_a_misdirected_404() {
+    // The twins straddle WORK and AUX: the old first-match-wins answer depended on
+    // which yaml sorted first, and a wrong-category hit 404'd naming the OTHER
+    // entry's public port. The client cannot fix that, so it is a 409.
+    let (control, work, _, _, runtime, _) = ambiguous_app().await;
+    let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"model":"twin"}"#).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["code"], "conflict");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("twin-work.yaml") && message.contains("twin-aux.yaml"),
+        "both files named: {message}"
+    );
+    assert!(
+        !message.contains("not found"),
+        "never a misdirection: {message}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "an ambiguous name ensures nothing"
+    );
+
+    // A no-`model` request never resolves a name, so the twins cannot affect it.
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"filler"}"#).await;
+    assert_eq!(status, StatusCode::OK, "the unique model loads: {body}");
+    let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
+    assert_eq!(status, StatusCode::OK, "no-model is unaffected: {body}");
+}
+
+#[tokio::test]
+async fn colliding_gguf_file_names_are_409_on_the_alias_tier() {
+    // Reviewer's example: distinct names, one shared gguf file name across two
+    // directories, so the alias tier is claimed twice.
+    let (control, _, _, _, _, dir) = app(
+        AppConfig::default(),
+        &[("filler", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let mid = dir.join("qwen3-mid.yaml");
+    let big = dir.join("qwen3-big.yaml");
+    std::fs::write(
+        &mid,
+        "name: qwen3-mid\nengine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_MID/Qwen3-0.6B-Q8_0.gguf\n",
+    )
+    .expect("seed mid");
+    std::fs::write(
+        &big,
+        "name: qwen3-big\nengine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_BIG/Qwen3-0.6B-Q8_0.gguf\n",
+    )
+    .expect("seed big");
+    post_json(&control, "/har/rescan", "{}").await;
+
+    for query in ["Qwen3-0.6B-Q8_0.gguf", "Qwen3-0.6B-Q8_0"] {
+        let body = format!(r#"{{"model":"{query}"}}"#);
+        let (status, reply) = post_json(&control, "/har/load", &body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "`{query}` body: {reply}");
+        let message = reply["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("qwen3-mid.yaml") && message.contains("qwen3-big.yaml"),
+            "`{query}` names both quantizations: {message}"
+        );
+    }
+
+    // Each entry stays individually addressable by its own harness name.
+    let (status, reply) = post_json(&control, "/har/load", r#"{"model":"qwen3-big"}"#).await;
+    assert_eq!(status, StatusCode::OK, "a unique name still loads: {reply}");
+}
+
+#[tokio::test]
+async fn setting_the_default_model_on_a_duplicate_name_is_refused_and_not_persisted() {
+    // The write-back half of the finding: `/har/config/default` persists the name it
+    // validated, so an ambiguity must stop before `persist_default_model`.
+    let (control, _, _, _, _, _) = ambiguous_app().await;
+    let (status, body) = post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"WORK","model":"twin"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("twin-work.yaml") && message.contains("twin-aux.yaml"),
+        "both files named: {message}"
+    );
+    let (_, status_body) = get_json(&control, "/har/status").await;
+    let work_cat = status_body["categories"]
+        .as_array()
+        .expect("categories")
+        .iter()
+        .find(|cat| cat["id"] == "WORK")
+        .expect("WORK");
+    assert!(
+        work_cat["default_model"].is_null(),
+        "an ambiguous name never becomes a category default: {status_body}"
+    );
+}
+
+#[tokio::test]
+async fn editing_a_duplicate_name_refuses_the_writeback_rather_than_picking_a_victim_file() {
+    // Chunk 7 [9]: `/har/config/model` resolves a name to choose WHICH yaml to edit.
+    // Under ambiguity it must refuse; editing the first match silently rewrites one
+    // operator file for a model the client did not necessarily name.
+    let (control, _, _, _, _, dir) = ambiguous_app().await;
+    let (work_file, aux_file) = (
+        std::fs::read_to_string(dir.join("twin-work.yaml")).expect("read twin-work"),
+        std::fs::read_to_string(dir.join("twin-aux.yaml")).expect("read twin-aux"),
+    );
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"twin","cpu":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["code"], "conflict");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("twin-work.yaml")).expect("read twin-work"),
+        work_file,
+        "the refused write must leave twin-work.yaml byte-identical"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("twin-aux.yaml")).expect("read twin-aux"),
+        aux_file,
+        "the refused write must leave twin-aux.yaml byte-identical"
+    );
+}
+
 #[tokio::test]
 async fn defaults_persist_to_the_config_boot_loaded_even_under_a_custom_path() {
     // Operator finding #2 (2026-10-26): write-back must hit the file boot read
