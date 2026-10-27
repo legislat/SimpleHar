@@ -1,6 +1,6 @@
 [package]
 name = "simplehar-se"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "One app managing local inference engines with a simple, reliable, adjustable model swap"
 license = "Apache-2.0"
@@ -50,3 +50,17 @@ tower = "0.5"
 
 # Approved but deliberately absent until its module lands (no unused deps):
 # - yaml crate    -> Step 9 ModelConf write-back (flat key: value round-trip)
+
+# Release profile for the v1.0 artifact (AGENTS.md: fully optimized). Fat LTO across
+# crates plus a single codegen unit trade build time for a smaller, faster binary, which
+# is worth it for a long-running harness with a hot proxy path.
+#
+# Panics deliberately stay unwound: several types own live engine children and reap them
+# in `Drop` (the scheduler handle, the harness's job-object child). `panic = "abort"`
+# skips those drops and would leave `llama-server` processes orphaned on the card.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"
