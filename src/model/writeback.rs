@@ -48,44 +48,24 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
     // Split on '\n' keeping every byte: each element keeps its own trailing '\r'.
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut out: Vec<String> = body.split('\n').map(str::to_string).collect();
-    let mut replaced = false;
-    let mut removed_line: Option<usize> = None;
-    for (index, line) in out.iter_mut().enumerate() {
-        let trimmed = line.trim();
-        // Only a real `key:` line matches; comments are passed through untouched.
-        if !replaced && !trimmed.starts_with('#') && !trimmed.is_empty() {
-            if let Some(colon) = trimmed.find(':') {
-                if trimmed[..colon].trim() == key {
-                    match value {
-                        Some(value) => {
-                            // CRLF files: the '\r' rides at the end of the line.
-                            let ending = if line.ends_with('\r') { "\r" } else { "" };
-                            *line = format!("{key}: {value}{ending}");
-                        }
-                        None => removed_line = Some(index),
-                    }
-                    replaced = true;
-                    break;
-                }
-            }
+    match (find_key_line(out.iter().map(String::as_str), key), value) {
+        (Some(index), Some(value)) => {
+            // CRLF files: the '\r' rides at the end of the line.
+            let ending = if out[index].ends_with('\r') { "\r" } else { "" };
+            out[index] = format!("{key}: {value}{ending}");
         }
-    }
-    match (replaced, value) {
-        (true, Some(_)) => {}
-        (true, None) => {
+        (Some(index), None) => {
             // Drop exactly the key's own line — blanking-then-filtering would
             // also delete unrelated blank lines the operator authored (review,
             // 2026-10-26, byte-preservation promise).
-            if let Some(index) = removed_line {
-                out.remove(index);
-            }
+            out.remove(index);
         }
-        (false, Some(value)) => {
+        (None, Some(value)) => {
             // Match the file's dominant line ending so a CRLF file gets a CRLF line.
             let ending = if text.contains("\r\n") { "\r" } else { "" };
             out.push(format!("{key}: {value}{ending}"));
         }
-        (false, None) => {
+        (None, None) => {
             return Err(format!("cannot remove `{key}`: the key is not in the file"));
         }
     }
@@ -94,6 +74,19 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
         joined.push('\n');
     }
     Ok(joined)
+}
+
+/// Index of the first real `key:` line — comments and blanks never count
+/// (v3.3 clobbered commented-out blocks; the D3 fix).
+fn find_key_line<'a>(mut lines: impl Iterator<Item = &'a str>, key: &str) -> Option<usize> {
+    lines.position(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#')
+            && !trimmed.is_empty()
+            && trimmed
+                .find(':')
+                .is_some_and(|colon| trimmed[..colon].trim() == key)
+    })
 }
 
 /// Applies [`set_key_in_text`] to the file on disk, atomically: write a temp file
@@ -118,17 +111,23 @@ pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(
 /// observed half-applied: the measured range's high end, low end and offload stamp
 /// are such a triple, because the scanner rejects an orphan or inverted pair and would
 /// otherwise drop the whole model after a failure between two writes (review,
-/// 2026-10-27).
+/// 2026-10-27). A category retag is the same shape: the non-EMB category write and
+/// the `is_embedding_model` removal must land together, or the file between the two
+/// writes is a scan-time conflict that drops the model (FINDINGS-12 [1]).
 ///
 /// # Arguments
 ///
-/// * `edits` - `(key, value)` pairs to set, applied in order to the same buffer.
+/// * `edits` - `(key, value)` pairs applied in order to the same buffer; a `None`
+///   value removes that key's line. Removing an absent key is a no-op: a batch edit
+///   states a desired end-shape, and a line that was never there is already in it.
+///   (The single-key [`set_flag_on_file`] keeps removal strict — there the caller
+///   named exactly one key and its absence is a mistake worth reporting.)
 ///
 /// # Errors
 ///
 /// As [`set_flag_on_file`]. Nothing reaches the disk unless every edit applied and the
 /// result parsed, so the file keeps its previous complete state.
-pub fn set_flags_on_file(path: &Path, edits: &[(&str, &str)]) -> Result<(), String> {
+pub fn set_flags_on_file(path: &Path, edits: &[(&str, Option<&str>)]) -> Result<(), String> {
     let _gate = write_gate()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -136,7 +135,10 @@ pub fn set_flags_on_file(path: &Path, edits: &[(&str, &str)]) -> Result<(), Stri
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut updated = original.clone();
     for (key, value) in edits {
-        updated = set_key_in_text(&updated, key, Some(value))?;
+        if value.is_none() && find_key_line(updated.split('\n'), key).is_none() {
+            continue;
+        }
+        updated = set_key_in_text(&updated, key, *value)?;
     }
     commit_verified(path, &original, &updated)
 }
@@ -255,9 +257,9 @@ mod tests {
         set_flags_on_file(
             &path,
             &[
-                ("measured_gb", "20.0"),
-                ("measured_gb_min", "10.0"),
-                ("measured_offload", "false"),
+                ("measured_gb", Some("20.0")),
+                ("measured_gb_min", Some("10.0")),
+                ("measured_offload", Some("false")),
             ],
         )
         .expect("batch edit");
@@ -271,6 +273,64 @@ mod tests {
         ] {
             assert!(text.contains(key), "missing `{key}`: {text}");
         }
+    }
+
+    #[test]
+    fn a_retag_rewrites_the_category_and_removes_the_embedding_alias_in_one_pass() {
+        // FINDINGS-12 [1]: a non-EMB category left beside `is_embedding_model: true`
+        // is a whole-file scan drop, so the two edits must share one rewrite and the
+        // result must scan clean.
+        let dir = crate::testutil::temp_dir("writeback-retag");
+        let path = dir.join("emb.yaml");
+        std::fs::write(
+            &path,
+            "# operator header\nname: emb\nengine: mock\nis_embedding_model: true\ncategory: EMB\nvram_gb: 2\n",
+        )
+        .expect("seed");
+        set_flags_on_file(
+            &path,
+            &[("category", Some("WORK")), ("is_embedding_model", None)],
+        )
+        .expect("batch retag");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("category: WORK"), "{text}");
+        assert_eq!(
+            text.matches("category:").count(),
+            1,
+            "one category line: {text}"
+        );
+        assert!(
+            !text.contains("is_embedding_model"),
+            "the stale alias must not survive: {text}"
+        );
+        assert!(
+            text.starts_with("# operator header\n"),
+            "header lost: {text}"
+        );
+        assert!(text.contains("vram_gb: 2"), "unrelated key lost: {text}");
+        let (map, problems) = parse_flat_yaml(&text);
+        assert!(problems.is_empty(), "{problems:?}");
+        let entry = crate::model::ModelEntry::from_flat(&map).expect("the retagged file must scan");
+        assert_eq!(entry.category, crate::config::CategoryId::Work);
+    }
+
+    #[test]
+    fn batch_removal_of_an_absent_key_is_a_no_op() {
+        // The retag handler pushes the alias removal with every non-EMB category
+        // write; a file that never carried the alias must still be edited, and
+        // edited only where it was asked.
+        let dir = crate::testutil::temp_dir("writeback-retag-absent");
+        let path = dir.join("plain.yaml");
+        std::fs::write(&path, "name: plain\ncategory: WORK\n").expect("seed");
+        set_flags_on_file(
+            &path,
+            &[("category", Some("AUX")), ("is_embedding_model", None)],
+        )
+        .expect("no-op removal rides along");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "name: plain\ncategory: AUX\n"
+        );
     }
 
     #[test]

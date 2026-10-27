@@ -1308,9 +1308,9 @@ impl ActorState {
                 if let Err(error) = crate::model::writeback::set_flags_on_file(
                     &path,
                     &[
-                        ("measured_gb", high_text.as_str()),
-                        ("measured_gb_min", low_text.as_str()),
-                        ("measured_offload", stamp.as_str()),
+                        ("measured_gb", Some(high_text.as_str())),
+                        ("measured_gb_min", Some(low_text.as_str())),
+                        ("measured_offload", Some(stamp.as_str())),
                     ],
                 ) {
                     tracing::warn!(

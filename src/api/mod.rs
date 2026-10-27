@@ -1059,6 +1059,16 @@ async fn har_config_model(
             .map_err(|reason| ApiError::BadRequest { reason })?;
         requested_category = Some(category);
         edits.push(("category", Some(category.to_string())));
+        // FINDINGS-12 [1]: a surviving `is_embedding_model: true` beside the new
+        // non-EMB `category:` is an `EmbeddingCategoryConflict` that makes the next
+        // scan DROP the whole file — one dropdown click deleted the model while the
+        // endpoint answered success. The two facts are one fact, so the removal
+        // rides the same atomic rewrite as the category write. EMB keeps the key:
+        // alias + EMB is the legal shape, and removing it would destroy an
+        // operator-authored declaration for no gain.
+        if category != CategoryId::Emb {
+            edits.push(("is_embedding_model", None));
+        }
     }
     if let Some(cpu) = body.get("cpu").and_then(Value::as_bool) {
         edits.push(("cpu_offload", Some(cpu.to_string())));
@@ -1068,10 +1078,15 @@ async fn har_config_model(
             reason: "nothing to edit: send `category` and/or `cpu`".to_string(),
         });
     }
-    for (key, value) in &edits {
-        crate::model::writeback::set_flag_on_file(&path, key, value.as_deref())
-            .map_err(|reason| ApiError::Internal { reason })?;
-    }
+    let refs: Vec<(&str, Option<&str>)> = edits
+        .iter()
+        .map(|(key, value)| (*key, value.as_deref()))
+        .collect();
+    // One rewrite for every edit: calling `set_flag_on_file` per key would leave
+    // the file half-edited (category moved, alias still there) if a write failed
+    // between the two — 1g's non-atomic defect, not replicated here.
+    crate::model::writeback::set_flags_on_file(&path, &refs)
+        .map_err(|reason| ApiError::Internal { reason })?;
     // The catalog must reflect the file the moment the operator looks again.
     state.scheduler.reload().await.map_err(ApiError::from)?;
 

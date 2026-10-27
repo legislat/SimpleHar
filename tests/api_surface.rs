@@ -668,6 +668,135 @@ async fn config_model_writes_back_to_the_yaml_file() {
 }
 
 #[tokio::test]
+async fn retagging_an_embedding_model_out_of_emb_keeps_it_in_the_catalog() {
+    // FINDINGS-12 [1]: the page's category dropdown wrote only `category:`, so
+    // retagging an `is_embedding_model: true` + `category: EMB` file to WORK left
+    // the alias; the reload at the end of the same handler hit
+    // EmbeddingCategoryConflict and DROPPED the file — the model 404s everywhere,
+    // its row vanishes, and the endpoint answered success. The removal must ride
+    // the same atomic rewrite as the category write.
+    let (control, _, _, _, _, modelconf) = app(
+        AppConfig::default(),
+        &[("plain", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let emb_file = modelconf.join("gemma-emb.yaml");
+    std::fs::write(
+        &emb_file,
+        "# operator header\nname: gemma-emb\nengine: mock\nis_embedding_model: true\ncategory: EMB\nvram_gb: 2\n",
+    )
+    .expect("seed embedding fixture");
+    let keep_file = modelconf.join("gemma-keep.yaml");
+    std::fs::write(
+        &keep_file,
+        "name: gemma-keep\nengine: mock\nis_embedding_model: true\ncategory: EMB\n",
+    )
+    .expect("seed alias-keeper fixture");
+    let plain_file = modelconf.join("plain.yaml");
+    let plain_before = std::fs::read_to_string(&plain_file).expect("seed plain");
+
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["models"], 3, "all fixtures catalogued: {body}");
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"gemma-emb","category":"WORK"}"#,
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "retag must answer 2xx: {status} {body}"
+    );
+
+    let edited = std::fs::read_to_string(&emb_file).expect("read back");
+    assert!(edited.contains("category: WORK"), "{edited}");
+    assert_eq!(
+        edited.matches("category:").count(),
+        1,
+        "exactly one category line: {edited}"
+    );
+    assert!(
+        !edited.contains("is_embedding_model"),
+        "the stale alias survives the retag: {edited}"
+    );
+    assert!(
+        edited.starts_with("# operator header"),
+        "operator bytes lost: {edited}"
+    );
+
+    // The survival claim, straight from the finding's falsifier: a fresh scan keeps
+    // the model in WORK with no catalog error.
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["models"], 3,
+        "the retagged model must survive the scan: {body}"
+    );
+    assert!(
+        body["catalog_errors"].as_array().is_some_and(Vec::is_empty),
+        "no conflict after the retag: {body}"
+    );
+    let (_, models) = get_json(&control, "/har/models").await;
+    let entry = models["data"]
+        .as_array()
+        .expect("list")
+        .iter()
+        .find(|m| m["id"] == "gemma-emb")
+        .expect("model gone from the catalog after one dropdown click");
+    assert_eq!(entry["category"], "WORK");
+
+    // Retag back to EMB: survives, no conflict.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"gemma-emb","category":"EMB"}"#,
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "retag back must answer 2xx: {status} {body}"
+    );
+    let (_, models) = get_json(&control, "/har/models").await;
+    let entry = models["data"]
+        .as_array()
+        .expect("list")
+        .iter()
+        .find(|m| m["id"] == "gemma-emb")
+        .expect("model must survive the retag back to EMB");
+    assert_eq!(entry["category"], "EMB");
+
+    // A retag to EMB must not needlessly strip a present alias: `category: EMB`
+    // beside `is_embedding_model: true` is the legal shape.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"gemma-keep","category":"EMB"}"#,
+    )
+    .await;
+    assert!(status.is_success(), "status: {status} {body}");
+    let kept = std::fs::read_to_string(&keep_file).expect("read back");
+    assert!(
+        kept.contains("is_embedding_model: true"),
+        "an EMB retag removed the operator's alias: {kept}"
+    );
+
+    // A non-embedding model retagged: its file changes only in the category line.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"plain","category":"AUX"}"#,
+    )
+    .await;
+    assert!(status.is_success(), "status: {status} {body}");
+    assert_eq!(
+        std::fs::read_to_string(&plain_file).expect("read back"),
+        plain_before.replace("category: WORK", "category: AUX"),
+        "a non-embedding model's file must change only where it was asked"
+    );
+}
+
+#[tokio::test]
 async fn moving_the_default_model_clears_its_old_category_default() {
     // Operator finding #1 (2026-10-26): moving the default model out of a category
     // must not leave the old listener defaulting to a model it no longer serves.

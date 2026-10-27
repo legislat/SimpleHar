@@ -146,7 +146,9 @@ pub(crate) fn truthy(value: &str) -> bool {
 /// The one GiB parser for every size-valued yaml key. Rust's `f64` parse accepts
 /// `nan`/`inf`/`1e400`, and every NaN comparison is false — an unchecked value
 /// would sail through `< 0.0` guards and silently disable the gates it feeds
-/// (review, 2026-10-26). Finite and non-negative, or it is a scan error.
+/// (review, 2026-10-26). Finite and non-negative, or it is a scan error. Individual
+/// keys tighten this at their call site: `vram_gb` also refuses 0 (a free booking),
+/// while `launch_only_with_at_least_vram_free` deliberately keeps 0 as its opt-out.
 fn parse_gib(field: &str, raw: &str) -> Result<f64, ModelError> {
     let v = raw
         .trim()
@@ -283,7 +285,8 @@ impl ModelEntry {
     /// - [`ModelError::MissingName`] when `name` is absent/empty.
     /// - [`ModelError::BadCategory`] / [`ModelError::EmbeddingCategoryConflict`] on an
     ///   unusable category combination.
-    /// - [`ModelError::BadNumber`] when `vram_gb` is not a number.
+    /// - [`ModelError::BadNumber`] when `vram_gb` is not a positive number (0 books
+    ///   a model free) or another size key holds a non-number.
     pub fn from_flat(keys: &BTreeMap<String, String>) -> Result<Self, ModelError> {
         let name = keys.get("name").map(String::as_str).unwrap_or_default();
         if name.trim().is_empty() {
@@ -304,7 +307,25 @@ impl ModelEntry {
             None => CategoryId::Work,
         };
         let vram_gb = match keys.get("vram_gb") {
-            Some(raw) => Some(parse_gib("vram_gb", raw)?),
+            Some(raw) => {
+                let v = parse_gib("vram_gb", raw)?;
+                // A declared 0 is not a declared cost: the declared number wins
+                // unconditionally at admission (`cost_source` → Declared), so
+                // `vram_gb: 0` books any model free — gate deficit 0, ledger 0, and
+                // the next load spends the same bytes (FINDINGS-12 [2]). Zero stays
+                // legal for `launch_only_with_at_least_vram_free` below: a floor of
+                // 0 means "no floor", the documented greedy opt-out (README), while
+                // a size of 0 claims a footprint no model has. `==` on f64 is
+                // IEEE-754, so this catches `-0.0` too (`-0.0 == 0.0` is true; the
+                // `< 0.0` guard in `parse_gib` alone would not).
+                if v == 0.0 {
+                    return Err(ModelError::BadNumber {
+                        field: "vram_gb".to_string(),
+                        value: raw.to_string(),
+                    });
+                }
+                Some(v)
+            }
             None => None,
         };
         let cost = match keys.get("cost") {
@@ -627,5 +648,42 @@ mod tests {
                 .expect_err("vram_gb must be a finite non-negative number");
             assert!(matches!(err, ModelError::BadNumber { .. }), "{err}");
         }
+    }
+
+    #[test]
+    fn vram_gb_must_be_positive_but_a_zero_launch_floor_is_the_opt_out() {
+        // FINDINGS-12 [2]: `vram_gb: 0` wins the booking precedence as Declared and
+        // books the model free — the gate deficit, the ledger and the in-flight sum
+        // all read 0, so the next load spends the same bytes on top.
+        for value in ["0", "0.0", "-0", "-0.0"] {
+            let err = ModelEntry::from_flat(&flat(&[("name", "x"), ("vram_gb", value)]))
+                .expect_err("a declared 0 GiB is not a declared cost");
+            assert!(
+                matches!(err, ModelError::BadNumber { ref field, .. } if field == "vram_gb"),
+                "{value}: {err}"
+            );
+        }
+        // The sibling opt-out keeps its documented zero (README: "set `0` per-model
+        // to opt out explicitly"); killing it here would break greedy launches.
+        let opt_out = ModelEntry::from_flat(&flat(&[
+            ("name", "g"),
+            ("cost", "greedy"),
+            ("launch_only_with_at_least_vram_free", "0"),
+        ]))
+        .expect("zero is the floor's explicit opt-out, not a typo");
+        assert_eq!(opt_out.launch_floor_gb, Some(0.0));
+        let full = ModelEntry::from_flat(&flat(&[
+            ("name", "full"),
+            ("engine", "llama"),
+            ("category", "RP"),
+            ("model", "F:/m.gguf"),
+            ("vram_gb", "6.5"),
+            ("cost", "fixed"),
+            ("launch_only_with_at_least_vram_free", "12"),
+            ("load_timeout", "300"),
+        ]))
+        .expect("a full valid yaml still parses under the new rule");
+        assert_eq!(full.vram_gb, Some(6.5));
+        assert_eq!(full.cost_source(), CostSource::Declared);
     }
 }

@@ -329,6 +329,37 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_vram_gb_file_is_named_not_silently_dropped() {
+        // FINDINGS-12 [2]: `vram_gb: 0` books the model free at admission, so the
+        // scan must refuse it — and name the file, as it does for every sibling
+        // reject, so /har/status says which yaml the operator has to fix.
+        let dir = crate::testutil::temp_dir("scan-vram0");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("free.yaml"),
+            "name: free\nengine: mock\nvram_gb: 0\n",
+        )
+        .expect("write");
+
+        let catalog = scan_dir(&dir);
+        assert!(
+            catalog.models.is_empty(),
+            "a free booking must never enter the catalog"
+        );
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .any(|e| e.file.contains("free.yaml") && e.reason.contains("vram_gb")),
+            "the file must be named in catalog_errors: {:?}",
+            catalog.errors
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn missing_dir_is_one_error_not_a_panic() {
         let catalog = scan_dir(Path::new("Z:/definitely-not-here"));
         assert!(catalog.models.is_empty());
