@@ -116,31 +116,22 @@ impl Harness {
             yaml("aux31", "AUX", &big_aux_gguf(), "29", "");
         }
 
+        // The temp catalog must be named in the config: `default_modelconf_dir()` is
+        // `<exe dir>/ModelConf`, i.e. target/debug/ModelConf, which on this box exists
+        // and is empty - so omitting it gave every test "catalog scanned models=0"
+        // and a `not found: model` assertion (T-suite Run 3).
         let config_path = work_dir.join("simplehar.json");
         std::fs::write(
             &config_path,
-            json!({ "internal_host": "127.0.0.1" }).to_string(),
+            json!({
+                "internal_host": "127.0.0.1",
+                "modelconf_dir": modelconf.display().to_string(),
+            })
+            .to_string(),
         )
         .expect("config");
 
-        // Tests run from target/<profile>/deps; the binary lives one level up.
-        let deps_dir = std::env::current_exe()
-            .expect("test exe path")
-            .parent()
-            .expect("deps dir")
-            .to_path_buf();
-        let exe = if deps_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == "deps")
-        {
-            deps_dir
-                .parent()
-                .expect("profile dir")
-                .join("simplehar-se.exe")
-        } else {
-            deps_dir.join("simplehar-se.exe")
-        };
+        let exe = harness_exe();
         let mut child = Command::new(&exe)
             .env("SIMPLEHAR_CONFIG", &config_path)
             .spawn()
@@ -188,15 +179,25 @@ impl Harness {
         }
     }
 
-    async fn get(&self, path: &str) -> Value {
+    /// GET against an absolute URL (the four listeners are separate authorities, so a
+    /// bare path cannot name one). `post` already takes absolute URLs; `get` must not
+    /// be the odd one out, which is what made a per-listener check build
+    /// `http://127.0.0.1:8708http://127.0.0.1:8711/v1/models` and die with
+    /// `reqwest::Error { kind: Builder, source: InvalidPort }` (T-suite Run 3).
+    async fn get_url(&self, url: &str) -> Value {
         self.http
-            .get(format!("{CONTROL}{path}"))
+            .get(url)
             .send()
             .await
             .expect("GET")
             .json()
             .await
             .expect("JSON")
+    }
+
+    /// GET against the control listener.
+    async fn get(&self, path: &str) -> Value {
+        self.get_url(&format!("{CONTROL}{path}")).await
     }
 
     async fn post(&self, url: &str, body: Value) -> (u16, Value) {
@@ -306,12 +307,29 @@ fn serial_lock() {
     drop(_guard);
 }
 
-fn cargo_bin() -> PathBuf {
-    std::env::current_exe()
-        .expect("test exe")
+/// The harness exe every test drives. Integration test binaries run from
+/// `target/<profile>/deps/`, so the exe sits one level up. `Harness::spawn` and the T1
+/// guard must agree on that, so the derivation exists exactly once here: T-suite Run 3
+/// found a second, divergent copy pointing at `deps/simplehar-se.exe`, which made t01
+/// report "build the exe first" while the exe was in fact built and serving.
+fn harness_exe() -> PathBuf {
+    let deps_dir = std::env::current_exe()
+        .expect("test exe path")
         .parent()
-        .expect("target dir")
-        .join("simplehar-se.exe")
+        .expect("deps dir")
+        .to_path_buf();
+    if deps_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "deps")
+    {
+        deps_dir
+            .parent()
+            .expect("profile dir")
+            .join("simplehar-se.exe")
+    } else {
+        deps_dir.join("simplehar-se.exe")
+    }
 }
 
 // ---------------------------------------------------------------- T1
@@ -321,7 +339,7 @@ fn cargo_bin() -> PathBuf {
 async fn t01_listener_routing_guards() {
     serial_lock();
     let harness = Harness::spawn("t01").await;
-    let work = cargo_bin();
+    let work = harness_exe();
     assert!(work.exists(), "build the exe first (cargo build)");
     assert!(
         harness.baseline_check(&[&small_gguf(), &emb_gguf()]),
@@ -361,11 +379,11 @@ async fn t01_listener_routing_guards() {
     assert_eq!(status, 400, "{body}");
 
     // 1.8: per-listener /v1/models sets.
-    let work = harness.get(&format!("{CONTROL}/v1/models")).await;
+    let work = harness.get_url(&format!("{CONTROL}/v1/models")).await;
     assert!(work["data"].as_array().is_some_and(|data| data
         .iter()
         .all(|m| ["work06", "work06b", "work31"].contains(&m["id"].as_str().unwrap_or_default()))));
-    let emb = harness.get(&format!("{EMB_LISTENER}/v1/models")).await;
+    let emb = harness.get_url(&format!("{EMB_LISTENER}/v1/models")).await;
     assert!(emb["data"]
         .as_array()
         .is_some_and(|data| data.iter().all(|m| m["id"] == "emb")));
