@@ -270,6 +270,78 @@ async fn eviction_picks_the_cheapest_sufficient_victim() {
 }
 
 #[tokio::test]
+async fn equal_cost_victims_evict_the_less_protected_category() {
+    // RP and AUX each book 20 GiB (witness reports 40 used) and WORK wants 35: either
+    // victim alone covers the deficit, so the choice is a tie - and a tie must fall to
+    // disposability. AUX may be evicted by WORK and RP; RP may be evicted by WORK only,
+    // so RP is the one that stays. Comparing masks in iteration order evicted RP
+    // instead, because its slot index precedes AUX's (T6, 2026-10-27).
+    let witness = FakeWitness::with(vec![sample(72.0, 40.0)]);
+    let handle = harness(
+        1,
+        &[
+            ("rp20", "mock", CategoryId::Rp, 20.0),
+            ("aux20", "mock", CategoryId::Aux, 20.0),
+            ("work35", "mock", CategoryId::Work, 35.0),
+        ],
+        Arc::new(witness.clone()),
+    );
+
+    handle
+        .swap("rp20", CategoryId::Rp)
+        .await
+        .expect("rp20 loads");
+    handle
+        .swap("aux20", CategoryId::Aux)
+        .await
+        .expect("aux20 loads");
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work35", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work35" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    witness.set_used(20.0);
+    let Reply::Loaded(_) = loading
+        .await
+        .expect("task alive")
+        .expect("work loads after evicting")
+    else {
+        panic!("expected Loaded");
+    };
+
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        model_of(&status, CategoryId::Work).as_deref(),
+        Some("work35")
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Rp).as_deref(),
+        Some("rp20"),
+        "the more protected category survives an equal-cost tie"
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Aux),
+        None,
+        "AUX is the disposable class"
+    );
+    let swap_job = status
+        .jobs
+        .iter()
+        .find(|job| job.model == "work35")
+        .expect("swap job");
+    assert_eq!(
+        swap_job.victims_released,
+        vec!["aux20".to_string()],
+        "the ledger must show which victim the tie selected"
+    );
+}
+
+#[tokio::test]
 async fn rp_load_cannot_evict_work_and_refuses_with_blockers() {
     // WORK holds 50; RP wants 50: free 20, deficit 30, and the only candidate
     // (WORK) is not evictable by RP -> refusal naming the blocker and the rule.

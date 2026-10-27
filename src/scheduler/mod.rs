@@ -1580,7 +1580,7 @@ impl ActorState {
                 .map(|cat| cat.evictable_by.clone())
                 .unwrap_or_default()
         };
-        let mut candidates: Vec<(usize, f64)> = Vec::new();
+        let mut candidates: Vec<(usize, f64, usize)> = Vec::new();
         let mut considered = Vec::new();
         let mut blockers = Vec::new();
         for (index, slot) in self.slots.iter().enumerate() {
@@ -1590,16 +1590,15 @@ impl ActorState {
             let Some(occupant) = &slot.occupant else {
                 continue;
             };
-            let allowed = evictable_by(slot.category).contains(&load_category);
-            if allowed {
-                candidates.push((index, occupant.need.0));
+            let allowed_list = evictable_by(slot.category);
+            if allowed_list.contains(&load_category) {
+                candidates.push((index, occupant.need.0, allowed_list.len()));
                 considered.push(crate::budget::VictimInfo {
                     model: occupant.model.clone(),
                     category: slot.category.to_string(),
                     need_gib: occupant.need.0,
                 });
             } else {
-                let allowed_list = evictable_by(slot.category);
                 let reason = if allowed_list.is_empty() {
                     format!("nothing may evict {}", slot.category)
                 } else {
@@ -1625,22 +1624,35 @@ impl ActorState {
             return Err((considered, blockers));
         }
         // Exhaustive cheapest covering subset (n ≤ 9 slots → ≤512 masks).
+        //
+        // Ties break by disposability — how many categories may evict a victim — and
+        // never by slot order. RP lists only WORK as an evictor while AUX lists WORK
+        // and RP, so when two victims cost the same and either would do, the more
+        // disposable category must be the one released. Comparing masks in iteration
+        // order evicted RP, the costlier model to bring back, purely because its slot
+        // index precedes AUX's — which contradicted the release ordering below (T6).
         let mut best: Option<u32> = None;
         let mut best_sum = f64::INFINITY;
         let mut best_count = usize::MAX;
+        let mut best_disposability = usize::MIN;
         for mask in 1u32..(1 << n) {
-            let (mut sum, mut count) = (0.0, 0);
-            for (bit, (_, cost)) in candidates.iter().enumerate() {
+            let (mut sum, mut count, mut disposability) = (0.0, 0, 0);
+            for (bit, (_, cost, protection)) in candidates.iter().enumerate() {
                 if mask & (1 << bit) != 0 {
                     sum += cost;
                     count += 1;
+                    disposability += protection;
                 }
             }
             if sum + 1e-9 >= deficit
-                && (sum < best_sum || (sum <= best_sum + 1e-9 && count < best_count))
+                && (sum < best_sum
+                    || (sum <= best_sum + 1e-9
+                        && (count < best_count
+                            || (count == best_count && disposability > best_disposability))))
             {
                 best_sum = sum;
                 best_count = count;
+                best_disposability = disposability;
                 best = Some(mask);
             }
         }
@@ -1666,7 +1678,7 @@ impl ActorState {
         let victims = chosen
             .into_iter()
             .map(|bit| {
-                let (index, _) = candidates[bit];
+                let (index, _, _) = candidates[bit];
                 let occupant = self.slots[index]
                     .occupant
                     .as_ref()
