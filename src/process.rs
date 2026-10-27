@@ -9,7 +9,12 @@
 //! any stale container of the same name — a harness crash can orphan one until the
 //! model loads again.
 //! Spawns are hidden (`CREATE_NO_WINDOW`) with stdout/stderr captured to
-//! `logs/<name>-<epoch>.log`.
+//! `logs/<name>-<epoch>.log`. Engine children receive exactly an OS baseline plus
+//! `LaunchSpec.env` (§5, E3): harness secrets (`SIMPLEHAR_TOKEN`) and Python
+//! import-hijack vars (`PYTHONPATH`, `VIRTUAL_ENV`) never leak into them.
+//! Harness-internal control commands (`wsl.exe`/docker, `netsh`, `nvidia-smi`,
+//! the Web UI opener) execute harness code, not operator config, and deliberately
+//! keep their inherited environment.
 //! G12 release evidence: the child handle is signaled *and* the port refuses TCP
 //! (for containers, the closed port after reaping is the evidence).
 //!
@@ -24,7 +29,7 @@ use crate::ownership::{
     boot_reap_decision, ContainerClaims, ReapDecision, ResourceKind, SpawnTicket,
 };
 use async_trait::async_trait;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,6 +42,107 @@ const RELEASE_POLL: Duration = Duration::from_millis(100);
 /// Log hygiene (Step 16): at most this many engine log files survive; the oldest
 /// are deleted at spawn time (T14's `logs/` budget).
 const LOG_FILE_CAP: usize = 50;
+
+/// Windows env var names (case-insensitive) an engine child may keep (§5 locked
+/// decision, E3): external engines obey only harness-owned configuration, so a
+/// child's environment is this baseline plus what [`LaunchSpec`] declares — never
+/// the harness's own environment with its plaintext `SIMPLEHAR_TOKEN`, its
+/// `PYTHONPATH`/`VIRTUAL_ENV` (strata is a Python child: import-hijack risk), and
+/// every other stray var.
+const OS_ENV_BASELINE: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "COMSPEC",
+    "Path",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+];
+
+/// Builds the child baseline by copying the [`OS_ENV_BASELINE`] names out of
+/// `source` (the harness env at the spawn site), matching names case-insensitively:
+/// Windows env names are case-insensitive and [`std::env::vars`] preserves whatever
+/// spelling the parent carried, so lookups go through the uppercased key while the
+/// output uses the baseline's canonical spelling. A name supplied under several
+/// spellings (e.g. `PATH` and `Path`) collapses to one entry, first occurrence
+/// wins. `SystemRoot`, `windir`, `COMSPEC` and `PATHEXT` are never invented: absent
+/// from `source` they stay absent and the spawn fails loudly if Windows demands
+/// one. `Path`, `TEMP` and `TMP` are always present via [`baseline_fallback`].
+fn child_env_baseline_from<I>(source: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let wanted: HashSet<String> = OS_ENV_BASELINE
+        .iter()
+        .map(|name| name.to_uppercase())
+        .collect();
+    let mut found: HashMap<String, String> = HashMap::new();
+    for (name, value) in source {
+        let upper = name.to_uppercase();
+        if wanted.contains(&upper) {
+            found.entry(upper).or_insert(value);
+        }
+    }
+    OS_ENV_BASELINE
+        .iter()
+        .filter_map(|name| {
+            let upper = name.to_uppercase();
+            let value = found
+                .get(&upper)
+                .cloned()
+                .or_else(|| baseline_fallback(&upper))?;
+            Some(((*name).to_string(), value))
+        })
+        .collect()
+}
+
+/// The always-present baseline values the harness env may lack: `Path` falls back
+/// to the harness's own directory and `TEMP`/`TMP` to [`std::env::temp_dir`];
+/// every other name returns `None` and is omitted rather than invented.
+///
+/// # Panics
+///
+/// Only when `name_upper` is `"PATH"` and the harness executable path cannot be
+/// resolved — there is no honest substitute for `Path`.
+fn baseline_fallback(name_upper: &str) -> Option<String> {
+    match name_upper {
+        "PATH" => Some(
+            std::env::current_exe()
+                .expect("invariant: the harness exe path resolves; Path has no other fallback")
+                .parent()
+                .expect("invariant: the harness exe lives in a directory")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        "TEMP" | "TMP" => Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+/// The complete environment for one engine child: the baseline copied from
+/// `source` (the harness env at the spawn site), then every `spec_env` entry
+/// applied last so a declared var overrides its baseline twin. Names are
+/// case-insensitive on Windows, so a spec entry first removes any baseline pair
+/// whose uppercased key equals its own, then appends under its own spelling —
+/// the assembly never carries two spellings of one name.
+///
+/// Applies to `LaunchSpec`-driven engine spawns **only**: the harness-internal
+/// control commands ([`reap_container`], [`docker_ps`], `netsh`, `nvidia-smi`,
+/// the Web UI opener) run harness code rather than operator config and keep
+/// inheriting the harness env by design. Shared by the spawn site and the tests
+/// so the tests exercise the real production assembly.
+fn engine_child_env<I>(source: I, spec_env: &BTreeMap<String, String>) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut env = child_env_baseline_from(source);
+    for (key, value) in spec_env {
+        let upper = key.to_uppercase();
+        env.retain(|(name, _)| name.to_uppercase() != upper);
+        env.push((key.clone(), value.clone()));
+    }
+    env
+}
 
 /// Deletes the oldest `*.log` files beyond `keep` in `dir`.
 fn prune_log_files(dir: &std::path::Path, keep: usize) {
@@ -195,7 +301,10 @@ fn excerpt(bytes: &[u8]) -> String {
 
 /// Best-effort `docker rm -f` inside WSL; every failure path warns and lets the
 /// caller proceed (the release poll is the arbiter). `kill_on_drop` so a timed-out
-/// client cannot accumulate as an orphan (review, 2026-10-26).
+/// client cannot accumulate as an orphan (review, 2026-10-26). A harness-internal
+/// control command: it runs harness code, not operator config, so it keeps
+/// inheriting the harness env (the [`engine_child_env`] baseline is for
+/// `LaunchSpec`-driven engine spawns only).
 ///
 /// # Returns
 ///
@@ -290,7 +399,8 @@ fn container_claims_path() -> PathBuf {
 }
 
 /// `wsl.exe … docker ps --format {{.Names}}`; `None` when the call cannot run or
-/// reports failure (the reconcile is advisory, never fatal).
+/// reports failure (the reconcile is advisory, never fatal). A harness-internal
+/// control command, inherited env by design (see [`reap_container`]).
 async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
     let mut argv = wsl_prefix(distro, user);
     argv.extend([
@@ -517,8 +627,12 @@ impl EngineRuntime for ProcessRuntime {
                 reason: format!("cannot duplicate log handle: {e}"),
             })?)
             .stderr(log_file)
-            .creation_flags(CREATE_NO_WINDOW);
-        for (key, value) in &spec.env {
+            .creation_flags(CREATE_NO_WINDOW)
+            // §5 (E3): the child sees exactly the OS baseline plus `spec.env`,
+            // never the harness environment. Control commands elsewhere keep
+            // inheriting on purpose — they are not LaunchSpec-driven.
+            .env_clear();
+        for (key, value) in engine_child_env(std::env::vars(), &spec.env) {
             command.env(key, value);
         }
         let mut child = command.spawn().map_err(|e| SpawnError::SpawnFailed {
@@ -806,6 +920,7 @@ unsafe fn terminate_job(job: windows::Win32::Foundation::HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::ReadinessSpec;
     use crate::ownership::{SKIP_INVALID_NAME, SKIP_NOT_NINFER, SKIP_UNCLAIMED};
 
     #[test]
@@ -1004,5 +1119,347 @@ mod tests {
         let claims = claims_with(&["ninfer-a"]);
         let plan = reclaim_plan(&[], &[candidate("ninfer", "ninfer-a")], &claims);
         assert!(plan.is_empty());
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn spec_map(list: &[(&str, &str)]) -> BTreeMap<String, String> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn upper_keys(env: &[(String, String)]) -> Vec<String> {
+        env.iter().map(|(key, _)| key.to_uppercase()).collect()
+    }
+
+    /// A synthetic harness env carrying every baseline var (mixed spellings where
+    /// Windows plausibly carries them) plus the vars that must never reach an
+    /// engine child: the plaintext control secret and the Python hijack vars.
+    fn secret_bearing_source() -> Vec<(String, String)> {
+        pairs(&[
+            ("SystemRoot", "C:\\Windows"),
+            ("windir", "C:\\Windows"),
+            ("COMSPEC", "C:\\Windows\\System32\\cmd.exe"),
+            ("Path", "C:\\Windows\\System32"),
+            ("PATHEXT", ".COM;.EXE"),
+            ("TEMP", "C:\\Temp"),
+            ("TMP", "C:\\Temp"),
+            ("SIMPLEHAR_TOKEN", "plaintext-secret"),
+            ("PYTHONPATH", "C:\\evil\\hijack"),
+            ("VIRTUAL_ENV", "C:\\evil\\venv"),
+            ("CARGO_MANIFEST_DIR", "C:\\src"),
+        ])
+    }
+
+    fn count_child_var(dump: &str, key: &str) -> usize {
+        let prefix = format!("{}=", key.to_uppercase());
+        dump.lines()
+            .filter(|line| line.trim_start().to_uppercase().starts_with(&prefix))
+            .count()
+    }
+
+    fn has_child_var(dump: &str, key: &str) -> bool {
+        count_child_var(dump, key) > 0
+    }
+
+    #[test]
+    fn baseline_keeps_only_the_os_names_and_drops_every_secret() {
+        let env = child_env_baseline_from(secret_bearing_source());
+        let keys = upper_keys(&env);
+        assert_eq!(
+            keys.len(),
+            OS_ENV_BASELINE.len(),
+            "one entry per baseline name, no duplicates: {keys:?}"
+        );
+        let actual: BTreeSet<String> = keys.iter().cloned().collect();
+        let expected: BTreeSet<String> = OS_ENV_BASELINE
+            .iter()
+            .map(|name| name.to_uppercase())
+            .collect();
+        assert_eq!(actual, expected, "baseline carries exactly the OS names");
+        for secret in [
+            "SIMPLEHAR_TOKEN",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+            "CARGO_MANIFEST_DIR",
+        ] {
+            assert!(
+                !keys.contains(&secret.to_string()),
+                "secret {secret} leaked into the baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_falls_back_for_path_temp_tmp_and_omits_the_rest() {
+        let env = child_env_baseline_from(pairs(&[("COMSPEC", "C:\\Windows\\System32\\cmd.exe")]));
+        let exe_dir = std::env::current_exe()
+            .expect("exe path")
+            .parent()
+            .expect("exe directory")
+            .to_string_lossy()
+            .into_owned();
+        let temp = std::env::temp_dir().to_string_lossy().into_owned();
+        let got: BTreeMap<String, String> = env
+            .into_iter()
+            .map(|(k, v)| (k.to_uppercase(), v))
+            .collect();
+        assert_eq!(got.get("PATH").expect("Path always present"), &exe_dir);
+        assert_eq!(got.get("TEMP").expect("TEMP always present"), &temp);
+        assert_eq!(got.get("TMP").expect("TMP always present"), &temp);
+        assert_eq!(
+            got.get("COMSPEC").expect("COMSPEC copied"),
+            "C:\\Windows\\System32\\cmd.exe"
+        );
+        for absent in ["SYSTEMROOT", "WINDIR", "PATHEXT"] {
+            assert!(!got.contains_key(absent), "{absent} must never be invented");
+        }
+    }
+
+    #[test]
+    fn baseline_collapses_case_duplicate_names_to_one_entry() {
+        let env = child_env_baseline_from(pairs(&[
+            ("PATH", "C:\\first"),
+            ("Path", "C:\\second"),
+            ("temp", "C:\\t1"),
+            ("TEMP", "C:\\t2"),
+        ]));
+        let keys = upper_keys(&env);
+        assert_eq!(keys.len(), env.len(), "no case-duplicates: {keys:?}");
+        let path = env
+            .iter()
+            .find(|(k, _)| k.to_uppercase() == "PATH")
+            .expect("Path present");
+        assert_eq!(path.0, "Path", "baseline emits its canonical spelling");
+        assert_eq!(path.1, "C:\\first", "first occurrence wins");
+    }
+
+    #[test]
+    fn spec_env_overrides_the_baseline_case_insensitively() {
+        let assembled = engine_child_env(
+            secret_bearing_source(),
+            &spec_map(&[("PATH", "C:\\engine\\bin"), ("EXTRA_ONE", "1")]),
+        );
+        let keys = upper_keys(&assembled);
+        assert_eq!(keys.len(), assembled.len(), "no case-duplicates: {keys:?}");
+        let (name, value) = assembled
+            .iter()
+            .find(|(k, _)| k.to_uppercase() == "PATH")
+            .expect("exactly one Path entry");
+        assert_eq!(name, "PATH", "the spec entry keeps its own spelling");
+        assert_eq!(
+            value, "C:\\engine\\bin",
+            "the spec entry replaces the baseline's"
+        );
+        assert!(
+            assembled.contains(&("EXTRA_ONE".to_string(), "1".to_string())),
+            "a fresh spec entry is appended"
+        );
+    }
+
+    #[test]
+    fn engine_child_env_keeps_baseline_and_spec_and_drops_everything_else() {
+        let assembled = engine_child_env(
+            secret_bearing_source(),
+            &spec_map(&[("PROBE_MARKER", "seen")]),
+        );
+        let keys = upper_keys(&assembled);
+        for name in OS_ENV_BASELINE {
+            assert!(
+                keys.contains(&name.to_uppercase()),
+                "baseline {name} missing: {keys:?}"
+            );
+        }
+        for secret in [
+            "SIMPLEHAR_TOKEN",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+            "CARGO_MANIFEST_DIR",
+        ] {
+            assert!(
+                !keys.contains(&secret.to_string()),
+                "secret {secret} must never reach a child"
+            );
+        }
+        assert!(
+            assembled.contains(&("PROBE_MARKER".to_string(), "seen".to_string())),
+            "spec entry must be present"
+        );
+        assert_eq!(keys.len(), assembled.len(), "no case-duplicates: {keys:?}");
+    }
+
+    #[test]
+    fn assembled_env_reaches_a_real_child_without_inherited_secrets() {
+        use std::os::windows::process::CommandExt as _;
+        let mut source: Vec<(String, String)> = std::env::vars().collect();
+        source.extend(pairs(&[
+            ("SIMPLEHAR_TOKEN", "plaintext-secret"),
+            ("PYTHONPATH", "C:\\evil\\hijack"),
+        ]));
+        let assembled = engine_child_env(source, &spec_map(&[("PROBE_MARKER", "seen")]));
+        let dir = crate::testutil::temp_dir("childenv");
+        let dump = dir.join("child-set.txt");
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .args(["/c", &format!("set > {}", dump.display())])
+            .current_dir(&dir)
+            .env_clear()
+            .creation_flags(CREATE_NO_WINDOW);
+        for (key, value) in &assembled {
+            command.env(key, value);
+        }
+        let status = command.status().expect("cmd.exe runs");
+        assert!(status.success(), "cmd /c set exited with {status}");
+        let text = std::fs::read_to_string(&dump).expect("child wrote its env dump");
+        assert!(
+            has_child_var(&text, "PROBE_MARKER"),
+            "spec entry missing from the child: {text}"
+        );
+        assert!(
+            !has_child_var(&text, "SIMPLEHAR_TOKEN"),
+            "secret reached the child: {text}"
+        );
+        assert!(
+            !has_child_var(&text, "PYTHONPATH"),
+            "python hijack var reached the child: {text}"
+        );
+        assert_eq!(
+            count_child_var(&text, "Path"),
+            1,
+            "exactly one Path line in the child env: {text}"
+        );
+        if std::env::var_os("SystemRoot").is_some() || std::env::var_os("windir").is_some() {
+            assert!(
+                has_child_var(&text, "SystemRoot") || has_child_var(&text, "windir"),
+                "OS locators must survive into the child: {text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Injects harness-process vars for one test and removes them on scope exit,
+    /// including through an assertion panic. Only names no other test in this
+    /// binary reads may be injected: the crate reads just `SIMPLEHAR_LOG`,
+    /// `SIMPLEHAR_TOKEN` and `SIMPLEHAR_CONFIG`, never `PYTHONPATH`/`VIRTUAL_ENV`,
+    /// and integration suites are separate processes. `std::env::set_var` is a
+    /// safe call in edition 2021 — an `unsafe` block here would deny the build
+    /// with `unused_unsafe` under `-D warnings`.
+    struct HarnessEnvGuard(Vec<String>);
+
+    impl HarnessEnvGuard {
+        fn set(list: &[(&str, &str)]) -> Self {
+            let mut keys = Vec::with_capacity(list.len());
+            for (key, value) in list {
+                std::env::set_var(key, value);
+                keys.push((*key).to_string());
+            }
+            Self(keys)
+        }
+    }
+
+    impl Drop for HarnessEnvGuard {
+        fn drop(&mut self) {
+            for key in &self.0 {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    /// Polls until the child's redirected `set` output exists and stops changing
+    /// (the file is created at redirect time, written when cmd flushes).
+    async fn wait_for_child_env_dump(path: &std::path::Path) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut previous = String::new();
+        loop {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            if !text.is_empty() && text == previous {
+                return text;
+            }
+            previous = text;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child `set` dump never stabilized at {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_spawn_serves_only_the_declared_environment() {
+        // The production path end to end: `ProcessRuntime::spawn` (the single
+        // LaunchSpec-driven spawn site) must hand the child baseline + spec only.
+        // Neutralising its `env_clear()` fails the PYTHONPATH/VIRTUAL_ENV/CARGO_
+        // assertions below, because these markers genuinely live in the harness
+        // process while the child spawns.
+        let _markers = HarnessEnvGuard::set(&[
+            ("PYTHONPATH", "C:\\evil\\hijack"),
+            ("VIRTUAL_ENV", "C:\\evil\\venv"),
+        ]);
+        let dir = crate::testutil::temp_dir("enginespawn");
+        let dump = dir.join("child-set.txt");
+        let runtime = ProcessRuntime::new();
+        let spec = LaunchSpec {
+            argv: vec![
+                "cmd.exe".to_string(),
+                "/c".to_string(),
+                format!("set > {}", dump.display()),
+            ],
+            cwd: dir.clone(),
+            env: spec_map(&[("PROBE_MARKER", "seen")]),
+            log_name: "engine-env-test".to_string(),
+            readiness: ReadinessSpec::Http {
+                path: "/health".to_string(),
+                expect_status: 200,
+            },
+            container: None,
+        };
+        let tk = SpawnTicket {
+            generation: 7,
+            kind: ResourceKind::ChildProcess,
+            pid: 0,
+            port: 18_195,
+        };
+        let spawned = runtime
+            .spawn(&spec, tk.clone())
+            .await
+            .expect("cmd.exe spawns as an engine child");
+        assert_eq!(spawned.port, 18_195);
+        let text = wait_for_child_env_dump(&dump).await;
+        assert!(
+            has_child_var(&text, "PROBE_MARKER"),
+            "spec entry missing from the engine child: {text}"
+        );
+        assert!(
+            has_child_var(&text, "Path"),
+            "baseline Path missing from the engine child: {text}"
+        );
+        for secret in ["SIMPLEHAR_TOKEN", "PYTHONPATH", "VIRTUAL_ENV"] {
+            assert!(
+                !has_child_var(&text, secret),
+                "engine child inherited harness {secret}: {text}"
+            );
+        }
+        let inherited_toolchain: Vec<&str> = text
+            .lines()
+            .filter(|line| line.trim_start().to_uppercase().starts_with("CARGO_"))
+            .collect();
+        assert!(
+            inherited_toolchain.is_empty(),
+            "engine child inherited harness toolchain vars: {inherited_toolchain:?}"
+        );
+        if std::env::var_os("SystemRoot").is_some() || std::env::var_os("windir").is_some() {
+            assert!(
+                has_child_var(&text, "SystemRoot") || has_child_var(&text, "windir"),
+                "OS locators must survive into the engine child: {text}"
+            );
+        }
+        runtime.kill(&tk).await.expect("cleanup kill runs");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

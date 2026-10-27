@@ -72,7 +72,10 @@ pub struct LaunchSpec {
     pub argv: Vec<String>,
     /// Working directory for the child.
     pub cwd: PathBuf,
-    /// Extra environment for the child.
+    /// Harness-declared environment for the child, applied last over the minimal
+    /// OS baseline the runtime builds (`process::OS_ENV_BASELINE`, §5/E3): a
+    /// declared var overrides its baseline twin, and nothing else from the
+    /// harness environment is inherited.
     pub env: BTreeMap<String, String>,
     /// Log file base name; the process module appends the epoch (Step 8).
     pub log_name: String,
