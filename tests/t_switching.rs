@@ -106,6 +106,12 @@ impl Harness {
         yaml("work06", "WORK", &small_gguf(), "1", "\ncpu_offload: true");
         yaml("work06b", "WORK", &small_gguf(), "1", "\ncpu_offload: true");
         yaml("emb", "EMB", &emb_gguf(), "1", "");
+        // Identity sentinel (review, 2026-10-27). `/health` is anonymous - every
+        // harness on the box answers it identically - so a server already listening
+        // (a leaked one, or the operator's own instance) would let our child die on
+        // the single-instance guard while the test drove the foreign server, where
+        // `unload {}` takes down live models. Only OUR catalog carries this name.
+        yaml(&format!("sentinel-{tag}"), "EMB", &emb_gguf(), "1", "");
         if big_work_gguf().exists() {
             yaml("work31", "WORK", &big_work_gguf(), "29", "");
         }
@@ -134,6 +140,9 @@ impl Harness {
         let exe = harness_exe();
         let mut child = Command::new(&exe)
             .env("SIMPLEHAR_CONFIG", &config_path)
+            // An ambient token would authenticate every harness we spawn and then 401
+            // the whole suite, because our client never sends one (review, 2026-10-27).
+            .env_remove("SIMPLEHAR_TOKEN")
             .spawn()
             .expect("spawn simplehar-se.exe");
 
@@ -170,11 +179,54 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // Liveness, then identity: our own child must still be running, and the server
+        // that answered must be the one whose catalog only this run could have written
+        // (review, 2026-10-27). Without this, a foreign harness silently impersonates a
+        // fresh one and every verdict is fiction.
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "T-harness: the exe we spawned exited ({status:?}) while something else \
+                 answered {CONTROL}/health - another harness already holds 8708-8711; \
+                 do not run the suite over it"
+            );
+        }
+        let sentinel = format!("sentinel-{tag}");
+        let mut identified = false;
+        for _ in 0..25 {
+            let value: Value = probe
+                .get(format!("{CONTROL}/har/models"))
+                .send()
+                .await
+                .expect("GET /har/models for identity")
+                .json()
+                .await
+                .expect("models json");
+            identified = value["data"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter().any(|row| {
+                        row["id"] == sentinel.as_str() || row["name"] == sentinel.as_str()
+                    })
+                })
+                .unwrap_or(false);
+            if identified {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            identified,
+            "T-harness: whatever is answering {CONTROL} has no `{sentinel}` in its catalog, \
+             so it is not the harness this test spawned"
+        );
         Harness {
             child,
             http,
             modelconf,
-            logs_dir: work_dir.join("logs"),
+            // The product writes engine logs beside the exe (`logs/<name>-<epoch>.log`),
+            // not in the temp dir; pointing here made t14's log bound assert on a
+            // directory that never exists, so `unwrap_or(0)` made it unfailable.
+            logs_dir: harness_exe().parent().expect("exe dir").join("logs"),
             run_tag: tag.to_string(),
         }
     }
@@ -196,6 +248,32 @@ impl Harness {
     }
 
     /// GET against the control listener.
+    /// POST on its own task. `/har/load` blocks until the engine is Serving, so a test
+    /// that awaits it inline can never observe a load *in progress* — which is exactly
+    /// how 8.1 became a normal unload in disguise and 9.3 never reached the in-flight
+    /// attach path (review, 2026-10-27).
+    fn post_task(&self, url: &str, body: Value) -> tokio::task::JoinHandle<(u16, Value)> {
+        let http = self.http.clone();
+        let url = url.to_string();
+        tokio::spawn(async move {
+            let response = http.post(&url).json(&body).send().await.expect("POST");
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+        })
+    }
+
+    /// The ledger row for `model`, newest first.
+    async fn job_for(&self, model: &str) -> Option<Value> {
+        let jobs = self.get("/har/jobs").await;
+        jobs["jobs"]
+            .as_array()?
+            .iter()
+            .rev()
+            .find(|job| job["model"] == model)
+            .cloned()
+    }
+
     async fn get(&self, path: &str) -> Value {
         self.get_url(&format!("{CONTROL}{path}")).await
     }
@@ -378,15 +456,43 @@ async fn t01_listener_routing_guards() {
     let (status, body) = harness.chat(RP_LISTENER, None).await;
     assert_eq!(status, 400, "{body}");
 
-    // 1.8: per-listener /v1/models sets.
+    // 1.8: per-listener /v1/models sets. Positive membership and a real count, not
+    // `all()` over an array that is trivially true when empty - the very shape that hid
+    // Run 3's `catalog scanned models=0` (review, 2026-10-27).
+    let ids_of = |value: &Value| -> Vec<String> {
+        value["data"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row["id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let work = harness.get_url(&format!("{CONTROL}/v1/models")).await;
-    assert!(work["data"].as_array().is_some_and(|data| data
-        .iter()
-        .all(|m| ["work06", "work06b", "work31"].contains(&m["id"].as_str().unwrap_or_default()))));
+    let work_ids = ids_of(&work);
+    assert!(
+        work_ids.contains(&"work06".to_string()) && work_ids.contains(&"work06b".to_string()),
+        "the WORK listener must list both small models, got {work_ids:?}"
+    );
+    if big_work_gguf().exists() {
+        assert!(
+            work_ids.contains(&"work31".to_string()),
+            "work31 is present on disk but not listed: {work_ids:?}"
+        );
+    }
     let emb = harness.get_url(&format!("{EMB_LISTENER}/v1/models")).await;
-    assert!(emb["data"]
-        .as_array()
-        .is_some_and(|data| data.iter().all(|m| m["id"] == "emb")));
+    let emb_ids = ids_of(&emb);
+    assert!(
+        emb_ids.contains(&"emb".to_string()),
+        "the EMB listener must list `emb`, got {emb_ids:?}"
+    );
+    assert!(
+        emb_ids
+            .iter()
+            .all(|id| id.starts_with("emb") || id.starts_with("sentinel-")),
+        "the EMB listener must not leak other categories: {emb_ids:?}"
+    );
     println!("T1 PASS");
 }
 
@@ -410,7 +516,20 @@ async fn t02_single_load_unload_llama() {
     assert_eq!(status, 200, "chat: {body}");
     assert!(body["choices"].as_array().is_some(), "completion: {body}");
 
-    // 2.5: unload by model; 2.7: the engine port actually frees.
+    // 2.5: unload by model; 2.7: the engine port actually closes. Reading the slot's
+    // own record proves only that the request was echoed — the same source writes it —
+    // and it inspected the AUX row for a WORK engine. Release is proven the way the
+    // product itself proves it: the port stops accepting (review, 2026-10-27).
+    let engine_port = {
+        let status = harness.status().await;
+        status["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["category"] == "WORK" && slot["model"] == "work06")
+            .and_then(|slot| slot["port"].as_u64())
+            .expect("the loaded WORK slot must report an engine port while it serves")
+    };
     let (status, _) = harness
         .post(
             &format!("{CONTROL}/har/unload"),
@@ -419,19 +538,14 @@ async fn t02_single_load_unload_llama() {
         .await;
     assert_eq!(status, 200);
     assert!(harness.wait_empty(30).await, "slot empty after unload");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let serving_port = {
-        let status = harness.status().await;
-        status["slots"]
-            .as_array()
-            .expect("slots")
-            .iter()
-            .find(|s| s["category"] == "AUX")
-            .and_then(|s| s["port"].as_u64())
-    };
+    let still_open = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], engine_port as u16)),
+        Duration::from_secs(2),
+    )
+    .is_ok();
     assert!(
-        serving_port.is_none() || serving_port == Some(0),
-        "port released"
+        !still_open,
+        "engine port {engine_port} must stop accepting once the release is confirmed"
     );
 
     // Orphan check (plan §0 abort criteria).
@@ -482,36 +596,61 @@ async fn t03_same_slot_replacements() {
 
     // 3.5 (adapted to SE): rapid A then B before A is ready — final slot = B,
     // no port conflict errors anywhere in the ledger.
-    harness
+    let (unload_status, unload_body) = harness
         .post(
             &format!("{CONTROL}/har/unload"),
             json!({ "category": "WORK" }),
         )
         .await;
-    let _ = harness
-        .post(&format!("{CONTROL}/har/load"), json!({ "model": "work06" }))
-        .await;
-    let rapid = harness
-        .post(
-            &format!("{CONTROL}/har/load"),
-            json!({ "model": "work06b" }),
-        )
-        .await;
-    assert_eq!(rapid.0, 200, "load: {:?}", rapid.1);
-    assert!(harness.wait_serving("work06b", 120).await);
+    assert_eq!(unload_status, 200, "unload WORK: {unload_body}");
+    assert!(
+        harness.wait_empty(30).await,
+        "WORK must be empty before the rapid pair"
+    );
+
+    // A then B, both in flight: supersede can only be exercised while A is still
+    // loading, which a sequential await makes impossible (review, 2026-10-27).
+    let a = harness.post_task(&format!("{CONTROL}/har/load"), json!({ "model": "work06" }));
+    let b = harness.post_task(
+        &format!("{CONTROL}/har/load"),
+        json!({ "model": "work06b" }),
+    );
+    let (ra, rb) = tokio::join!(a, b);
+    let (status_a, body_a) = ra.expect("load A task");
+    let (status_b, body_b) = rb.expect("load B task");
+    assert!(
+        status_a == 200 || status_a == 409,
+        "superseded load A must be accepted or reported as superseded: {body_a}"
+    );
+    assert_eq!(status_b, 200, "load B must win: {body_b}");
+    assert!(harness.wait_serving("work06b", 120).await, "B ends serving");
+
+    // Positive ledger facts replace the old negative substring: `"already used"`
+    // appears nowhere in the product, so `!has_conflict` could never fail.
+    let job_a = harness
+        .job_for("work06")
+        .await
+        .expect("the superseded load stays in the ledger");
+    assert_eq!(
+        job_a["is_fault"], false,
+        "a superseded load is a deliberate cancel, not a fault: {job_a}"
+    );
+    let job_b = harness
+        .job_for("work06b")
+        .await
+        .expect("B is in the ledger");
+    assert!(job_b["error"].is_null(), "B completed cleanly: {job_b}");
     let jobs = harness.get("/har/jobs").await;
-    let has_conflict = jobs["jobs"]
+    let faults: Vec<&Value> = jobs["jobs"]
         .as_array()
         .expect("jobs")
         .iter()
-        .filter(|job| job["error"].is_string())
-        .any(|job| {
-            job["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("already used")
-        });
-    assert!(!has_conflict, "no port-conflict errors: {jobs}");
+        .filter(|job| job["is_fault"] == true)
+        .collect();
+    assert!(
+        faults.is_empty(),
+        "nothing in this run is a fault: {faults:?}"
+    );
     println!("T3 PASS");
 }
 
@@ -682,13 +821,25 @@ async fn t08_cancel_during_load() {
         return;
     }
 
-    // 8.1: load the big model; mid-load, unload the category -> the load job is
-    // cancelled and cleanup (kill + release confirmation) completes.
-    let (status, body) = harness
-        .post(&format!("{CONTROL}/har/load"), json!({ "model": "rp31" }))
-        .await;
-    assert_eq!(status, 200, "{body}");
-    tokio::time::sleep(Duration::from_secs(8)).await; // mid-load
+    // 8.1: load the big model and cancel it WHILE IT IS STILL LOADING. The POST is on
+    // its own task because /har/load blocks until Serving: awaiting it inline means the
+    // engine already finished, and the "cancel" would be an ordinary unload wearing a
+    // cancel's clothes (review, 2026-10-27).
+    let load = harness.post_task(&format!("{CONTROL}/har/load"), json!({ "model": "rp31" }));
+    let mut in_flight = false;
+    for _ in 0..40 {
+        if let Some(job) = harness.job_for("rp31").await {
+            if job["terminal"] == false {
+                in_flight = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        in_flight,
+        "8.1 tests a mid-load cancel; the rp31 load job was never observed in flight"
+    );
     let (status, _) = harness
         .post(
             &format!("{CONTROL}/har/unload"),
@@ -696,7 +847,16 @@ async fn t08_cancel_during_load() {
         )
         .await;
     assert_eq!(status, 200, "unload mid-load = cancel");
+    let _ = load.await.expect("load task"); // the waiter's reply may be 200/409/502
     assert!(harness.wait_empty(60).await, "slot empties after cancel");
+    let cancelled = harness
+        .job_for("rp31")
+        .await
+        .expect("the cancelled load stays in the ledger");
+    assert_eq!(
+        cancelled["is_fault"], false,
+        "a deliberate cancel is policy, not a fault: {cancelled}"
+    );
 
     // 8.2: immediately load it again - no stuck lock, no port in use.
     let (status, body) = harness
@@ -717,16 +877,19 @@ async fn t09_concurrency() {
     serial_lock();
     let harness = Harness::spawn("t09").await;
 
-    // 9.3: duplicate /har/load x3 while loading -> all accepted, one job.
+    // 9.3: duplicate /har/load x3 WHILE LOADING -> all accepted, one job. They must be
+    // issued together and awaited together: awaiting them one by one lets the first
+    // reach Serving, so #2 and #3 only ever see `Already` and the in-flight attach path
+    // under test is never reached — while `load_jobs == 1` passes anyway.
     let url = format!("{CONTROL}/har/load");
     let body = json!({ "model": "work06" });
-    let mut results = Vec::new();
-    for _ in 0..3 {
-        results.push(harness.post(&url, body.clone()));
-    }
-    for result in results {
-        let (status, _) = result.await;
-        assert_eq!(status, 200);
+    let a = harness.post_task(&url, body.clone());
+    let b = harness.post_task(&url, body.clone());
+    let c = harness.post_task(&url, body.clone());
+    let (ra, rb, rc) = tokio::join!(a, b, c);
+    for result in [ra, rb, rc] {
+        let (status, body) = result.expect("load task");
+        assert_eq!(status, 200, "duplicate load: {body}");
     }
     assert!(harness.wait_serving("work06", 120).await);
     let jobs = harness.get("/har/jobs").await;
@@ -980,9 +1143,21 @@ async fn t14_soak() {
         0,
         "zero orphans after the soak"
     );
+    // Engine logs land beside the exe as `<name>-<epoch>.log`. Count only this run's
+    // engines, and fail closed if the directory cannot be read: the previous version
+    // counted a temp path that never exists, so `unwrap_or(0)` made this unfailable.
     let log_files = std::fs::read_dir(&harness.logs_dir)
-        .map(|entries| entries.filter_map(Result::ok).count())
-        .unwrap_or(0);
-    assert!(log_files <= 50, "logs/ bounded: {log_files} files");
+        .map_err(|error| format!("cannot read {}: {error}", harness.logs_dir.display()))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("work06"))
+                .count()
+        })
+        .expect("engine log directory readable");
+    assert!(
+        log_files <= 50,
+        "this run's engine logs bounded: {log_files} files"
+    );
     println!("T14 PASS ({iterations} iterations; full plan: set SE_SOAK_ITERATIONS=20)");
 }
