@@ -16,7 +16,7 @@
 
 use crate::config::{AppConfig, CategoryId};
 use crate::model::ModelEntry;
-use crate::scheduler::{JobId, Reply, SchedulerError, SchedulerHandle};
+use crate::scheduler::{JobId, Reply, SchedulerError, SchedulerHandle, SchedulerStatus};
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -1227,29 +1227,12 @@ async fn ensure_target(
         None => {
             // F-2 rule (operator, 2026-10-24): "use this category".
             let status = api.scheduler.status().await.map_err(ApiError::from)?;
-            let mut occupants: Vec<(String, u16, Instant)> = status
-                .slots
-                .iter()
-                .filter(|slot| slot.category == listener.category)
-                .filter_map(|slot| match (&slot.model, slot.port) {
-                    (Some(model), Some(port)) if port != 0 => Some((
-                        model.clone(),
-                        port,
-                        api.last_used(model).unwrap_or_else(slot_loaded_fallback),
-                    )),
-                    _ => None,
-                })
-                .collect();
-            occupants.sort_by_key(|&(_, _, used)| std::cmp::Reverse(used)); // MRU first
-            if let Some((model, port, _)) = occupants.first() {
-                api.touch(model);
-                api.scheduler.touch(model);
-                let serve_id = status
-                    .slots
-                    .iter()
-                    .find(|slot| slot.model.as_deref() == Some(model.as_str()))
-                    .and_then(|slot| slot.serve_id.clone());
-                return Ok((model.clone(), *port, serve_id));
+            if let Some((model, port, serve_id)) =
+                pick_loaded_occupant(api, &status, listener.category)
+            {
+                api.touch(&model);
+                api.scheduler.touch(&model);
+                return Ok((model, port, serve_id));
             }
             let default = api.default_model(listener.category);
             match default {
@@ -1269,10 +1252,77 @@ async fn ensure_target(
     }
 }
 
-fn slot_loaded_fallback() -> Instant {
-    // Occupants without a usage hint fall back to "least recently used" semantics by
-    // appearing oldest; loaded-time tracking refines this when eviction lands.
-    Instant::now() - Duration::from_secs(3_600)
+/// Picks the serving occupant for a no-`model` request: MRU by last proxy use,
+/// with untouched occupants sorted by their ACTUAL load time (FINDINGS-06 [1]:
+/// `slot.loaded_at`, never a fabricated instant that underflows on a young
+/// process). `None` when the category serves nothing.
+fn pick_loaded_occupant(
+    api: &ApiState,
+    status: &SchedulerStatus,
+    category: CategoryId,
+) -> Option<(String, u16, Option<String>)> {
+    let mut occupants: Vec<(String, u16, Instant)> = status
+        .slots
+        .iter()
+        .filter(|slot| slot.category == category)
+        .filter_map(|slot| match (&slot.model, slot.port) {
+            (Some(model), Some(port)) if port != 0 => Some((
+                model.clone(),
+                port,
+                api.last_used(model).unwrap_or(slot.loaded_at),
+            )),
+            _ => None,
+        })
+        .collect();
+    occupants.sort_by_key(|&(_, _, used)| std::cmp::Reverse(used)); // MRU first
+    occupants.first().map(|(model, port, _)| {
+        let serve_id = status
+            .slots
+            .iter()
+            .find(|slot| slot.model.as_deref() == Some(model.as_str()))
+            .and_then(|slot| slot.serve_id.clone());
+        (model.clone(), *port, serve_id)
+    })
+}
+
+/// What the proxy does when a forward fails before any response head arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAction {
+    /// The request never got a response and nothing listens on the port: the
+    /// engine class of failure that justifies exactly one reap + reload + retry.
+    Restart,
+}
+
+/// Classifies a `send()` failure for the crash-retry arm (FINDINGS-06 [2]).
+///
+/// Restart-and-retry ONLY when the request never got a response AND the engine is
+/// not listening — reqwest's `is_connect()` (refused/reset before response head).
+/// A timeout (`is_timeout()`) is a live-but-slow engine (long non-streamed
+/// generation, huge prefill): reaping it would discard a healthy KV cache and
+/// re-forward the same slow request, so it answers `502` naming the class
+/// instead. Any other send error is likewise never treated as death.
+///
+/// # Arguments
+///
+/// * `error` - the error returned by `reqwest::Client::send()`
+/// * `port` - the engine port the forward targeted, for the operator-facing reason
+///
+/// # Errors
+///
+/// [`ApiError::Upstream`] for every non-connect class.
+///
+/// Public only so the integration suite can feed it real reqwest error values;
+/// the proxy loop is its sole caller in production code.
+pub fn classify_send_failure(error: &reqwest::Error, port: u16) -> Result<RetryAction, ApiError> {
+    if error.is_connect() {
+        return Ok(RetryAction::Restart);
+    }
+    let reason = if error.is_timeout() {
+        format!("engine on :{port} timed out; not restarting a live engine")
+    } else {
+        format!("forward failed: {error}")
+    };
+    Err(ApiError::Upstream { reason })
 }
 
 /// Ensures `model` is serving in `category`; returns its engine port and the
@@ -1313,9 +1363,12 @@ async fn proxy(
     // the harness name is the fallback (llama engines ignore the field either way).
     body["model"] = Value::String(serve_id.unwrap_or_else(|| model.clone()));
 
-    // T10.1: a connection-level failure (engine died mid-request) triggers exactly
-    // one reap + reload + retry. A genuine upstream HTTP status is never retried
-    // (A9), and a death mid-stream surfaces in the body stream, past this loop.
+    // T10.1: a connection-level failure (engine died before any response) triggers
+    // exactly one reap + reload + retry. Only `is_connect()` classifies as death
+    // (FINDINGS-06 [2]): a timeout means a live engine is still thinking, and
+    // reaping it discards a healthy KV cache. A genuine upstream HTTP status is
+    // never retried (A9), and a death mid-stream surfaces in the body stream,
+    // past this loop.
     let mut port = port;
     let mut attempts = 0;
     let upstream = loop {
@@ -1323,6 +1376,7 @@ async fn proxy(
         match listener.api.proxy.post(&url).json(&body).send().await {
             Ok(upstream) => break upstream,
             Err(error) => {
+                classify_send_failure(&error, port)?;
                 attempts += 1;
                 if attempts >= 2 {
                     return Err(ApiError::Upstream {
@@ -1456,6 +1510,7 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::SlotStatus;
 
     #[test]
     fn config_write_path_follows_boot_and_never_the_legacy_file() {
@@ -1668,5 +1723,248 @@ mod tests {
             mapped.to_string().contains("nvidia-smi timed out"),
             "the witness's reason must travel: {mapped}"
         );
+    }
+
+    fn unit_state() -> ApiState {
+        // The selection and classification logic never issues a scheduler command,
+        // so a dummy handle (no actor) is the honest seam here.
+        ApiState::new(
+            AppConfig::default(),
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        )
+    }
+
+    fn occupied_slot(model: &str, port: u16, loaded_at: Instant) -> SlotStatus {
+        SlotStatus {
+            category: CategoryId::Aux,
+            index: 0,
+            model: Some(model.to_string()),
+            port: Some(port),
+            pid: Some(1),
+            need_gib: Some(4.0),
+            idle_s: Some(0),
+            serve_id: Some("mock-model".to_string()),
+            loading_job: None,
+            loaded_at,
+        }
+    }
+
+    #[test]
+    fn no_fabricated_instants_survive_short_uptime() {
+        // FINDINGS-06 [1]: the removed fallback sorted untouched occupants by a
+        // fabricated `Instant::now() - 3600s`, which panics outright on a host
+        // younger than an hour. Fixture instants are FORWARD offsets of `now`
+        // (`Instant + Duration` cannot underflow) so the test never panics on a
+        // young host — the same panic the finding condemned. The pin is the
+        // REAL picker's winner: pre-fix both slots collapse to the fabricated
+        // hour and the last-evaluated slot (`older`, snapshot order reversed
+        // against load order) wins the jitter tie; post-fix the actual
+        // `loaded_at` ordering makes `newer` win, on any uptime.
+        let api = unit_state();
+        let now = Instant::now();
+        // 20-minute separation is far above QueryPerformanceCounter jitter.
+        let t_older = now + Duration::from_secs(600);
+        let t_newer = now + Duration::from_secs(1_200);
+        let status = SchedulerStatus {
+            slots: vec![
+                occupied_slot("newer", 9002, t_newer),
+                occupied_slot("older", 9001, t_older),
+            ],
+            jobs: Vec::new(),
+            catalog_errors: Vec::new(),
+        };
+        let picked = pick_loaded_occupant(&api, &status, CategoryId::Aux)
+            .expect("an occupied category must resolve");
+        assert_eq!(
+            picked.0, "newer",
+            "untouched occupants sort by ACTUAL load time"
+        );
+        assert_eq!(picked.1, 9002);
+        assert_eq!(picked.2.as_deref(), Some("mock-model"));
+    }
+
+    #[test]
+    fn mru_touch_wins_over_a_fresher_load() {
+        let api = unit_state();
+        // Load stamps sit NEAR now (not in the future: an in-process future stamp
+        // would outrank a touch landing at ~now, inverting reality — real loads
+        // always precede their touches). `hot` loaded last, yet the touch on
+        // `cold` must outrank it. Backward offsets stay under a minute so the
+        // fixtures are safe on any host uptime; the touch lands after them.
+        let status = SchedulerStatus {
+            slots: vec![
+                occupied_slot("cold", 9001, Instant::now()),
+                occupied_slot(
+                    "hot",
+                    9002,
+                    Instant::now()
+                        .checked_sub(Duration::from_millis(150))
+                        .expect("invariant: process start precedes first fixture stamp"),
+                ),
+            ],
+            jobs: Vec::new(),
+            catalog_errors: Vec::new(),
+        };
+        api.touch("cold");
+        let picked = pick_loaded_occupant(&api, &status, CategoryId::Aux)
+            .expect("an occupied category must resolve");
+        assert_eq!(picked.0, "cold", "a proxied model outranks a fresher load");
+    }
+
+    #[test]
+    fn other_category_and_dead_ports_resolve_to_nothing() {
+        let api = unit_state();
+        let now = Instant::now();
+        let foreign = SlotStatus {
+            category: CategoryId::Work,
+            ..occupied_slot("elsewhere", 9003, now)
+        };
+        let portless = SlotStatus {
+            port: None,
+            ..occupied_slot("unbound", 9004, now)
+        };
+        let zero = SlotStatus {
+            port: Some(0),
+            ..occupied_slot("zombie", 0, now)
+        };
+        let empty = SlotStatus {
+            category: CategoryId::Aux,
+            index: 1,
+            model: None,
+            port: None,
+            pid: None,
+            need_gib: None,
+            idle_s: None,
+            serve_id: None,
+            loading_job: None,
+            loaded_at: now,
+        };
+        let status = SchedulerStatus {
+            slots: vec![foreign, portless, zero, empty],
+            jobs: Vec::new(),
+            catalog_errors: Vec::new(),
+        };
+        assert!(
+            pick_loaded_occupant(&api, &status, CategoryId::Aux).is_none(),
+            "wrong-category, portless, and port-0 slots must not resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_failure_is_the_only_restart_class() {
+        // FINDINGS-06 [2] evidence for the connect class: the T10.1 mock death is
+        // a `handle.abort()` that drops the listener socket, so the port REFUSES
+        // and `send()` yields `is_connect()` — exactly what this classifier maps
+        // to the single sanctioned reap + reload + retry.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let error = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&json!({"messages": []}))
+            .send()
+            .await
+            .expect_err("nothing accepts on the released port");
+        assert!(
+            error.is_connect(),
+            "dead port must be connect-class: {error}"
+        );
+        let action = classify_send_failure(&error, port).expect("connect-class retries once");
+        assert_eq!(action, RetryAction::Restart);
+    }
+
+    #[tokio::test]
+    async fn timeout_of_a_live_engine_never_restarts() {
+        // A server that accepts but never answers produces a real reqwest
+        // timeout — the class that used to mean "engine died" and reaped a
+        // healthy engine mid-generation. It must now be a typed 502 instead.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind free port");
+        let port = listener.local_addr().expect("local addr").port();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .expect("plain-HTTP client with a timeout");
+        let error = client
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&json!({"messages": []}))
+            .send()
+            .await
+            .expect_err("the socket is accepted but never answered");
+        assert!(
+            error.is_timeout(),
+            "hanging server must be timeout-class: {error}"
+        );
+        let err = classify_send_failure(&error, port).expect_err("timeouts never restart");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        let reason = match &err {
+            ApiError::Upstream { reason } => reason.clone(),
+            other => panic!("expected Upstream, got {other:?}"),
+        };
+        assert!(
+            reason.contains(&format!("engine on :{port} timed out"))
+                && reason.contains("not restarting a live engine"),
+            "reason must name the class and the refusal to reap: {reason}"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn non_connect_errors_are_upstream_never_death() {
+        // A redirect loop is the finding's named non-death trigger ("a redirect
+        // loop or a request-body error"): the engine was alive and answering, so
+        // the class must never be read as death and must never restart. Raw
+        // sockets speak just enough HTTP/1.1 to bounce the client forever.
+        let looping = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirect loop server binds");
+        let port = looping.local_addr().expect("loop addr").port();
+        let server = tokio::spawn(async move {
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/loop\r\n\
+                 Content-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+            );
+            while let Ok((mut stream, _)) = looping.accept().await {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if stream.write_all(reply.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let error = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(4))
+            .build()
+            .expect("plain-HTTP client")
+            .post(format!("http://127.0.0.1:{port}/loop"))
+            .json(&json!({"messages": []}))
+            .send()
+            .await
+            .expect_err("the redirect loop must exhaust the policy");
+        assert!(
+            !error.is_connect(),
+            "a live answering server is not death: {error}"
+        );
+        let err = classify_send_failure(&error, port).expect_err("non-connect never restarts");
+        match err {
+            ApiError::Upstream { reason } => assert!(
+                reason.starts_with("forward failed:"),
+                "reason must name the class: {reason}"
+            ),
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+        server.abort();
     }
 }

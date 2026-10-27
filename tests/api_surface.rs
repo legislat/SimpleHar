@@ -9,8 +9,8 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use mock_runtime::MockRuntime;
 use serde_json::Value;
-use simplehar_se::api::{category_router, control_router, ApiState};
-use simplehar_se::config::{AppConfig, CategoryId};
+use simplehar_se::api::{category_router, classify_send_failure, control_router, ApiState};
+use simplehar_se::config::{AppConfig, CategoryConfig, CategoryId};
 use simplehar_se::engine::mock::MockAdapter;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
 use simplehar_se::scheduler::Scheduler;
@@ -43,7 +43,14 @@ category: {category}
 fn app(
     config: AppConfig,
     specs: &[Spec],
-) -> (Router, Router, Router, MockRuntime, std::path::PathBuf) {
+) -> (
+    Router,
+    Router,
+    Router,
+    Router,
+    MockRuntime,
+    std::path::PathBuf,
+) {
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
@@ -51,6 +58,7 @@ fn app(
     adapters.insert("mock-never".to_string(), Arc::new(MockAdapter));
     adapters.insert("mock-slow".to_string(), Arc::new(MockAdapter));
     adapters.insert("mock-dies-once".to_string(), Arc::new(MockAdapter));
+    adapters.insert("mock-dies".to_string(), Arc::new(MockAdapter));
     let dir = write_modelconf(specs);
     let scheduler = Scheduler::start(
         config.clone(),
@@ -69,7 +77,8 @@ fn app(
     let control = control_router(Arc::clone(&state));
     let work = category_router(Arc::clone(&state), CategoryId::Work);
     let rp = category_router(Arc::clone(&state), CategoryId::Rp);
-    (control, work, rp, runtime, dir)
+    let aux = category_router(state, CategoryId::Aux);
+    (control, work, rp, aux, runtime, dir)
 }
 
 async fn post_json(app: &Router, path: &str, body: &str) -> (StatusCode, Value) {
@@ -118,7 +127,7 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
         control_token: Some("s3cret".to_string()),
         ..AppConfig::default()
     };
-    let (control, work, _rp, _runtime, _modelconf) =
+    let (control, work, _rp, _, _runtime, _modelconf) =
         app(config, &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
 
     let (status, body) = get_json(&control, "/har/status").await;
@@ -186,7 +195,7 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
 
 #[tokio::test]
 async fn load_flow_populates_jobs_and_status() {
-    let (control, _work, _rp, runtime, _modelconf) = app(
+    let (control, _work, _rp, _, runtime, _modelconf) = app(
         AppConfig::default(),
         &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -215,7 +224,7 @@ async fn load_flow_populates_jobs_and_status() {
 
 #[tokio::test]
 async fn load_unknown_model_is_typed_not_found() {
-    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
     let (status, body) = post_json(&control, "/har/load", r#"{"model":"ghost"}"#).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "not_found");
@@ -223,7 +232,7 @@ async fn load_unknown_model_is_typed_not_found() {
 
 #[tokio::test]
 async fn unload_bodies_are_strict() {
-    let (control, _, _, _, _modelconf) = app(
+    let (control, _, _, _, _, _modelconf) = app(
         AppConfig::default(),
         &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -250,7 +259,7 @@ async fn unload_bodies_are_strict() {
 
 #[tokio::test]
 async fn models_are_filtered_per_listener() {
-    let (_, work, rp, _, _modelconf) = app(
+    let (_, work, rp, _, _, _modelconf) = app(
         AppConfig::default(),
         &[
             ("work-model", "mock", CategoryId::Work, Some(4.0)),
@@ -276,7 +285,7 @@ async fn models_are_filtered_per_listener() {
 #[tokio::test]
 async fn wrong_category_is_404_before_any_load() {
     // The RP listener must refuse a WORK model with 404 and create no job.
-    let (control, _, rp, runtime, _modelconf) = app(
+    let (control, _, rp, _, runtime, _modelconf) = app(
         AppConfig::default(),
         &[("work-model", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -299,7 +308,7 @@ async fn wrong_category_is_404_before_any_load() {
 
 #[tokio::test]
 async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
-    let (control, work, _, runtime, _modelconf) = app(
+    let (control, work, _, _, runtime, _modelconf) = app(
         AppConfig::default(),
         &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -327,7 +336,7 @@ async fn crash_retry_re_resolves_by_name_after_the_id_rewrite() {
     // before forwarding. The crash-retry then re-resolved the target from that
     // rewritten body, so it searched the catalog for a model *named* by engine id and
     // 404'd: the restart succeeded, the request still failed.
-    let (control, work, _, runtime, _modelconf) = app(
+    let (control, work, _, _, runtime, _modelconf) = app(
         AppConfig::default(),
         &[("qwen3", "mock-dies-once", CategoryId::Work, Some(4.0))],
     );
@@ -378,7 +387,7 @@ async fn crash_retry_re_resolves_by_name_after_the_id_rewrite() {
 
 #[tokio::test]
 async fn no_model_fallback_serves_the_loaded_occupant() {
-    let (control, work, _, _, _modelconf) = app(
+    let (control, work, _, _, _, _modelconf) = app(
         AppConfig::default(),
         &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -399,7 +408,7 @@ async fn no_model_fallback_loads_the_category_default() {
         .category_mut(CategoryId::Rp)
         .expect("default config has RP")
         .default_model = Some("default-model".to_string());
-    let (control, _, rp, runtime, _modelconf) = app(
+    let (control, _, rp, _, runtime, _modelconf) = app(
         config,
         &[("default-model", "mock", CategoryId::Rp, Some(4.0))],
     );
@@ -418,7 +427,7 @@ async fn no_model_fallback_loads_the_category_default() {
 
 #[tokio::test]
 async fn no_model_without_default_is_400_naming_the_listener() {
-    let (_, work, _, _, _) = app(AppConfig::default(), &[]);
+    let (_, work, _, _, _, _) = app(AppConfig::default(), &[]);
     let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let message = body["message"].as_str().unwrap_or_default();
@@ -430,7 +439,7 @@ async fn no_model_without_default_is_400_naming_the_listener() {
 
 #[tokio::test]
 async fn admission_refusal_via_proxy_is_503_with_numbers() {
-    let (control, _, rp, _, _) = app(
+    let (control, _, rp, _, _, _) = app(
         AppConfig::default(),
         &[
             ("big-a", "mock", CategoryId::Work, Some(50.0)),
@@ -450,7 +459,7 @@ async fn admission_refusal_via_proxy_is_503_with_numbers() {
 
 #[tokio::test]
 async fn rescan_picks_up_new_model_files() {
-    let (control, work, _, _, modelconf) = app(
+    let (control, work, _, _, _, modelconf) = app(
         AppConfig::default(),
         &[("first", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -477,7 +486,7 @@ vram_gb: 4
 
 #[tokio::test]
 async fn control_page_serves_assets() {
-    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
     let (status, _) = get_json_html(&control, "/").await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = get_json_html(&control, "/style.css").await;
@@ -505,7 +514,7 @@ async fn get_json_html(app_router: &Router, path: &str) -> (StatusCode, String) 
 
 #[tokio::test]
 async fn har_models_lists_the_full_catalog() {
-    let (control, _, _, _, _) = app(
+    let (control, _, _, _, _, _) = app(
         AppConfig::default(),
         &[
             ("work-model", "mock", CategoryId::Work, Some(4.0)),
@@ -519,7 +528,7 @@ async fn har_models_lists_the_full_catalog() {
 
 #[tokio::test]
 async fn default_model_endpoint_validates_and_takes_effect() {
-    let (control, work, _, _, _) = app(
+    let (control, work, _, _, _, _) = app(
         AppConfig::default(),
         &[
             ("qwen3", "mock", CategoryId::Work, Some(4.0)),
@@ -560,7 +569,7 @@ async fn default_model_endpoint_validates_and_takes_effect() {
 
 #[tokio::test]
 async fn extended_logging_toggle_round_trips_and_validates() {
-    let (control, _, _, _, _) = app(
+    let (control, _, _, _, _, _) = app(
         AppConfig::default(),
         &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -578,7 +587,7 @@ async fn extended_logging_toggle_round_trips_and_validates() {
 
 #[tokio::test]
 async fn events_stream_serves_sse_with_an_immediate_state() {
-    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
     let response = control
         .oneshot(
             Request::get("/har/events")
@@ -615,7 +624,7 @@ async fn events_stream_serves_sse_with_an_immediate_state() {
 
 #[tokio::test]
 async fn config_model_writes_back_to_the_yaml_file() {
-    let (control, _, _, _, modelconf) = app(
+    let (control, _, _, _, _, modelconf) = app(
         AppConfig::default(),
         &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -662,7 +671,7 @@ async fn config_model_writes_back_to_the_yaml_file() {
 async fn moving_the_default_model_clears_its_old_category_default() {
     // Operator finding #1 (2026-10-26): moving the default model out of a category
     // must not leave the old listener defaulting to a model it no longer serves.
-    let (control, _, _, _, _) = app(
+    let (control, _, _, _, _, _) = app(
         AppConfig::default(),
         &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
     );
@@ -705,7 +714,7 @@ async fn defaults_persist_to_the_config_boot_loaded_even_under_a_custom_path() {
         AppConfig::parse(&std::fs::read_to_string(&path).expect("read")).expect("parses");
     config.source_path = Some(path.clone());
 
-    let (control, _, _, _, _) = app(config, &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
+    let (control, _, _, _, _, _) = app(config, &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
     let (status, body) = post_json(
         &control,
         "/har/config/default",
@@ -767,7 +776,7 @@ async fn last_error_is_the_newest_failed_load_and_survives_unrelated_success() {
         load_timeout_s: 2,
         ..AppConfig::default()
     };
-    let (control, _, _, _, _) = app(
+    let (control, _, _, _, _, _) = app(
         config,
         &[
             ("bad", "mock-never", CategoryId::Work, Some(4.0)),
@@ -817,7 +826,8 @@ async fn below_launch_floor_gets_its_own_error_code() {
         load_timeout_s: 5,
         ..AppConfig::default()
     };
-    let (control, _, _, _, dir) = app(config, &[("filler", "mock", CategoryId::Work, Some(4.0))]);
+    let (control, _, _, _, _, dir) =
+        app(config, &[("filler", "mock", CategoryId::Work, Some(4.0))]);
     std::fs::write(
         dir.join("guarded.yaml"),
         "name: guarded\nengine: mock\ncategory: RP\nvram_gb: 2\n\
@@ -842,7 +852,7 @@ async fn below_launch_floor_gets_its_own_error_code() {
 
 #[tokio::test]
 async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
-    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
 
     // DNS-rebinding guard: a hostname in Host is refused 400 before any handler.
     let response = control
@@ -903,7 +913,7 @@ async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
 
 #[tokio::test]
 async fn posts_without_json_content_type_are_415() {
-    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
     let response = control
         .oneshot(
             Request::post("/har/unload")
@@ -919,7 +929,7 @@ async fn posts_without_json_content_type_are_415() {
 
 #[tokio::test]
 async fn request_ids_are_echoed_or_generated() {
-    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
 
     // Client-provided id is echoed.
     let response = control
@@ -964,7 +974,7 @@ async fn request_ids_are_echoed_or_generated() {
 async fn genuine_upstream_error_is_surfaced_never_retried() {
     // A9: a 500 from the engine is a real answer - no crash-restart, no retry,
     // exactly one job in the ledger.
-    let (control, work, _, runtime, _) = app(
+    let (control, work, _, _, runtime, _) = app(
         AppConfig::default(),
         &[("err-model", "mock-error", CategoryId::Work, Some(4.0))],
     );
@@ -990,7 +1000,7 @@ async fn genuine_upstream_error_is_surfaced_never_retried() {
 
 #[tokio::test]
 async fn har_log_serves_the_ring() {
-    let (control, _, _, _, _) = app(AppConfig::default(), &[]);
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
     // Push a marker entry straight into the ring (the test binary has no global
     // subscriber; the endpoint reads the same process-global storage).
     simplehar_se::observability::ring_push(simplehar_se::observability::LogEntry::now(
@@ -1008,4 +1018,182 @@ async fn har_log_serves_the_ring() {
             .contains("last load failed")
     }));
     assert!(body["capacity"].is_u64());
+}
+
+#[tokio::test]
+async fn no_model_fallback_with_fresh_instants_answers_200() {
+    // FINDINGS-06 [1] shape check on a young process. Honest scope: at HEAD
+    // every in-process `/har/load` goes through `swap_for_port`, which touches
+    // the usage map, so the API cannot leave an occupant hint-free and this
+    // request passes pre-fix too; the pre-fix panic (a fabricated
+    // `Instant::now() - 3600s`, reachable when the ACTOR loads an occupant
+    // without an API touch, e.g. a crash-reload after boot) is pinned by the
+    // lib unit test `no_fabricated_instants_survive_short_uptime`.
+    let (control, work, _, _, _, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let (status, _) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "no-model request must not die: {body}"
+    );
+    assert_eq!(body["echo"], true);
+    assert_eq!(body["body"]["model"], "mock-model");
+}
+
+#[tokio::test]
+async fn no_model_fallback_prefers_the_most_recently_proxied_occupant() {
+    // F-2 MRU contract end to end. Honest scope: `swap_for_port` calls
+    // `api.touch` on every in-process load, so the control API cannot leave an
+    // occupant usage-hint-free; the untouched fallback branch (the pre-fix
+    // panic site, reached in production when the ACTOR reloads an occupant
+    // without an API touch) is pinned instead by the lib unit test
+    // `no_fabricated_instants_survive_short_uptime`. What is observable here:
+    // the genuine proxy touch on `newer` must outrank the later-loaded `older`
+    // (whose mock answers 500) — a mis-selection is immediately visible.
+    let mut config = AppConfig::default();
+    let aux: &mut CategoryConfig = config
+        .category_mut(CategoryId::Aux)
+        .expect("default config has AUX");
+    aux.max_models = 2;
+    let (control, _, _, aux_router, runtime, _modelconf) = app(
+        config,
+        &[
+            ("newer", "mock", CategoryId::Aux, Some(4.0)),
+            ("older", "mock-error", CategoryId::Aux, Some(4.0)),
+        ],
+    );
+    for name in ["newer", "older"] {
+        let body = format!(r#"{{"model":"{name}"}}"#);
+        let (status, body) = post_json(&control, "/har/load", &body).await;
+        assert_eq!(status, StatusCode::OK, "load {name}: {body}");
+    }
+    assert_eq!(runtime.server_count(), 2, "both occupants serve");
+
+    let (status, body) = post_json(
+        &aux_router,
+        "/v1/chat/completions",
+        r#"{"model":"newer","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "named warm-up must reach `newer`: {body}"
+    );
+
+    let (status, body) = post_json(&aux_router, "/v1/chat/completions", r#"{"messages":[]}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the touched `newer` must win the MRU sort over the later-loaded `older` \
+         (whose mock answers 500): {body}"
+    );
+    assert_eq!(body["echo"], true);
+    assert_eq!(body["body"]["model"], "mock-model");
+    assert_eq!(
+        runtime.server_count(),
+        2,
+        "selection must not reap anything"
+    );
+}
+
+#[tokio::test]
+async fn timeout_class_is_502_and_never_restarts() {
+    // FINDINGS-06 [2] classifier half: a server that ACCEPTS but never answers
+    // produces a real reqwest timeout - the class that used to mean "engine
+    // died" and reaped healthy engines. It must map to a typed 502 naming the
+    // class, with no restart in sight. The production proxy client's 600 s
+    // deadline is hard-coded and not injectable without new public surface, so
+    // the end-to-end 600 s wait is out of scope; the classifier is the decision
+    // site and is exercised with the real error value here.
+    let hanging = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("hang server binds");
+    let port = hanging.local_addr().expect("hang addr").port();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .expect("plain-HTTP client with a timeout");
+    let error = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&serde_json::json!({"messages": []}))
+        .send()
+        .await
+        .expect_err("the hang server never answers");
+    assert!(
+        error.is_timeout(),
+        "accepted-but-silent must be timeout-class: {error:?}"
+    );
+
+    let err = classify_send_failure(&error, port).expect_err("timeouts never restart");
+    assert_eq!(err.status(), StatusCode::BAD_GATEWAY, "exact class");
+    let message = match err {
+        simplehar_se::api::ApiError::Upstream { reason } => reason,
+        other => panic!("expected Upstream, got {other:?}"),
+    };
+    assert!(
+        message.contains(&format!("engine on :{port} timed out"))
+            && message.contains("not restarting a live engine"),
+        "reason must name the class and refuse the reap: {message}"
+    );
+}
+
+#[tokio::test]
+async fn dead_engine_connect_failure_restarts_exactly_once() {
+    // FINDINGS-06 [2] restart-class proof, verified: the T10.1 mock death aborts
+    // the axum serve task so the port REFUSES and `send()` yields
+    // `is_connect()` (probe-verified: kind Request, source hyper Connect /
+    // ConnectionRefused 10061 - see report). `mock-dies-once` makes only the
+    // first engine a corpse and its replacement lives forever, so the crash-retry
+    // is fully deterministic. (A 502 "retry exhausted" end-to-end case is
+    // unattainable with this runtime: a dies-always engine cannot pass
+    // `/har/load` readiness, so the connect arm can never fire twice.)
+    let (control, work, _, _, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("doomed", "mock-dies-once", CategoryId::Work, Some(4.0))],
+    );
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"doomed"}"#).await;
+    assert_eq!(status, StatusCode::OK, "load: {body}");
+    assert_eq!(runtime.spawn_count(), 1);
+
+    let (_, loaded) = get_json(&control, "/har/status").await;
+    let port = u16::try_from(
+        loaded["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["model"] == "doomed")
+            .and_then(|slot| slot["port"].as_u64())
+            .expect("the serving slot reports its engine port"),
+    )
+    .expect("port fits u16");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !runtime.is_dead(port).await && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(runtime.is_dead(port).await, "the engine is really dead");
+
+    let (status, body) = post_json(
+        &work,
+        "/v1/chat/completions",
+        r#"{"model":"doomed","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "connect-class must crash-retry: {body}"
+    );
+    assert_eq!(body["echo"], true);
+    assert_eq!(
+        runtime.spawn_count(),
+        2,
+        "initial spawn + exactly one restart for the connect class"
+    );
 }

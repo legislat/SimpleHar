@@ -156,6 +156,14 @@ pub struct SlotStatus {
     pub serve_id: Option<String>,
     /// Job currently running for this slot, if any.
     pub loading_job: Option<JobId>,
+    /// When the occupant was loaded (copy of the actor's `Occupant::loaded_at`).
+    /// Empty slots carry the snapshot time, mirroring the `map_or(Instant::now(),
+    /// |o| o.loaded_at)` policy of the scheduler's own LRU picks. Not serialized:
+    /// an `Instant` has no wall-clock meaning outside the process, so `/har/status`
+    /// keeps exposing `idle_s`. The no-`model` proxy fallback sorts untouched
+    /// occupants by this (FINDINGS-06 [1]: never fabricate an instant instead).
+    #[serde(skip)]
+    pub loaded_at: Instant,
 }
 
 /// One job ledger entry (Step 12: this is what `loading: bool` always pretended to be).
@@ -277,6 +285,17 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
+    /// Test-only handle over a dummy channel: for unit tests that need an
+    /// `ApiState` but never issue scheduler commands (no actor is spawned).
+    #[cfg(test)]
+    pub(crate) fn test_dummy() -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        SchedulerHandle {
+            tx,
+            events: tokio::sync::broadcast::channel(1).0,
+        }
+    }
+
     /// Runtime switch for the decision-level log lines (page checkbox, off at
     /// boot): admit comparisons, settle evidence, full request ring.
     pub fn set_extended_logging(&self, on: bool) {
@@ -2628,6 +2647,7 @@ impl ActorState {
                     }),
                     serve_id: s.occupant.as_ref().and_then(|o| o.serve_id.clone()),
                     loading_job: s.job,
+                    loaded_at: s.occupant.as_ref().map_or(now, |o| o.loaded_at),
                 })
                 .collect(),
             jobs: self

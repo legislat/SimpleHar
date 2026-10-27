@@ -414,6 +414,7 @@ mod tests {
             idle_s: model.map(|_| 0),
             serve_id: None,
             loading_job: None,
+            loaded_at: std::time::Instant::now(),
         }
     }
 
