@@ -178,7 +178,13 @@ fn default_protected_ports() -> BTreeSet<u16> {
 }
 
 /// One declarative category: slot count, listener, and policy as data (DESIGN Step 5).
+///
+/// `deny_unknown_fields` (FINDINGS-11 [1]): the categories carry all the safety policy and
+/// the file is hand-edited, so a key typo must fail the boot like any other invalid value —
+/// silently defaulting `"max_model": 6` to `max_models: 1` or `"evictable": ["WORK"]` to an
+/// empty list is the D1 defect this file's module doc promises against.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CategoryConfig {
     /// Category identity; also the key referenced by `evictable_by` entries.
     pub id: CategoryId,
@@ -586,6 +592,17 @@ impl AppConfig {
         }
         let mut ports = BTreeMap::new();
         for cat in &self.categories {
+            if cat.public_port == 0 {
+                errors.push(ConfigError::Invalid {
+                    field: format!("categories.{}.public_port", cat.id),
+                    reason: "must not be 0 (port 0 binds an OS-chosen ephemeral listener, so \
+                             /har/status and the tray report a green listener no client can \
+                             address at the documented port; 0 is also the harness's own \
+                             \"no port\" sentinel, which hides the slot from the no-`model` \
+                             proxy path)"
+                        .to_string(),
+                });
+            }
             if let Some(owner) = ports.insert(cat.public_port, cat.id) {
                 errors.push(ConfigError::Invalid {
                     field: format!("categories.{}.public_port", cat.id),
@@ -602,10 +619,32 @@ impl AppConfig {
                 });
             }
         }
-        if self.vram_total_gb <= 0.0 {
+        if !(self.vram_total_gb.is_finite() && self.vram_total_gb > 0.0) {
             errors.push(ConfigError::Invalid {
                 field: "vram_total_gb".to_string(),
-                reason: "must be positive (the ledger ceiling, Step 4)".to_string(),
+                reason: "must be a finite number greater than 0 (the ledger ceiling, Step 4): \
+                         +inf admits the world onto one card and NaN makes every comparison \
+                         false, refusing forever"
+                    .to_string(),
+            });
+        }
+        if !(self.vram_reserve_gb.is_finite() && self.vram_reserve_gb >= 0.0) {
+            errors.push(ConfigError::Invalid {
+                field: "vram_reserve_gb".to_string(),
+                reason: "must be a finite number greater than or equal to 0 (the headroom kept \
+                         unreachable by admission, Step 4 rule 2; 0 means no reserve, while a \
+                         negative reserve makes the budget grow as more reserve is asked for)"
+                    .to_string(),
+            });
+        }
+        if !(self.witness_tolerance_gb.is_finite() && self.witness_tolerance_gb >= 0.0) {
+            errors.push(ConfigError::Invalid {
+                field: "witness_tolerance_gb".to_string(),
+                reason: "must be a finite number greater than or equal to 0 (the witness \
+                         disagreement band, Step 4 rule 4; +inf makes the settle gate's \
+                         `baseline + tolerance` test always true, deleting the pre-spawn \
+                         physical check)"
+                    .to_string(),
             });
         }
         // WSL coordinates are load-bearing for ninfer spawn AND container reap
@@ -629,10 +668,35 @@ impl AppConfig {
                     .to_string(),
             });
         }
-        if self.load_timeout_s == 0 {
+        // Same shape as the per-model `load_timeout` key (model/mod.rs): a u64 rejects
+        // nan/inf outright, and the ceiling guards a typo that would park a load job in
+        // readiness forever (FINDINGS-11 [6]).
+        if self.load_timeout_s == 0 || self.load_timeout_s > 86_400 {
             errors.push(ConfigError::Invalid {
                 field: "load_timeout_s".to_string(),
-                reason: "must be positive (readiness deadline, Step 3)".to_string(),
+                reason:
+                    "must be 1..=86400 (readiness deadline, Step 3): a zero deadline fails every \
+                     load instantly and one mistyped digit parks the job in `Loading` forever, \
+                     holding its slot, port and VRAM"
+                        .to_string(),
+            });
+        }
+        if self.release_timeout_s == 0 {
+            errors.push(ConfigError::Invalid {
+                field: "release_timeout_s".to_string(),
+                reason: "must be positive (G12 release-confirmation deadline, §0.3): a zero \
+                         timeout kills the victim and then fails its own confirmation, so the \
+                         dead model stays installed and the new load never spawns"
+                    .to_string(),
+            });
+        }
+        if self.settle_timeout_s == 0 {
+            errors.push(ConfigError::Invalid {
+                field: "settle_timeout_s".to_string(),
+                reason: "must be positive (G12 memory-settle deadline after a confirmed release, \
+                         §0.3): a zero timeout is the same loss one step later, once the \
+                         eviction has already run"
+                    .to_string(),
             });
         }
         if self.measured_sample_s == 0 {
@@ -647,6 +711,16 @@ impl AppConfig {
         let mut engine_ports_seen = BTreeSet::new();
         for (category, ports) in self.effective_engine_ports() {
             for port in ports {
+                if port == 0 {
+                    errors.push(ConfigError::Invalid {
+                        field: format!("categories.{category}.engine_ports"),
+                        reason: "must not be 0 (the engine argv gets `--port 0`, so the engine \
+                                 binds an OS-chosen ephemeral port while the harness probes :0 \
+                                 until the readiness deadline and the kill path keys the port \
+                                 the engine does not hold)"
+                            .to_string(),
+                    });
+                }
                 if !engine_ports_seen.insert(port) {
                     errors.push(ConfigError::Invalid {
                         field: format!("categories.{category}.engine_ports"),
@@ -974,6 +1048,223 @@ mod tests {
         let reloaded = AppConfig::parse(&text).expect("persisted denial parses");
         assert!(!reloaded.allow_mock_engine);
         assert!(reloaded.validate().is_empty());
+    }
+
+    /// True when `validate()` reports at least one problem naming `field`.
+    fn fails_with(config: &AppConfig, field: &str) -> bool {
+        config
+            .validate()
+            .iter()
+            .any(|e| e.to_string().contains(field))
+    }
+
+    /// The write-back document with one key mutated, as the parser sees it. Used for
+    /// category-level cases: hand-spelling a category would have to get all eight key names
+    /// right just to reach the case under test, and this keeps the field list the
+    /// serializer's rather than a copy that can drift from it.
+    fn parse_mutated(
+        mutation: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<AppConfig, ConfigError> {
+        let mut root = serde_json::to_value(AppConfig::default()).expect("invariant: serializes");
+        mutation(&mut root);
+        AppConfig::parse(&root.to_string())
+    }
+
+    #[test]
+    fn category_typos_are_refused_not_silently_defaulted() {
+        // FINDINGS-11 [1], mirroring `unknown_field_is_an_error_not_a_silent_default` one
+        // level down: the categories hold the whole safety policy and are hand-edited, so
+        // `"max_model": 6` must fail the boot instead of quietly booting a one-slot AUX.
+        let err = parse_mutated(|root| root["categories"][2]["max_model"] = serde_json::json!(6))
+            .expect_err("`max_model` is not a CategoryConfig key");
+        let message = err.to_string();
+        assert!(
+            message.contains("max_model") && message.contains(CONFIG_FILE),
+            "the error must name the unknown field and the file: {message}"
+        );
+
+        // Over-rejection guard: every name the serializer writes is a name the parser
+        // accepts, so the write-back round trip cannot strand the operator's file.
+        let exact = parse_mutated(|_| {}).expect("exact field names must parse");
+        assert!(exact.validate().is_empty(), "{:?}", exact.validate());
+    }
+
+    #[test]
+    fn vram_reserve_must_be_finite_and_non_negative() {
+        // FINDINGS-11 [2]: the reserve is the headroom kept unreachable by admission. The
+        // budget subtracts it from the total, so a negative value *grows* the budget the more
+        // reserve the operator asks for. serde_json refuses the `1e999` spelling as "number out
+        // of range" (settled here, as FINDINGS-11 [3] asked), so +inf reaches the struct only
+        // the way NaN does: hand-built, from a test or a future API-patched config.
+        let inf = AppConfig {
+            vram_reserve_gb: f64::INFINITY,
+            ..AppConfig::default()
+        };
+        assert!(
+            fails_with(&inf, "vram_reserve_gb"),
+            "+inf must be refused, not accepted as headroom"
+        );
+        assert!(
+            AppConfig::parse("{\"vram_reserve_gb\": 1e999}").is_err(),
+            "the JSON route refuses the overflow spelling too"
+        );
+        let negative = AppConfig::parse("{\"vram_reserve_gb\": -1000.0}").expect("parses");
+        assert!(fails_with(&negative, "vram_reserve_gb"));
+        // serde_json has no NaN literal, so NaN only arrives from a hand-built struct.
+        let nan = AppConfig {
+            vram_reserve_gb: f64::NAN,
+            ..AppConfig::default()
+        };
+        assert!(fails_with(&nan, "vram_reserve_gb"));
+        let legal = AppConfig::parse("{\"vram_reserve_gb\": 0.0}").expect("parses");
+        assert!(
+            legal.validate().is_empty(),
+            "0 means no reserve and is legal: {:?}",
+            legal.validate()
+        );
+    }
+
+    #[test]
+    fn witness_tolerance_must_be_finite_and_non_negative() {
+        // FINDINGS-11 [2]: the tolerance is the band of witness disagreement that is not a
+        // re-sample trigger. The settle gate accepts `baseline + tolerance`, so an inf
+        // tolerance makes that test always true and deletes the last check before a spawn.
+        // +inf arrives hand-built, as in `vram_reserve_must_be_finite_and_non_negative`.
+        let inf = AppConfig {
+            witness_tolerance_gb: f64::INFINITY,
+            ..AppConfig::default()
+        };
+        assert!(
+            fails_with(&inf, "witness_tolerance_gb"),
+            "+inf must be refused, not accepted as a band"
+        );
+        assert!(
+            AppConfig::parse("{\"witness_tolerance_gb\": 1e999}").is_err(),
+            "the JSON route refuses the overflow spelling too"
+        );
+        let negative = AppConfig::parse("{\"witness_tolerance_gb\": -1.0}").expect("parses");
+        assert!(fails_with(&negative, "witness_tolerance_gb"));
+        let nan = AppConfig {
+            witness_tolerance_gb: f64::NAN,
+            ..AppConfig::default()
+        };
+        assert!(fails_with(&nan, "witness_tolerance_gb"));
+        let legal = AppConfig::parse("{\"witness_tolerance_gb\": 0.0}").expect("parses");
+        assert!(
+            legal.validate().is_empty(),
+            "0 demands exact witness agreement and is legal"
+        );
+    }
+
+    #[test]
+    fn vram_total_ceiling_must_be_finite_and_positive() {
+        // FINDINGS-11 [3]: the old `<= 0.0` form was false for exactly the two values that
+        // make the ledger ceiling meaningless. +inf arrives hand-built, as in
+        // `vram_reserve_must_be_finite_and_non_negative`.
+        let inf = AppConfig {
+            vram_total_gb: f64::INFINITY,
+            ..AppConfig::default()
+        };
+        assert!(
+            fails_with(&inf, "vram_total_gb"),
+            "+inf admits the world onto one card"
+        );
+        assert!(
+            AppConfig::parse("{\"vram_total_gb\": 1e999}").is_err(),
+            "the JSON route refuses the overflow spelling too"
+        );
+        let nan = AppConfig {
+            vram_total_gb: f64::NAN,
+            ..AppConfig::default()
+        };
+        assert!(fails_with(&nan, "vram_total_gb"), "NaN refuses forever");
+        let negative = AppConfig::parse("{\"vram_total_gb\": -8.0}").expect("parses");
+        assert!(fails_with(&negative, "vram_total_gb"));
+        let zero = AppConfig::parse("{\"vram_total_gb\": 0.0}").expect("parses");
+        assert!(fails_with(&zero, "vram_total_gb"));
+        let legal = AppConfig::parse("{\"vram_total_gb\": 72.0}").expect("parses");
+        assert!(
+            legal.validate().is_empty(),
+            "72 GiB is the documented ceiling"
+        );
+    }
+
+    #[test]
+    fn release_timeout_refuses_zero() {
+        // FINDINGS-11 [5]: the reaper kills the victim first, so a zero deadline loses the
+        // model it meant to free and never spawns the new one.
+        let zero = AppConfig::parse("{\"release_timeout_s\": 0}").expect("parses");
+        assert!(
+            fails_with(&zero, "release_timeout_s"),
+            "a zero deadline fails its own release confirmation"
+        );
+        let legal = AppConfig::parse("{\"release_timeout_s\": 1}").expect("parses");
+        assert!(legal.validate().is_empty(), "1 s is legal, however tight");
+    }
+
+    #[test]
+    fn settle_timeout_refuses_zero() {
+        // FINDINGS-11 [5]: same shape as release_timeout_s, one step later — by the time the
+        // settle gate runs the eviction has already happened.
+        let zero = AppConfig::parse("{\"settle_timeout_s\": 0}").expect("parses");
+        assert!(
+            fails_with(&zero, "settle_timeout_s"),
+            "a zero deadline fails the settle gate after the eviction ran"
+        );
+        let legal = AppConfig::parse("{\"settle_timeout_s\": 1}").expect("parses");
+        assert!(legal.validate().is_empty(), "1 s is legal, however tight");
+    }
+
+    #[test]
+    fn load_timeout_is_bounded_below_and_at_one_day() {
+        // FINDINGS-11 [6]: the per-model `load_timeout` key already carries this ceiling
+        // (model/mod.rs); this field is its default, so it needs the same bound.
+        let day = AppConfig::parse("{\"load_timeout_s\": 86400}").expect("parses");
+        assert!(day.validate().is_empty(), "86_400 is the inclusive ceiling");
+        let over = AppConfig::parse("{\"load_timeout_s\": 86401}").expect("parses");
+        assert!(
+            fails_with(&over, "load_timeout_s"),
+            "one mistyped digit must not park a load job in readiness forever"
+        );
+        let zero = AppConfig::parse("{\"load_timeout_s\": 0}").expect("parses");
+        assert!(fails_with(&zero, "load_timeout_s"));
+    }
+
+    #[test]
+    fn public_port_zero_is_refused() {
+        // FINDINGS-11 [7]: port 0 binds an ephemeral listener, so /har/status and the tray
+        // report a green category no client can address at the documented port — and 0 is the
+        // harness's own "no port" sentinel, which hides the slot from the no-`model` proxy.
+        let zero =
+            parse_mutated(|root| root["categories"][3]["public_port"] = serde_json::json!(0))
+                .expect("0 parses as a u16");
+        let errors = zero.validate();
+        assert!(
+            errors.iter().any(|e| {
+                e.to_string().contains("categories.EMB.public_port")
+                    && e.to_string().contains("must not be 0")
+            }),
+            "an ephemeral public listener must fail the boot: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn engine_port_zero_is_refused() {
+        // FINDINGS-11 [7]: `--port 0` hands the engine an OS-chosen ephemeral port while the
+        // harness probes :0 until the readiness deadline and the kill path keys the port the
+        // engine does not hold. The list length must equal max_models, or the plan
+        // auto-assigns and the pinned 0 never reaches validation.
+        let zero =
+            parse_mutated(|root| root["categories"][0]["engine_ports"] = serde_json::json!([0]))
+                .expect("0 parses as a u16");
+        let errors = zero.validate();
+        assert!(
+            errors.iter().any(|e| {
+                e.to_string().contains("categories.WORK.engine_ports")
+                    && e.to_string().contains("must not be 0")
+            }),
+            "an ephemeral engine port must fail the boot: {errors:?}"
+        );
     }
 
     /// The serializer the config write-back uses (`api::persist_default_model`):
