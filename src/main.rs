@@ -609,6 +609,8 @@ Start Port    End Port
             launch_floor_gb: None,
             load_timeout_s: None,
             measured_gb: None,
+            measured_min_gb: None,
+            measured_offload: None,
             model_ref: model_ref.map(str::to_string),
             serve_model: None,
             file: None,

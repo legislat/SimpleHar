@@ -40,6 +40,14 @@ pub enum ModelError {
         /// Raw value.
         value: String,
     },
+    /// A harness-written stamp token is neither true nor false.
+    #[error("field `{field}` is not a boolean: `{value}`")]
+    BadBool {
+        /// Field name.
+        field: String,
+        /// Raw value.
+        value: String,
+    },
     /// `cost:` is not one of fixed|greedy|exact.
     #[error("bad `cost` value `{value}` (fixed|greedy|exact)")]
     BadCost {
@@ -95,12 +103,23 @@ pub struct ModelEntry {
     /// config default. Strata-class cold starts run for many minutes and would
     /// otherwise be cut off by the global gate (v3.3 parity).
     pub load_timeout_s: Option<u64>,
-    /// Engine footprint measured by the harness at its last successful load
-    /// (`measured_gb:`, written back after Install). The page shows it as truth
-    /// for every cost class; admission consults it only for `fixed` models with
-    /// no declared `vram_gb` (greedy keeps nominal semantics; exact refuses
-    /// without its declared precision claim).
+    /// High end of the engine footprint measured by the harness while this model
+    /// served (`measured_gb:`, written back after Install; see
+    /// [`ModelEntry::measured_min_gb`] for the low end). The page shows the range as
+    /// truth for every cost class; admission consults the high end only for `fixed`
+    /// models with no declared `vram_gb` (greedy keeps nominal semantics; exact
+    /// refuses without its declared precision claim).
     pub measured_gb: Option<f64>,
+    /// Low end of the measured range (`measured_gb_min:`): the smallest witness
+    /// total-diff seen while the model served. The spread is what the model actually
+    /// varies over — a growing KV cache — not measurement noise, so booking a single
+    /// point would be a guess with false precision.
+    pub measured_min_gb: Option<f64>,
+    /// The `cpu_offload` setting the range was measured under (`measured_offload:`),
+    /// written with it. An offloaded launch has no comparable footprint, so a flip
+    /// between then and now voids the pair at scan time (measured values verify, they
+    /// never mislead).
+    pub measured_offload: Option<bool>,
     /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
     /// Informational for managed models; used for stem/path aliases (Step 10).
     pub model_ref: Option<String>,
@@ -143,6 +162,81 @@ fn parse_gib(field: &str, raw: &str) -> Result<f64, ModelError> {
         });
     }
     Ok(v)
+}
+
+/// The measured footprint pair and the `cpu_offload` setting it was taken under
+/// (high end, low end, stamp).
+type MeasuredPair = (Option<f64>, Option<f64>, Option<bool>);
+
+/// Reads the measured footprint pair and its `cpu_offload` stamp together, because
+/// they are only meaningful as a unit: if the model is now launched differently than
+/// when it was measured, the range describes a different run and is dropped (the stamp
+/// itself survives so the page can say what it was measured under).
+///
+/// # Errors
+///
+/// [`ModelError::BadNumber`] for a non-numeric or sub-quantum size, [`ModelError::BadBool`]
+/// for an unreadable stamp, and a `measured_gb_min` that exceeds its `measured_gb` or
+/// appears without one.
+fn read_measured(keys: &BTreeMap<String, String>) -> Result<MeasuredPair, ModelError> {
+    let stamp = keys
+        .get("measured_offload")
+        .map(|raw| parse_bool_stamp("measured_offload", raw))
+        .transpose()?;
+    // Read the live setting with the engine's own truth set, the same one the page uses
+    // (HANDOFF §6): a flip must not hide behind a third reading of the same token.
+    let offload_now = keys
+        .get("cpu_offload")
+        .is_some_and(|v| crate::engine::llama::jinja_on(v));
+    if stamp.is_some_and(|stamped| stamped != offload_now) {
+        return Ok((None, None, stamp));
+    }
+    let size = |field: &str, raw: &str| -> Result<f64, ModelError> {
+        let v = parse_gib(field, raw)?;
+        // Below the writer's 0.1 quantum: a footprint this small means nothing was
+        // attributed — absence, not a measurement, and persisting it would write the
+        // exact token the reader rejects.
+        if v < 0.05 {
+            return Err(ModelError::BadNumber {
+                field: field.to_string(),
+                value: raw.to_string(),
+            });
+        }
+        Ok(v)
+    };
+    let max = keys
+        .get("measured_gb")
+        .map(|raw| size("measured_gb", raw))
+        .transpose()?;
+    let min = keys
+        .get("measured_gb_min")
+        .map(|raw| {
+            let v = size("measured_gb_min", raw)?;
+            match max {
+                Some(max) if v <= max => Ok(v),
+                // A lone low end cannot book anything, and an inverted pair is a typo
+                // that would silently widen every range read from it.
+                Some(_) | None => Err(ModelError::BadNumber {
+                    field: "measured_gb_min".to_string(),
+                    value: raw.to_string(),
+                }),
+            }
+        })
+        .transpose()?;
+    Ok((max, min, stamp))
+}
+
+/// Strict reading of a boolean token this harness wrote itself: the engine's truth set
+/// plus its explicit negatives, so a typo is a scan error rather than a silent false.
+fn parse_bool_stamp(field: &str, raw: &str) -> Result<bool, ModelError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(true),
+        "false" | "0" | "off" | "no" => Ok(false),
+        _ => Err(ModelError::BadBool {
+            field: field.to_string(),
+            value: raw.to_string(),
+        }),
+    }
 }
 
 /// Which figure admission will book for an entry. Decided once, here, and read by
@@ -252,6 +346,7 @@ impl ModelEntry {
             }
             None => None,
         };
+        let (measured_gb, measured_min_gb, measured_offload) = read_measured(keys)?;
         Ok(ModelEntry {
             name: name.trim().to_string(),
             engine: keys
@@ -264,21 +359,9 @@ impl ModelEntry {
             cost,
             launch_floor_gb,
             load_timeout_s,
-            measured_gb: match keys.get("measured_gb") {
-                Some(raw) => {
-                    let v = parse_gib("measured_gb", raw)?;
-                    if v < 0.05 {
-                        // Below the writer's 0.1 quantum: a footprint this small
-                        // means nothing was attributed — absence, not a measurement.
-                        return Err(ModelError::BadNumber {
-                            field: "measured_gb".to_string(),
-                            value: raw.to_string(),
-                        });
-                    }
-                    Some(v)
-                }
-                None => None,
-            },
+            measured_gb,
+            measured_min_gb,
+            measured_offload,
             model_ref: keys.get("model").cloned(),
             serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
             file: None,
@@ -313,6 +396,79 @@ mod tests {
         assert_eq!(entry.category, CategoryId::Work);
         assert_eq!(entry.engine, "llama");
         assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
+    }
+
+    #[test]
+    fn measured_range_parses_and_books_its_high_end() {
+        let entry = ModelEntry::from_flat(&flat(&[
+            ("name", "m"),
+            ("measured_gb", "41.7"),
+            ("measured_gb_min", "24.3"),
+            ("measured_offload", "false"),
+            ("cpu_offload", "false"),
+        ]))
+        .expect("valid range");
+        assert_eq!(entry.measured_gb, Some(41.7));
+        assert_eq!(entry.measured_min_gb, Some(24.3));
+        assert_eq!(entry.measured_offload, Some(false));
+        assert_eq!(entry.cost_source(), CostSource::Measured);
+    }
+
+    #[test]
+    fn an_inverted_or_orphan_low_end_is_a_scan_error() {
+        let inverted = ModelEntry::from_flat(&flat(&[
+            ("name", "m"),
+            ("measured_gb", "10"),
+            ("measured_gb_min", "30"),
+        ]));
+        assert!(
+            matches!(inverted, Err(ModelError::BadNumber { ref field, .. }) if field == "measured_gb_min"),
+            "an inverted pair would silently widen every range read from it"
+        );
+        assert!(
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb_min", "10")])).is_err(),
+            "a low end with no high end books nothing"
+        );
+    }
+
+    #[test]
+    fn a_cpu_offload_flip_voids_the_range_but_keeps_its_stamp() {
+        // The pair describes a different launch: an offloaded run has no comparable
+        // footprint, so it must be neither booked nor displayed (§0.4 invalidation).
+        let entry = ModelEntry::from_flat(&flat(&[
+            ("name", "m"),
+            ("measured_gb", "41.7"),
+            ("measured_gb_min", "24.3"),
+            ("measured_offload", "true"),
+            ("cpu_offload", "false"),
+        ]))
+        .expect("still a valid entry");
+        assert_eq!(entry.measured_gb, None);
+        assert_eq!(entry.measured_min_gb, None);
+        assert_eq!(
+            entry.measured_offload,
+            Some(true),
+            "the page can still say what it was measured under"
+        );
+        assert_eq!(entry.cost_source(), CostSource::Estimate);
+        // A flip is judged with the engine's truth set, so `on` is `true` here too —
+        // a third reading of the token would let a flip hide (HANDOFF §6).
+        let agreed = ModelEntry::from_flat(&flat(&[
+            ("name", "m"),
+            ("measured_gb", "41.7"),
+            ("measured_offload", "true"),
+            ("cpu_offload", "on"),
+        ]))
+        .expect("valid");
+        assert_eq!(agreed.measured_gb, Some(41.7));
+    }
+
+    #[test]
+    fn an_unreadable_offload_stamp_is_a_scan_error_not_a_silent_false() {
+        let err = ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_offload", "maybe")]));
+        assert!(
+            matches!(err, Err(ModelError::BadBool { ref field, .. }) if field == "measured_offload")
+        );
     }
 
     #[test]

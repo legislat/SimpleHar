@@ -18,17 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Scripted witness: samples come off the queue (the last one repeats).
-/// `live` — when set — overrides the per-process table at sample time, so a
-/// test can attribute a pid it only learns after a spawn (install-measure
-/// retries) without fighting the queue for pop order.
-type Procs = Vec<(u32, f64)>;
-
 #[derive(Clone, Default)]
 struct FakeWitness {
     queue: Arc<Mutex<VecDeque<MemorySample>>>,
-    live: Arc<Mutex<Option<Procs>>>,
     /// Overrides `used_gib` on *every* reading. An override, not a queue step:
-    /// unrelated samples (the measured-footprint task, a status poll) also pop the
+    /// unrelated samples (the serving-window sampler, a status poll) also pop the
     /// queue, so a scripted sequence silently shifts when anyone else asks.
     used: Arc<Mutex<Option<f64>>>,
 }
@@ -37,17 +31,12 @@ impl FakeWitness {
     fn with(samples: Vec<MemorySample>) -> Self {
         FakeWitness {
             queue: Arc::new(Mutex::new(samples.into())),
-            live: Arc::new(Mutex::new(None)),
             used: Arc::new(Mutex::new(None)),
         }
     }
 
     fn set_used(&self, used: f64) {
         *self.used.lock().expect("witness used lock") = Some(used);
-    }
-
-    fn set_procs(&self, procs: Procs) {
-        *self.live.lock().expect("witness lock") = Some(procs);
     }
 }
 
@@ -70,9 +59,6 @@ impl VramWitness for FakeWitness {
                 })
             }
         };
-        if let Some(procs) = self.live.lock().expect("witness lock").as_ref() {
-            base.processes = procs.clone();
-        }
         if let Some(used) = *self.used.lock().expect("witness used lock") {
             base.used_gib = used;
         }
@@ -422,11 +408,9 @@ async fn greedy_replacement_clears_floor_after_victim_release() {
     // replacement victim dies first, so the floor is judged on the fresh observed
     // free at settle, never on the pre-release reading that still counts the
     // victim's own memory.
-    let witness = FakeWitness::with(vec![
-        sample(72.0, 35.4), // holder admit
-        sample(72.0, 35.4), // chonky admit: victim planned -> no pre-release clamp
-        sample(72.0, 0.0),  // settle: card actually emptied
-    ]);
+    // One repeating sample plus an explicit `used` override: which phase a reading
+    // belongs to must not depend on how many readings anyone takes.
+    let witness = FakeWitness::with(vec![sample(72.0, 35.4)]);
     let handle = harness_ext(
         &[
             (
@@ -450,13 +434,16 @@ async fn greedy_replacement_clears_floor_after_victim_release() {
                 ],
             ),
         ],
-        Arc::new(witness),
+        Arc::new(witness.clone()),
         5,
     );
     handle
         .swap("holder", CategoryId::Work)
         .await
         .expect("holder loads");
+    // The victim's release is what empties the card, so the floor is judged here:
+    // an override, not a queue step, so no extra reading can shift it.
+    witness.set_used(0.0);
     let Reply::Loaded(receipt) = handle
         .swap("chonky", CategoryId::Work)
         .await
@@ -487,11 +474,7 @@ async fn settle_refuses_when_observed_card_stays_busy() {
     // Same replacement, but the card never empties (foreign holder keeps 20 GiB):
     // the release is confirmed, yet the FRESH observed free sits below the floor
     // - the load is refused at settle with an explanatory error, engine unspawned.
-    let witness = FakeWitness::with(vec![
-        sample(72.0, 35.4),
-        sample(72.0, 35.4),
-        sample(72.0, 20.0),
-    ]);
+    let witness = FakeWitness::with(vec![sample(72.0, 35.4)]);
     let handle = harness_ext(
         &[
             (
@@ -515,13 +498,16 @@ async fn settle_refuses_when_observed_card_stays_busy() {
                 ],
             ),
         ],
-        Arc::new(witness),
+        Arc::new(witness.clone()),
         3,
     );
     handle
         .swap("holder", CategoryId::Work)
         .await
         .expect("holder loads");
+    // A foreign holder keeps 20 GiB of the card through the release, so the fresh
+    // observed free at settle sits under the floor and the load is refused there.
+    witness.set_used(20.0);
     handle
         .swap("chonky", CategoryId::Work)
         .await
@@ -584,159 +570,5 @@ async fn fresh_load_refused_on_physically_full_card() {
     assert_eq!(
         model_of(&status, CategoryId::Work).as_deref(),
         Some("resident")
-    );
-}
-
-#[tokio::test]
-async fn install_records_measured_footprint_and_persists_it() {
-    // Operator 2026-10-26: a greedy model's nominal size is not its footprint.
-    // The install-time witness sample measures it, the catalog shows the truth,
-    // and the model yaml records `measured_gb` byte-preservingly for later boots.
-    let dir = write_modelconf_ext(&[(
-        "stratoid",
-        &[
-            "name: stratoid",
-            "engine: mock",
-            "category: WORK",
-            "vram_gb: 55",
-            "cost: greedy",
-            "launch_only_with_at_least_vram_free: 65",
-        ],
-    )]);
-    // Attribution is live-settled by the witness: a decoy entry keeps the
-    // measure task retrying until the test scripts the real pid (no pop-order
-    // race, no guessed pid).
-    let witness = FakeWitness::with(vec![sample(72.0, 0.0)]);
-    witness.set_procs(vec![(999_999, 0.0)]);
-    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
-    adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let cfg = AppConfig {
-        settle_timeout_s: 5,
-        ..AppConfig::default()
-    };
-    let handle = Scheduler::start(
-        cfg,
-        dir.clone(),
-        adapters,
-        Arc::new(MockRuntime::with_unique_pids(41_000)) as Arc<dyn EngineRuntime>,
-        Arc::new(witness.clone()),
-    );
-    handle
-        .swap("stratoid", CategoryId::Work)
-        .await
-        .expect("greedy loads on an idle card");
-    let status = handle.status().await.expect("actor alive");
-    let pid = status
-        .slots
-        .iter()
-        .find(|s| s.category == CategoryId::Work)
-        .and_then(|s| s.pid)
-        .expect("occupant pid surfaced");
-    witness.set_procs(vec![(pid, 70.5)]);
-
-    let yaml = dir.join("stratoid.yaml");
-    let mut written = None;
-    for _ in 0..50 {
-        if let Ok(text) = std::fs::read_to_string(&yaml) {
-            if text.contains("measured_gb:") {
-                written = Some(text);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let text = written.expect("measured_gb written back to the yaml");
-    assert!(text.contains("measured_gb: 70.5"), "{text}");
-    assert!(
-        text.contains("cost: greedy"),
-        "write-back preserves the file"
-    );
-    let catalog = handle.catalog().await.expect("catalog");
-    let entry = catalog
-        .models
-        .iter()
-        .find(|m| m.name == "stratoid")
-        .expect("entry");
-    assert_eq!(entry.measured_gb, Some(70.5));
-}
-
-#[tokio::test]
-async fn measured_charges_only_the_installed_engine() {
-    // Review BLOCKER 2026-10-26: measuring the union of all harness pids would
-    // charge a co-resident tenant's memory to the new model (45 recorded as 75).
-    let dir = write_modelconf_ext(&[
-        (
-            "decoy",
-            &[
-                "name: decoy",
-                "engine: mock",
-                "category: AUX",
-                "vram_gb: 30",
-            ],
-        ),
-        (
-            "target",
-            &[
-                "name: target",
-                "engine: mock",
-                "category: WORK",
-                "vram_gb: 30",
-            ],
-        ),
-    ]);
-    let witness = FakeWitness::with(vec![sample(72.0, 0.0)]);
-    witness.set_procs(vec![(999_999, 0.0)]);
-    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
-    adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let cfg = AppConfig {
-        settle_timeout_s: 5,
-        ..AppConfig::default()
-    };
-    let handle = Scheduler::start(
-        cfg,
-        dir.clone(),
-        adapters,
-        Arc::new(MockRuntime::with_unique_pids(41_000)) as Arc<dyn EngineRuntime>,
-        Arc::new(witness.clone()),
-    );
-    handle
-        .swap("decoy", CategoryId::Aux)
-        .await
-        .expect("decoy loads");
-    handle
-        .swap("target", CategoryId::Work)
-        .await
-        .expect("target loads");
-    let status = handle.status().await.expect("actor alive");
-    let pid_of = |category: CategoryId| {
-        status
-            .slots
-            .iter()
-            .find(|s| s.category == category)
-            .and_then(|s| s.pid)
-            .expect("occupant pid surfaced")
-    };
-    let p_decoy = pid_of(CategoryId::Aux);
-    let p_target = pid_of(CategoryId::Work);
-    witness.set_procs(vec![(p_decoy, 30.0), (p_target, 30.0)]);
-
-    let yaml = dir.join("target.yaml");
-    let mut text = String::new();
-    for _ in 0..50 {
-        if let Ok(read) = std::fs::read_to_string(&yaml) {
-            if read.contains("measured_gb:") {
-                text = read;
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        text.contains("measured_gb: 30.0"),
-        "only the installed engine is charged: {text}"
-    );
-    assert!(
-        !text.contains("60.0"),
-        "the decoy is never folded in: {text}"
     );
 }

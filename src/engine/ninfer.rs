@@ -199,6 +199,8 @@ mod tests {
             launch_floor_gb: None,
             load_timeout_s: Some(600),
             measured_gb: None,
+            measured_min_gb: None,
+            measured_offload: None,
             model_ref: Some("ninfer://ninfer-x:8004/served".to_string()),
             serve_model: Some("served".to_string()),
             file: None,

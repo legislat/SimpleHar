@@ -63,6 +63,7 @@ partial files are completed, an invalid file is fatal with every problem logged
 | `witness_tolerance_gb` | `2.0` | NVML/ledger disagreement band; also the settle allowance |
 | `greedy_launch_min_free_gb` | `4.0` | Launch floor applied to `cost: greedy` models without their own `launch_only_with_at_least_vram_free` |
 | `load_timeout_s` | `120` | Readiness deadline per load; per-model override via the `load_timeout:` yaml key |
+| `measured_sample_s` | `60` | Seconds between witness samples while a model serves; builds the `measured_gb`/`measured_gb_min` range |
 | `release_timeout_s` | `60` | Kill-confirmation deadline (G12) |
 | `settle_timeout_s` | `30` | Memory-settle deadline after release |
 | `protected_ports` | `8003-8005`, `8009`, `8016-8017`, `8030`, `18203-18209` | Ports the harness must never bind or touch |
@@ -86,7 +87,9 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `launch_only_with_at_least_vram_free` | GiB. Refuse the load **before spawn** unless the physically free card reaches this floor (reserve deducted; foreign processes counted whenever per-process attribution is available) — the thrash guard for big/greedy quants. Greedy models without it inherit `greedy_launch_min_free_gb`; set `0` per-model to opt out explicitly |
 | `cpu_offload` | `true`/`1`/`on` → forces `-ngl 0` |
 | `serve_model` | Expected engine-reported id; mismatch = recorded warning, never trusted |
-| `measured_gb` | Written back by the harness after a successful load: the engine's witness-measured VRAM footprint, attributed to that engine's pid alone. The page shows it as truth for every cost class; admission consults it only for `fixed` models that lack `vram_gb` (greedy keeps nominal semantics, exact refuses without its declaration); a large divergence from `vram_gb` logs a verification warning |
+| `measured_gb` | High end of the footprint the harness measured from the witness while this model served (`total - used` diff against the free memory its load was admitted at, sampled every `measured_sample_s`). Written back after a load; `fixed` admission books it when `vram_gb` is absent, and a large divergence from `vram_gb` logs a verification warning |
+| `measured_gb_min` | Low end of that range: the smallest total-diff seen while serving. The spread is the KV cache growing during a session, which is why one number would be false precision. Must not exceed `measured_gb` |
+| `measured_offload` | The `cpu_offload` setting the pair was measured under, written with it. An offloaded launch has no comparable footprint, so flipping `cpu_offload` voids both values at scan while leaving the stamp visible on the page |
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `sticky` | Legacy alias → `AUX` |
 | `context`, `batch`, `flash_attn`, … | Mapped to llama flags per the start.ps1 parity table |

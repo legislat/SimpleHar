@@ -234,11 +234,14 @@ const driver = `
     ...fixtures["/har/status"],
     models: [
       { id: "greedyone", engine: "strata", category: "WORK", vram_gb: 55, cost: "greedy",
-        launch_floor_gb: 65, measured_gb: null, context: null, model_ref: "strata://g",
-        serve_model: null, cpu_offload: false },
+        launch_floor_gb: 65, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "strata://g", serve_model: null, cpu_offload: false },
       { id: "measuredone", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
-        launch_floor_gb: null, measured_gb: 29.9, est_vram_gb: 29.4, context: null,
-        model_ref: "F:/x.gguf", serve_model: null, cpu_offload: false },
+        launch_floor_gb: null, measured_gb: 29.9, measured_min_gb: null, est_vram_gb: 29.4,
+        context: null, model_ref: "F:/x.gguf", serve_model: null, cpu_offload: false },
+      { id: "rangeone", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        launch_floor_gb: null, measured_gb: 41.7, measured_min_gb: 24.3, est_vram_gb: null,
+        context: null, model_ref: "F:/y.gguf", serve_model: null, cpu_offload: false },
     ],
   });
   const costs = {};
@@ -251,6 +254,8 @@ const driver = `
     costs["greedyone"] === "greedy · floor 65 GiB", JSON.stringify(costs));
   check("measured row shows measured",
     costs["measuredone"] === "measured 29.9 GiB", JSON.stringify(costs));
+  check("measured row shows the range when a low end exists",
+    costs["rangeone"] === "measured 24.3-41.7 GiB", JSON.stringify(costs));
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
 
   for (const [name, ok, extra] of results)

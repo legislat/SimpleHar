@@ -154,6 +154,8 @@ mod tests {
             launch_floor_gb: None,
             load_timeout_s: None,
             measured_gb: None,
+            measured_min_gb: None,
+            measured_offload: None,
             model_ref: Some("strata://test".to_string()),
             serve_model: Some("qwen3.8-flash-next".to_string()),
             file: None,

@@ -168,7 +168,7 @@ async fn settle_blocks_spawn_while_the_card_has_not_freed() {
         settle_timeout_s: 1,
         ..AppConfig::default()
     };
-    let handle = harness_models(
+    let (handle, _dir) = harness_models(
         cfg,
         &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 8.0)],
         Arc::new(witness.clone()),
@@ -208,7 +208,7 @@ async fn settle_passes_once_the_card_frees() {
         settle_timeout_s: 5,
         ..AppConfig::default()
     };
-    let handle = harness_models(
+    let (handle, _dir) = harness_models(
         cfg,
         &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 8.0)],
         Arc::new(witness.clone()),
@@ -252,7 +252,7 @@ async fn settle_fails_closed_when_the_witness_dies_mid_window() {
         settle_timeout_s: 1,
         ..AppConfig::default()
     };
-    let handle = harness_models(
+    let (handle, _dir) = harness_models(
         cfg,
         &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 8.0)],
         Arc::new(witness.clone()),
@@ -320,29 +320,96 @@ async fn unreadable_card_reading_refuses_rather_than_silently_fitting() {
     );
 }
 
+#[tokio::test]
+async fn serving_window_folds_total_diff_into_the_yaml_measured_range() {
+    // §0.4 item c: while a model serves, the witness total-diff is sampled on
+    // `measured_sample_s` and persisted as `measured_gb` (the high end `fixed` books),
+    // `measured_gb_min` (the low end the page shows) and the `cpu_offload` setting the
+    // pair was taken under, so a later flip voids it at scan.
+    // A foreign process already holds 30 GiB. The baseline is the free memory this load
+    // was admitted at, so the tenant must never be folded into the range — the
+    // guarantee the old pid-attributed sample gave, kept on the new basis.
+    let witness = FakeWitness::with(vec![sample(72.0, 30.0, vec![])]);
+    let cfg = AppConfig {
+        measured_sample_s: 1,
+        ..AppConfig::default()
+    };
+    let (handle, dir) = harness_models(
+        cfg,
+        &[("a", CategoryId::Work, 8.0)],
+        Arc::new(witness.clone()),
+    );
+    let Reply::Loaded(_) = handle.swap("a", CategoryId::Work).await.expect("a loads") else {
+        panic!("expected Loaded");
+    };
+
+    // The card filling by 10 then 20 GiB is this model's own footprint growing — the
+    // KV cache spread the range exists to record.
+    let await_range = |high: f64, low: Option<f64>| {
+        let handle = handle.clone();
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let catalog = handle.catalog().await.expect("actor alive");
+                let entry = catalog.models.iter().find(|m| m.name == "a");
+                if entry.is_some_and(|m| m.measured_gb == Some(high) && m.measured_min_gb == low) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "range never reached {high}/{low:?}: {:?}",
+                    entry.map(|m| (m.measured_gb, m.measured_min_gb, m.measured_offload))
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    witness.set(sample(72.0, 40.0, vec![]));
+    await_range(10.0, Some(10.0)).await;
+    witness.set(sample(72.0, 50.0, vec![]));
+    await_range(20.0, Some(10.0)).await;
+
+    let yaml = std::fs::read_to_string(dir.join("a.yaml")).expect("yaml readable");
+    assert!(yaml.contains("measured_gb: 20.0"), "was: {yaml}");
+    assert!(yaml.contains("measured_gb_min: 10.0"), "was: {yaml}");
+    assert!(
+        yaml.contains("measured_offload: false"),
+        "the pair must carry the setting it was measured under: {yaml}"
+    );
+    assert!(
+        yaml.contains("engine: mock") && yaml.contains("vram_gb: 8"),
+        "the write-back preserves the rest of the file: {yaml}"
+    );
+}
+
 /// `harness` with a per-model `vram_gb` (the shared one pins 4 GiB for everything).
+/// Returns the catalog directory too: write-back tests read the yaml back from it.
 fn harness_models(
     cfg: AppConfig,
     specs: &[(&'static str, CategoryId, f64)],
     witness: Arc<dyn VramWitness>,
-) -> SchedulerHandle {
+) -> (SchedulerHandle, std::path::PathBuf) {
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let dir = simplehar_se::testutil::temp_dir("wit-models");
+    let catalog_dir = simplehar_se::testutil::temp_dir("wit-models");
     for (name, category, vram) in specs {
         std::fs::write(
-            dir.join(format!("{name}.yaml")),
+            catalog_dir.join(format!("{name}.yaml")),
             format!("name: {name}\nengine: mock\ncategory: {category}\nvram_gb: {vram}\n"),
         )
         .expect("model yaml");
     }
-    Scheduler::start(
-        cfg,
-        dir,
-        adapters,
-        Arc::new(runtime) as Arc<dyn EngineRuntime>,
-        witness,
+    (
+        Scheduler::start(
+            cfg,
+            catalog_dir.clone(),
+            adapters,
+            Arc::new(runtime) as Arc<dyn EngineRuntime>,
+            witness,
+        ),
+        catalog_dir,
     )
 }
 
@@ -407,7 +474,7 @@ async fn concurrent_loads_cannot_double_spend_the_same_bytes() {
         vram_reserve_gb: 2.0,
         ..AppConfig::default()
     };
-    let handle = harness_models(
+    let (handle, _dir) = harness_models(
         cfg,
         &[
             ("a0", CategoryId::Work, 10.0),

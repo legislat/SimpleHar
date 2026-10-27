@@ -123,6 +123,10 @@ fn default_greedy_min_free() -> f64 {
     4.0
 }
 
+fn default_measured_sample_s() -> u64 {
+    60
+}
+
 fn default_wsl_distro() -> String {
     "Ubuntu".to_string()
 }
@@ -304,6 +308,12 @@ pub struct AppConfig {
     /// template schema (Step 3 knobs).
     #[serde(default = "default_load_timeout")]
     pub load_timeout_s: u64,
+    /// Interval between witness samples while a model serves, which build the
+    /// `measured_gb`/`measured_gb_min` range (§0.4 measured cost). One minute by
+    /// default: the KV cache grows over a session, so a faster cadence only buys a
+    /// wider max, while a slower one can miss the peak entirely.
+    #[serde(default = "default_measured_sample_s")]
+    pub measured_sample_s: u64,
     /// Whether the tray icon starts with the harness (Step 15; loopback tool knob, G9).
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
@@ -373,6 +383,7 @@ impl Default for AppConfig {
             settle_timeout_s: default_settle_timeout(),
             witness_tolerance_gb: default_witness_tolerance(),
             greedy_launch_min_free_gb: default_greedy_min_free(),
+            measured_sample_s: default_measured_sample_s(),
             wsl_distro: default_wsl_distro(),
             wsl_user: None,
             control_token: None,
@@ -601,6 +612,14 @@ impl AppConfig {
                 reason: "must be positive (readiness deadline, Step 3)".to_string(),
             });
         }
+        if self.measured_sample_s == 0 {
+            errors.push(ConfigError::Invalid {
+                field: "measured_sample_s".to_string(),
+                reason:
+                    "must be positive (a zero cadence would spin the witness; 60 is the default)"
+                        .to_string(),
+            });
+        }
         // Engine ports: unique among themselves and disjoint from both namespaces.
         let mut engine_ports_seen = BTreeSet::new();
         for (category, ports) in self.effective_engine_ports() {
@@ -733,6 +752,21 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(cfg.validate().is_empty(), "0.0.0.0 must validate");
+    }
+
+    #[test]
+    fn measured_cadence_defaults_to_a_minute_and_refuses_zero() {
+        let absent = AppConfig::parse("{}").expect("defaults parse");
+        assert_eq!(absent.measured_sample_s, 60);
+        assert!(absent.validate().is_empty());
+        let zero = AppConfig::parse("{\"measured_sample_s\": 0}")
+            .expect("parses")
+            .validate();
+        assert!(
+            zero.iter()
+                .any(|e| e.to_string().contains("measured_sample_s")),
+            "a zero cadence would spin the witness instead of sampling it"
+        );
     }
 
     #[test]

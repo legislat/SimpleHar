@@ -476,13 +476,12 @@ enum ActorMsg {
     Touch {
         model: String,
     },
-    /// Witness-measured engine footprint from the install task (fire-and-forget):
-    /// displayed as truth and persisted to the model yaml for later reference
-    /// (operator 2026-10-26). `pid` binds the sample to the exact engine it was
-    /// taken for; a late message for a swapped-out model is dropped.
+    /// One witness total-diff taken while `model` serves (§0.4 measured cost): the
+    /// serving-window sampler folds it into the model's `measured_gb` range and the
+    /// yaml write-back follows. A message for a model that no longer occupies a slot
+    /// is dropped, as is one taken while another swap is in flight.
     Measured {
         model: String,
-        pid: u32,
         gib: f64,
     },
     /// Periodic sweep from the tick task: idles out occupants per category policy.
@@ -526,6 +525,9 @@ struct Occupant {
     /// The engine's self-reported model id (discovered at readiness, F-4 fix);
     /// proxy rewriting targets this, falling back to the harness name.
     serve_id: Option<String>,
+    /// Serving-window witness sampler folding this occupant's total-diff into the
+    /// model's measured range; aborted the moment the slot empties (§0.4).
+    measure: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// A release target during Quiesce/Dispose (Step 6 calls these victims).
@@ -651,7 +653,7 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
         match msg {
             ActorMsg::Command { cmd, reply } => state.on_command(cmd, reply),
             ActorMsg::Touch { model } => state.touch_model(&model),
-            ActorMsg::Measured { model, pid, gib } => state.on_measured(&model, pid, gib),
+            ActorMsg::Measured { model, gib } => state.on_measured(&model, gib),
             ActorMsg::Tick => {
                 state.on_tick();
                 state.publish();
@@ -1067,56 +1069,90 @@ impl ActorState {
         self.last_used.insert(model.to_string(), Instant::now());
     }
 
-    /// Records the install-time witness footprint: on the catalog entry (page
-    /// shows it without a rescan) and — when it changed — in the model yaml
-    /// (`measured_gb`, byte-preserving write-back) so the number is referenced
-    /// on later boots (operator 2026-10-26). The pid must still be the serving
-    /// engine's own (late samples for swapped-out models are dropped) and a
-    /// value far from the declared size verifies the declaration with a warning
-    /// (design: measurement verifies, never silently overrides).
-    fn on_measured(&mut self, model: &str, pid: u32, gib: f64) {
-        let live = self.slots.iter().any(|slot| {
-            slot.occupant
-                .as_ref()
-                .is_some_and(|o| o.model == model && o.ticket.pid == pid)
-        });
+    /// Folds one serving-window total-diff into the model's measured range and writes
+    /// it back to the yaml (§0.4): `measured_gb` keeps the high end — what `fixed`
+    /// admission consults — and `measured_gb_min` the low end the page shows, with the
+    /// `cpu_offload` setting they were taken under so a later flip voids them at scan.
+    /// Two guards keep the number honest: the model must still occupy a slot, and no
+    /// other job may be in flight, so a co-resident engine starting up is never
+    /// charged to this model (measurement verifies, it never guesses).
+    fn on_measured(&mut self, model: &str, gib: f64) {
+        let live = self
+            .slots
+            .iter()
+            .any(|slot| slot.occupant.as_ref().is_some_and(|o| o.model == model));
         if !live {
+            return;
+        }
+        let swapping = self
+            .jobs
+            .values()
+            .any(|job| !job.terminal && job.model != model);
+        if swapping {
             return;
         }
         let rounded = (gib * 10.0).round() / 10.0;
         if rounded < 0.05 {
-            // Sub-quantum attribution is absence, not a measurement: persisting
-            // it would write the exact token the scanner's reader rule rejects.
+            // Sub-quantum attribution is absence, not a measurement: persisting it
+            // would write the exact token the scanner's reader rule rejects.
             return;
         }
-        let mut persist: Option<std::path::PathBuf> = None;
+        let mut persist: Option<(std::path::PathBuf, f64, f64, bool)> = None;
         let mut changed = false;
         if let Some(entry) = self.catalog.iter_mut().find(|m| m.name == model) {
-            if entry.measured_gb != Some(rounded) {
+            // Stamped with the engine's own truth set, the reading the page and the
+            // adapter use, so the invalidation cannot disagree with them (HANDOFF §6).
+            let offload = entry
+                .raw
+                .get("cpu_offload")
+                .is_some_and(|v| crate::engine::llama::jinja_on(v));
+            let high = entry.measured_gb.unwrap_or(rounded).max(rounded);
+            let low = entry
+                .measured_min_gb
+                .unwrap_or(rounded)
+                .min(rounded)
+                .min(high);
+            if entry.measured_gb != Some(high)
+                || entry.measured_min_gb != Some(low)
+                || entry.measured_offload != Some(offload)
+            {
                 if let Some(declared) = entry.vram_gb {
-                    let drift = (rounded - declared).abs();
+                    let drift = (high - declared).abs();
                     if drift > (declared * 0.25).max(2.0) {
                         tracing::warn!(
                             model,
                             declared,
-                            measured = rounded,
+                            measured = high,
                             "measured footprint diverges from the declared vram_gb"
                         );
                     }
                 }
-                entry.measured_gb = Some(rounded);
-                persist = entry.file.clone();
+                entry.measured_gb = Some(high);
+                entry.measured_min_gb = Some(low);
+                entry.measured_offload = Some(offload);
+                if let Some(path) = entry.file.clone() {
+                    persist = Some((path, high, low, offload));
+                }
                 changed = true;
             }
         }
-        if let Some(path) = persist {
-            let text = format!("{rounded:.1}");
+        if let Some((path, high, low, offload)) = persist {
             let name = model.to_string();
             tokio::task::spawn_blocking(move || {
-                if let Err(error) =
-                    crate::model::writeback::set_flag_on_file(&path, "measured_gb", Some(&text))
-                {
-                    tracing::warn!(error = %error, model = %name, "cannot persist measured_gb");
+                // High end first: a crash between these atomic rewrites then leaves an
+                // old low end under a new high end, which is a valid (narrower) pair.
+                // The reverse order could strand `measured_gb_min` above `measured_gb`,
+                // and the scanner rejects that pair — a model that would not load.
+                for (key, value) in [
+                    ("measured_gb", format!("{high:.1}")),
+                    ("measured_gb_min", format!("{low:.1}")),
+                    ("measured_offload", offload.to_string()),
+                ] {
+                    if let Err(error) =
+                        crate::model::writeback::set_flag_on_file(&path, key, Some(&value))
+                    {
+                        tracing::warn!(error = %error, model = %name, "cannot persist {key}");
+                    }
                 }
             });
         }
@@ -1900,7 +1936,12 @@ impl ActorState {
                         .map(|o| o.ticket.clone())
                         == Some(victim.ticket.clone())
                     {
-                        self.slots[victim.slot].occupant = None;
+                        // TEMP-BISECT: restore the take()+abort; the abort is what owns the sampler.
+                        if let Some(occupant) = self.slots[victim.slot].occupant.take() {
+                            if let Some(task) = occupant.measure {
+                                task.abort();
+                            }
+                        }
                     }
                     if let Some(job) = self.jobs.get_mut(&job_id) {
                         job.released_cost += victim.cost;
@@ -2083,50 +2124,59 @@ impl ActorState {
                     .expect("invariant: install only happens after a spawn"),
                 loaded_at: Instant::now(),
                 serve_id: serve_id.clone(),
+                measure: None,
             });
         }
-        // Measured footprint (review, 2026-10-26): attributed to THIS engine's
-        // pid only — a co-resident tenant's memory must never be charged to this
-        // model. The witness caches ~2 s, so a pre-spawn sample simply lacks the
-        // pid: retry briefly, and on continued absence persist nothing.
-        // Container-backed engines are skipped outright: the ticket pid is a
-        // short-lived wsl.exe client whose memory is never the GPU footprint.
-        if slot.is_some() && self.jobs[&job_id].container.is_none() {
+        // Measured footprint (§0.4, rehearsal item c): the witness total-diff against
+        // the free memory this load was admitted at, sampled on the model's own cadence
+        // while it serves. Total-diff rather than pid attribution so a container-backed
+        // engine is measurable too — its ticket pid is a short-lived `wsl.exe` client
+        // whose memory is never the GPU footprint, which is why the old install-time
+        // sample skipped those models outright. Attribution safety moves to the actor:
+        // a sample taken while another swap is in flight is dropped there, so a
+        // co-resident tenant can never be charged to this model.
+        let baseline_free = self.jobs.get(&job_id).and_then(|job| job.observed_at_admit);
+        if let (Some(slot), Some(baseline_free)) = (slot, baseline_free) {
             let witness = Arc::clone(&self.witness);
             let tx = self.tx.clone();
             let measured_model = model.clone();
-            let child_pid = self.jobs[&job_id]
-                .spawned
-                .as_ref()
-                .map(|ticket| ticket.pid)
-                .unwrap_or(0);
-            tokio::spawn(async move {
-                for attempt in 0..4u32 {
-                    if attempt > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    }
+            let every = std::time::Duration::from_secs(self.cfg.measured_sample_s.max(1));
+            let handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(every);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // The first interval tick completes at once; consume it, because a
+                // sample taken the instant the port opened measures the state the load
+                // was admitted in — and it would spend a scripted witness sample.
+                tick.tick().await;
+                // Bound the sampler's life rather than relying on the unload path to
+                // abort it: a day of serving is far past any range's convergence.
+                for _ in 0..86_400u32 {
+                    tick.tick().await;
                     match witness.sample().await {
                         Ok(sample) => {
-                            if let Some(gib) = sample.own_gib(&[child_pid]) {
-                                let _ = tx.send(ActorMsg::Measured {
-                                    model: measured_model,
-                                    pid: child_pid,
-                                    gib,
-                                });
-                                return;
+                            let gib = baseline_free - sample.free_gib();
+                            if gib < 0.05 {
+                                continue; // nothing attributable yet
                             }
-                            // A cached pre-spawn sample (2 s TTL) can lack the new
-                            // pid while attribution otherwise works: retry briefly.
-                            // No per-process data at all is degraded attribution —
-                            // absence — retrying cannot help.
-                            if sample.processes.is_empty() {
-                                return;
+                            if tx
+                                .send(ActorMsg::Measured {
+                                    model: measured_model.clone(),
+                                    gib,
+                                })
+                                .is_err()
+                            {
+                                return; // actor gone
                             }
                         }
+                        // A witness that cannot answer yields no measurement, never a
+                        // false one (§0.3): stop rather than guess or hammer it.
                         Err(_) => return,
                     }
                 }
             });
+            if let Some(occupant) = self.slots.get_mut(slot).and_then(|s| s.occupant.as_mut()) {
+                occupant.measure = Some(handle);
+            }
         }
         self.set_timing(job_id, |t| &mut t.install_ms);
         self.step(job_id, SwapState::Serving);

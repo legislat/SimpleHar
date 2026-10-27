@@ -425,8 +425,17 @@ function modelRow(status, model, category) {
       text(
         // Cost honesty (operator 2026-10-26): a greedy model's nominal size is a
         // model-size claim, not a VRAM footprint — measured or floor, never 55.
+        // The measured figure is a range (§0.4): the low end is where the session
+        // started, the high end is what admission books, so showing only one of
+        // them would hide how much of the card the KV cache can take.
         model.measured_gb !== null && model.measured_gb !== undefined
-          ? `measured ${model.measured_gb.toFixed(1)} GiB${model.cost === "greedy" ? " (greedy)" : ""}`
+          ? `measured ${
+              model.measured_min_gb !== null &&
+              model.measured_min_gb !== undefined &&
+              model.measured_min_gb < model.measured_gb
+                ? model.measured_min_gb.toFixed(1) + "-" + model.measured_gb.toFixed(1)
+                : model.measured_gb.toFixed(1)
+            } GiB${model.cost === "greedy" ? " (greedy)" : ""}`
           : model.cost === "greedy"
             ? model.launch_floor_gb !== null && model.launch_floor_gb !== undefined
               ? `greedy · floor ${model.launch_floor_gb} GiB`
