@@ -1192,15 +1192,71 @@ async fn t12_unload_semantics() {
     assert!(harness.wait_empty(30).await);
 
     // 12.4: {} -> explicit unload-all.
-    harness
-        .post(&format!("{CONTROL}/har/load"), json!({ "model": "emb" }))
-        .await;
-    assert!(harness.wait_serving("emb", 120).await);
+    //
+    // This step exists to gate the SCOPE of `{}` - every occupied slot, not one
+    // (src/api/mod.rs:539-542). 12.3 has just emptied WORK, so loading a single model
+    // leaves the two statements this test must tell apart ("the one slot I happened to
+    // free" and "every slot") indistinguishable to `wait_empty`, and a `{}` that
+    // releases only the first occupied slot passes with a 31B still holding the card
+    // (review, 2026-10-27). Occupy every category this harness registers
+    // unconditionally - WORK, AUX, EMB - and prove they serve before the request.
+    let occupants = |status: &Value, category: &str| -> Vec<String> {
+        status["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .filter(|slot| slot["category"] == category)
+            .filter_map(|slot| slot["model"].as_str())
+            .map(str::to_string)
+            .collect()
+    };
+    for model in ["work06", "aux06", "emb"] {
+        harness
+            .post(&format!("{CONTROL}/har/load"), json!({ "model": model }))
+            .await;
+    }
+    for (category, model) in [("WORK", "work06"), ("AUX", "aux06"), ("EMB", "emb")] {
+        assert!(
+            harness.wait_serving(model, 120).await,
+            "{model} never reached Serving"
+        );
+        assert_eq!(
+            occupants(&harness.status().await, category),
+            vec![model.to_string()],
+            "the {category} slot must be occupied before `{{}}` runs, or this step \
+             proves nothing about the scope of unload-all"
+        );
+    }
     let (status, _) = harness
         .post(&format!("{CONTROL}/har/unload"), json!({}))
         .await;
     assert_eq!(status, 200);
-    assert!(harness.wait_empty(30).await);
+    assert!(
+        harness.wait_empty(30).await,
+        "`{{}}` left the slot table non-empty"
+    );
+    let after = harness.status().await;
+    for category in ["WORK", "RP", "AUX", "EMB"] {
+        assert!(
+            after["slots"]
+                .as_array()
+                .expect("slots")
+                .iter()
+                .any(|slot| slot["category"] == category),
+            "the slot table must materialize a {category} slot: a missing record is \
+             not an emptied one"
+        );
+        assert!(
+            occupants(&after, category).is_empty(),
+            "`{{}}` must release every category: {category} still serves {:?}",
+            occupants(&after, category)
+        );
+    }
+    assert_eq!(
+        harness.llama_server_count(),
+        0,
+        "no engine may survive an explicit unload-all"
+    );
 
     // 12.5: garbage -> 400, never an implicit unload-all.
     let status = harness
