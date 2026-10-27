@@ -81,7 +81,9 @@ struct Harness {
 
 impl Harness {
     /// Spawns the real exe with a temp config + ModelConf, waits for readiness.
-    fn spawn(tag: &str) -> Harness {
+    /// Async because the readiness probe must share the test's tokio runtime: a
+    /// nested blocking runtime dropped from this context aborts the test (Run 2).
+    async fn spawn(tag: &str) -> Harness {
         let work_dir = simplehar_se::testutil::temp_dir(&format!("t14-{tag}"));
         let modelconf = work_dir.join("ModelConf");
         std::fs::create_dir_all(&modelconf).expect("temp ModelConf");
@@ -139,7 +141,7 @@ impl Harness {
         } else {
             deps_dir.join("simplehar-se.exe")
         };
-        let child = Command::new(&exe)
+        let mut child = Command::new(&exe)
             .env("SIMPLEHAR_CONFIG", &config_path)
             .spawn()
             .expect("spawn simplehar-se.exe");
@@ -148,25 +150,34 @@ impl Harness {
             .timeout(Duration::from_secs(300))
             .build()
             .expect("client");
-        // Readiness poll: a blocking client keeps `spawn` sync-friendly.
-        let probe = reqwest::blocking::Client::builder()
+        // Readiness poll on the async client. A `reqwest::blocking` client builds its
+        // own current-thread runtime and drops it on this thread, and every test here
+        // runs inside `#[tokio::test]`: dropping a nested runtime from an async context
+        // panics at once, so all 11 runnable tests failed before reaching a single
+        // assertion while the harness itself served 200s (T-suite Run 2, 2026-10-27).
+        let probe = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
-            .expect("blocking client");
-        let deadline = Instant::now() + Duration::from_secs(20);
+            .expect("probe client");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
             if probe
                 .get(format!("{CONTROL}/health"))
                 .send()
+                .await
                 .is_ok_and(|response| response.status().as_u16() == 200)
             {
                 break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "T-harness: the exe did not become ready in 20 s"
-            );
-            std::thread::sleep(Duration::from_millis(100));
+            if tokio::time::Instant::now() >= deadline {
+                // Never let a failed spawn leave a server behind: `Child::drop`
+                // detaches, so an unwinding panic here used to leak a harness
+                // listening on 8708-8711 and poison every later test.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("T-harness: the exe did not become ready in 20 s");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Harness {
             child,
@@ -309,7 +320,7 @@ fn cargo_bin() -> PathBuf {
 #[ignore = "operator-gated: real exe + real model files (SE_T_*)"]
 async fn t01_listener_routing_guards() {
     serial_lock();
-    let harness = Harness::spawn("t01");
+    let harness = Harness::spawn("t01").await;
     let work = cargo_bin();
     assert!(work.exists(), "build the exe first (cargo build)");
     assert!(
@@ -367,7 +378,7 @@ async fn t01_listener_routing_guards() {
 #[ignore = "operator-gated"]
 async fn t02_single_load_unload_llama() {
     serial_lock();
-    let harness = Harness::spawn("t02");
+    let harness = Harness::spawn("t02").await;
 
     // 2.1-2.2: load the fast smoke model into AUX; the slot appears Serving.
     let (status, body) = harness
@@ -416,7 +427,7 @@ async fn t02_single_load_unload_llama() {
 #[ignore = "operator-gated"]
 async fn t03_same_slot_replacements() {
     serial_lock();
-    let harness = Harness::spawn("t03");
+    let harness = Harness::spawn("t03").await;
 
     // 3.1 (llama-only): work06 -> work06b replaces the occupant on the SAME port.
     let first = harness
@@ -492,7 +503,7 @@ async fn t03_same_slot_replacements() {
 #[ignore = "operator-gated"]
 async fn t04_cross_category_cycle() {
     serial_lock();
-    let harness = Harness::spawn("t04");
+    let harness = Harness::spawn("t04").await;
 
     // T4 adapted: the singleton slot is per category; the cycle drives implicit
     // loads through the category listeners (chat = auto-load).
@@ -526,7 +537,7 @@ async fn t04_cross_category_cycle() {
 #[ignore = "operator-gated"]
 async fn t05_implicit_load_and_no_model_fallback() {
     serial_lock();
-    let harness = Harness::spawn("t05");
+    let harness = Harness::spawn("t05").await;
 
     // 5.4: empty + no default -> 400 naming the listener.
     let (status, body) = harness.chat(CONTROL, None).await;
@@ -549,7 +560,7 @@ async fn t05_implicit_load_and_no_model_fallback() {
 #[ignore = "operator-gated: loads three 31B models (~29 GiB each, minutes)"]
 async fn t06_eviction_matrix() {
     serial_lock();
-    let harness = Harness::spawn("t06");
+    let harness = Harness::spawn("t06").await;
     if !harness.baseline_check(&[&big_work_gguf(), &big_rp_gguf(), &big_aux_gguf()]) {
         println!("T6 BLOCKED: 31B model files missing (SE_T_* overrides)");
         return;
@@ -602,7 +613,7 @@ async fn t06_eviction_matrix() {
 #[ignore = "operator-gated: loads three 31B models (~29 GiB each)"]
 async fn t07_admission_failure() {
     serial_lock();
-    let harness = Harness::spawn("t07");
+    let harness = Harness::spawn("t07").await;
     if !harness.baseline_check(&[&big_work_gguf(), &big_rp_gguf(), &big_aux_gguf()]) {
         println!("T7 BLOCKED: 31B model files missing (SE_T_* overrides)");
         return;
@@ -647,7 +658,7 @@ async fn t07_admission_failure() {
 #[ignore = "operator-gated: loads a 31B model (~29 GiB, minutes)"]
 async fn t08_cancel_during_load() {
     serial_lock();
-    let harness = Harness::spawn("t08");
+    let harness = Harness::spawn("t08").await;
     if !harness.baseline_check(&[&big_rp_gguf()]) {
         println!("T8 BLOCKED: 31B model file missing (SE_T_RP31)");
         return;
@@ -686,7 +697,7 @@ async fn t08_cancel_during_load() {
 #[ignore = "operator-gated"]
 async fn t09_concurrency() {
     serial_lock();
-    let harness = Harness::spawn("t09");
+    let harness = Harness::spawn("t09").await;
 
     // 9.3: duplicate /har/load x3 while loading -> all accepted, one job.
     let url = format!("{CONTROL}/har/load");
@@ -723,7 +734,7 @@ async fn t09_concurrency() {
 #[ignore = "operator-gated"]
 async fn t10_crash_resilience() {
     serial_lock();
-    let harness = Harness::spawn("t10");
+    let harness = Harness::spawn("t10").await;
 
     // 10.1: kill every llama-server mid-serving; the next chat triggers one
     // restart-and-retry and answers 200 (built in SE).
@@ -769,7 +780,7 @@ async fn t10_crash_resilience() {
         "Job Objects killed every engine with the harness"
     );
 
-    let harness = Harness::spawn("t10b");
+    let harness = Harness::spawn("t10b").await;
     let status = harness.status().await;
     assert!(
         status["slots"]
@@ -807,7 +818,7 @@ async fn t11_external_interplay() {
 #[ignore = "operator-gated"]
 async fn t12_unload_semantics() {
     serial_lock();
-    let harness = Harness::spawn("t12");
+    let harness = Harness::spawn("t12").await;
 
     // 12.1: loaded -> unloaded.
     harness
@@ -875,7 +886,7 @@ async fn t12_unload_semantics() {
 #[ignore = "operator-gated"]
 async fn t13_security_guards() {
     serial_lock();
-    let harness = Harness::spawn("t13");
+    let harness = Harness::spawn("t13").await;
     for listener in [CONTROL, RP_LISTENER, AUX_LISTENER, EMB_LISTENER] {
         // 13.1: POST without JSON content type -> 415.
         let status = harness
@@ -916,7 +927,7 @@ async fn t13_security_guards() {
 #[ignore = "operator-gated: soak loop; iterations via SE_SOAK_ITERATIONS (default 3)"]
 async fn t14_soak() {
     serial_lock();
-    let harness = Harness::spawn("t14");
+    let harness = Harness::spawn("t14").await;
     let iterations: usize = std::env::var("SE_SOAK_ITERATIONS")
         .ok()
         .and_then(|n| n.parse().ok())
