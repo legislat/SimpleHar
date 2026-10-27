@@ -20,7 +20,9 @@ pub use vocab::{transition_allowed, Command, JobId, SwapState};
 
 use crate::budget::{self, AdmissionError, BudgetFacts, Gibibytes};
 use crate::config::{AppConfig, CategoryId};
-use crate::engine::{EngineAdapter, EngineRuntime, Probe, ReadinessSpec, SpawnError, Spawned};
+use crate::engine::{
+    EngineAdapter, EngineRuntime, LaunchSpec, Probe, ReadinessSpec, SpawnError, Spawned,
+};
 use crate::model::ModelEntry;
 use crate::ownership::{ResourceKind, SpawnTicket};
 use serde::Serialize;
@@ -1540,6 +1542,17 @@ impl ActorState {
                 "admission decision (extended)"
             );
         }
+        // Chunk 10 [2]: everything the adapter validates about a launch — required
+        // keys, profile/interpreter existence, WSL word and container legality — must
+        // be settled *before* the eviction. Run after Dispose it would destroy the
+        // resident model and every victim, then refuse, leaving an empty slot and
+        // work nobody can un-kill. Read-only, so a refusal here changes nothing.
+        if let Err(error) = self.preflight_spec(job_id) {
+            self.step(job_id, SwapState::AdmitFail);
+            self.log_refusal(job_id, &error, "launch");
+            self.finish(job_id, Err(error), "launch refused");
+            return;
+        }
         self.step(job_id, SwapState::Quiesce);
         self.step(job_id, SwapState::Dispose);
         // Ensure a release target: the same-slot replacement first, else the first
@@ -1809,39 +1822,76 @@ impl ActorState {
             .push(handle);
     }
 
+    /// The engine port the slot plan assigned to this job's slot (Step 8/11).
+    fn slot_engine_port(&self, job_id: JobId) -> u16 {
+        self.jobs
+            .get(&job_id)
+            .and_then(|job| job.slot)
+            .map_or(0, |slot| self.slots[slot].engine_port)
+    }
+
+    /// Read-only launch preparation for a live job: adapter lookup, catalog lookup,
+    /// the slot's engine port, and the adapter's own validation of the entry.
+    ///
+    /// A pure function of state — it mutates nothing, kills nothing and spawns
+    /// nothing — so the actor can settle every launch-time refusal (chunk 10 [2])
+    /// while the resident model and the planned victims are still alive. `begin_spawn`
+    /// calls the same helper, so the pre-eviction refusal and the spawn cannot drift.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_id` - a live job that has passed admission, in `Admit` or later.
+    ///
+    /// # Returns
+    ///
+    /// The [`LaunchSpec`] to hand the runtime, with the slot's engine port embedded.
+    ///
+    /// # Errors
+    ///
+    /// * [`SchedulerError::Spawn`] - no adapter is registered for the job's engine, or
+    ///   the model vanished from the catalog mid-job.
+    /// * [`SchedulerError::Engine`] - the adapter refused the entry (`MissingField` for
+    ///   a key it requires, `Rejected` for an illegal or absent value).
+    fn preflight_spec(&self, job_id: JobId) -> Result<LaunchSpec, SchedulerError> {
+        let (engine, model) = {
+            let job = self
+                .jobs
+                .get(&job_id)
+                .expect("invariant: callers hold live job ids");
+            (job.engine.clone(), job.model.clone())
+        };
+        let Some(adapter) = self.adapters.get(&engine).cloned() else {
+            return Err(SchedulerError::Spawn(format!(
+                "no adapter registered for engine `{engine}`"
+            )));
+        };
+        let Some(entry) = self.catalog.iter().find(|m| m.name == model).cloned() else {
+            return Err(SchedulerError::Spawn(format!(
+                "model `{model}` vanished from the catalog mid-job"
+            )));
+        };
+        let engine_port = self.slot_engine_port(job_id);
+        adapter
+            .spec(&entry, engine_port)
+            .map_err(SchedulerError::from)
+    }
+
     /// `Dispose -> Spawn` edge (G12): only called after release is confirmed, or when
     /// there was nothing to release.
     fn begin_spawn(&mut self, job_id: JobId) {
         self.step(job_id, SwapState::Spawn);
-        let (engine, model) = {
-            let job = &self.jobs[&job_id];
-            (job.engine.clone(), job.model.clone())
-        };
+        let engine_port = self.slot_engine_port(job_id);
         let spawn_error = |reason: String| Event::Spawned(Err(SpawnError::SpawnFailed { reason }));
-        let Some(adapter) = self.adapters.get(&engine).cloned() else {
-            self.on_event(
-                job_id,
-                spawn_error(format!("no adapter registered for engine `{engine}`")),
-            );
-            return;
-        };
-        let Some(entry) = self.catalog.iter().find(|m| m.name == model).cloned() else {
-            self.on_event(
-                job_id,
-                spawn_error(format!("model `{model}` vanished from the catalog mid-job")),
-            );
-            return;
-        };
-        let engine_port = self
-            .jobs
-            .get(&job_id)
-            .and_then(|job| job.slot)
-            .map(|slot| self.slots[slot].engine_port)
-            .unwrap_or_default();
-        let spec = match adapter.spec(&entry, engine_port) {
+        let spec = match self.preflight_spec(job_id) {
             Ok(spec) => spec,
             Err(error) => {
-                self.on_event(job_id, spawn_error(error.to_string()));
+                // The `Spawn` arm already reads like a spawn failure; anything else
+                // (an adapter refusal) is quoted verbatim, as before.
+                let reason = match &error {
+                    SchedulerError::Spawn(reason) => reason.clone(),
+                    other => other.to_string(),
+                };
+                self.on_event(job_id, spawn_error(reason));
                 return;
             }
         };
