@@ -86,27 +86,32 @@ impl Harness {
         let modelconf = work_dir.join("ModelConf");
         std::fs::create_dir_all(&modelconf).expect("temp ModelConf");
 
-        let yaml = |name: &str, category: &str, path: &PathBuf, extra: &str| {
+        // Each entry declares the footprint the gate must book. The 31B Q6_K files
+        // really do sit at ~29 GiB on the card, so saying `1` here would let the gate
+        // approve three of them at once (87 GiB on a 72 GiB card) and only the driver
+        // would notice, as a CUDA OOM: the whole point of T6/T7 is that admission
+        // refuses, and it can only refuse against honest numbers.
+        let yaml = |name: &str, category: &str, path: &PathBuf, vram: &str, extra: &str| {
             std::fs::write(
                 modelconf.join(format!("{name}.yaml")),
                 format!(
-                    "name: {name}\nengine: llama\ncategory: {category}\nmodel: {}\ncontext: 4096\nvram_gb: 1{extra}\n",
+                    "name: {name}\nengine: llama\ncategory: {category}\nmodel: {}\ncontext: 4096\nvram_gb: {vram}{extra}\n",
                     path.display()
                 ),
             )
             .expect("model yaml");
         };
-        yaml("work06", "WORK", &small_gguf(), "\ncpu_offload: true");
-        yaml("work06b", "WORK", &small_gguf(), "\ncpu_offload: true");
-        yaml("emb", "EMB", &emb_gguf(), "");
+        yaml("work06", "WORK", &small_gguf(), "1", "\ncpu_offload: true");
+        yaml("work06b", "WORK", &small_gguf(), "1", "\ncpu_offload: true");
+        yaml("emb", "EMB", &emb_gguf(), "1", "");
         if big_work_gguf().exists() {
-            yaml("work31", "WORK", &big_work_gguf(), "");
+            yaml("work31", "WORK", &big_work_gguf(), "29", "");
         }
         if big_rp_gguf().exists() {
-            yaml("rp31", "RP", &big_rp_gguf(), "");
+            yaml("rp31", "RP", &big_rp_gguf(), "29", "");
         }
         if big_aux_gguf().exists() {
-            yaml("aux31", "AUX", &big_aux_gguf(), "");
+            yaml("aux31", "AUX", &big_aux_gguf(), "29", "");
         }
 
         let config_path = work_dir.join("simplehar.json");
