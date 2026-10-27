@@ -102,7 +102,7 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `strata_config` | **Required for strata.** Profile JSON path; existence-checked before spawn. Weights/quant/context all live in this file, never in argv |
 | `strata_python` | Interpreter (default `C:\Strata\.venv\Scripts\python.exe`); existence-checked before spawn |
 | `strata_cwd` | Working directory (default `C:\Strata`) |
-| `extra_args` | The **only** key whose text reaches argv verbatim (whitespace-split); all other unknown keys are preserved in the catalog for reference but never launched |
+| `extra_args` | Whitespace-split words appended to the argv; words naming a harness-owned flag (`-m`, `--model`, `--host`, `--port`, `-ngl`, `--jinja`, `--mmproj`, `=` forms included) are refused with the launch. The forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` are appended after it, so they always win. All other unknown keys are preserved in the catalog for reference but never launched |
 | `ninfer_autostart` | **Required for ninfer.** Path (inside WSL) of the operator's autostart script; invoked as `bash <script> <profile> <key\|nokey> <port>` via `wsl.exe` |
 | `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload — strictly scoped to the name this harness claimed at spawn (`ninfer-claims.json` beside the harness exe). Must be docker-legal and must not look like a container ID (4+ hex chars): docker would resolve such an argument as an id prefix and delete someone else's container |
 | `ninfer_profile` | Profile passed as the script's `$1` (default `b`) |

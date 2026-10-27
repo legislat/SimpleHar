@@ -281,6 +281,27 @@ mod tests {
         assert_eq!(window.len(), 1, "exactly one --host: {:?}", spec.argv);
         assert_eq!(window[0], ["--host", "127.0.0.1"]);
         assert!(!spec.argv.iter().any(|a| a == "0.0.0.0"));
+        assert_eq!(
+            spec.argv[spec.argv.len() - 4..],
+            ["--host", "127.0.0.1", "--port", "18109"],
+            "host/port must tail the argv, after every other word"
+        );
+        let offloaded = entry(&[
+            ("model", "F:/m.gguf"),
+            ("cpu_offload", "true"),
+            ("extra_args", "--embedding --pooling last"),
+        ]);
+        let spec = adapter.spec(&offloaded, 18109).expect("valid");
+        assert_eq!(
+            spec.argv[spec.argv.len() - 6..],
+            ["--host", "127.0.0.1", "--port", "18109", "-ngl", "0"],
+            "forced host/port/-ngl 0 must tail every extra_args word"
+        );
+        assert_eq!(
+            spec.argv[spec.argv.len() - 2..],
+            ["-ngl", "0"],
+            "forced -ngl 0 must be last of all"
+        );
     }
 
     #[test]
