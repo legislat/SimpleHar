@@ -379,6 +379,14 @@ pub struct AppConfig {
     /// the value is never logged and never accepted in a URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_token: Option<String>,
+    /// Gate for the test-facing `mock` engine adapter: production boot registers it **only**
+    /// when this is true (chunk 10 [3]). The adapter's argv names the bare program
+    /// `mock-engine`, which `CreateProcessW` resolves through the harness's own directories,
+    /// so setting this on a machine where untrusted parties can write beside the harness exe
+    /// or its cwd is a code-execution grant, not a debugging knob. Tests never need it: each
+    /// builds its own adapter map. Always serialized, like [`CategoryConfig::control`].
+    #[serde(default)]
+    pub allow_mock_engine: bool,
 }
 
 impl Default for AppConfig {
@@ -401,6 +409,7 @@ impl Default for AppConfig {
             wsl_distro: default_wsl_distro(),
             wsl_user: None,
             control_token: None,
+            allow_mock_engine: false,
             source_path: None,
         }
     }
@@ -903,5 +912,74 @@ mod tests {
                 .any(|e| e.to_string().contains("greedy_launch_min_free_gb")),
             "inf must be refused, not locked in as a permanent refusal generator"
         );
+    }
+
+    #[test]
+    fn mock_engine_adapter_is_off_until_the_config_opts_in() {
+        // The `mock` adapter spawns the bare program name `mock-engine`, so boot registers
+        // it only on an explicit opt-in: absent means off, and a file written before the
+        // key existed must still parse rather than fail the boot (§0.2 step 1).
+        let absent = AppConfig::parse("{}").expect("defaults parse");
+        assert!(
+            !absent.allow_mock_engine,
+            "a stray `engine: mock` yaml must not find an adapter at boot"
+        );
+        assert_eq!(absent, AppConfig::default());
+        assert!(absent.validate().is_empty());
+
+        let older_file = AppConfig::parse("{\"tray_enabled\": false, \"load_timeout_s\": 300}")
+            .expect("a config written before the key existed still parses");
+        assert!(!older_file.allow_mock_engine);
+        assert!(older_file.validate().is_empty());
+
+        let opted_in = AppConfig::parse("{\"allow_mock_engine\": true}").expect("flag parses");
+        assert!(
+            opted_in.allow_mock_engine,
+            "the key is the only thing that turns the grant on"
+        );
+        assert!(opted_in.validate().is_empty());
+    }
+
+    #[test]
+    fn allow_mock_engine_survives_the_config_write_back() {
+        // §6 restart guard: the flag decides whether boot hands out a code-execution grant,
+        // so the value the write-back stamps must come back through parse+validate unchanged
+        // — a restart that quietly flipped it would either revoke an operator's setup or
+        // re-open the planted-`mock-engine.exe` path without a config edit.
+        let opted_in = AppConfig {
+            allow_mock_engine: true,
+            ..AppConfig::default()
+        };
+        let text = write_back_text(&opted_in);
+        let reloaded = AppConfig::parse(&text).expect("persisted grant parses");
+        let errors = reloaded.validate();
+        assert!(
+            errors.is_empty(),
+            "persisted config must validate: {errors:?}"
+        );
+        assert!(
+            reloaded.allow_mock_engine,
+            "an opt-in must survive a write-back and a restart"
+        );
+
+        // Pinned serde choice: false is serialized (like `control`), never omitted, so the
+        // operator's file states the denial explicitly instead of relying on a default.
+        let text = write_back_text(&AppConfig::default());
+        let stamped: serde_json::Value = serde_json::from_str(&text).expect("stamped json parses");
+        assert_eq!(
+            stamped["allow_mock_engine"],
+            serde_json::Value::Bool(false),
+            "the default must be written, not skipped"
+        );
+        let reloaded = AppConfig::parse(&text).expect("persisted denial parses");
+        assert!(!reloaded.allow_mock_engine);
+        assert!(reloaded.validate().is_empty());
+    }
+
+    /// The serializer the config write-back uses (`api::persist_default_model`):
+    /// `to_value` of the whole struct, then pretty JSON to disk.
+    fn write_back_text(config: &AppConfig) -> String {
+        let root = serde_json::to_value(config).expect("invariant: config serializes");
+        serde_json::to_string_pretty(&root).expect("invariant: JSON serializes")
     }
 }

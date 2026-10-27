@@ -3,9 +3,7 @@
 
 use simplehar_se::api::{category_router, control_router, ApiState};
 use simplehar_se::config::{self, AppConfig, ConfigError};
-use simplehar_se::engine::llama::LlamaAdapter;
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime};
+use simplehar_se::engine::EngineRuntime;
 use simplehar_se::observability;
 use simplehar_se::process::{ContainerCandidate, ProcessRuntime, SingleInstanceGuard};
 use simplehar_se::scheduler::{Scheduler, SchedulerHandle};
@@ -96,21 +94,7 @@ async fn main() -> ExitCode {
         }
     };
     let config_ms = boot_started.elapsed().as_millis() as u64;
-    let mut adapters = std::collections::BTreeMap::new();
-    let mock: Arc<dyn EngineAdapter> = Arc::new(MockAdapter);
-    adapters.insert("mock".to_string(), mock);
-    let llama: Arc<dyn EngineAdapter> =
-        Arc::new(LlamaAdapter::new(config.llama_server_exe.clone()));
-    adapters.insert("llama".to_string(), llama);
-    let strata: Arc<dyn EngineAdapter> =
-        Arc::new(simplehar_se::engine::strata::StrataAdapter::default());
-    adapters.insert("strata".to_string(), strata);
-    let ninfer: Arc<dyn EngineAdapter> =
-        Arc::new(simplehar_se::engine::ninfer::NinferAdapter::new(
-            config.wsl_distro.clone(),
-            config.wsl_account().unwrap_or_default(),
-        ));
-    adapters.insert("ninfer".to_string(), ninfer);
+    let adapters = simplehar_se::engine::default_adapters(&config);
     let runtime = ProcessRuntime::new().with_wsl(
         config.wsl_distro.clone(),
         config.wsl_account().unwrap_or_default(),
@@ -554,6 +538,11 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    //! Boot composition lives in `engine::default_adapters` (including the
+    //! `allow_mock_engine` gate), where it is pinned by a test; `main` itself is not
+    //! unit-reachable — it takes the single-instance guard, binds every listener and
+    //! starts the NVML witness.
+
     use super::{decode_console_output, parse_excluded_ranges};
 
     const SAMPLE: &str = "

@@ -66,6 +66,7 @@ partial files are completed, an invalid file is fatal with every problem logged
 |---|---|---|
 | `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN — set `control_token` first, see Security |
 | `control_token` | *unset* | When set, every route but the page assets demands it (`X-Har-Token` or `Authorization: Bearer`); `SIMPLEHAR_TOKEN` overrides it and keeps the secret out of the file |
+| `allow_mock_engine` | `false` | Registers the test-facing `mock` engine at boot. Its argv is the bare name `mock-engine`, resolved through the harness's own directories — turning this on where others can write beside the harness exe or its cwd is a code-execution grant; tests never need it |
 | `categories` | four defaults | Per-category `id`, `public_port`, `max_models`, `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), `engine_ports` |
 | `vram_total_gb` | `72.0` | Admission ceiling |
 | `vram_reserve_gb` | `2.0` | Kept unreachable by admission |

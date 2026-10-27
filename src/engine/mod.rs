@@ -14,6 +14,7 @@ use crate::model::ModelEntry;
 use crate::ownership::SpawnTicket;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Why an adapter could not produce a [`LaunchSpec`].
@@ -277,6 +278,47 @@ pub trait EngineRuntime: Send + Sync {
     async fn discover_model_id(&self, port: u16) -> Option<String>;
 }
 
+/// Production boot's adapter map (FINDINGS-10 [3]): llama + strata + ninfer always,
+/// the test-facing `mock` adapter only on the config's explicit
+/// `allow_mock_engine` grant (its argv is the bare name `mock-engine`, which
+/// `CreateProcessW` resolves through the harness's own directories). A stray
+/// `engine: mock` yaml without the grant therefore meets an adapter-lookup
+/// refusal at preflight — before Quiesce (`79f6256`), with victims and the
+/// resident model untouched. Lives here, not in `main`, so the gate has a test.
+///
+/// # Errors
+///
+/// Infallible today; `Result` mirrors the adapter constructors' contract for the
+/// day a registry validation can reject a config-referenced binary.
+#[must_use]
+pub fn default_adapters(
+    config: &crate::config::AppConfig,
+) -> BTreeMap<String, Arc<dyn EngineAdapter>> {
+    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+    if config.allow_mock_engine {
+        tracing::warn!(
+            "mock engine adapter enabled by allow_mock_engine — not for production machines"
+        );
+        adapters.insert("mock".to_string(), Arc::new(mock::MockAdapter));
+    }
+    adapters.insert(
+        "llama".to_string(),
+        Arc::new(llama::LlamaAdapter::new(config.llama_server_exe.clone())),
+    );
+    adapters.insert(
+        "strata".to_string(),
+        Arc::new(strata::StrataAdapter::default()),
+    );
+    adapters.insert(
+        "ninfer".to_string(),
+        Arc::new(ninfer::NinferAdapter::new(
+            config.wsl_distro.clone(),
+            config.wsl_account().unwrap_or_default(),
+        )),
+    );
+    adapters
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +465,23 @@ mod tests {
             http_probe(&client(), 1, &spec).await,
             Probe::Failed { .. }
         ));
+    }
+
+    #[test]
+    fn boot_adapters_exclude_mock_unless_the_config_grants_it() {
+        let mut config = crate::config::AppConfig::default();
+        let ids: Vec<String> = default_adapters(&config).into_keys().collect();
+        assert_eq!(
+            ids,
+            ["llama", "ninfer", "strata"],
+            "default boot has no mock"
+        );
+        config.allow_mock_engine = true;
+        let ids: Vec<String> = default_adapters(&config).into_keys().collect();
+        assert_eq!(
+            ids,
+            ["llama", "mock", "ninfer", "strata"],
+            "the grant adds mock"
+        );
     }
 }

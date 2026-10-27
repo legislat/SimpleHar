@@ -1,5 +1,13 @@
 //! The mock engine adapter (DESIGN Step 19): everything in Steps 2-8 is testable
 //! without touching the 72 GB card.
+//!
+//! Test-facing only. Production boot registers this adapter in the scheduler's map solely
+//! when config `allow_mock_engine` is true — §5 E3-adjacent doctrine: engines obey only
+//! harness-owned config. The reason it needs an opt-in is the launch spec below: its argv is
+//! the bare program name `mock-engine` with cwd `.`, so an ungated "mock" engine would let a
+//! stray yaml win admission against a real model and let a planted `mock-engine.exe` beside
+//! the harness exe run as a job-ordained child. Integration tests never set the flag; each
+//! builds its own adapter map.
 
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
