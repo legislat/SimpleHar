@@ -208,6 +208,21 @@ pub enum SpawnError {
         /// What went wrong.
         reason: String,
     },
+    /// The ticket names a port whose live entry is a newer spawn, so this ticket is
+    /// stale and the child it identified is already gone. Reported rather
+    /// silently-ignored: killing or confirming the successor would be an unowned kill
+    /// wearing a harness ticket.
+    #[error(
+        "stale ticket for port {port}: carries generation {expected}, live generation {found}"
+    )]
+    StaleTicket {
+        /// Port the ticket names.
+        port: u16,
+        /// Generation this ticket carries.
+        expected: u64,
+        /// Generation the table holds for that port.
+        found: u64,
+    },
 }
 
 /// A started engine instance (Step 8).

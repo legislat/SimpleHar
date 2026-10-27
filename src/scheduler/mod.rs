@@ -1930,44 +1930,70 @@ impl ActorState {
             .push(handle);
     }
 
-    /// Kill the job's victim (or its own spawn on failure/cancel) and confirm release
-    /// with evidence, inside `release_timeout_s` (G12).
+    /// Kill every process this job owns (its pending victim and its own spawn) and
+    /// confirm release with evidence, inside `release_timeout_s` (G12).
     fn spawn_kill_confirm(&mut self, job_id: JobId) {
-        let victim = {
+        // Both targets, never one chosen by preference. `job.victim` is only ever
+        // assigned (when a victim is queued or dequeued) and never cleared, so the old
+        // `match job.victim.as_ref()` re-killed a victim that had already been released
+        // and never killed the engine this job had itself started — leaving it holding
+        // the card and its port while the slot read empty (review CRITICAL, 2026-10-27).
+        let targets: Vec<Victim> = {
             let job = &self.jobs[&job_id];
-            match job.victim.as_ref() {
-                Some(victim) => victim.clone(),
-                // Failure/cancel reaping: the kill target is the job's own spawn.
-                None => Victim {
-                    model: job.model.clone(),
-                    ticket: job
-                        .spawned
-                        .clone()
-                        .expect("invariant: kill targets exist for jobs in release phases"),
-                    slot: job.slot.expect("invariant: spawned jobs have a slot"),
-                    evicted: false,
-                    cost: 0.0,
-                },
+            let mut targets: Vec<Victim> = Vec::with_capacity(2);
+            if let Some(victim) = job.victim.clone() {
+                targets.push(victim);
             }
+            if let Some(ticket) = job.spawned.clone() {
+                if !targets.iter().any(|t| t.ticket == ticket) {
+                    targets.push(Victim {
+                        model: job.model.clone(),
+                        ticket,
+                        // Unused on this path: a job reaping its own spawn has its slot
+                        // cleared by its own transition, not by the victim-slot check.
+                        slot: job.slot.unwrap_or(0),
+                        evicted: false,
+                        cost: 0.0,
+                    });
+                }
+            }
+            targets
         };
+        if targets.is_empty() {
+            tracing::warn!(
+                %job_id,
+                "nothing to reap: release phase with neither a victim nor a spawn"
+            );
+            return;
+        }
         let tx = self.tx.clone();
         let runtime = Arc::clone(&self.runtime);
         let timeout = Duration::from_secs(self.cfg.release_timeout_s);
         let handle = tokio::spawn(async move {
+            let holder = targets
+                .iter()
+                .map(|t| t.model.clone())
+                .collect::<Vec<_>>()
+                .join("+");
             let outcome = match tokio::time::timeout(timeout, async {
-                runtime.kill(&victim.ticket).await?;
-                loop {
-                    if runtime.release_confirmed(&victim.ticket).await? {
-                        break Ok(());
-                    }
-                    tokio::time::sleep(RELEASE_POLL).await;
+                for target in &targets {
+                    runtime.kill(&target.ticket).await?;
                 }
+                for target in &targets {
+                    loop {
+                        if runtime.release_confirmed(&target.ticket).await? {
+                            break;
+                        }
+                        tokio::time::sleep(RELEASE_POLL).await;
+                    }
+                }
+                Ok(())
             })
             .await
             {
                 Ok(inner) => inner,
                 Err(_) => Err(SpawnError::KillFailed {
-                    holder: victim.model.clone(),
+                    holder,
                     reason: "release not confirmed within release_timeout_s".to_string(),
                 }),
             };

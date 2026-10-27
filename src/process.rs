@@ -64,6 +64,34 @@ fn prune_log_files(dir: &std::path::Path, keep: usize) {
     }
 }
 
+/// What the engine table says about a kill/release request for a port.
+#[derive(Debug, PartialEq, Eq)]
+enum TableVerdict {
+    /// No entry: we never owned anything on that port, so there is nothing to kill and
+    /// nothing to confirm away.
+    Unowned,
+    /// An entry exists, but under a newer spawn: this ticket is stale and the child it
+    /// named is already gone.
+    Stale {
+        /// The generation the table holds for that port.
+        found: u64,
+    },
+    /// This ticket is the live owner of the port.
+    Ours,
+}
+
+/// The one identity rule behind `kill` and `release_confirmed`: a port is a slot in the
+/// port space, not a process, so ownership is `(port, generation)` — never the port
+/// alone. A stale ticket must not be able to terminate, or "confirm the release" of, the
+/// successor that inherited the port.
+fn table_verdict(held_generation: Option<u64>, ticket_generation: u64) -> TableVerdict {
+    match held_generation {
+        None => TableVerdict::Unowned,
+        Some(found) if found != ticket_generation => TableVerdict::Stale { found },
+        Some(_) => TableVerdict::Ours,
+    }
+}
+
 /// One tracked engine tree: the child plus its Job Object.
 struct EngineProc {
     child: Child,
@@ -75,6 +103,11 @@ struct EngineProc {
     /// reaps the `wsl.exe` client, so `kill` must additionally `docker rm -f`
     /// this name or the container keeps holding the GPU.
     container: Option<String>,
+    /// The generation of the [`SpawnTicket`] that created this entry. Kill and release
+    /// must match it: a port names a slot in the port space, not a process, and the
+    /// ticket that identified the original child can outlive it — a stale ticket must
+    /// never terminate the successor that inherited the port.
+    generation: u64,
 }
 
 /// Owned Job Object handle. `Send` because the runtime owns it exclusively: it is
@@ -393,15 +426,31 @@ impl EngineRuntime for ProcessRuntime {
         let pid = child.id().unwrap_or(0);
         tracing::info!(port = ticket.port, pid, log = %log_path.display(),
             "engine spawned under a kill-on-close job object");
-        self.engines.lock().expect("engine table lock").insert(
-            ticket.port,
-            EngineProc {
-                child,
-                job,
-                terminated: false,
-                container,
-            },
-        );
+        {
+            let mut engines = self.engines.lock().expect("engine table lock");
+            if let Some(stale) = engines.get(&ticket.port) {
+                // Replacing a live entry closes its job handle, which reaps that tree by
+                // design (a crash-retry reclaims its own port). Saying so keeps the one
+                // case that must never happen — two live engines on one port — visible
+                // instead of silent.
+                tracing::warn!(
+                    port = ticket.port,
+                    replaced_generation = stale.generation,
+                    new_generation = ticket.generation,
+                    "replacing a tracked engine on this port; its job object reaps it"
+                );
+            }
+            engines.insert(
+                ticket.port,
+                EngineProc {
+                    child,
+                    job,
+                    terminated: false,
+                    container,
+                    generation: ticket.generation,
+                },
+            );
+        }
         Ok(Spawned {
             port: ticket.port,
             pid,
@@ -411,9 +460,23 @@ impl EngineRuntime for ProcessRuntime {
     async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError> {
         let container = {
             let mut engines = self.engines.lock().expect("engine table lock");
-            let Some(engine) = engines.get_mut(&ticket.port) else {
-                return Ok(()); // nothing we own on that port: never a foreign kill
-            };
+            match table_verdict(
+                engines.get(&ticket.port).map(|entry| entry.generation),
+                ticket.generation,
+            ) {
+                TableVerdict::Unowned => return Ok(()), // never ours: never a foreign kill
+                TableVerdict::Stale { found } => {
+                    return Err(SpawnError::StaleTicket {
+                        port: ticket.port,
+                        expected: ticket.generation,
+                        found,
+                    })
+                }
+                TableVerdict::Ours => {}
+            }
+            let engine = engines
+                .get_mut(&ticket.port)
+                .expect("invariant: the verdict above just read Ours for this port");
             // Safety: the job handle is valid (created in spawn, closed by Drop)
             // and terminating a job is safe from any thread.
             unsafe { terminate_job(engine.job.0) };
@@ -434,9 +497,23 @@ impl EngineRuntime for ProcessRuntime {
     async fn release_confirmed(&self, ticket: &SpawnTicket) -> Result<bool, SpawnError> {
         let (exited, is_container) = {
             let mut engines = self.engines.lock().expect("engine table lock");
-            let Some(engine) = engines.get_mut(&ticket.port) else {
-                return Ok(true); // never tracked here -> nothing to confirm
-            };
+            match table_verdict(
+                engines.get(&ticket.port).map(|entry| entry.generation),
+                ticket.generation,
+            ) {
+                TableVerdict::Unowned => return Ok(true), // never ours: nothing to confirm
+                TableVerdict::Stale { found } => {
+                    return Err(SpawnError::StaleTicket {
+                        port: ticket.port,
+                        expected: ticket.generation,
+                        found,
+                    })
+                }
+                TableVerdict::Ours => {}
+            }
+            let engine = engines
+                .get_mut(&ticket.port)
+                .expect("invariant: the verdict above just read Ours for this port");
             if !engine.terminated {
                 return Ok(false);
             }
@@ -601,6 +678,17 @@ unsafe fn terminate_job(job: windows::Win32::Foundation::HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_ticket_never_owns_the_port_it_renames() {
+        assert_eq!(table_verdict(None, 7), TableVerdict::Unowned);
+        assert_eq!(table_verdict(Some(7), 7), TableVerdict::Ours);
+        assert_eq!(
+            table_verdict(Some(8), 7),
+            TableVerdict::Stale { found: 8 },
+            "the previous ticket must not be able to kill, or confirm away, the successor"
+        );
+    }
 
     #[test]
     fn container_rm_uses_the_shared_wsl_prefix() {

@@ -559,6 +559,63 @@ async fn engine_that_never_becomes_ready_fails_within_the_deadline() {
     assert!(terminal_jobs(&status).iter().any(|j| j.error.is_some()));
 }
 
+#[tokio::test]
+async fn failed_swap_that_released_its_victim_still_reaps_its_own_engine() {
+    // The kill target used to be `job.victim` when one existed, and `job.victim` is never
+    // cleared once queued — so a swap that evicted its victim, spawned, and then failed
+    // readiness re-killed a corpse and left the engine it had started holding the card and
+    // its port while the slot read empty (chunk 3, CRITICAL, 2026-10-27).
+    let (handle, runtime) = harness5(
+        config(1),
+        &[
+            ("aux30", "mock", CategoryId::Aux, Some(30.0), ""),
+            ("work60", "mock-never", CategoryId::Work, Some(60.0), ""),
+        ],
+    );
+    handle
+        .swap("aux30", CategoryId::Aux)
+        .await
+        .expect("aux30 loads");
+    assert_eq!(runtime.server_count(), 1, "the victim engine is live");
+
+    let error = handle
+        .swap("work60", CategoryId::Work)
+        .await
+        .expect_err("the never-ready engine must fail its load");
+    assert!(
+        error.to_string().contains("ready"),
+        "must fail on readiness, not on admission: {error}"
+    );
+
+    let status = handle.status().await.expect("actor alive");
+    let swap_job = terminal_jobs(&status)
+        .into_iter()
+        .find(|job| job.model == "work60")
+        .expect("the swap is in the ledger");
+    assert_eq!(
+        swap_job.victims_released,
+        vec!["aux30".to_string()],
+        "the eviction must really have happened, or this test proves nothing: {swap_job:?}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "both the evicted victim and the failed engine must be reaped"
+    );
+    assert!(
+        slot_model(&status, CategoryId::Aux)
+            .iter()
+            .all(Option::is_none),
+        "the evicted slot stays empty"
+    );
+    assert!(
+        slot_model(&status, CategoryId::Work)
+            .iter()
+            .all(Option::is_none),
+        "a failed load must not leave an occupant"
+    );
+}
+
 /// Submits a slow load without keeping the waiter and returns its job id.
 async fn spawn_and_find_job(handle: &SchedulerHandle) -> JobId {
     submit_and_vanish(handle, "qwen3", CategoryId::Work).await;
