@@ -119,7 +119,8 @@ impl EngineAdapter for NinferAdapter {
             .ok_or_else(|| missing("ninfer_container"))?;
         if !valid_container_name(&container) {
             return Err(rejected(format!(
-                "ninfer_container must be a docker name (alphanumeric start, [A-Za-z0-9._-] only): {container}"
+                "ninfer_container must be a docker name (alphanumeric start, \
+                 [A-Za-z0-9._-] only, never a container-ID shape): {container}"
             )));
         }
         let profile = model
@@ -356,6 +357,39 @@ mod tests {
                 "{name}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn container_names_docker_could_resolve_as_an_id_are_refused() {
+        // Chunk 10 [4]: `docker rm -f <hex>` is resolved as a container-**ID prefix**, so
+        // a name of that shape must die here — the same validator the boot reclaim and
+        // the claim ledger use — before it can reach the pre-reap argv and delete an
+        // unrelated container in the operator's distro.
+        for name in ["1234abc", "beef", "deadbeef"] {
+            let err = NinferAdapter::new("Ubuntu", "ops")
+                .spec(
+                    &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", name)]),
+                    18109,
+                )
+                .expect_err("an ID-shaped name cannot be owned");
+            assert!(
+                matches!(&err, EngineError::Rejected { reason, .. }
+                    if reason.contains("docker name")),
+                "{name}: {err}"
+            );
+        }
+        assert_eq!(
+            NinferAdapter::new("Ubuntu", "ops")
+                .spec(
+                    &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", "c")]),
+                    18109,
+                )
+                .expect("a short name is not an id shape")
+                .container
+                .as_deref(),
+            Some("c"),
+            "a one-character hex name must still load: the load path stays intact"
+        );
     }
 
     #[test]

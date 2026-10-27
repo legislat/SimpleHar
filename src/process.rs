@@ -474,15 +474,26 @@ impl EngineRuntime for ProcessRuntime {
         // minutes-long readiness failure) or the stale container answers
         // readiness for a model the harness never started.
         if let Some(name) = container.as_deref() {
-            // Record ownership FIRST (chunk 10 [1]): this claim is the positive
-            // evidence the boot reclaim demands, and `claim` refuses names the
-            // spawn-path validator would reject, so a claim can never exist for
-            // a name boot would not also refuse to reap.
-            self.claims
+            // One rule for both reaping paths (chunk 10 [1] and [4]): `claim` is the sole
+            // authority on whether this harness may address the name at all. It records
+            // the positive evidence the boot reclaim demands, and it refuses what the
+            // shared validator rejects — including docker container-ID shapes — so the
+            // pre-reap can never hand `docker rm -f` an argument docker would resolve as
+            // someone else's id prefix. A refused name reaps nothing.
+            let claimable = self
+                .claims
                 .lock()
                 .expect("container claim ledger lock")
                 .claim(name);
-            reap_container(&self.wsl_distro, &self.wsl_user, name).await;
+            if claimable {
+                reap_container(&self.wsl_distro, &self.wsl_user, name).await;
+            } else {
+                tracing::warn!(
+                    container = name,
+                    port = ticket.port,
+                    "not a name this harness may address: the stale container is left alone"
+                );
+            }
         }
         if let Err(error) = tokio::fs::create_dir_all(&self.logs_dir).await {
             return Err(SpawnError::SpawnFailed {
@@ -958,6 +969,32 @@ mod tests {
                 ("_illegal", Some(SKIP_INVALID_NAME)),
             ]
         );
+    }
+
+    #[test]
+    fn boot_reclaim_never_reaps_an_id_shaped_name_even_when_a_stale_ledger_holds_it() {
+        // Chunk 10 [4] on the boot path: `docker rm -f 1234abc` deletes whichever
+        // *unrelated* container's id merely starts with those characters. The shape gate
+        // therefore has to outrank any claim an older ledger still carries, so the seed
+        // is written behind `claim` (which rightly refuses such names).
+        let dir = crate::testutil::temp_dir("claims-stale");
+        let path = dir.join("ninfer-claims.json");
+        let stale: BTreeSet<String> = ["1234abc".to_string()].into_iter().collect();
+        let bytes = serde_json::to_vec(&stale).expect("seed a stale ledger");
+        std::fs::write(&path, bytes).expect("write the stale ledger");
+        let claims = ContainerClaims::load(&path);
+        assert!(
+            claims.contains("1234abc"),
+            "the hazard is a ledger that does hold the name"
+        );
+        let present = vec!["1234abc".to_string()];
+        let plan = reclaim_plan(&present, &[candidate("ninfer", "1234abc")], &claims);
+        assert_eq!(
+            verdicts(&plan),
+            vec![("1234abc", Some(SKIP_INVALID_NAME))],
+            "an ID-shaped name is never destroyed, claim or no claim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

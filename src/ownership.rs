@@ -9,8 +9,11 @@
 //! Containers outlive the process that started them, so their provenance must too:
 //! [`ContainerClaims`] is the persisted claim ledger written at spawn and read at boot,
 //! and [`boot_reap_decision`] is the single rule the boot reclaim evaluates against it
-//! (chunk 10 [1], 2026-10-27). Both the spawn path and the boot path validate container
-//! names through [`valid_container_name`], so the two rules can never drift.
+//! (chunk 10 [1], 2026-10-27). Both reaping paths — the spawn-time pre-reap and the boot
+//! reclaim — address a name only if the ledger accepts it: the spawn-time pre-reap is
+//! gated on [`ContainerClaims::claim`], the boot reclaim on [`boot_reap_decision`], and
+//! both — with the adapter spec — validate the name through the one function
+//! [`valid_container_name`], so the rules can never drift.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -21,10 +24,24 @@ use std::path::PathBuf;
 /// same token.
 pub const NINFER_ENGINE: &str = "ninfer";
 
-/// Docker's own name rule, applied as a defense-in-depth guard before the value ever
-/// reaches `docker rm -f` argv (review, 2026-10-26). Lives here — not in the adapter —
-/// because the spawn path (`NinferAdapter::spec`), the claim ledger, and the boot
-/// reclaim decision must all validate through this one function.
+/// Shortest argument docker tries to resolve as a container **ID prefix** instead of a
+/// name (chunk 10 [4]): `docker rm -f 1234abc` deletes whichever unrelated container's
+/// id happens to start with those characters, in the operator's distro, with workloads
+/// on it. A name of that shape is therefore never claimable and never reaped, whatever
+/// the ledger says.
+const MIN_ID_PREFIX_LEN: usize = 4;
+
+/// Whether `name` is shaped like a docker container-ID prefix rather than a name.
+fn id_shaped(name: &str) -> bool {
+    name.len() >= MIN_ID_PREFIX_LEN && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Docker's own name rule plus the ID-prefix-shape exclusion, applied as a
+/// defense-in-depth guard before the value ever reaches `docker rm -f` argv (review,
+/// 2026-10-26; chunk 10 [1] and [4], 2026-10-27). Lives here — not in the adapter —
+/// because the spawn path (`NinferAdapter::spec`), the spawn-time pre-reap through
+/// [`ContainerClaims::claim`], and the boot reclaim decision must all validate through
+/// this one function, so no reaping path can accept a name another one refuses.
 #[must_use]
 pub fn valid_container_name(name: &str) -> bool {
     !name.is_empty()
@@ -32,6 +49,7 @@ pub fn valid_container_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !id_shaped(name)
 }
 
 /// Why boot reclaim may (or may not) destroy a catalog-declared container.
@@ -52,14 +70,16 @@ pub enum ReapDecision {
 /// wording cannot drift between the two.
 pub const SKIP_NOT_NINFER: &str =
     "not a ninfer-engine model: the harness never starts containers for other engines";
-pub const SKIP_INVALID_NAME: &str = "not a docker-legal container name";
+pub const SKIP_INVALID_NAME: &str =
+    "not a docker-legal container name, or it is shaped like a docker container-ID prefix";
 pub const SKIP_UNCLAIMED: &str = "no harness spawn claim on record for this name";
 
 /// The boot-reclaim rule, evaluated once per catalog-declared container name. Firing
 /// requires all three gates (chunk 10 [1], operator policy 2026-10-27): (a) the
-/// declaring model runs on the ninfer engine, (b) the name satisfies the same
-/// docker-legality validation the spawn path applies, and (c) [`ContainerClaims`]
-/// positively records that this harness started the name and never released it.
+/// declaring model runs on the ninfer engine, (b) the name passes the very validation
+/// the spawn path applies — docker-legal and not a container-ID shape, through
+/// [`valid_container_name`] — and (c) [`ContainerClaims`] positively records that this
+/// harness started the name and never released it.
 ///
 /// # Arguments
 ///
@@ -331,6 +351,39 @@ mod tests {
                 },
                 "name `{name}` is not docker-legal"
             );
+        }
+    }
+
+    #[test]
+    fn boot_reap_skips_a_name_docker_would_resolve_as_a_container_id() {
+        // Chunk 10 [4]: `docker rm -f 1234abc` deletes whichever *unrelated* container's
+        // id merely starts with those characters, so an ID-shaped name is refused by the
+        // one rule the spawn path and the reclaim share. A short hex string stays legal:
+        // docker only attempts id-prefix resolution from `MIN_ID_PREFIX_LEN` up, and the
+        // adapter's own names ("c") depend on that.
+        let dir = crate::testutil::temp_dir("claims-id-shaped");
+        let mut claims = ContainerClaims::load(dir.join("ninfer-claims.json"));
+        for name in ["1234abc", "beef", "deadbeef", "0aB9", "1234"] {
+            assert!(
+                !valid_container_name(name),
+                "name `{name}` is a container-ID shape"
+            );
+            assert_eq!(
+                boot_reap_decision(NINFER_ENGINE, name, true),
+                ReapDecision::Skip {
+                    reason: SKIP_INVALID_NAME
+                },
+                "the shape gate must fire before the claim gate: `{name}` is never reaped, \
+                 even if a stale ledger still holds it"
+            );
+            assert!(
+                !claims.claim(name) && !claims.contains(name),
+                "an ID-shaped name can never even be claimed: `{name}`"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in ["c", "abc", "1234abc-dead", "SE-nin-bonsai", "ninfer-0"] {
+            assert!(valid_container_name(name), "`{name}` is a plain name");
         }
     }
 

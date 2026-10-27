@@ -104,7 +104,7 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `strata_cwd` | Working directory (default `C:\Strata`) |
 | `extra_args` | The **only** key whose text reaches argv verbatim (whitespace-split); all other unknown keys are preserved in the catalog for reference but never launched |
 | `ninfer_autostart` | **Required for ninfer.** Path (inside WSL) of the operator's autostart script; invoked as `bash <script> <profile> <key\|nokey> <port>` via `wsl.exe` |
-| `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload — strictly scoped to the name this harness claimed at spawn |
+| `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload — strictly scoped to the name this harness claimed at spawn (`ninfer-claims.json` beside the harness exe). Must be docker-legal and must not look like a container ID (4+ hex chars): docker would resolve such an argument as an id prefix and delete someone else's container |
 | `ninfer_profile` | Profile passed as the script's `$1` (default `b`) |
 | `ninfer_key` | `true` sends `key` as `$2`; anything else sends `nokey` |
 
@@ -120,9 +120,13 @@ catalog carries is managed; manual
 servers the harness did not spawn are never registered or monitored, only
 subtracted from VRAM via the witness. A harness crash can orphan a container (the job object only reaps
 the client); the next load of that name reconciles by removing the stale
-container before autostart runs. Duplicate `ninfer_container` names across
-models are refused at scan — reaping is by name. As with strata: no preload,
-booting spawns nothing.
+container before autostart runs. At boot an orphan is reclaimed only when all
+three ownership gates hold — a `ninfer` model declares the name, the name is
+legal, and the claim ledger proves this harness started it — otherwise the
+harness warns and leaves the container alone: boot reclaim never destroys on
+suspicion, never by prefix, never by container-ID prefix. Duplicate
+`ninfer_container` names across models are refused at scan — reaping is by
+name. As with strata: no preload, booting spawns nothing.
 
 ### Strata engines
 
