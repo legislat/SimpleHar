@@ -1000,7 +1000,18 @@ async fn t08_cancel_during_load() {
         )
         .await;
     assert_eq!(status, 200, "unload mid-load = cancel");
-    let _ = load.await.expect("load task"); // the waiter's reply may be 200/409/502
+    let (load_status, load_body) = load.await.expect("load task");
+    // Two values are reachable for this race: 409 when the cancel won (the waiter gets
+    // `SchedulerError::Cancelled`, mapped to Conflict -> 409 at src/api/mod.rs:183/:116),
+    // or 200 when the engine reached Serving between the sighting above and the unload
+    // reaching the actor. Any other status is the load failing for its own reason. This
+    // assert is not the gate - the 200 it tolerates is the defect - so the ledger pair
+    // below is what makes that case a FAIL.
+    assert!(
+        load_status == 200 || load_status == 409,
+        "the cancelled load must answer 409 (cancelled) or 200 (it completed before the \
+         unload reached the actor); no other status is reachable for this race: {load_body}"
+    );
     assert!(harness.wait_empty(60).await, "slot empties after cancel");
     let cancelled = harness
         .job_for(model)
@@ -1009,6 +1020,38 @@ async fn t08_cancel_during_load() {
     assert_eq!(
         cancelled["is_fault"], false,
         "a deliberate cancel is policy, not a fault: {cancelled}"
+    );
+    // Positive evidence that a CANCELLATION happened (chunk 17 [2]). `is_fault == false`
+    // is satisfied by construction for a load that completed: `fault_of` needs an error,
+    // and an unload after a finished load records a separate Unload row ("unloaded")
+    // whose `is_fault` is false too. The load's OWN row is the only record that can tell
+    // the two apart, and the product writes it distinctly: `unload_slots` cancels the
+    // in-flight job with reason "unloaded by request" (src/scheduler/mod.rs:975),
+    // `cancel_job` stamps `error = Cancelled(reason)` (src/scheduler/mod.rs:2438, Display
+    // "cancelled: {0}" at :72) and both cancel exits funnel through
+    // `finish(job_id, Err(error), "cancelled")` (src/scheduler/mod.rs:2450 / :2239), so
+    // outcome == "cancelled". A load that reached Serving keeps outcome "loaded" and a
+    // null error, which fails both asserts below.
+    let jobs = harness.get("/har/jobs").await;
+    let load_row = jobs["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .rev()
+        .find(|job| job["model"] == model && job["kind"] == "Load")
+        .expect("the load under test is recorded as a Load row");
+    assert_eq!(
+        load_row["outcome"],
+        json!("cancelled"),
+        "8.1 claims a mid-load cancel, so the load's own ledger row must record the \
+         cancellation; outcome \"loaded\" here means the engine finished and this was an \
+         ordinary unload wearing a cancel's clothes: {load_row}"
+    );
+    assert_eq!(
+        load_row["error"],
+        json!("cancelled: unloaded by request"),
+        "the cancel must carry the reason the unload-during-load path writes, not just \
+         any cancelled note: {load_row}"
     );
 
     // 8.2: immediately load it again - no stuck lock, no port in use.
