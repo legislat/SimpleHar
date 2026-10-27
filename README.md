@@ -39,9 +39,12 @@ models load on demand (first request, or from the page).
 | AUX | 8710 | 1–6 | utility models | WORK, RP |
 | EMB | 8711 | 1 | embeddings | WORK, RP |
 
-Engine processes bind loopback only, one port per slot allocated sequentially from
+llama engines are **forced** to `--host 127.0.0.1` by the harness; strata and ninfer
+take their bind address from their own external config (strata profile `host`,
+ninfer autostart script) — keep those loopback unless you mean to publish. One
+port per slot allocated sequentially from
 18109 (`18109`–`18112` with the default four single-slot categories, up to `18117`
-with six AUX slots; never exposed). All ports are declarative — see `categories` in
+with six AUX slots). All ports are declarative — see `categories` in
 the config.
 
 Each public listener answers OpenAI-style `/v1/models` (category-filtered),
@@ -102,7 +105,7 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `strata_config` | **Required for strata.** Profile JSON path; existence-checked before spawn. Weights/quant/context all live in this file, never in argv |
 | `strata_python` | Interpreter (default `C:\Strata\.venv\Scripts\python.exe`); existence-checked before spawn |
 | `strata_cwd` | Working directory (default `C:\Strata`) |
-| `extra_args` | Whitespace-split words appended to the argv; words naming a harness-owned flag (`-m`, `--model`, `--host`, `--port`, `-ngl`, `--jinja`, `--mmproj`, `=` forms included) are refused with the launch. The forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` are appended after it, so they always win. All other unknown keys are preserved in the catalog for reference but never launched |
+| `extra_args` | Whitespace-split words appended to the argv; words naming a harness-owned flag (`-m`, `--model`, `--host`, `-h`, `--port`, `-p`, `-ngl`, `--n-gpu-layers`, `--jinja`, `--mmproj`, `=` forms included) are refused with the launch. The forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` are appended after it, so they win under any parser that honors last occurrence. All other unknown keys are preserved in the catalog for reference but never launched |
 | `ninfer_autostart` | **Required for ninfer.** Path (inside WSL) of the operator's autostart script; invoked as `bash <script> <profile> <key\|nokey> <port>` via `wsl.exe` |
 | `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload — strictly scoped to the name this harness claimed at spawn (`ninfer-claims.json` beside the harness exe). Must be docker-legal and must not look like a container ID (4+ hex chars): docker would resolve such an argument as an id prefix and delete someone else's container |
 | `ninfer_profile` | Profile passed as the script's `$1` (default `b`) |
@@ -242,4 +245,6 @@ token decides *who*, never *whether* the request shape is acceptable. The token 
 never logged and never accepted from a URL. With no token set the harness has **no authentication**:
 `internal_host: 0.0.0.0` (Publish to LAN) then trusts every machine on the segment to
 load/unload models and drive the GPUs; it exists for LAN boxes and warns loudly at
-boot. Default is loopback only.
+boot. Default is loopback only. The token guards only the harness's own listeners —
+engine ports have no harness auth, so a published strata profile (`host` non-loopback)
+needs its own `api_key`, and llama is forced loopback regardless of `internal_host`.
