@@ -6,6 +6,9 @@ models between four category listeners with a typed, single-writer scheduler,
 admits loads against a real memory ledger, and refuses — with reasons — rather
 than overcommitting.
 
+Current release: **1.0** — `cargo build --release` produces
+`target\release\simplehar-se.exe`.
+
 ## Requirements
 
 - Windows 10/11 with an NVIDIA GPU (NVML witness; `nvidia-smi` fallback).
@@ -36,12 +39,15 @@ models load on demand (first request, or from the page).
 | AUX | 8710 | 1–6 | utility models | WORK, RP |
 | EMB | 8711 | 1 | embeddings | WORK, RP |
 
-Engine processes bind loopback 18109–18119 (never exposed). All ports are
-declarative — see `categories` in the config.
+Engine processes bind loopback only, one port per slot allocated sequentially from
+18109 (`18109`–`18112` with the default four single-slot categories, up to `18117`
+with six AUX slots; never exposed). All ports are declarative — see `categories` in
+the config.
 
 Each public listener answers OpenAI-style `/v1/models` (category-filtered),
-`/v1/chat/completions`, `/v1/embeddings`. A request naming no model (or the
-engine's default id) loads that category's `default_model` instead of erroring.
+`/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. A request naming no
+model (or the engine's default id) loads that category's `default_model` instead of
+erroring.
 
 ## Configuration: `simplehar-se.json`
 
@@ -91,8 +97,7 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `measured_gb_min` | Low end of that range: the smallest total-diff seen while serving. The spread is the KV cache growing during a session, which is why one number would be false precision. Must not exceed `measured_gb` |
 | `measured_offload` | The `cpu_offload` setting the pair was measured under, written with it. An offloaded launch has no comparable footprint, so flipping `cpu_offload` voids both values at scan while leaving the stamp visible on the page |
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
-| `sticky` | Legacy alias → `AUX` |
-| `context`, `batch`, `flash_attn`, … | Mapped to llama flags per the start.ps1 parity table |
+| `context`, `batch`, `flash_attn`, … | Mapped to the corresponding `llama-server` flags |
 | `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata/ninfer cold starts use 600–1200) |
 | `strata_config` | **Required for strata.** Profile JSON path; existence-checked before spawn. Weights/quant/context all live in this file, never in argv |
 | `strata_python` | Interpreter (default `C:\Strata\.venv\Scripts\python.exe`); existence-checked before spawn |
@@ -111,8 +116,7 @@ short-lived `wsl.exe -d <wsl_distro> -u <wsl_user> -- bash <ninfer_autostart>
 **then** `/v1/models` 200. Because the container outlives the client, unload
 reaps it by name (`docker rm -f <ninfer_container>`); the release evidence is
 the port closing after the reaping, not the client's exit. Every ninfer model the
-catalog carries is managed — the legacy `external: true` key is inert (scrapped by the
-operator, 2026-10-26), so such an entry loads like any other; manual
+catalog carries is managed; manual
 servers the harness did not spawn are never registered or monitored, only
 subtracted from VRAM via the witness. A harness crash can orphan a container (the job object only reaps
 the client); the next load of that name reconciles by removing the stale
@@ -151,7 +155,7 @@ All / per-category, Exit.
 
 | Endpoint | Body / meaning |
 |---|---|
-| `GET /health` | Liveness |
+| `GET /health` | Liveness — token-gated like every other route once `control_token` is set |
 | `GET /har/status` | Full snapshot incl. `mem`, `jobs`, `last_error`, boot timings |
 | `GET /har/events` | SSE state pushes |
 | `GET /har/jobs`, `GET /har/jobs/{id}` | Job ledger |
@@ -161,10 +165,18 @@ All / per-category, Exit.
 | `POST /har/unload` | `{model}` \| `{category}` \| `{}` (all). Unloading a *loading* slot cancels that swap (cleanup still completes) |
 | `POST /har/rescan` | `{}` catalog rescan |
 | `POST /har/config/default` | `{category, model \| null}` — persists to the config file |
+| `POST /har/config/logging` | `{enabled: bool}` — toggles the verbose harness log (answers `extended_logging`) |
 | `POST /har/config/model` | `{model, category?, cpu?}` — writes back to the model yaml |
 
 Errors carry both a flat `{code, message}` and the OpenAI-style
-`{error:{message,type,code}}` envelope.
+`{error:{message,type,code}}` envelope, with the same values in both. The `code` is
+one of: `not_found` (404), `bad_request` (400), `unauthorized` (401, control token),
+`forbidden` (403, cross-site `Origin` on a POST), `conflict` (409, cancelled /
+superseded / port still held), `unsupported_media_type` (415), `unavailable` (503,
+admission refused with the numbers and blockers), `below_launch_floor` (503, refused
+before spawn), `witness_unavailable` (503, card unreadable), `upstream` (502),
+`not_implemented` (501), `internal` (500). Refusals that carry numbers do so in
+`message` and in the job ledger, never in a bare status.
 
 ## Autostart
 
@@ -215,11 +227,15 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
 ## Security note
 
 Set `control_token` (or `SIMPLEHAR_TOKEN`, which wins so the secret can stay out of
-the file) and the whole control surface — `/har/*`, the control category's `/v1/*`
-proxy, and the page's own API calls — requires it on `X-Har-Token` or
-`Authorization: Bearer`. Only `/`, `/index.html`, `/app.js` and `/style.css` answer
-unauthenticated, so the page can load and ask. The token is never logged and never
-accepted from a URL. With no token set the harness has **no authentication**:
+the file) and **every route requires it** on `X-Har-Token` or `Authorization: Bearer` —
+`/har/*`, each listener's `/v1/*`, and `GET /health` too, so a liveness probe must carry
+the token or it will read 401 and look like a dead listener. Only the page and the assets
+it links — `/`, `/index.html`, `/app.js`, `/style.css` and `/pico.min.css` — answer
+unauthenticated, so the page can load and ask. The structural guards run **before** the
+token check: a cross-site `Origin` on a POST is `403` whether or not a token is presented,
+and a missing `application/json` content-type is `415` even with a valid one — so the
+token decides *who*, never *whether* the request shape is acceptable. The token is
+never logged and never accepted from a URL. With no token set the harness has **no authentication**:
 `internal_host: 0.0.0.0` (Publish to LAN) then trusts every machine on the segment to
 load/unload models and drive the GPUs; it exists for LAN boxes and warns loudly at
 boot. Default is loopback only.

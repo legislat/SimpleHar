@@ -278,6 +278,20 @@ pub const CONFIG_FILE: &str = "simplehar-se.json";
 /// rollback path keeps the file it expects.
 pub const LEGACY_CONFIG_FILE: &str = "simplehar.json";
 
+/// Where [`CONFIG_FILE`] lives when nothing points elsewhere: beside the executable.
+///
+/// One definition on purpose. Boot reads from here (`main.rs::boot_config`) and config
+/// write-back writes to here (`api::config_write_path`); when the two were spelled out
+/// separately they drifted by exactly one filename, and a write landed in a file boot
+/// never loads. Returns `None` only when the process cannot resolve its own executable
+/// path.
+#[must_use]
+pub fn default_config_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(CONFIG_FILE)))
+}
+
 /// Root of [`CONFIG_FILE`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

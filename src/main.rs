@@ -26,11 +26,7 @@ fn boot_config() -> Result<AppConfig, Vec<ConfigError>> {
     let path = std::env::var("SIMPLEHAR_CONFIG")
         .map(PathBuf::from)
         .ok()
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(|dir| dir.join(config::CONFIG_FILE)))
-        });
+        .or_else(config::default_config_path);
     // One-time migration from the shared v3.3 name. The legacy file is copied, never
     // moved or rewritten: the rollback exe must still find what it expects there
     // (deploy review, 2026-10-26 — SE's full-struct persist writes `protected_ports`,

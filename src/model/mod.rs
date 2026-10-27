@@ -274,9 +274,9 @@ impl ModelEntry {
 
 impl ModelEntry {
     /// Builds an entry from a flat `key: value` map (the v3.3 yaml shape), applying the
-    /// documented aliases: `is_embedding_model: true` forces EMB, `sticky: true` maps
-    /// to AUX when no explicit `category:` is present, and the default is WORK
-    /// (Step 5, Step 9).
+    /// documented alias `is_embedding_model: true` → EMB; the default category is WORK
+    /// (Step 5, Step 9). The older app's `sticky:` alias is gone: a model is placed by
+    /// its own `category:`, never by an inherited label.
     ///
     /// # Errors
     ///
@@ -301,7 +301,6 @@ impl ModelEntry {
                 parsed
             }
             None if embedding => CategoryId::Emb,
-            None if keys.get("sticky").is_some_and(|v| truthy(v)) => CategoryId::Aux,
             None => CategoryId::Work,
         };
         let vram_gb = match keys.get("vram_gb") {
@@ -555,14 +554,16 @@ mod tests {
     }
 
     #[test]
-    fn aliases_sticky_to_aux_and_embedding_to_emb() {
-        let sticky = ModelEntry::from_flat(&flat(&[("name", "a"), ("sticky", "true")]))
-            .expect("valid entry");
-        assert_eq!(sticky.category, CategoryId::Aux);
-
+    fn embedding_alias_forces_emb_and_no_category_means_work() {
         let embed = ModelEntry::from_flat(&flat(&[("name", "b"), ("is_embedding_model", "true")]))
             .expect("valid entry");
         assert_eq!(embed.category, CategoryId::Emb);
+
+        // The removed `sticky:` alias must not quietly keep working: an entry naming no
+        // category lands in WORK whatever else it carries.
+        let unplaced = ModelEntry::from_flat(&flat(&[("name", "a"), ("sticky", "true")]))
+            .expect("unknown keys are preserved, not rejected");
+        assert_eq!(unplaced.category, CategoryId::Work);
     }
 
     #[test]

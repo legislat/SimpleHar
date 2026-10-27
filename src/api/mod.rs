@@ -316,7 +316,7 @@ impl ApiState {
     }
 
     /// Sets (or clears, with `None`) the category default and persists it to
-    /// `simplehar.json` atomically (temp file + rename). In-memory wins even when
+    /// `simplehar-se.json` atomically (temp file + rename). In-memory wins even when
     /// persistence fails (logged); the response says which happened.
     pub fn set_default_model(
         &self,
@@ -358,20 +358,31 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Writes `category.default_model` into `simplehar.json` atomically: parse the
+/// Where a config write-back belongs: the file boot actually loaded (`SIMPLEHAR_CONFIG`
+/// included), else the default beside the executable — taken from
+/// [`crate::config::default_config_path`] so the file SE reads and the file SE writes can
+/// never drift apart.
+///
+/// The final `PathBuf::from(CONFIG_FILE)` is a last resort for a process that cannot
+/// resolve its own executable path: `boot_config` always stamps `source_path`, so this is
+/// reached in practice only by a hand-built `AppConfig`. It used to name `simplehar.json`,
+/// the older app's file, which SE promises never to write and never reads — a latent
+/// hazard in a nearly unreachable branch, not a live bug (README review, 2026-10-27).
+fn config_write_path(config: &AppConfig) -> std::path::PathBuf {
+    config
+        .source_path
+        .clone()
+        .or_else(crate::config::default_config_path)
+        .unwrap_or_else(|| std::path::PathBuf::from(crate::config::CONFIG_FILE))
+}
+
+/// Writes `category.default_model` into the config file atomically: parse the
 /// on-disk file (or the boot config when absent), patch the one field, temp+rename.
 fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option<&str>) -> bool {
-    // Write-back must target the file boot actually loaded (`SIMPLEHAR_CONFIG`
-    // included), or a test/LAN config silently loses its defaults (finding #2).
-    let path = config.source_path.clone().unwrap_or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("simplehar.json")))
-            .unwrap_or_else(|| std::path::PathBuf::from("simplehar.json"))
-    });
+    let path = config_write_path(config);
     let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|error| {
-            tracing::warn!(error = %error, "simplehar.json unreadable; rewriting from boot config");
+            tracing::warn!(error = %error, path = %path.display(), "config unreadable; rewriting from boot config");
             serde_json::to_value(&*config).expect("invariant: config serializes")
         }),
         Err(_) => serde_json::to_value(config).expect("invariant: config serializes"),
@@ -387,7 +398,7 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
         root = serde_json::to_value(config).expect("invariant: config serializes");
     }
     let Some(categories) = root.get_mut("categories").and_then(|c| c.as_array_mut()) else {
-        tracing::error!("cannot persist default_model: no categories in simplehar.json");
+        tracing::error!(path = %path.display(), "cannot persist default_model: no categories in the config file");
         return false;
     };
     let mut patched = false;
@@ -432,7 +443,7 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
         tracing::error!(error = %error, "cannot persist default_model: rename failed");
         return false;
     }
-    tracing::info!(category = %id, model = ?model, "default_model persisted to simplehar.json");
+    tracing::info!(category = %id, model = ?model, path = %path.display(), "default_model persisted to the config file");
     true
 }
 
@@ -691,7 +702,20 @@ fn next_request_id() -> String {
 /// Routes that must answer before a token exists, so the page can load and ask for
 /// one. Exact matches only — never a prefix, which would re-open `/har/*`-adjacent
 /// paths.
-const PUBLIC_PATHS: [&str; 4] = ["/", "/index.html", "/app.js", "/style.css"];
+///
+/// `pub` so the token test iterates this list rather than its own copy of it: when the
+/// two were separate, a stylesheet added to the page but not here shipped an unstyled
+/// control page while the test stayed green, because each asserted a private truth.
+pub const PUBLIC_PATHS: [&str; 5] = [
+    "/",
+    "/index.html",
+    "/app.js",
+    "/style.css",
+    // The page links Pico's base stylesheet, so it must answer before a token exists;
+    // omitting it left the control page rendering unstyled whenever `control_token` was
+    // set (README review, 2026-10-27).
+    "/pico.min.css",
+];
 
 /// The control token, if any: the environment wins so the secret can stay out of the
 /// config file entirely (AGENTS.md — secrets live in the environment, not in
@@ -892,7 +916,7 @@ async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
 
 /// `POST /har/config/default {"category": …, "model": name|null}` — set the
 /// category's default model (Step 11 fallback); validated against the catalog and
-/// persisted to `simplehar.json` atomically.
+/// persisted to `simplehar-se.json` atomically.
 async fn har_config_default(
     State(state): State<Arc<ApiState>>,
     body: Result<Json<Value>, JsonRejection>,
@@ -1432,6 +1456,39 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_write_path_follows_boot_and_never_the_legacy_file() {
+        // Write-back must land where boot reads. Comparing the WHOLE path is what makes
+        // this bite: every fallback branch ends in CONFIG_FILE, so a filename-only
+        // assertion would pass even if the default directory moved under it.
+        let no_source = AppConfig {
+            source_path: None,
+            ..AppConfig::default()
+        };
+        let expected = crate::config::default_config_path().expect("test process has an exe path");
+        assert_eq!(
+            config_write_path(&no_source),
+            expected,
+            "with no stamped path, write to boot's own default location"
+        );
+        assert_ne!(
+            config_write_path(&no_source).file_name(),
+            Some(std::ffi::OsStr::new(crate::config::LEGACY_CONFIG_FILE)),
+            "SE never writes the older app's config file"
+        );
+
+        let loaded = std::path::PathBuf::from(r"C:\Configs\lan.json");
+        let stamped = AppConfig {
+            source_path: Some(loaded.clone()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            config_write_path(&stamped),
+            loaded,
+            "the file boot actually loaded always wins"
+        );
+    }
 
     #[test]
     fn model_json_cpu_offload_agrees_with_the_engine() {

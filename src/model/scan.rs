@@ -337,12 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn aliases_survive_the_round_trip() {
-        let dir = crate::testutil::temp_dir("scan-alias");
+    fn categories_survive_the_round_trip() {
+        let dir = crate::testutil::temp_dir("scan-category");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("a.yaml"), "name: a\nis_embedding_model: true\n").expect("write");
-        std::fs::write(dir.join("b.yaml"), "name: b\nsticky: true\n").expect("write");
+        std::fs::write(dir.join("b.yaml"), "name: b\ncategory: AUX\n").expect("write");
         let catalog = scan_dir(&dir);
         assert_eq!(catalog.models[0].category, CategoryId::Emb);
         assert_eq!(catalog.models[1].category, CategoryId::Aux);

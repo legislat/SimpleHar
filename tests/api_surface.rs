@@ -165,17 +165,23 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
     let (status, _body) = post_json(&work, "/v1/chat/completions", r#"{"model":"qwen3"}"#).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // ...while the static page is not: it has to load before it can ask for a token.
-    let page = control
-        .clone()
-        .oneshot(
-            Request::get("/")
-                .body(Body::empty())
-                .expect("static request"),
-        )
-        .await
-        .expect("in-process request");
-    assert_eq!(page.status(), StatusCode::OK);
+    // ...while the static page and every asset it links are not: the page has to load
+    // before it can ask for a token. `/pico.min.css` was missing from the public list,
+    // which meant a token-protected harness served an unstyled page (README review).
+    // Iterating the guard's own list, not a copy, so adding an asset to the page without
+    // exempting it can never pass here again.
+    for path in simplehar_se::api::PUBLIC_PATHS {
+        let page = control
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .body(Body::empty())
+                    .expect("static request"),
+            )
+            .await
+            .expect("in-process request");
+        assert_eq!(page.status(), StatusCode::OK, "public asset {path}");
+    }
 }
 
 #[tokio::test]

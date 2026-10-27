@@ -56,6 +56,10 @@ async fn not_found() -> Response {
 pub fn router(_state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/", get(index))
+        // The guard's PUBLIC_PATHS already names this, and the README advertises it, so
+        // a bookmarked `.../index.html` should answer rather than 404 on a path that is
+        // documented as public.
+        .route("/index.html", get(index))
         .route("/style.css", get(stylesheet))
         .route("/app.js", get(script))
         .route("/pico.min.css", get(pico))
