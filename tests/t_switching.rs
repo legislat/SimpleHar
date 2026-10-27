@@ -69,6 +69,35 @@ fn big_aux_gguf() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(r"F:\MODELS_MID\Artoma-Lexicon-31B.Q6_K.gguf"))
 }
 
+fn mid_gguf() -> PathBuf {
+    std::env::var("SE_T_MID")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(r"F:\MODELS_MID\Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q8_K_P.gguf")
+        })
+}
+
+/// Whether T8 cancels a mid-size load (default) or the 31B (`SE_T_MIDS=0`, or the mid
+/// file is absent).
+///
+/// `tier.ps1` evaluates the same two conditions, so the memory gate can never disagree
+/// with the test about what is about to occupy the card - which is the only property
+/// that makes a gate like it worth having.
+fn use_mid_t08() -> bool {
+    std::env::var("SE_T_MIDS").map_or(true, |value| value != "0") && mid_gguf().exists()
+}
+
+/// The `vram_gb` to declare for `path`: the product's own estimate for an undeclared
+/// model, so the ledger the admission gate reasons about here is the one it would
+/// compute in production (`need_gb`, src/budget.rs:193) rather than a hand-written guess.
+fn booked_gib(path: &std::path::Path) -> String {
+    let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let size = simplehar_se::budget::Gibibytes(bytes as f64 / 1024.0_f64.powi(3));
+    simplehar_se::budget::need_gb(None, Some(size))
+        .map(|need| format!("{:.2}", need.0))
+        .unwrap_or_else(|_| "12".to_string())
+}
+
 struct Harness {
     child: Child,
     http: reqwest::Client,
@@ -105,6 +134,10 @@ impl Harness {
         };
         yaml("work06", "WORK", &small_gguf(), "1", "\ncpu_offload: true");
         yaml("work06b", "WORK", &small_gguf(), "1", "\ncpu_offload: true");
+        // Listeners are per category and a wrong-category chat is a 404 by design
+        // (T1 asserts it), so any test that drives the AUX listener needs a model
+        // whose category IS AUX - `work06b` is WORK and never could serve there.
+        yaml("aux06", "AUX", &small_gguf(), "1", "\ncpu_offload: true");
         yaml("emb", "EMB", &emb_gguf(), "1", "");
         // Identity sentinel (review, 2026-10-27). `/health` is anonymous - every
         // harness on the box answers it identically - so a server already listening
@@ -120,6 +153,12 @@ impl Harness {
         }
         if big_aux_gguf().exists() {
             yaml("aux31", "AUX", &big_aux_gguf(), "29", "");
+        }
+        // T8's cancel target: a mid-size load is slow enough that the cancel arrives
+        // while the job is genuinely still in flight, which is what the test claims to
+        // prove and what a 0.6B model (ready in ~1 s) could never show.
+        if use_mid_t08() {
+            yaml("rp8", "RP", &mid_gguf(), &booked_gib(&mid_gguf()), "");
         }
 
         // The temp catalog must be named in the config: `default_modelconf_dir()` is
@@ -303,6 +342,32 @@ impl Harness {
         self.get("/har/status").await
     }
 
+    /// The `(port, pid)` the slot table reports for the engine serving `model`.
+    ///
+    /// Both come from `/har/status` (`SlotStatus`), so the pair is the product's own
+    /// view of the child process. `pid` is `0` when the runtime reports none, which
+    /// is treated as missing rather than as a usable process identity.
+    ///
+    /// # Panics
+    ///
+    /// If no slot reports `model`, or the occupant reports no usable port or pid.
+    async fn engine_of(&self, model: &str) -> (u64, u32) {
+        let status = self.status().await;
+        let slot = status["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|s| s["model"] == model)
+            .unwrap_or_else(|| panic!("no slot reports {model} as serving"));
+        let port = slot["port"].as_u64().expect("engine port");
+        let pid = slot["pid"]
+            .as_u64()
+            .and_then(|p| u32::try_from(p).ok())
+            .filter(|p| *p != 0)
+            .expect("engine pid");
+        (port, pid)
+    }
+
     /// Polls until `model` is serving in the slot table (or timeout).
     async fn wait_serving(&self, model: &str, secs: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(secs);
@@ -318,6 +383,26 @@ impl Harness {
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Polls until the newest job for `model` exists and is not terminal (or timeout).
+    ///
+    /// A load that already finished cannot be superseded, so any test claiming to
+    /// replace or cancel an in-flight load must first see it in flight - or say it
+    /// never did.
+    async fn wait_job_in_flight(&self, model: &str, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(job) = self.job_for(model).await {
+                if job["terminal"] == false {
+                    return true;
+                }
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -511,8 +596,10 @@ async fn t02_single_load_unload_llama() {
     assert_eq!(status, 200, "load: {body}");
     assert!(harness.wait_serving("work06", 120).await, "slot Serving");
 
-    // 2.3: chat on the owning listener -> 200 with a completion.
-    let (status, body) = harness.chat(AUX_LISTENER, Some("work06")).await;
+    // 2.3: chat on the owning listener -> 200 with a completion. `work06` is a WORK
+    // model, so its owning listener is the control port; on AUX the same request is
+    // the 404 that T1 asserts (T-suite Run 3 drove it here and could never pass).
+    let (status, body) = harness.chat(CONTROL, Some("work06")).await;
     assert_eq!(status, 200, "chat: {body}");
     assert!(body["choices"].as_array().is_some(), "completion: {body}");
 
@@ -594,36 +681,64 @@ async fn t03_same_slot_replacements() {
     let (status, body) = harness.chat(CONTROL, Some("work06b")).await;
     assert_eq!(status, 200, "{body}");
 
-    // 3.5 (adapted to SE): rapid A then B before A is ready — final slot = B,
-    // no port conflict errors anywhere in the ledger.
-    let (unload_status, unload_body) = harness
-        .post(
-            &format!("{CONTROL}/har/unload"),
-            json!({ "category": "WORK" }),
-        )
-        .await;
-    assert_eq!(unload_status, 200, "unload WORK: {unload_body}");
-    assert!(
-        harness.wait_empty(30).await,
-        "WORK must be empty before the rapid pair"
-    );
+    // 3.5 (adapted to SE): A loads, and B is posted only AFTER A is seen still loading;
+    // final slot = B, and nothing in the ledger is a fault.
+    //
+    // Posting the pair blind makes the winner a coin-flip on arrival order: the 409
+    // `cancelled: superseded by a newer load` lands on whichever request the scheduler
+    // took first (Run 4 passed the coin-flip, Run 5 lost it twice). Requiring the
+    // sighting is also what makes this a supersede test at all - two loads that never
+    // overlap are just two loads - so an attempt that misses it is retried, and the
+    // test reports the miss instead of banking a green it did not earn.
+    let mut superseded = false;
+    for attempt in 1..=4 {
+        let (unload_status, unload_body) = harness
+            .post(
+                &format!("{CONTROL}/har/unload"),
+                json!({ "category": "WORK" }),
+            )
+            .await;
+        assert_eq!(unload_status, 200, "unload WORK: {unload_body}");
+        assert!(
+            harness.wait_empty(30).await,
+            "WORK must be empty before the rapid pair"
+        );
 
-    // A then B, both in flight: supersede can only be exercised while A is still
-    // loading, which a sequential await makes impossible (review, 2026-10-27).
-    let a = harness.post_task(&format!("{CONTROL}/har/load"), json!({ "model": "work06" }));
-    let b = harness.post_task(
-        &format!("{CONTROL}/har/load"),
-        json!({ "model": "work06b" }),
-    );
-    let (ra, rb) = tokio::join!(a, b);
-    let (status_a, body_a) = ra.expect("load A task");
-    let (status_b, body_b) = rb.expect("load B task");
+        let a = harness.post_task(&format!("{CONTROL}/har/load"), json!({ "model": "work06" }));
+        if !harness.wait_job_in_flight("work06", 6).await {
+            let _ = a.await.expect("load A task");
+            println!("T3 attempt {attempt}: A finished before B could supersede it");
+            continue;
+        }
+        let b = harness.post_task(
+            &format!("{CONTROL}/har/load"),
+            json!({ "model": "work06b" }),
+        );
+        let (ra, rb) = tokio::join!(a, b);
+        let (status_a, body_a) = ra.expect("load A task");
+        let (status_b, body_b) = rb.expect("load B task");
+        assert!(
+            status_a == 200 || status_a == 409,
+            "load A must be accepted or superseded, never faulted: {body_a}"
+        );
+        // A 200 means the pair never actually overlapped: A finished between the
+        // sighting and B reaching the actor, so the scheduler took its ordinary
+        // same-slot replacement path and there was no supersede to observe. Retrying
+        // is the honest answer; banking that attempt as a pass would be the same drift
+        // that let the CSRF test assert 409 for years (review, 2026-10-27).
+        if status_a != 409 {
+            println!("T3 attempt {attempt}: A returned {status_a}, no supersede observed");
+            continue;
+        }
+        assert_eq!(status_b, 200, "B displaced A, so B must win: {body_b}");
+        assert!(harness.wait_serving("work06b", 120).await, "B ends serving");
+        superseded = true;
+        break;
+    }
     assert!(
-        status_a == 200 || status_a == 409,
-        "superseded load A must be accepted or reported as superseded: {body_a}"
+        superseded,
+        "3.5 needs A observed loading while B arrives; every attempt found the window too narrow"
     );
-    assert_eq!(status_b, 200, "load B must win: {body_b}");
-    assert!(harness.wait_serving("work06b", 120).await, "B ends serving");
 
     // Positive ledger facts replace the old negative substring: `"already used"`
     // appears nowhere in the product, so `!has_conflict` could never fail.
@@ -662,30 +777,56 @@ async fn t04_cross_category_cycle() {
     serial_lock();
     let harness = Harness::spawn("t04").await;
 
-    // T4 adapted: the singleton slot is per category; the cycle drives implicit
-    // loads through the category listeners (chat = auto-load).
+    // T4 adapted: `max_models: 1` per category, so each category is a singleton slot
+    // and a chat drives an implicit load on its OWN category's listener - a WORK model
+    // on the AUX listener is the 404 T1 asserts, not a 200 (T-suite Run 3). The cycle
+    // therefore drives AUX, then WORK twice, which covers both rules at once: the
+    // same-category replacement (work06 -> work06b releases the previous occupant) and
+    // cross-category independence.
+    let occupant = |status: &Value, category: &str| -> Option<String> {
+        status["slots"]
+            .as_array()?
+            .iter()
+            .find(|slot| slot["category"] == category)
+            .and_then(|slot| slot["model"].as_str())
+            .map(str::to_string)
+    };
+
     for (listener, model) in [
-        (AUX_LISTENER, "work06"),
+        (AUX_LISTENER, "aux06"),
+        (CONTROL, "work06"),
         (CONTROL, "work06b"),
-        (AUX_LISTENER, "work06"),
     ] {
+        let own = if listener == CONTROL { "WORK" } else { "AUX" };
+        let other = if own == "WORK" { "AUX" } else { "WORK" };
+        let other_before = occupant(&harness.status().await, other);
+
         let (status, body) = harness.chat(listener, Some(model)).await;
         assert_eq!(status, 200, "cycle step {model}: {body}");
-        assert!(harness.wait_serving(model, 120).await);
-        // The other category must be empty (singleton per slot, per category).
-        let status = harness.status().await;
-        let other = if listener == CONTROL { "AUX" } else { "WORK" };
         assert!(
-            status["slots"]
-                .as_array()
-                .expect("slots")
-                .iter()
-                .filter(|s| s["category"] == other)
-                .all(|s| s["model"] == Value::Null),
-            "the previous occupant was released"
+            harness.wait_serving(model, 120).await,
+            "{model} never reached Serving"
+        );
+
+        let after = harness.status().await;
+        assert_eq!(
+            occupant(&after, own).as_deref(),
+            Some(model),
+            "the {own} singleton must hold the model just driven there"
+        );
+        // Nothing in the shipped contract releases a category the request never
+        // touched; if cross-category exclusivity is intended instead, flip this
+        // assertion and the PASS line below together (open operator ruling, 2026-10-27).
+        assert_eq!(
+            occupant(&after, other),
+            other_before,
+            "driving {own} must leave the {other} slot alone"
         );
     }
-    println!("T4 PASS (llama-only cycle; strata/ninfer SKIP in v1.0)");
+    println!(
+        "T4 PASS (llama-only cycle; strata/ninfer SKIP in v1.0) \
+         (FINDING: categories are independent, not exclusive - no cross-category release rule)"
+    );
 }
 
 // ---------------------------------------------------------------- T5
@@ -724,8 +865,11 @@ async fn t06_eviction_matrix() {
     }
 
     // SE ledger: rp31 (29) + aux31 (29) = 58 ledger, free 10; work31 needs 29
-    // -> deficit 19 -> the cheapest evictable set is aux31 (AUX is evictable by
-    // WORK; RP is not) -> AUX evicted, RP KEPT (T6.2 keep + T6.3 evict).
+    // -> deficit 19 -> one 29 GiB victim is sufficient, and both candidates cost the
+    // same. The tie must fall to disposability: AUX may be evicted by WORK and RP, RP
+    // only by WORK, so AUX is the one released and RP survives. RP is NOT protected
+    // from WORK (src/config/mod.rs:238 says `evictable_by: [Work]`) - it survives
+    // because an equally cheap, more disposable victim existed (T6.2 keep + T6.3 evict).
     for model in ["rp31", "aux31"] {
         let (status, body) = harness
             .post(&format!("{CONTROL}/har/load"), json!({ "model": model }))
@@ -750,8 +894,12 @@ async fn t06_eviction_matrix() {
             .map(str::to_string)
     };
     assert_eq!(of("WORK").as_deref(), Some("work31"));
-    assert_eq!(of("RP").as_deref(), Some("rp31"), "RP kept (not evictable)");
-    assert_eq!(of("AUX"), None, "AUX evicted (cheapest sufficient set)");
+    assert_eq!(
+        of("RP").as_deref(),
+        Some("rp31"),
+        "RP survives: equally costly as AUX but evictable by fewer categories"
+    );
+    assert_eq!(of("AUX"), None, "AUX evicted (equal cost, less protected)");
 
     let jobs = harness.get("/har/jobs").await;
     let swap = jobs["jobs"]
@@ -761,7 +909,7 @@ async fn t06_eviction_matrix() {
         .find(|job| job["model"] == "work31")
         .expect("swap job");
     assert_eq!(swap["victims_released"], json!(["aux31"]));
-    println!("T6 PASS (llama matrix: keep-RP, evict-AUX, WORK loads)");
+    println!("T6 PASS (llama matrix: evict-AUX-by-disposability, keep-RP, WORK loads)");
 }
 
 // ---------------------------------------------------------------- T7
@@ -812,23 +960,28 @@ async fn t07_admission_failure() {
 // ---------------------------------------------------------------- T8
 
 #[tokio::test]
-#[ignore = "operator-gated: loads a 31B model (~29 GiB, minutes)"]
+#[ignore = "operator-gated: loads one mid-size model (~11 GiB booked); SE_T_MIDS=0 uses the 31B"]
 async fn t08_cancel_during_load() {
     serial_lock();
     let harness = Harness::spawn("t08").await;
-    if !harness.baseline_check(&[&big_rp_gguf()]) {
-        println!("T8 BLOCKED: 31B model file missing (SE_T_RP31)");
+    let (model, file) = if use_mid_t08() {
+        ("rp8", mid_gguf())
+    } else {
+        ("rp31", big_rp_gguf())
+    };
+    if !harness.baseline_check(&[&file]) {
+        println!("T8 BLOCKED: {model} model file missing (SE_T_MID / SE_T_RP31)");
         return;
     }
 
-    // 8.1: load the big model and cancel it WHILE IT IS STILL LOADING. The POST is on
-    // its own task because /har/load blocks until Serving: awaiting it inline means the
-    // engine already finished, and the "cancel" would be an ordinary unload wearing a
+    // 8.1: load it and cancel WHILE IT IS STILL LOADING. The POST is on its own task
+    // because /har/load blocks until Serving: awaiting it inline means the engine
+    // already finished, and the "cancel" would be an ordinary unload wearing a
     // cancel's clothes (review, 2026-10-27).
-    let load = harness.post_task(&format!("{CONTROL}/har/load"), json!({ "model": "rp31" }));
+    let load = harness.post_task(&format!("{CONTROL}/har/load"), json!({ "model": model }));
     let mut in_flight = false;
     for _ in 0..40 {
-        if let Some(job) = harness.job_for("rp31").await {
+        if let Some(job) = harness.job_for(model).await {
             if job["terminal"] == false {
                 in_flight = true;
                 break;
@@ -838,7 +991,7 @@ async fn t08_cancel_during_load() {
     }
     assert!(
         in_flight,
-        "8.1 tests a mid-load cancel; the rp31 load job was never observed in flight"
+        "8.1 tests a mid-load cancel; the {model} load job was never observed in flight"
     );
     let (status, _) = harness
         .post(
@@ -850,7 +1003,7 @@ async fn t08_cancel_during_load() {
     let _ = load.await.expect("load task"); // the waiter's reply may be 200/409/502
     assert!(harness.wait_empty(60).await, "slot empties after cancel");
     let cancelled = harness
-        .job_for("rp31")
+        .job_for(model)
         .await
         .expect("the cancelled load stays in the ledger");
     assert_eq!(
@@ -860,13 +1013,13 @@ async fn t08_cancel_during_load() {
 
     // 8.2: immediately load it again - no stuck lock, no port in use.
     let (status, body) = harness
-        .post(&format!("{CONTROL}/har/load"), json!({ "model": "rp31" }))
+        .post(&format!("{CONTROL}/har/load"), json!({ "model": model }))
         .await;
     assert_eq!(status, 200, "reload after cancel: {body}");
-    assert!(harness.wait_serving("rp31", 600).await);
+    assert!(harness.wait_serving(model, 600).await);
 
     assert_eq!(harness.llama_server_count(), 1, "no orphan engines");
-    println!("T8 PASS");
+    println!("T8 PASS ({model} cancelled mid-load)");
 }
 
 // ---------------------------------------------------------------- T9
@@ -917,23 +1070,21 @@ async fn t10_crash_resilience() {
     serial_lock();
     let harness = Harness::spawn("t10").await;
 
-    // 10.1: kill every llama-server mid-serving; the next chat triggers one
+    // 10.1: kill the engine mid-serving; the next chat triggers one
     // restart-and-retry and answers 200 (built in SE).
     let (status, _) = harness
         .post(&format!("{CONTROL}/har/load"), json!({ "model": "work06" }))
         .await;
     assert_eq!(status, 200);
     assert!(harness.wait_serving("work06", 120).await);
-    let port_old = harness.status().await["slots"]
-        .as_array()
-        .expect("slots")
-        .iter()
-        .find(|s| s["model"] == "work06")
-        .and_then(|s| s["port"].as_u64())
-        .expect("port");
+    let (port_old, pid_old) = harness.engine_of("work06").await;
 
+    // Only OUR engine is killed. The blanket `/FI "IMAGENAME eq llama-server.exe" /F`
+    // also took down every unrelated llama.cpp session on the box - the same class of
+    // harm the boot-reclaim rule exists to prevent, which only allows us to touch
+    // processes this harness started.
     assert!(Command::new("taskkill")
-        .args(["/FI", "IMAGENAME eq llama-server.exe", "/F"])
+        .args(["/PID", &pid_old.to_string(), "/F"])
         .output()
         .expect("taskkill")
         .status
@@ -942,13 +1093,15 @@ async fn t10_crash_resilience() {
 
     let (status, body) = harness.chat(CONTROL, Some("work06")).await;
     assert_eq!(status, 200, "crash-retry must answer: {body}");
-    let port_new = harness.status().await["slots"]
-        .as_array()
-        .expect("slots")
-        .iter()
-        .find(|s| s["model"] == "work06")
-        .and_then(|s| s["port"].as_u64());
-    assert_ne!(port_new, Some(port_old), "a fresh engine is serving");
+    let (port_new, pid_new) = harness.engine_of("work06").await;
+    // Engine ports are assigned per slot and never move (`ENGINE_PORT_BASE` + slot
+    // index, src/config/mod.rs:166), so a restart changes the PROCESS and keeps the
+    // port. The old `assert_ne!(port_new, port_old)` was unsatisfiable by design.
+    assert_eq!(
+        port_new, port_old,
+        "the slot must keep its assigned engine port across a crash-retry"
+    );
+    assert_ne!(pid_new, pid_old, "a fresh engine process must be serving");
 
     // 10.4 (adapted, FINDING-by-design): kill the HARNESS abruptly; Job Objects
     // kill every engine; a fresh boot starts with empty slots (no state
@@ -1115,8 +1268,15 @@ async fn t14_soak() {
         .unwrap_or(3);
 
     let mut failures = 0;
+    // The WORK legs alternate so every iteration forces a real same-category
+    // replacement (the churn this soak exists to exercise); the AUX leg must use the
+    // AUX-category model, since `work06b` is WORK and 404s there.
     for iteration in 1..=iterations {
-        for (listener, model) in [(CONTROL, "work06"), (AUX_LISTENER, "work06b")] {
+        for (listener, model) in [
+            (CONTROL, "work06"),
+            (CONTROL, "work06b"),
+            (AUX_LISTENER, "aux06"),
+        ] {
             let (status, body) = harness.chat(listener, Some(model)).await;
             if status != 200 {
                 println!("T14 iteration {iteration} {model}: FAIL ({body})");
