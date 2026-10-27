@@ -29,10 +29,20 @@ pub const LLAMA_ENGINE_HOST: &str = "127.0.0.1";
 
 /// Flags the harness owns; an `extra_args` word equal to one of these, or equal to
 /// one of them followed by `=` (e.g. `--port=8080`), is a refused launch rather
-/// than a silent override (FINDINGS-09 [2]). Case-sensitive exact matching, no
-/// heuristics.
+/// than a silent override (FINDINGS-09 [2]). Includes llama.cpp's alias spellings
+/// (`-h`, `-p`, `--n-gpu-layers`) so the refusal does not rest on the tail-forcing
+/// last-occurrence assumption alone. Case-sensitive exact matching, no heuristics.
 const HARNESS_OWNED_FLAGS: &[&str] = &[
-    "-m", "--model", "--host", "--port", "-ngl", "--jinja", "--mmproj",
+    "-m",
+    "--model",
+    "--host",
+    "-h",
+    "--port",
+    "-p",
+    "-ngl",
+    "--n-gpu-layers",
+    "--jinja",
+    "--mmproj",
 ];
 
 /// Rejects any `extra_args` word that names a harness-owned flag.
@@ -84,13 +94,18 @@ pub fn jinja_on(value: &str) -> bool {
     matches!(value, "true" | "1" | "on")
 }
 
-/// Builds the llama-server argv from the raw yaml map, mirroring `start.ps1:45-63`:
-/// `-m` first (required), `--mmproj`, the remaining mapped flags with non-empty
+/// Builds the llama-server argv from the raw yaml map, mirroring `start.ps1:45-63`
+/// (the deliberate deviation: the forced flags move to the tail): `-m` first
+/// (required), `--mmproj`, the remaining mapped flags with non-empty
 /// values, `--jinja` when truthy, then `extra_args` split on whitespace, and the
 /// harness-forced flags at the tail (`--host`, `--port`, and `-ngl 0` when
 /// `cpu_offload` is on) so forced values win under any parser that honors last
 /// occurrence. Any `extra_args` word naming a harness-owned flag is refused
 /// outright (see [`HARNESS_OWNED_FLAGS`]).
+///
+/// Crate-internal: `host` is only ever [`LLAMA_ENGINE_HOST`] in production (from
+/// [`LlamaAdapter::spec`]); a public host knob would be the struct-literal bypass
+/// `ff235e6` deleted from the adapter, back in parameter form.
 ///
 /// # Errors
 ///
@@ -98,7 +113,7 @@ pub fn jinja_on(value: &str) -> bool {
 ///   refuses to launch without it too.
 /// - [`EngineError::Rejected`] when an `extra_args` word matches a harness-owned
 ///   flag, naming the offending token.
-pub fn build_args(
+pub(crate) fn build_args(
     raw: &BTreeMap<String, String>,
     host: &str,
     port: u16,
@@ -307,11 +322,20 @@ mod tests {
     #[test]
     fn extra_args_naming_a_harness_owned_flag_is_refused() {
         for (extra, token) in [
-            ("--port 8080", "--port"),
-            ("--host 0.0.0.0", "--host"),
-            ("-ngl 99", "-ngl"),
+            ("-m D:/evil.gguf", "-m"),
             ("--model D:/evil.gguf", "--model"),
+            ("--host 0.0.0.0", "--host"),
+            ("-h 0.0.0.0", "-h"),
+            ("--port 8080", "--port"),
+            ("-p 8080", "-p"),
+            ("-ngl 99", "-ngl"),
+            ("--n-gpu-layers 99", "--n-gpu-layers"),
+            ("--jinja", "--jinja"),
+            ("--mmproj D:/evil.gguf", "--mmproj"),
             ("--port=8080", "--port"),
+            ("--host=0.0.0.0", "--host"),
+            ("-ngl=99", "-ngl"),
+            ("--n-gpu-layers=99", "--n-gpu-layers"),
         ] {
             let error = build_args(
                 &raw(&[("model", "m"), ("extra_args", extra)]),
@@ -352,6 +376,23 @@ mod tests {
             .windows(3)
             .any(|w| w == ["--embedding", "--pooling", "last"]);
         assert!(window, "extra_args missing from {args:?}");
+    }
+
+    #[test]
+    fn near_miss_words_are_not_refused() {
+        // The `=` matcher requires the byte right after the flag, so look-alikes
+        // of harness-owned flags must pass (review finding [1] false-positive guard).
+        let args = build_args(
+            &raw(&[
+                ("model", "m"),
+                ("extra_args", "-ngld 5 --model-draft D:/d.gguf --portolan 1"),
+            ]),
+            "127.0.0.1",
+            18109,
+            "t",
+        )
+        .expect("near-miss words must be accepted");
+        assert!(args.windows(2).any(|w| w == ["-ngld", "5"]));
     }
 
     #[test]
