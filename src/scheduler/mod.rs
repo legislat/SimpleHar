@@ -1930,6 +1930,16 @@ impl ActorState {
             .push(handle);
     }
 
+    /// Whether a reap error on one target should abort the whole reap.
+    ///
+    /// A stale ticket means the process this job meant is already gone — there is nothing
+    /// left to reap for that target, and aborting here would strand the job's OTHER
+    /// target, its own live engine (chunk 2, 2026-10-27). Any other failure is real and
+    /// must surface.
+    fn reap_should_continue(error: &SpawnError) -> bool {
+        matches!(error, SpawnError::StaleTicket { .. })
+    }
+
     /// Kill every process this job owns (its pending victim and its own spawn) and
     /// confirm release with evidence, inside `release_timeout_s` (G12).
     fn spawn_kill_confirm(&mut self, job_id: JobId) {
@@ -1977,14 +1987,32 @@ impl ActorState {
                 .join("+");
             let outcome = match tokio::time::timeout(timeout, async {
                 for target in &targets {
-                    runtime.kill(&target.ticket).await?;
+                    if let Err(error) = runtime.kill(&target.ticket).await {
+                        if !Self::reap_should_continue(&error) {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            port = target.ticket.port,
+                            generation = target.ticket.generation,
+                            model = %target.model,
+                            "stale reap target: its process is already gone, reaping the rest"
+                        );
+                    }
                 }
                 for target in &targets {
                     loop {
-                        if runtime.release_confirmed(&target.ticket).await? {
-                            break;
+                        match runtime.release_confirmed(&target.ticket).await {
+                            Ok(true) => break,
+                            Ok(false) => tokio::time::sleep(RELEASE_POLL).await,
+                            Err(error) if Self::reap_should_continue(&error) => {
+                                tracing::warn!(
+                                    port = target.ticket.port,
+                                    "stale reap target: nothing left to confirm"
+                                );
+                                break;
+                            }
+                            Err(error) => return Err(error),
                         }
-                        tokio::time::sleep(RELEASE_POLL).await;
                     }
                 }
                 Ok(())
@@ -2589,6 +2617,29 @@ impl Job {
 mod tests {
     use super::{headline_fault, JobId, JobKind, JobStatus, SwapState};
     use crate::config::CategoryId;
+
+    #[test]
+    fn a_stale_reap_target_does_not_abort_the_rest() {
+        // Chunk 2: aborting the reap on a stale victim ticket stranded the job's own live
+        // engine — the very orphan the multi-target reap exists to prevent.
+        use super::ActorState;
+        use crate::engine::SpawnError;
+        assert!(
+            ActorState::reap_should_continue(&SpawnError::StaleTicket {
+                port: 18_109,
+                expected: 3,
+                found: 4,
+            }),
+            "a vanished victim leaves nothing to reap; the next target must still be tried"
+        );
+        assert!(
+            !ActorState::reap_should_continue(&SpawnError::KillFailed {
+                holder: "model".to_string(),
+                reason: "TerminateProcess failed".to_string(),
+            }),
+            "a real kill failure must still fail the job"
+        );
+    }
 
     fn job(id: u64, kind: JobKind, model: &str, error: Option<&str>, outcome: &str) -> JobStatus {
         JobStatus {
