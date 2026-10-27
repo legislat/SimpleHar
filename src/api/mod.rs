@@ -571,8 +571,10 @@ fn ambiguous_catalog_error(query: &str, entries: &[&ModelEntry]) -> ApiError {
 ///
 /// # Errors
 ///
-/// [`ApiError::Conflict`] (`409`) for an ambiguous query, else whatever `not_found`
-/// returns for an unknown one.
+/// [`ApiError::Conflict`] (`409`) for an ambiguous query **or** a uniquely-found
+/// entry whose `name` is duplicated in the catalog (the actor re-resolves by
+/// name find-first, so a shared name must never reach it), else whatever
+/// `not_found` returns for an unknown one.
 fn resolve_unique<'a, F>(
     query: &str,
     catalog: &'a [ModelEntry],
@@ -582,7 +584,23 @@ where
     F: FnOnce(&str) -> ApiError,
 {
     match crate::catalog::resolve(query, catalog) {
-        crate::catalog::Resolution::Found(entry) => Ok(entry),
+        crate::catalog::Resolution::Found(entry) => {
+            // A uniquely-resolved entry can still hand its `name` to the actor,
+            // which re-resolves name→entry find-first (scheduler/mod.rs). Two
+            // entries sharing a `name:` therefore serve the wrong twin under the
+            // requested identity (one GGUF, one booking) with a green 200 even
+            // when the client's own query matched exactly one of them (review
+            // FINDINGS-FIXTRACK [1]). Refuse any Found whose name is duplicated
+            // in the catalog, naming every colliding file.
+            let twins: Vec<&ModelEntry> = catalog
+                .iter()
+                .filter(|other| other.name == entry.name)
+                .collect();
+            if twins.len() > 1 {
+                return Err(ambiguous_catalog_error(&entry.name, &twins));
+            }
+            Ok(entry)
+        }
         crate::catalog::Resolution::None => Err(not_found(query)),
         crate::catalog::Resolution::Ambiguous(entries) => {
             Err(ambiguous_catalog_error(query, &entries))

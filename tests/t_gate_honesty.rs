@@ -38,12 +38,12 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Serializes the whole suite: the harness spawns the real exe and the
 /// single-instance guard refuses a second one.
-static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 /// Per-spawn discriminator for the identity sentinel (FINDINGS-17 [3] fix): a
 /// leaked or foreign harness can replicate a static `sentinel-{tag}` name, but
 /// not a name this process minted seconds ago for one specific child.
@@ -84,12 +84,17 @@ fn booked_gib(path: &std::path::Path) -> String {
         .unwrap_or_else(|_| "12".to_string())
 }
 
-fn serial_lock() {
-    let guard = SERIAL
-        .get_or_init(|| Mutex::new(()))
+/// Takes the suite lock for the CALLER's lifetime: an acquired-then-dropped
+/// lock serializes nothing (review FINDINGS-FIXTRACK [2]); each async test
+/// binds the guard for its whole body. A tokio (not std) mutex because the
+/// guard must survive `.await` points. `run-group.ps1 --test-threads=1`
+/// remains the second line of defense, not the only one.
+#[must_use = "the guard is the serialization; dropping it immediately guards nothing"]
+async fn serial_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    drop(guard);
+        .await
 }
 
 /// Same derivation as the T-suite's: integration binaries live under `deps/`.
@@ -620,7 +625,7 @@ fn log_verdicts(
 #[tokio::test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + models"]
 async fn g01_unload_all_frees_every_occupant() {
-    serial_lock();
+    let _serial = serial_lock().await;
     let entries = [Entry::aux("auxA"), Entry::aux("auxB")];
     let harness = Harness::spawn_verified("g01", &entries, 2)
         .await
@@ -667,7 +672,7 @@ async fn g01_unload_all_frees_every_occupant() {
 #[tokio::test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + models"]
 async fn g02_evidence_before_and_after_the_unload() {
-    serial_lock();
+    let _serial = serial_lock().await;
     let entries = [Entry::aux("auxA"), Entry::aux("auxB")];
     let harness = Harness::spawn_verified("g02", &entries, 2)
         .await
@@ -721,7 +726,7 @@ async fn g02_evidence_before_and_after_the_unload() {
 #[tokio::test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + models"]
 async fn g03_foreign_harness_cannot_impersonate() {
-    serial_lock();
+    let _serial = serial_lock().await;
     let decoy = Decoy::own_ports("g03").await;
     let refusal = Harness::spawn_verified("g03", &[Entry::aux("auxA")], 1)
         .await
@@ -771,7 +776,7 @@ async fn g03_foreign_harness_cannot_impersonate() {
 #[tokio::test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + mid model"]
 async fn g04_supersede_409_names_the_reason() {
-    serial_lock();
+    let _serial = serial_lock().await;
     if !mid_gguf().exists() {
         println!("G4 BLOCKED: mid model missing (SE_T_MID) — the in-flight window cannot be opened honestly");
         return;
@@ -819,13 +824,15 @@ async fn g04_supersede_409_names_the_reason() {
 // ---------------------------------------------------------------- G5 (FINDINGS-17 [5])
 
 /// ADVERSARIAL-with-honest-SKIP. T9 claimed the in-flight attach path but never
-/// sighted an in-flight job; issuance is not overlap. This test MUST sight the
-/// in-flight state before posting the duplicates; if it cannot, it prints SKIP
-/// and the finding stands — an `Already`-only run can never print REFUTED.
+/// sighted an in-flight job; issuance is not overlap. Two gates make REFUTED
+/// mean the thing: the job must be SIGHTED non-terminal before the duplicates
+/// go out, AND the duplicates must return `loaded` receipts carrying the SAME
+/// job as the first post (review FINDINGS-FIXTRACK [3]) — the post-serving
+/// `already` path answers 200 with no job and must never satisfy the claim.
 #[tokio::test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + models"]
 async fn g05_attach_path_is_sighted_not_assumed() {
-    serial_lock();
+    let _serial = serial_lock().await;
     let harness = Harness::spawn_verified("g05", &[Entry::aux("auxA")], 1)
         .await
         .expect("verified harness");
@@ -834,9 +841,10 @@ async fn g05_attach_path_is_sighted_not_assumed() {
     let b = harness.post_task(&format!("{CONTROL}/har/load"), json!({ "model": "auxA" }));
     let c = harness.post_task(&format!("{CONTROL}/har/load"), json!({ "model": "auxA" }));
     let (sa, sb, sc) = tokio::join!(a, b, c);
-    for (status, body) in [sa.expect("task"), sb.expect("task"), sc.expect("task")] {
+    let (sa, sb, sc) = (sa.expect("task"), sb.expect("task"), sc.expect("task"));
+    for (status, body) in [(&sa.0, &sa.1), (&sb.0, &sb.1), (&sc.0, &sc.1)] {
         assert!(
-            status == 200 || status == 202,
+            *status == 200 || *status == 202,
             "attach load: {status} {body}"
         );
     }
@@ -853,14 +861,27 @@ async fn g05_attach_path_is_sighted_not_assumed() {
         load_rows, 1,
         "concurrent loads must collapse to one job row"
     );
-    if !sighted {
+    // The attach proof: duplicates that joined the in-flight job answer
+    // `loaded` with that job's receipt; an `already` means the job served
+    // before the post landed — the path FINDINGS-17 [5] says proves nothing.
+    let job_of = |body: &Value| {
+        (body["status"] == "loaded")
+            .then(|| body["receipt"]["job"].clone())
+            .filter(|job| job != &Value::Null)
+    };
+    let attached = [sb.1, sc.1]
+        .iter()
+        .filter_map(job_of)
+        .filter(|job| *job == job_of(&sa.1).unwrap_or(Value::Null))
+        .count();
+    if !sighted || attached < 2 {
         println!(
-            "G5 SKIP: duplicates collapsed but the in-flight attach was never sighted — an \
-             Already-only run is indistinguishable from here; FINDINGS-17 [5] stands unrefuted"
+            "G5 SKIP: sighted={sighted}, {attached}/2 duplicates proved the in-flight attach \
+             (same loaded receipt); an Already-only window cannot REFUTE FINDINGS-17 [5]"
         );
         return;
     }
-    println!("G5 REFUTED: attach path sighted in flight before duplicates; 3 posts, 1 job row");
+    println!("G5 REFUTED: duplicates attached to the SAME loaded job, sighted in flight — 3 posts, 1 job row");
 }
 
 // ---------------------------------------------------------------- G6 (FINDINGS-17 [6])
@@ -871,7 +892,7 @@ async fn g05_attach_path_is_sighted_not_assumed() {
 #[tokio::test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + models"]
 async fn g06_kill_guard_accepts_child_rejects_strangers() {
-    serial_lock();
+    let _serial = serial_lock().await;
     let harness = Harness::spawn_verified("g06", &[Entry::aux("auxA")], 1)
         .await
         .expect("verified harness");
@@ -905,7 +926,7 @@ async fn g06_kill_guard_accepts_child_rejects_strangers() {
 #[tokio::test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + models"]
 async fn g07_release_is_proven_by_the_port_not_a_sleep() {
-    serial_lock();
+    let _serial = serial_lock().await;
     let harness = Harness::spawn_verified("g07", &[Entry::aux("auxA")], 1)
         .await
         .expect("verified harness");
@@ -987,7 +1008,7 @@ fn g08_log_bound_fails_a_leak_and_ignores_litter() {
 #[tokio::test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + models"]
 async fn g09_orphan_count_is_parent_scoped() {
-    serial_lock();
+    let _serial = serial_lock().await;
     let harness = Harness::spawn_verified("g09", &[Entry::aux("auxA")], 1)
         .await
         .expect("verified harness");

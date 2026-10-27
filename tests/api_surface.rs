@@ -925,6 +925,33 @@ async fn named_proxy_on_a_duplicate_name_is_the_same_409_not_a_misdirected_404()
 }
 
 #[tokio::test]
+async fn alias_unique_hit_on_a_shared_name_is_refused_before_the_actors_find_first() {
+    // Review FINDINGS-FIXTRACK [1]: the query `twin-q4.gguf` matches exactly ONE
+    // entry on the alias tier, so `resolve` says Found — but that entry's NAME
+    // is shared, and the API hands only the name to the actor, which re-resolves
+    // name→entry find-first and can arm the OTHER twin (wrong GGUF, wrong
+    // category) with a green 200. The refusal belongs at the API boundary, where
+    // the whole catalog is still visible.
+    let (control, _, _, _, runtime, _) = ambiguous_app().await;
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"twin-q4.gguf"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "an alias-unique twin must still be refused: {body}"
+    );
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("twin-work.yaml") && message.contains("twin-aux.yaml"),
+        "both twins named: {message}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "a shared name must never reach the actor at all"
+    );
+}
+
+#[tokio::test]
 async fn colliding_gguf_file_names_are_409_on_the_alias_tier() {
     // Reviewer's example: distinct names, one shared gguf file name across two
     // directories, so the alias tier is claimed twice.
