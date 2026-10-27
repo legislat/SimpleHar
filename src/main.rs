@@ -7,7 +7,7 @@ use simplehar_se::engine::llama::LlamaAdapter;
 use simplehar_se::engine::mock::MockAdapter;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
 use simplehar_se::observability;
-use simplehar_se::process::{ProcessRuntime, SingleInstanceGuard};
+use simplehar_se::process::{ContainerCandidate, ProcessRuntime, SingleInstanceGuard};
 use simplehar_se::scheduler::{Scheduler, SchedulerHandle};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -113,10 +113,14 @@ async fn main() -> ExitCode {
             config.wsl_account().unwrap_or_default(),
         ));
     adapters.insert("ninfer".to_string(), ninfer);
-    let runtime: Arc<dyn EngineRuntime> = Arc::new(ProcessRuntime::new().with_wsl(
+    let runtime = ProcessRuntime::new().with_wsl(
         config.wsl_distro.clone(),
         config.wsl_account().unwrap_or_default(),
-    ));
+    );
+    // Same runtime instance for the boot reclaim: one shared engine table and one
+    // shared container-claim ledger (chunk 10 [1]).
+    let boot_runtime = runtime.clone();
+    let runtime: Arc<dyn EngineRuntime> = Arc::new(runtime);
     let witness: Arc<dyn simplehar_se::budget::VramWitness> =
         Arc::new(simplehar_se::witness::NvmlWitness::new());
     let scheduler = Scheduler::start(
@@ -183,7 +187,7 @@ async fn main() -> ExitCode {
         );
     }
 
-    match run(state, shutdown_rx, boot_started).await {
+    match run(state, shutdown_rx, boot_started, boot_runtime).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(error = %error, "harness stopped with an error");
@@ -438,10 +442,15 @@ fn parse_excluded_ranges(text: &str) -> Vec<(u16, u16)> {
 }
 
 /// Starts one supervisor per category listener and waits for shutdown.
+///
+/// `boot_runtime` is the same [`ProcessRuntime`] instance the scheduler drives:
+/// the container reclaim consults the very ledger that runtime's spawn/release
+/// paths maintain, so ownership evidence cannot disagree between the two.
 async fn run(
     state: Arc<ApiState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     boot_started: std::time::Instant,
+    boot_runtime: ProcessRuntime,
 ) -> anyhow::Result<()> {
     tracing::info!(
         control = %state.control_addr,
@@ -501,27 +510,36 @@ async fn run(
             "boot ready (0.2): config validated, catalog scanned, listeners resolved"
         );
     }
-    // Boot reconcile (deploy review, 2026-10-26): a container left by a crashed run
-    // keeps the card occupied, and observed-VRAM admission then refuses every load
-    // with no pointer to the culprit. Runs after `boot ready` so it can never delay
-    // binding (§0.2), and only for container names the operator's own catalog
-    // declares — ownership stays name-scoped, never a wildcard.
+    // Boot reclaim (deploy review, 2026-10-26; scoped per chunk 10 [1], 2026-10-27):
+    // a container left by a crashed run keeps the card occupied, and observed-VRAM
+    // admission then refuses every load with no pointer to the culprit. Runs after
+    // `boot ready` so it can never delay binding (§0.2). The reclaim may touch ONLY
+    // catalog-declared container names this harness positively owns — ninfer engine,
+    // spawn-path-legal name, live claim in the runtime's ledger — never by prefix,
+    // never by container-ID prefix, never a container it did not start; every other
+    // running container is warned about and left alone.
     {
         let handle = state.scheduler.clone();
-        let distro = state.config.wsl_distro.clone();
-        let user = state.config.wsl_account().unwrap_or_default().to_string();
         tokio::spawn(async move {
             let Ok(catalog) = handle.catalog().await else {
                 return;
             };
-            let owned: Vec<String> = catalog
+            let candidates: Vec<ContainerCandidate> = catalog
                 .models
                 .iter()
-                .filter_map(|entry| entry.raw.get("ninfer_container"))
-                .map(|name| name.trim().to_string())
-                .filter(|name| !name.is_empty())
+                .filter_map(|entry| {
+                    entry
+                        .raw
+                        .get("ninfer_container")
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .map(|name| ContainerCandidate {
+                            engine: entry.engine.clone(),
+                            name,
+                        })
+                })
                 .collect();
-            simplehar_se::process::reclaim_owned_containers(&distro, &user, &owned).await;
+            boot_runtime.reclaim_at_boot(&candidates).await;
         });
     }
     tokio::select! {

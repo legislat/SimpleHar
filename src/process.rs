@@ -20,9 +20,11 @@
 use crate::engine::{
     http_probe, wsl_prefix, EngineRuntime, LaunchSpec, Probe, SpawnError, Spawned,
 };
-use crate::ownership::{ResourceKind, SpawnTicket};
+use crate::ownership::{
+    boot_reap_decision, ContainerClaims, ReapDecision, ResourceKind, SpawnTicket,
+};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -133,6 +135,9 @@ impl Drop for JobHandle {
 #[derive(Clone)]
 pub struct ProcessRuntime {
     engines: Arc<Mutex<HashMap<u16, EngineProc>>>,
+    /// Shared so every clone of the runtime reads and writes one claim ledger:
+    /// the boot reclaim and the spawn/release paths cannot disagree.
+    claims: Arc<Mutex<ContainerClaims>>,
     client: reqwest::Client,
     logs_dir: PathBuf,
     wsl_distro: String,
@@ -191,7 +196,13 @@ fn excerpt(bytes: &[u8]) -> String {
 /// Best-effort `docker rm -f` inside WSL; every failure path warns and lets the
 /// caller proceed (the release poll is the arbiter). `kill_on_drop` so a timed-out
 /// client cannot accumulate as an orphan (review, 2026-10-26).
-async fn reap_container(distro: &str, user: &str, name: &str) {
+///
+/// # Returns
+///
+/// `true` only when docker confirmed the removal — the boot reclaim drops the
+/// ownership claim for a name only on that evidence, so a failed reap stays
+/// reclaimable at the next boot instead of silently orphaning.
+async fn reap_container(distro: &str, user: &str, name: &str) -> bool {
     if user.trim().is_empty() || distro.trim().is_empty() {
         // Neither coordinate has a shipped default (`wsl_user` names a personal account);
         // never hand `wsl.exe` an empty `-d`/`-u` and call the result a reaping.
@@ -201,7 +212,7 @@ async fn reap_container(distro: &str, user: &str, name: &str) {
             user = user,
             "WSL coordinates missing from the config: refusing to address this container"
         );
-        return;
+        return false;
     }
     let (program, args) = container_rm(distro, user, name);
     let command = Command::new(&program)
@@ -212,59 +223,70 @@ async fn reap_container(distro: &str, user: &str, name: &str) {
     match tokio::time::timeout(Duration::from_secs(10), command).await {
         Ok(Ok(output)) if output.status.success() => {
             tracing::info!(container = name, "container removed");
+            true
         }
-        Ok(Ok(output)) => tracing::warn!(
-            container = name,
-            stderr = %excerpt(&output.stderr),
-            "docker rm -f reported failure"
-        ),
+        Ok(Ok(output)) => {
+            tracing::warn!(
+                container = name,
+                stderr = %excerpt(&output.stderr),
+                "docker rm -f reported failure"
+            );
+            false
+        }
         Ok(Err(error)) => {
             tracing::warn!(container = name, error = %error, "docker rm -f cannot run");
+            false
         }
-        Err(_) => tracing::warn!(container = name, "docker rm -f timed out"),
+        Err(_) => {
+            tracing::warn!(container = name, "docker rm -f timed out");
+            false
+        }
     }
 }
 
-/// Boot reconcile (deploy review, 2026-10-26): a container this harness started in an
-/// earlier lifetime survives a crash holding tens of GiB, and observed-VRAM admission
-/// then refuses every later load with no pointer to the culprit. Only names the
-/// operator's own catalog declares (`ninfer_container`) are candidates — never a
-/// wildcard, never a hardcoded prefix — so reaping stays ownership-scoped (§5).
-/// Best-effort: any failure logs and boot proceeds.
-pub async fn reclaim_owned_containers(distro: &str, user: &str, owned: &[String]) {
-    if owned.is_empty() {
-        return;
-    }
-    if user.trim().is_empty() || distro.trim().is_empty() {
-        // Name the containers the catalog declares: without them the operator's next
-        // load only says "insufficient VRAM", and this line is the sole pointer to the
-        // orphan holding the card (review, 2026-10-26).
-        tracing::warn!(
-            declared = ?owned,
-            distro = distro,
-            user = user,
-            "WSL coordinates missing from the config: boot reclaim stands down, an orphaned \
-             container keeps the card occupied"
-        );
-        return;
-    }
-    let Some(present) = docker_ps(distro, user).await else {
-        return;
-    };
-    for name in to_reclaim(&present, owned) {
-        tracing::warn!(container = %name, "reclaiming a container left behind by an earlier run");
-        reap_container(distro, user, &name).await;
-    }
+/// One catalog-declared container candidate for the boot reclaim: the declaring
+/// model's `engine:` plus its `ninfer_container:` value. Both travel together so
+/// [`boot_reap_decision`] can apply the engine gate and the name gate at boot,
+/// while the claim gate reads the ledger the spawn path wrote (chunk 10 [1]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerCandidate {
+    /// The declaring model's `engine:` value.
+    pub engine: String,
+    /// The declared container name (shape-unvalidated until the decision says so).
+    pub name: String,
 }
 
-/// Running containers that the catalog claims we own. Pure, so the ownership rule is
-/// testable without WSL.
-fn to_reclaim(present: &[String], owned: &[String]) -> Vec<String> {
-    present
+/// The pure core of [`ProcessRuntime::reclaim_at_boot`]: what to destroy and what
+/// to leave running with a named reason. Pure, so the ownership rule is testable
+/// without WSL. A candidate is judged only when a running container already has
+/// its exact name — presence is re-checked, never assumed.
+fn reclaim_plan(
+    present: &[String],
+    candidates: &[ContainerCandidate],
+    claims: &ContainerClaims,
+) -> Vec<(ContainerCandidate, ReapDecision)> {
+    candidates
         .iter()
-        .filter(|name| owned.contains(name))
-        .cloned()
+        .filter(|candidate| present.iter().any(|name| name == &candidate.name))
+        .map(|candidate| {
+            let decision = boot_reap_decision(
+                &candidate.engine,
+                &candidate.name,
+                claims.contains(&candidate.name),
+            );
+            (candidate.clone(), decision)
+        })
         .collect()
+}
+
+/// Home of the persisted container-claim ledger (chunk 10 [1]): beside the
+/// engine logs, next to the exe. Spawn, release, and the boot reclaim all
+/// address this one file through [`ContainerClaims`].
+fn container_claims_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("ninfer-claims.json")))
+        .unwrap_or_else(|| PathBuf::from("ninfer-claims.json"))
 }
 
 /// `wsl.exe … docker ps --format {{.Names}}`; `None` when the call cannot run or
@@ -323,6 +345,9 @@ impl ProcessRuntime {
             .unwrap_or_else(|| PathBuf::from("logs"));
         ProcessRuntime {
             engines: Arc::new(Mutex::new(HashMap::new())),
+            // One ledger for the whole process lifetime, shared by every clone:
+            // claimed at spawn, cleared on confirmed release, consulted at boot.
+            claims: Arc::new(Mutex::new(ContainerClaims::load(container_claims_path()))),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
@@ -344,6 +369,77 @@ impl ProcessRuntime {
         self.wsl_distro = wsl_distro.into();
         self.wsl_user = wsl_user.into();
         self
+    }
+
+    /// Boot reconcile (deploy review, 2026-10-26; scoped by chunk 10 [1], 2026-10-27):
+    /// a container this harness started in an earlier lifetime survives a crash holding
+    /// tens of GiB, and observed-VRAM admission then refuses every later load with no
+    /// pointer to the culprit. A running container is destroyed only when
+    /// [`boot_reap_decision`] passes every ownership gate: declared by a **ninfer**
+    /// model, docker-legal under the same validation the spawn path applies, and
+    /// positively claimed by this harness's ledger at spawn. Any gate failing — above
+    /// all a missing claim — logs a warning naming the container and SKIPs it: the
+    /// harness never destroys on suspicion (operator policy). Best-effort: any failure
+    /// logs and boot proceeds.
+    pub async fn reclaim_at_boot(&self, candidates: &[ContainerCandidate]) {
+        if candidates.is_empty() {
+            return;
+        }
+        let declared: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+        if self.wsl_user.trim().is_empty() || self.wsl_distro.trim().is_empty() {
+            // Name the containers the catalog declares: without them the operator's next
+            // load only says "insufficient VRAM", and this line is the sole pointer to the
+            // orphan holding the card (review, 2026-10-26).
+            tracing::warn!(
+                declared = ?declared,
+                distro = %self.wsl_distro,
+                user = %self.wsl_user,
+                "WSL coordinates missing from the config: boot reclaim stands down, an orphaned \
+                 container keeps the card occupied"
+            );
+            return;
+        }
+        let Some(present) = docker_ps(&self.wsl_distro, &self.wsl_user).await else {
+            return;
+        };
+        let plan = {
+            let claims = self.claims.lock().expect("container claim ledger lock");
+            reclaim_plan(&present, candidates, &claims)
+        };
+        let mut reaped: BTreeSet<String> = BTreeSet::new();
+        for (candidate, decision) in plan {
+            match decision {
+                ReapDecision::Skip { reason } => tracing::warn!(
+                    container = %candidate.name,
+                    engine = %candidate.engine,
+                    reason,
+                    declared = ?declared,
+                    "boot reclaim skipped: no ownership evidence for this container; leaving it running"
+                ),
+                ReapDecision::Reap => {
+                    if !reaped.insert(candidate.name.clone()) {
+                        continue; // two catalog entries, one reap
+                    }
+                    // Re-check the ledger under its lock immediately before destroying:
+                    // a release that completed while we deliberated withdraws permission.
+                    if !self
+                        .claims
+                        .lock()
+                        .expect("container claim ledger lock")
+                        .contains(&candidate.name)
+                    {
+                        continue;
+                    }
+                    tracing::warn!(container = %candidate.name, "reclaiming a container left behind by an earlier run");
+                    if reap_container(&self.wsl_distro, &self.wsl_user, &candidate.name).await {
+                        self.claims
+                            .lock()
+                            .expect("container claim ledger lock")
+                            .unclaim(&candidate.name);
+                    }
+                }
+            }
+        }
     }
 
     /// Number of tracked engines (test/leak assertion helper).
@@ -378,6 +474,14 @@ impl EngineRuntime for ProcessRuntime {
         // minutes-long readiness failure) or the stale container answers
         // readiness for a model the harness never started.
         if let Some(name) = container.as_deref() {
+            // Record ownership FIRST (chunk 10 [1]): this claim is the positive
+            // evidence the boot reclaim demands, and `claim` refuses names the
+            // spawn-path validator would reject, so a claim can never exist for
+            // a name boot would not also refuse to reap.
+            self.claims
+                .lock()
+                .expect("container claim ledger lock")
+                .claim(name);
             reap_container(&self.wsl_distro, &self.wsl_user, name).await;
         }
         if let Err(error) = tokio::fs::create_dir_all(&self.logs_dir).await {
@@ -532,9 +636,22 @@ impl EngineRuntime for ProcessRuntime {
             .await
             .is_err();
         if release_ready(is_container, exited, port_closed) {
-            let mut engines = self.engines.lock().expect("engine table lock");
-            if let Some(engine) = engines.remove(&ticket.port) {
-                drop(engine.job); // JobHandle::drop closes the handle exactly once.
+            let reaped_name = self
+                .engines
+                .lock()
+                .expect("engine table lock")
+                .remove(&ticket.port)
+                .and_then(|engine| engine.container); // `engine` drops here:
+                                                      // `JobHandle::drop` closes the
+                                                      // handle exactly once.
+            if let (true, Some(name)) = (is_container, reaped_name) {
+                // G12 evidence held: the container is gone, so its ownership claim
+                // ends — a later hand-started container reusing the name can never
+                // inherit a claim this harness no longer needs.
+                self.claims
+                    .lock()
+                    .expect("container claim ledger lock")
+                    .unclaim(&name);
             }
             tracing::info!(
                 port = ticket.port,
@@ -678,6 +795,7 @@ unsafe fn terminate_job(job: windows::Win32::Foundation::HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ownership::{SKIP_INVALID_NAME, SKIP_NOT_NINFER, SKIP_UNCLAIMED};
 
     #[test]
     fn a_stale_ticket_never_owns_the_port_it_renames() {
@@ -762,18 +880,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn claims_with(names: &[&str]) -> ContainerClaims {
+        let dir = crate::testutil::temp_dir("claims-plan");
+        let mut claims = ContainerClaims::load(dir.join("ninfer-claims.json"));
+        for name in names {
+            assert!(claims.claim(name), "test seed name must be valid");
+        }
+        claims
+    }
+
+    fn candidate(engine: &str, name: &str) -> ContainerCandidate {
+        ContainerCandidate {
+            engine: engine.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    fn verdicts(plan: &[(ContainerCandidate, ReapDecision)]) -> Vec<(&str, Option<&'static str>)> {
+        plan.iter()
+            .map(|(c, d)| {
+                (
+                    c.name.as_str(),
+                    match d {
+                        ReapDecision::Reap => None,
+                        ReapDecision::Skip { reason } => Some(*reason),
+                    },
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn boot_reclaim_touches_only_catalog_owned_names() {
         // Reaping stays ownership-scoped (§5): a running container is reclaimed only
         // when the operator's own ModelConf declares that exact name — never by
-        // prefix, never by wildcard.
+        // prefix, never by wildcard. `someone-elses-container` never appears.
         let present: Vec<String> = ["SE-nin-bonsai", "ninfer-bonsai", "someone-elses-container"]
             .map(String::from)
             .to_vec();
-        assert_eq!(
-            to_reclaim(&present, &["SE-nin-bonsai".to_string()]),
-            vec!["SE-nin-bonsai".to_string()]
+        let claims = claims_with(&["SE-nin-bonsai"]);
+        let plan = reclaim_plan(&present, &[candidate("ninfer", "SE-nin-bonsai")], &claims);
+        assert_eq!(verdicts(&plan), vec![("SE-nin-bonsai", None)]);
+        assert!(reclaim_plan(&present, &[], &claims).is_empty());
+    }
+
+    #[test]
+    fn boot_reclaim_skips_every_container_lacking_ownership_evidence() {
+        // Chunk 10 [1] reproduced: a running container named by SOME yaml is still
+        // untouchable without all three gates — each failure SKIPs with its reason.
+        // (The invalid name is unclaimable, so the claim gate cannot even be reached:
+        // the shape gate fires first and the container is left running.)
+        let present: Vec<String> = [
+            "ninfer-claimed",
+            "ninfer-unclaimed",
+            "llama-named",
+            "_illegal",
+        ]
+        .map(String::from)
+        .to_vec();
+        let claims = claims_with(&["ninfer-claimed", "llama-named"]);
+        let plan = reclaim_plan(
+            &present,
+            &[
+                candidate("ninfer", "ninfer-claimed"),
+                candidate("ninfer", "ninfer-unclaimed"),
+                candidate("llama", "llama-named"),
+                candidate("ninfer", "_illegal"),
+            ],
+            &claims,
         );
-        assert!(to_reclaim(&present, &[]).is_empty());
+        assert_eq!(
+            verdicts(&plan),
+            vec![
+                ("ninfer-claimed", None),
+                ("ninfer-unclaimed", Some(SKIP_UNCLAIMED)),
+                ("llama-named", Some(SKIP_NOT_NINFER)),
+                ("_illegal", Some(SKIP_INVALID_NAME)),
+            ]
+        );
+    }
+
+    #[test]
+    fn boot_reclaim_never_judges_a_container_that_is_not_running() {
+        // Presence in `docker ps` is the precondition: an absent declared name
+        // produces no verdict at all, not even a skip line.
+        let claims = claims_with(&["ninfer-a"]);
+        let plan = reclaim_plan(&[], &[candidate("ninfer", "ninfer-a")], &claims);
+        assert!(plan.is_empty());
     }
 }

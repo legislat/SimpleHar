@@ -15,6 +15,7 @@
 
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
+use crate::ownership::{valid_container_name, NINFER_ENGINE};
 use std::collections::BTreeMap;
 
 /// Defaults matching v3.3 `appconf` (operator-owned WSL coordinates).
@@ -31,16 +32,6 @@ pub struct NinferDefaults {
 pub struct NinferAdapter {
     /// WSL coordinates, wired from config at boot.
     pub defaults: NinferDefaults,
-}
-
-/// Docker's own name rule, applied as a defense-in-depth guard before the value
-/// ever reaches `docker rm -f` argv (review, 2026-10-26).
-fn valid_container(name: &str) -> bool {
-    !name.is_empty()
-        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// Whether `value` is safe to hand to WSL as a single word: the argv after
@@ -84,12 +75,12 @@ impl NinferAdapter {
 
 impl EngineAdapter for NinferAdapter {
     fn engine_id(&self) -> &str {
-        "ninfer"
+        NINFER_ENGINE
     }
 
     fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
         let rejected = |reason: String| EngineError::Rejected {
-            engine: "ninfer".to_string(),
+            engine: NINFER_ENGINE.to_string(),
             model: model.name.clone(),
             reason,
         };
@@ -126,7 +117,7 @@ impl EngineAdapter for NinferAdapter {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .ok_or_else(|| missing("ninfer_container"))?;
-        if !valid_container(&container) {
+        if !valid_container_name(&container) {
             return Err(rejected(format!(
                 "ninfer_container must be a docker name (alphanumeric start, [A-Za-z0-9._-] only): {container}"
             )));

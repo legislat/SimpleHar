@@ -169,7 +169,7 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 // One container name may back exactly one model: unload reaps by
                 // name, so a duplicate would let either model's release destroy
                 // the other's live engine (review, 2026-10-26).
-                if entry.engine == "ninfer" {
+                if entry.engine == crate::ownership::NINFER_ENGINE {
                     if let Some(name) = map.get("ninfer_container").map(|v| v.trim()) {
                         if !name.is_empty() {
                             if let Some(first) =
