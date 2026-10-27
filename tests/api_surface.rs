@@ -50,6 +50,7 @@ fn app(
     adapters.insert("mock-error".to_string(), Arc::new(MockAdapter));
     adapters.insert("mock-never".to_string(), Arc::new(MockAdapter));
     adapters.insert("mock-slow".to_string(), Arc::new(MockAdapter));
+    adapters.insert("mock-dies-once".to_string(), Arc::new(MockAdapter));
     let dir = write_modelconf(specs);
     let scheduler = Scheduler::start(
         config.clone(),
@@ -311,6 +312,62 @@ async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
     // Alias resolved to the harness name, then rewritten to the engine's
     // self-reported id (F-4: the mock reports `mock-model`).
     assert_eq!(body["body"]["model"], "mock-model");
+}
+
+#[tokio::test]
+async fn crash_retry_re_resolves_by_name_after_the_id_rewrite() {
+    // T10.1 regression (T-suite Run 4, 2026-10-27). `proxy` rewrites `body["model"]`
+    // to the engine's self-reported id - `mock-model` here, the gguf PATH for llama -
+    // before forwarding. The crash-retry then re-resolved the target from that
+    // rewritten body, so it searched the catalog for a model *named* by engine id and
+    // 404'd: the restart succeeded, the request still failed.
+    let (control, work, _, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock-dies-once", CategoryId::Work, Some(4.0))],
+    );
+    let (load_status, load_body) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(
+        load_status,
+        StatusCode::OK,
+        "the first load must succeed before anything is killed: {load_body}"
+    );
+    assert_eq!(runtime.spawn_count(), 1, "one engine started");
+    let (_, loaded) = get_json(&control, "/har/status").await;
+    let port = u16::try_from(
+        loaded["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["model"] == "qwen3")
+            .and_then(|slot| slot["port"].as_u64())
+            .expect("the serving slot reports its engine port"),
+    )
+    .expect("port fits u16");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !runtime.is_dead(port).await && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(runtime.is_dead(port).await, "the engine must really die");
+
+    let (status, body) = post_json(
+        &work,
+        "/v1/chat/completions",
+        r#"{"model":"qwen3","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "crash-retry must answer: {body}");
+    assert_eq!(body["echo"], true, "the restarted engine answered");
+    assert_eq!(
+        body["body"]["model"], "mock-model",
+        "the retried request still carries the engine's own id (F-4)"
+    );
+    assert_eq!(runtime.spawn_count(), 2, "exactly one restart");
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "the corpse is gone, one live engine"
+    );
 }
 
 #[tokio::test]
@@ -809,7 +866,11 @@ async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
         assert_eq!(response.status(), StatusCode::OK, "host {host}");
     }
 
-    // CSRF guard: a cross-site Origin on POST is refused 403.
+    // CSRF guard: a cross-site Origin on POST is refused 403. This assertion used to
+    // read `StatusCode::CONFLICT`, which agreed with the implementation and quietly
+    // overruled both the guard's documented contract and this comment; 409 tells a
+    // client the state may change so retrying is reasonable, and a security refusal
+    // must not say that (T13 is what caught it, 2026-10-27).
     let response = control
         .oneshot(
             Request::post("/har/unload")
@@ -821,7 +882,17 @@ async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
         )
         .await
         .expect("in-process request");
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    let body: Value = serde_json::from_slice(&bytes).expect("error body");
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(body["code"], "forbidden", "flat code: {body}");
+    assert_eq!(
+        body["error"]["code"], "forbidden",
+        "the OpenAI envelope carries the same code"
+    );
 }
 
 #[tokio::test]

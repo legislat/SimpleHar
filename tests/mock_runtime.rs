@@ -2,7 +2,8 @@
 //! the whole scheduler actor is testable without spawning processes or touching the
 //! GPU. Behavior modes are selected by the `engine:` id the model carries: `mock`
 //! (instant ready), `mock-slow` (3 s readiness delay), `mock-dies` (server stops
-//! 300 ms after start), `mock-never` (never ready).
+//! 300 ms after start), `mock-dies-once` (only the FIRST engine this runtime starts
+//! stops, so a crash-retry can be observed end to end), `mock-never` (never ready).
 
 use async_trait::async_trait;
 use axum::extract::State;
@@ -13,7 +14,7 @@ use serde_json::json;
 use simplehar_se::engine::{EngineRuntime, LaunchSpec, Probe, ReadinessSpec, SpawnError, Spawned};
 use simplehar_se::ownership::SpawnTicket;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,6 +27,10 @@ pub enum MockMode {
     DelayMs(u64),
     /// The server stops this long after start (the port refuses afterwards).
     DiesAfterMs(u64),
+    /// Only the first engine this runtime starts dies; its replacement lives. This is
+    /// what makes the T10.1 crash-retry observable: the corpse is real and the
+    /// restart is real, in one request.
+    DiesOnce,
     /// `/health` always reports not-loaded.
     Never,
     /// Every proxy target answers 500 (A9: a genuine upstream error is never
@@ -37,6 +42,7 @@ fn mode_for(engine: &str) -> MockMode {
     match engine {
         "mock-slow" => MockMode::DelayMs(2_500),
         "mock-dies" => MockMode::DiesAfterMs(300),
+        "mock-dies-once" => MockMode::DiesOnce,
         "mock-never" => MockMode::Never,
         "mock-error" => MockMode::AlwaysError,
         _ => MockMode::Instant,
@@ -67,6 +73,8 @@ pub struct MockRuntime {
     client: reqwest::Client,
     pid_base: Arc<Mutex<Option<u32>>>,
     spawn_counter: Arc<AtomicU32>,
+    /// Latched by the first `DiesOnce` engine, so only the corpse is real.
+    dies_once_used: Arc<AtomicBool>,
 }
 
 impl Default for MockRuntime {
@@ -88,6 +96,7 @@ impl MockRuntime {
             client,
             pid_base: Arc::new(Mutex::new(None)),
             spawn_counter: Arc::new(AtomicU32::new(0)),
+            dies_once_used: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -96,6 +105,14 @@ impl MockRuntime {
     #[allow(dead_code)]
     pub fn server_count(&self) -> usize {
         self.servers.lock().expect("mock runtime lock").len()
+    }
+
+    /// Number of engines this runtime has ever started, including ones that died.
+    /// Crash-retry evidence: a real retry restarts, so the count grows while
+    /// `server_count` stays at the live set.
+    #[allow(dead_code)]
+    pub fn spawn_count(&self) -> u32 {
+        self.spawn_counter.load(Ordering::Relaxed)
     }
 
     /// Report unique pids (base, base+1, ...) per spawn instead of the default
@@ -158,6 +175,16 @@ async fn echo(
     .into_response()
 }
 
+/// Aborts the server on `port` after `ms`, making the port refuse connections.
+fn schedule_death(servers: Arc<Mutex<HashMap<u16, MockServer>>>, port: u16, ms: u64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        if let Some(server) = servers.lock().expect("mock runtime lock").remove(&port) {
+            server.handle.abort();
+        }
+    });
+}
+
 #[async_trait]
 impl EngineRuntime for MockRuntime {
     async fn spawn(&self, spec: &LaunchSpec, _ticket: SpawnTicket) -> Result<Spawned, SpawnError> {
@@ -186,21 +213,28 @@ impl EngineRuntime for MockRuntime {
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        if let MockMode::DiesAfterMs(ms) = mode {
-            let servers = Arc::clone(&self.servers);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                if let Some(server) = servers.lock().expect("mock runtime lock").remove(&port) {
-                    server.handle.abort();
-                }
-            });
+        self.servers.lock().expect("mock runtime lock").insert(
+            port,
+            MockServer {
+                mode: mode.clone(),
+                handle,
+            },
+        );
+        let spawns = self.spawn_counter.fetch_add(1, Ordering::Relaxed);
+        match mode {
+            MockMode::DiesAfterMs(ms) => schedule_death(Arc::clone(&self.servers), port, ms),
+            // Only the first engine dies, so the crash-retry has a live replacement to
+            // answer from; no later spawn of this runtime is ever the corpse again.
+            MockMode::DiesOnce if !self.dies_once_used.swap(true, Ordering::Relaxed) => {
+                // Generous on purpose: the timer starts at spawn, before the readiness
+                // probe and `/v1/models` discovery have run, and the crash-retry test
+                // needs the engine to die after it is serving, not during its load.
+                schedule_death(Arc::clone(&self.servers), port, 1_500);
+            }
+            _ => {}
         }
-        self.servers
-            .lock()
-            .expect("mock runtime lock")
-            .insert(port, MockServer { mode, handle });
         let pid = match *self.pid_base.lock().expect("pid base lock") {
-            Some(base) => base + self.spawn_counter.fetch_add(1, Ordering::Relaxed),
+            Some(base) => base + spawns,
             None => 0,
         };
         Ok(Spawned { port, pid })

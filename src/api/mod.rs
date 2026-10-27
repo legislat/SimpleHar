@@ -67,6 +67,13 @@ pub enum ApiError {
     /// 2026-10-26: publishing the control plane to a segment without a secret).
     #[error("unauthorized: {reason}")]
     Unauthorized { reason: String },
+    /// A request refused for protection, not for state: the CSRF guard's cross-site
+    /// `Origin` (`403`). Deliberately distinct from [`ApiError::Conflict`], whose
+    /// live-state clashes (cancelled, superseded, port held) invite a retry; a security
+    /// refusal must tell the client to stop. The guard's own contract and T13 both
+    /// specify 403.
+    #[error("forbidden: {reason}")]
+    Forbidden { reason: String },
     /// A POST body lacks the required `application/json` content type — `415`.
     #[error("unsupported media type: {reason}")]
     UnsupportedMedia { reason: String },
@@ -90,6 +97,7 @@ impl ApiError {
             ApiError::Upstream { .. } => "upstream",
             ApiError::Conflict { .. } => "conflict",
             ApiError::Unauthorized { .. } => "unauthorized",
+            ApiError::Forbidden { .. } => "forbidden",
             ApiError::UnsupportedMedia { .. } => "unsupported_media_type",
             ApiError::NotImplemented { .. } => "not_implemented",
             ApiError::Internal { .. } => "internal",
@@ -107,6 +115,7 @@ impl ApiError {
             ApiError::Upstream { .. } => StatusCode::BAD_GATEWAY,
             ApiError::Conflict { .. } => StatusCode::CONFLICT,
             ApiError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden { .. } => StatusCode::FORBIDDEN,
             ApiError::UnsupportedMedia { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ApiError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             ApiError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -806,7 +815,7 @@ fn reject_reason(request: &axum::extract::Request) -> Option<ApiError> {
                     origin_authority(origin).is_some_and(|authority| authority == host)
                 });
             if !same_authority {
-                return Some(ApiError::Conflict {
+                return Some(ApiError::Forbidden {
                     reason: format!(
                         "Origin `{origin}` does not match this listener; cross-site POSTs are refused (CSRF guard)"
                     ),
@@ -1134,8 +1143,50 @@ async fn v1_models(State(listener): State<Arc<ListenerState>>) -> Result<Json<Va
     Ok(Json(json!({ "object": "list", "data": models })))
 }
 
-/// Resolves the request to a serving port on this listener, or a typed error:
-/// wrong-category and unknown models `404` **before** any ensure (Step 11).
+/// Resolves a catalog NAME (not an engine id) to `(name, port, serve_id)`, loading it
+/// into `listener`'s category when it is not serving yet.
+///
+/// This is deliberately a separate entry point from [`ensure_target`]: `proxy` rewrites
+/// `body["model"]` to the engine's self-reported id (F-4), so anything re-resolving a
+/// request after that rewrite must pass the NAME it captured beforehand. The T10.1
+/// crash-retry used to re-resolve from the rewritten body and therefore looked the
+/// engine's id up in the catalog, which 404s every llama engine (its id is the gguf
+/// path) - the restart succeeded and the request still failed.
+///
+/// # Errors
+///
+/// [`ApiError::NotFound`] for an unknown model or one belonging to another category.
+async fn ensure_named(
+    listener: &ListenerState,
+    model: &str,
+) -> Result<(String, u16, Option<String>), ApiError> {
+    let api = &listener.api;
+    let catalog = api.catalog().await?;
+    let entry = crate::catalog::resolve(model, &catalog).ok_or_else(|| ApiError::NotFound {
+        what: format!(
+            "model `{model}` on the {} listener; its /v1/models lists the ids it serves",
+            listener.category
+        ),
+    })?;
+    if entry.category != listener.category {
+        let hint = api
+            .config
+            .categories
+            .iter()
+            .find(|cat| cat.id == entry.category)
+            .map(|cat| cat.public_port)
+            .unwrap_or_default();
+        return Err(ApiError::NotFound {
+            what: format!(
+                "model `{model}` is served on the {} listener (port {hint}), not {}",
+                entry.category, listener.category
+            ),
+        });
+    }
+    let (port, serve_id) = swap_for_port(api, &entry.name, entry.category).await?;
+    Ok((entry.name.clone(), port, serve_id))
+}
+
 /// Resolves the request to a serving target on this listener, or a typed error:
 /// wrong-category and unknown models `404` **before** any ensure (Step 11).
 ///
@@ -1148,33 +1199,7 @@ async fn ensure_target(
     let api = &listener.api;
     let requested = body.get("model").and_then(Value::as_str);
     match requested {
-        Some(model) => {
-            let catalog = api.catalog().await?;
-            let entry =
-                crate::catalog::resolve(model, &catalog).ok_or_else(|| ApiError::NotFound {
-                    what: format!(
-                        "model `{model}` on the {} listener; its /v1/models lists the ids it serves",
-                        listener.category
-                    ),
-                })?;
-            if entry.category != listener.category {
-                let hint = api
-                    .config
-                    .categories
-                    .iter()
-                    .find(|cat| cat.id == entry.category)
-                    .map(|cat| cat.public_port)
-                    .unwrap_or_default();
-                return Err(ApiError::NotFound {
-                    what: format!(
-                        "model `{model}` is served on the {} listener (port {hint}), not {}",
-                        entry.category, listener.category
-                    ),
-                });
-            }
-            let (port, serve_id) = swap_for_port(api, &entry.name, entry.category).await?;
-            Ok((entry.name.clone(), port, serve_id))
-        }
+        Some(model) => ensure_named(listener, model).await,
         None => {
             // F-2 rule (operator, 2026-10-24): "use this category".
             let status = api.scheduler.status().await.map_err(ApiError::from)?;
@@ -1292,9 +1317,15 @@ async fn proxy(
                     .restart(&model, listener.category)
                     .await
                     .map_err(ApiError::from)?;
-                // Re-resolve: the fresh occupant may serve on a different port.
-                let (_, new_port, _) = ensure_target(&listener, &body).await?;
+                // Re-resolve from the NAME, never from `body`: `body["model"]` holds the
+                // engine id written above, and an engine id is not a catalog key. The
+                // fresh occupant may serve on a different port and may report a
+                // different id, so both come from the new receipt; when discovery found
+                // no id, fall back to the harness name exactly as the first forward did
+                // rather than keeping the dead engine's.
+                let (_, new_port, new_serve_id) = ensure_named(&listener, &model).await?;
                 port = new_port;
+                body["model"] = Value::String(new_serve_id.unwrap_or_else(|| model.clone()));
             }
         }
     };
