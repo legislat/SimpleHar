@@ -30,12 +30,15 @@ pub enum Command {
     /// (Step 3 — never a dropped task).
     Cancel { job: JobId },
     /// Unload every occupant of a category; a loading slot in it is cancelled
-    /// first (T8 semantics: unload during load = cancel, cleanup completes).
+    /// first and unloaded when that cancel terminalizes (T8 semantics: unload
+    /// during load = cancel, cleanup completes; FINDINGS-02 [2]: never cancel
+    /// *or* unload, always both).
     Unload { category: CategoryId },
-    /// Unload one model's slot (T12.1); a loading swap for it is cancelled.
+    /// Unload one model's slot (T12.1); a loading swap for it is cancelled, and
+    /// whatever the cancel leaves installed is unloaded after it.
     UnloadModel { model: String },
     /// Unload every occupied slot across all categories (T12.4, the tray's
-    /// Unload All); loading jobs are cancelled.
+    /// Unload All); loading jobs are cancelled and their slots unloaded after them.
     UnloadAll,
     /// Re-scan `ModelConf` (hot reload, Step 9).
     Reload,

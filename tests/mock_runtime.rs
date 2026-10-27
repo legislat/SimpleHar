@@ -17,7 +17,7 @@ use serde_json::json;
 use simplehar_se::engine::{EngineRuntime, LaunchSpec, Probe, ReadinessSpec, SpawnError, Spawned};
 use simplehar_se::ownership::SpawnTicket;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,6 +84,12 @@ pub struct MockRuntime {
     dies_once_used: Arc<AtomicBool>,
     /// Zero-permit gate every `HoldKill` kill waits on (see [`MockRuntime::release_held_kills`]).
     kill_gate: Arc<tokio::sync::Semaphore>,
+    /// How many further `HoldKill` kills park on that gate. Unlimited by default, so
+    /// every held kill behaves as it always did; a test that needs one release it
+    /// cannot prove *followed* by one it can (a cancelled swap, then the operator's
+    /// unload of what the cancel left installed) lowers this instead of racing the
+    /// release deadline. See [`MockRuntime::hold_next_kills`].
+    kill_holds: Arc<AtomicUsize>,
 }
 
 impl Default for MockRuntime {
@@ -107,6 +113,7 @@ impl MockRuntime {
             spawn_counter: Arc::new(AtomicU32::new(0)),
             dies_once_used: Arc::new(AtomicBool::new(false)),
             kill_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            kill_holds: Arc::new(AtomicUsize::new(usize::MAX)),
         }
     }
 
@@ -115,6 +122,16 @@ impl MockRuntime {
     #[allow(dead_code)]
     pub fn release_held_kills(&self) {
         self.kill_gate.add_permits(64);
+    }
+
+    /// Parks at most `n` further `HoldKill` kills; every later one dies normally.
+    /// Call it before driving the scheduler, so a test holds an *unprovable release*
+    /// as a state rather than as a race against `release_timeout_s`: the kills that
+    /// must stay unconfirmed park forever, and the kill the test wants proven is not
+    /// held at all and confirms inside its own deadline.
+    #[allow(dead_code)]
+    pub fn hold_next_kills(&self, n: usize) {
+        self.kill_holds.store(n, Ordering::SeqCst);
     }
 
     /// Number of live engines (leak-check helper for F-1 / F-6). Used by the
@@ -258,44 +275,58 @@ impl EngineRuntime for MockRuntime {
     }
 
     async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError> {
-        let held = self
+        let holdkill = self
             .servers
             .lock()
             .expect("mock runtime lock")
             .get(&ticket.port)
             .is_some_and(|server| server.mode == MockMode::HoldKill);
-        if held {
+        // A `HoldKill` engine parks only while the test still holds kills for it:
+        // `hold_next_kills` spends that budget, so a later terminate is provable.
+        let holds_one = holdkill
+            && self
+                .kill_holds
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+        if holds_one {
             let _permit = self
                 .kill_gate
                 .acquire()
                 .await
                 .expect("invariant: the kill gate is never closed");
         }
-        if let Some(server) = self
+        let dead = self
             .servers
             .lock()
             .expect("mock runtime lock")
-            .remove(&ticket.port)
-        {
+            .remove(&ticket.port);
+        if let Some(server) = dead {
             server.handle.abort();
+            // An abort only *schedules* the cancellation: the `axum::serve` future, and
+            // with it the bound listener, is dropped when the runtime next polls the
+            // task. Waiting for it here means a kill that has returned has really
+            // stopped answering. The map lock is released above, before this await.
+            let _gone = server.handle.await;
         }
         Ok(())
     }
 
     async fn release_confirmed(&self, ticket: &SpawnTicket) -> Result<bool, SpawnError> {
-        if self
+        // The runtime's own bookkeeping is the release evidence: `kill` clears the
+        // entry only after its server has been aborted and reaped, and a held kill
+        // leaves the entry in place — exactly the "terminate has not landed yet" state
+        // a test needs to observe (chunk 4 [1]). Re-probing the port here instead made
+        // the answer depend on when the runtime happened to drop the listener of a task
+        // it had just cancelled: the kernel kept completing handshakes into a backlog
+        // nobody serviced, so the connect hung past the release deadline of an engine
+        // that was already dead. `is_dead` keeps that TCP check for the tests that want
+        // the port-level claim.
+        let live = self
             .servers
             .lock()
             .expect("mock runtime lock")
-            .contains_key(&ticket.port)
-        {
-            return Ok(false);
-        }
-        let port = ticket.port;
-        let closed = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_err();
-        Ok(closed)
+            .contains_key(&ticket.port);
+        Ok(!live)
     }
 
     async fn probe(&self, port: u16, readiness: &ReadinessSpec) -> Probe {

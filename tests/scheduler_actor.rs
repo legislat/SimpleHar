@@ -6,6 +6,7 @@
 mod mock_runtime;
 
 use mock_runtime::MockRuntime;
+use simplehar_se::budget::{MemorySample, VramWitness};
 use simplehar_se::config::{AppConfig, CategoryId};
 use simplehar_se::engine::llama::LlamaAdapter;
 use simplehar_se::engine::mock::MockAdapter;
@@ -13,7 +14,7 @@ use simplehar_se::engine::ninfer::NinferAdapter;
 use simplehar_se::engine::strata::StrataAdapter;
 use simplehar_se::engine::EngineAdapter;
 use simplehar_se::scheduler::{
-    JobId, Reply, Scheduler, SchedulerError, SchedulerHandle, SwapState,
+    JobId, JobKind, Reply, Scheduler, SchedulerError, SchedulerHandle, SchedulerStatus, SwapState,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -72,6 +73,20 @@ category: {category}
 }
 
 fn harness5(cfg: AppConfig, specs: &[Spec5]) -> (SchedulerHandle, MockRuntime) {
+    harness5_witness(
+        cfg,
+        specs,
+        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+    )
+}
+
+/// `harness5` against a caller-supplied witness, for the cases that must control when
+/// an admission decision is allowed to land.
+fn harness5_witness(
+    cfg: AppConfig,
+    specs: &[Spec5],
+    witness: Arc<dyn VramWitness>,
+) -> (SchedulerHandle, MockRuntime) {
     let runtime = MockRuntime::new();
     let mut adapters = BTreeMap::new();
     let adapter: Arc<dyn simplehar_se::engine::EngineAdapter> = Arc::new(MockAdapter);
@@ -97,7 +112,7 @@ fn harness5(cfg: AppConfig, specs: &[Spec5]) -> (SchedulerHandle, MockRuntime) {
         write_modelconf5(specs),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn simplehar_se::engine::EngineRuntime>,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        witness,
     );
     (handle, runtime)
 }
@@ -1381,4 +1396,394 @@ async fn a_llama_model_without_its_model_key_is_refused_before_the_occupant_dies
         !runtime.is_dead(resident.port).await,
         "the replaced model must still be answering on its engine port"
     );
+}
+
+// --- unload during a swap, and the load parked behind it (FINDINGS-02 [2], [3]) -----
+
+/// The model that ends up queued on the category's only slot, behind the swap.
+const PARKED_MODEL: &str = "model-c";
+
+/// A ledger-only witness the test can park. The admission decision waits on exactly
+/// one `sample()` (Step 4), so a gate with `samples` permits answers that many reads
+/// and parks every later one: a load frozen in `Admit` is the state in which a cancel
+/// can never prove its victim's release, which is the precondition both findings need.
+/// Without it these scenarios would be a race against the witness rather than a state
+/// the test holds.
+struct GatedWitness {
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl GatedWitness {
+    /// Answers `samples` reads, then parks every later one.
+    fn new(samples: usize) -> Self {
+        GatedWitness {
+            gate: Arc::new(tokio::sync::Semaphore::new(samples)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl VramWitness for GatedWitness {
+    fn source(&self) -> String {
+        "gated-ledger".to_string()
+    }
+
+    fn ledger_only(&self) -> bool {
+        true
+    }
+
+    async fn sample(&self) -> Result<MemorySample, String> {
+        let permit = self
+            .gate
+            .acquire()
+            .await
+            .map_err(|_| "the test gate is closed".to_string())?;
+        permit.forget();
+        Err("witness unavailable (ledger-only mode)".to_string())
+    }
+}
+
+/// The three-model, single-slot WORK fixture both findings need: a resident engine
+/// whose terminate can be held, a swap that cannot get past `Admit`, and
+/// [`PARKED_MODEL`] to queue behind it. The release deadline is short so an
+/// unconfirmed release terminalizes quickly rather than at the default.
+fn parked_swap_harness() -> (SchedulerHandle, MockRuntime) {
+    let cfg = AppConfig {
+        release_timeout_s: 2,
+        ..config(10)
+    };
+    let witness = GatedWitness::new(1); // one sample: the resident load's admission
+    let (handle, runtime) = harness5_witness(
+        cfg,
+        &[
+            (
+                HOLD_MODEL,
+                "mock-hold-kill",
+                CategoryId::Work,
+                Some(4.0),
+                "",
+            ),
+            (INCOMING_MODEL, "mock", CategoryId::Work, Some(4.0), ""),
+            (PARKED_MODEL, "mock", CategoryId::Work, Some(4.0), ""),
+        ],
+        Arc::new(witness),
+    );
+    (handle, runtime)
+}
+
+/// Serves [`HOLD_MODEL`] and submits the swap to [`INCOMING_MODEL`], waiting until it
+/// sits frozen in `Admit` (the gate has no sample left for it), so the victim still
+/// holds its slot and a live engine when the operator's cancel lands.
+async fn serve_and_submit_frozen_swap(
+    handle: &SchedulerHandle,
+) -> simplehar_se::scheduler::SwapReceipt {
+    let victim = serve_hold_model(handle).await;
+    submit_and_vanish(handle, INCOMING_MODEL, CategoryId::Work).await;
+    wait_until(handle, 5, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.model == INCOMING_MODEL && j.state == SwapState::Admit)
+    })
+    .await;
+    victim
+}
+
+/// Whether `model` is on the ledger as a queued load: registered, non-terminal, still
+/// `Idle` because it has never been admitted.
+fn is_queued(status: &SchedulerStatus, model: &str) -> bool {
+    status.jobs.iter().any(|j| {
+        j.model == model && j.kind == JobKind::Load && !j.terminal && j.state == SwapState::Idle
+    })
+}
+
+/// The job id of `model`'s row, whichever stage it is in.
+fn job_of(status: &SchedulerStatus, model: &str) -> JobId {
+    status
+        .jobs
+        .iter()
+        .find(|j| j.model == model)
+        .unwrap_or_else(|| panic!("`{model}` must be in the job ledger: {:?}", status.jobs))
+        .id
+}
+
+#[tokio::test]
+async fn unload_during_a_swap_frees_the_slot_after_cancelling_the_swap() {
+    // FINDINGS-02 [2]: `unload_slots` chose cancel OR unload. A slot with an occupant
+    // *and* an in-flight swap is where that choice loses the card: the cancel's reap
+    // cannot prove the victim's release (chunk 4 [1] deliberately keeps an engine
+    // nobody proved dead installed), so before the fix the operator was told `Done`
+    // while the model stayed loaded and serving.
+    let (handle, runtime) = parked_swap_harness();
+    let victim = serve_and_submit_frozen_swap(&handle).await;
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "only the resident engine is live"
+    );
+    // One held kill: the cancel's reap of the victim stays unprovable (chunk 4 [1]
+    // keeps the engine installed over it) while the unload that must follow gets a
+    // terminate it can prove. Holding by count rather than releasing a gate from the
+    // test keeps the second release inside its own deadline instead of racing it.
+    runtime.hold_next_kills(1);
+
+    assert!(
+        matches!(
+            handle
+                .unload_model(HOLD_MODEL)
+                .await
+                .expect("unload accepted"),
+            Reply::Done
+        ),
+        "the unload of a swapping slot is accepted"
+    );
+
+    wait_until(&handle, 10, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.model == INCOMING_MODEL && j.terminal)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let swap = status
+        .jobs
+        .iter()
+        .find(|j| j.model == INCOMING_MODEL)
+        .expect("the cancelled swap is in the ledger");
+    assert_eq!(swap.outcome.as_deref(), Some("cancelled"), "{swap:?}");
+    assert!(
+        swap.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unloaded by request"),
+        "{swap:?}"
+    );
+    assert!(
+        !swap.is_fault,
+        "an operator's unload is not a fault: {swap:?}"
+    );
+    // The cancel proved nothing about the victim: no release timing, no released
+    // victim. Whatever freed the slot therefore cannot be attributed to the swap.
+    assert!(
+        swap.victims_released.is_empty(),
+        "the cancelled swap never proved a release: {:?}",
+        swap.victims_released
+    );
+    assert!(
+        swap.timings.release_ms.is_none(),
+        "and its release stage never completed: {:?}",
+        swap.timings
+    );
+    assert_eq!(
+        runtime.spawn_count(),
+        1,
+        "a swap cancelled in Admit never spawns"
+    );
+
+    // The second half of that one unload command: the slot's own unload job, started
+    // when the cancel it triggered terminalized. Without it the card stays spent, so
+    // this wait is the falsifier: pre-fix the slot keeps its occupant and live engine.
+    wait_until(&handle, 10, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let unload = status
+        .jobs
+        .iter()
+        .find(|j| j.kind == JobKind::Unload && j.model == HOLD_MODEL)
+        .expect("one unload must have run for the slot the cancel left occupied");
+    assert_eq!(unload.outcome.as_deref(), Some("unloaded"), "{unload:?}");
+    assert!(
+        unload.timings.release_ms.is_some(),
+        "the unload proved its own release: {unload:?}"
+    );
+    let swap = status
+        .jobs
+        .iter()
+        .find(|j| j.model == INCOMING_MODEL)
+        .expect("the cancelled swap is in the ledger");
+    assert!(
+        unload.id > swap.id,
+        "the unload followed the cancel it was waiting on: {:?} then {:?}",
+        swap.id,
+        unload.id
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "a single unload must leave no live engine behind"
+    );
+    assert!(
+        runtime.is_dead(victim.port).await,
+        "and no engine answering on the freed slot's port"
+    );
+}
+
+#[tokio::test]
+async fn unload_replies_done_before_any_release_evidence() {
+    // FINDINGS-02 [2], second half: the reply honesty pin. `unload_slots` answers
+    // `Reply::Done` as soon as the commands are dispatched, while the kill it
+    // triggered is still in flight, so a client cannot tell a freed slot from one
+    // whose release is unproven. This pins what the API returns TODAY: making the
+    // reply carry release evidence is API surgery outside this finding's approved fix
+    // (`Reply::Done` has no payload and `/har/unload` hands back no job id to poll).
+    let (handle, runtime) = parked_swap_harness();
+    serve_and_submit_frozen_swap(&handle).await;
+
+    handle
+        .unload_model(HOLD_MODEL)
+        .await
+        .expect("unload accepted");
+
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![Some(HOLD_MODEL.to_string())],
+        "the Done the caller already holds arrived with the slot still occupied"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "and with the engine still live: no release had been proven yet"
+    );
+}
+
+#[tokio::test]
+async fn a_parked_load_is_answered_when_its_predecessor_keeps_the_occupant() {
+    // FINDINGS-02 [3], the reviewer's experiment: A serving, swap B frozen in Admit,
+    // swap C parked behind it, B cancelled. B terminalizes with A still installed, so
+    // C's queue place can never be satisfied: it must be answered, not left hanging,
+    // and it must not fire later when the operator finally frees the slot.
+    let (handle, runtime) = parked_swap_harness();
+    serve_and_submit_frozen_swap(&handle).await;
+    // Two held kills: parking C cancels B once ("superseded by a newer load") and the
+    // operator's cancel below re-issues that same reap. Both stay unprovable, which is
+    // what keeps A installed when B terminalizes; the unload that follows the answer
+    // then gets a terminate it can prove.
+    runtime.hold_next_kills(2);
+
+    let client = handle.clone();
+    let parked = tokio::spawn(async move { client.swap(PARKED_MODEL, CategoryId::Work).await });
+    wait_until(&handle, 5, |s| is_queued(s, PARKED_MODEL)).await;
+
+    let swap = job_of(&handle.status().await.expect("actor alive"), INCOMING_MODEL);
+    // Parking C already cancelled B; this is the operator's own cancel of the same job,
+    // which must still terminalize it.
+    handle.cancel(swap).await.expect("cancel accepted");
+
+    let answer = tokio::time::timeout(Duration::from_secs(8), parked)
+        .await
+        .expect("a parked load's waiter must be answered, not left to hang")
+        .expect("the parked load's task must not panic");
+    let error = answer.expect_err("a parked load whose slot never freed cannot report a load");
+    assert!(
+        matches!(error, SchedulerError::Cancelled(_)),
+        "the parked load must be told it was cancelled, got {error}"
+    );
+    assert!(
+        error.to_string().contains("did not free the slot"),
+        "the answer must name why, so a client can act on it: {error}"
+    );
+
+    // Freeing the slot now must not resurrect the load its caller was answered about.
+    handle
+        .unload_model(HOLD_MODEL)
+        .await
+        .expect("unload accepted");
+    wait_until(&handle, 10, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![None],
+        "the unload must have freed the slot"
+    );
+    assert!(
+        !is_queued(&status, PARKED_MODEL),
+        "the answered load must no longer hold the slot's queue place"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "an abandoned parked load must not start when the slot is finally freed"
+    );
+    let parked_row = status
+        .jobs
+        .iter()
+        .find(|j| j.model == PARKED_MODEL)
+        .expect("the parked load keeps its ledger row");
+    assert_eq!(
+        parked_row.outcome.as_deref(),
+        Some("cancelled"),
+        "{parked_row:?}"
+    );
+    assert!(
+        !parked_row.is_fault,
+        "a busy card is not an engine fault: {parked_row:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_parked_load_has_a_queued_ledger_row_before_it_starts() {
+    // FINDINGS-02 [3], the ledger half: `/har/jobs` is what F-5 exists to make honest,
+    // and a parked load used to have no row at all while its request hung. The row it
+    // gets at park time is the same one it runs on when it does start, and the one
+    // the answered error is recorded against.
+    let (handle, _runtime) = parked_swap_harness();
+    serve_and_submit_frozen_swap(&handle).await;
+    submit_and_vanish(&handle, PARKED_MODEL, CategoryId::Work).await;
+    wait_until(&handle, 5, |s| is_queued(s, PARKED_MODEL)).await;
+
+    let status = handle.status().await.expect("actor alive");
+    let parked = status
+        .jobs
+        .iter()
+        .find(|j| j.model == PARKED_MODEL)
+        .expect("a parked load must have a ledger row while its caller waits");
+    assert_eq!(parked.kind, JobKind::Load, "a queued load is a load row");
+    assert!(!parked.terminal, "a queued load has not finished");
+    assert_eq!(
+        parked.state,
+        SwapState::Idle,
+        "queued: registered, never admitted ({parked:?})"
+    );
+    assert!(
+        parked.error.is_none(),
+        "a queued load has failed nothing: {parked:?}"
+    );
+    let swap = job_of(&status, INCOMING_MODEL);
+    assert!(
+        status
+            .slots
+            .iter()
+            .any(|s| s.category == CategoryId::Work && s.loading_job == Some(swap)),
+        "the slot still runs the swap this load is parked behind: {:?}",
+        status.slots
+    );
+
+    handle.cancel(swap).await.expect("cancel accepted");
+    wait_until(&handle, 8, |s| {
+        s.jobs.iter().any(|j| j.model == PARKED_MODEL && j.terminal)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let parked = status
+        .jobs
+        .iter()
+        .find(|j| j.model == PARKED_MODEL)
+        .expect("the parked load's row is kept after it is dropped");
+    assert_eq!(parked.outcome.as_deref(), Some("cancelled"), "{parked:?}");
+    assert!(
+        parked
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("did not free the slot"),
+        "the row records why the queued load was dropped: {parked:?}"
+    );
+    assert!(!parked.is_fault, "{parked:?}");
 }

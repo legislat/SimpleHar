@@ -26,7 +26,7 @@ use crate::engine::{
 use crate::model::ModelEntry;
 use crate::ownership::{ResourceKind, SpawnTicket};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +40,13 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const RELEASE_POLL: Duration = Duration::from_millis(50);
 /// Idle sweep cadence (Step 5): thresholds are seconds, so a 2 s tick is ample.
 const IDLE_TICK: Duration = Duration::from_secs(2);
+/// What a parked load is answered with when the job it waited behind leaves the slot
+/// occupied (FINDINGS-02 [3]). `Cancelled` is the variant that fits: the API maps it
+/// to 409 (a conflict the caller can retry once the slot is free), the ledger records
+/// it under outcome `cancelled` so `fault_of` never pins a red headline on a load the
+/// card was simply busy for, and the message names the fact the client can act on —
+/// unload the model still in that slot, then load again.
+const PARKED_SLOT_NOT_FREED: &str = "the load it was waiting on did not free the slot";
 
 /// Failures reported to swap/unload/cancel callers, with the numbers used (G13).
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -635,12 +642,6 @@ struct Job {
     slot: Option<usize>,
 }
 
-/// A load parked until its slot returns to `Idle` (supersede, T3.4).
-struct PendingSwap {
-    model: String,
-    waiters: Vec<Waiter>,
-}
-
 struct ActorState {
     cfg: AppConfig,
     models_dir: PathBuf,
@@ -655,7 +656,14 @@ struct ActorState {
     jobs: BTreeMap<JobId, Job>,
     /// Last proxy-side use per model (idle sweep input, Step 5).
     last_used: HashMap<String, Instant>,
-    pending: HashMap<usize, PendingSwap>,
+    /// Slots holding a queued (parked) load, T3.4, mapped to the ledger row registered
+    /// when it parks (FINDINGS-02 [3]): its model, waiters and state all live on that
+    /// row, and [`ActorState::start_pending`] arms the same row rather than creating
+    /// a second one.
+    pending: HashMap<usize, JobId>,
+    /// Slots whose occupant an operator's unload must still free once the in-flight
+    /// job it cancelled terminalizes (FINDINGS-02 [2]: unload = cancel *and* unload).
+    unload_after_finish: HashSet<usize>,
     next_job: u64,
     next_gen: u64,
 }
@@ -758,6 +766,7 @@ impl ActorState {
             jobs: BTreeMap::new(),
             last_used: HashMap::new(),
             pending: HashMap::new(),
+            unload_after_finish: HashSet::new(),
             next_job: 0,
             next_gen: 0,
         }
@@ -891,18 +900,19 @@ impl ActorState {
                             .map_or(Instant::now(), |j| j.t0)
                     })
                     .expect("invariant: the category has at least one slot");
-                if let Some(old) = self.pending.insert(
-                    target,
-                    PendingSwap {
-                        model: entry.name.clone(),
-                        waiters: vec![reply],
-                    },
-                ) {
-                    for waiter in old.waiters {
-                        let _ = waiter.send(Err(SchedulerError::Cancelled(
+                // The parked load gets its ledger row now, not when it starts: a
+                // queued load must be visible at `/har/jobs` while its caller waits
+                // (FINDINGS-02 [3]). One queue place per slot, so the load it
+                // replaces is answered and terminalized rather than left stranded.
+                let queued = self.register_queued_load(target, &entry, vec![reply]);
+                if let Some(old) = self.pending.insert(target, queued) {
+                    self.finish_queued_load(
+                        old,
+                        Err(SchedulerError::Cancelled(
                             "superseded by a newer load before it started".to_string(),
-                        )));
-                    }
+                        )),
+                        "cancelled",
+                    );
                 }
                 if let Some(job_id) = self.slots[target].job {
                     self.cancel_job(job_id, "superseded by a newer load");
@@ -959,9 +969,12 @@ impl ActorState {
         self.unload_slots(targets, reply);
     }
 
-    /// T12.1: unload one model's slot; a loading swap for it is cancelled first.
-    /// A loading slot has no occupant yet — the in-flight job's model is the
-    /// only way to find it (T8: unload during load = cancel, cleanup completes).
+    /// T12.1: unload one model's slot; a loading swap for it is cancelled first and
+    /// the slot is unloaded after that cancel terminalizes. A loading slot has no
+    /// occupant yet — the in-flight job's model is the only way to find it (T8:
+    /// unload during load = cancel, cleanup completes). A load queued on the model
+    /// counts as a target too, so the row the operator can see is the row the command
+    /// removes.
     fn on_unload_model(&mut self, model: &str, reply: Waiter) {
         let targets: Vec<usize> = self
             .slots
@@ -974,10 +987,24 @@ impl ActorState {
             })
             .map(|(i, _)| i)
             .collect();
+        let queued: Vec<usize> = self
+            .pending
+            .iter()
+            .filter(|(_, queued)| {
+                self.jobs
+                    .get(queued)
+                    .is_some_and(|job| job.model == model && !job.terminal)
+            })
+            .map(|(slot, _)| *slot)
+            .collect();
+        let mut targets: Vec<usize> = targets.into_iter().chain(queued).collect();
+        targets.sort_unstable();
+        targets.dedup();
         self.unload_slots(targets, reply);
     }
 
-    /// T12.4: unload every occupied slot; loading jobs are cancelled.
+    /// T12.4: unload every occupied slot; loading jobs are cancelled, and the slot
+    /// they still leave occupied is unloaded when the cancel terminalizes.
     fn on_unload_all(&mut self, reply: Waiter) {
         let targets: Vec<usize> = (0..self.slots.len())
             .filter(|&i| self.slots[i].occupant.is_some() || self.slots[i].job.is_some())
@@ -985,13 +1012,38 @@ impl ActorState {
         self.unload_slots(targets, reply);
     }
 
-    /// Shared unload path: free slots start an unload job; slots with an
-    /// in-flight job get that job cancelled (T8: unload during load = cancel,
-    /// and the cancellation still runs kill + release confirmation).
+    /// Shared unload path: free slots start an unload job; a slot with an in-flight
+    /// job has that job cancelled **and** — when it still holds an occupant — unloaded
+    /// the moment the cancellation terminalizes (FINDINGS-02 [2]: an unload means
+    /// cancel *and* unload, never either/or). The occupant survives a cancelled swap
+    /// whenever the swap's release was never confirmed (chunk 4 [1] keeps an engine
+    /// nobody proved dead installed), so cancelling alone can leave the model loaded
+    /// and serving while the caller is told `Done`. A load parked on a targeted slot
+    /// is dropped here too: an operator's unload must never be followed by the load
+    /// they abandoned starting on the slot it just freed (FINDINGS-02 [3]).
     fn unload_slots(&mut self, slots: Vec<usize>, reply: Waiter) {
         for slot in slots {
+            if let Some(queued) = self.pending.remove(&slot) {
+                self.finish_queued_load(
+                    queued,
+                    Err(SchedulerError::Cancelled(
+                        "unloaded by request before it started".to_string(),
+                    )),
+                    "cancelled",
+                );
+            }
             match self.slots[slot].job {
-                Some(job_id) => self.cancel_job(job_id, "unloaded by request"),
+                Some(job_id) => {
+                    // Flagged before the cancel: it may terminalize the job inline,
+                    // and that finish is exactly where the flag is consumed.
+                    let cancel_continues_into_unload =
+                        self.jobs.get(&job_id).is_some_and(|job| !job.terminal)
+                            && self.slots[slot].occupant.is_some();
+                    if cancel_continues_into_unload {
+                        self.unload_after_finish.insert(slot);
+                    }
+                    self.cancel_job(job_id, "unloaded by request");
+                }
                 None => {
                     if self.slots[slot].occupant.is_some() {
                         self.begin_unload_slot(slot, "unloaded");
@@ -1273,11 +1325,35 @@ impl ActorState {
             self.publish();
         }
     }
+    /// The ordinary load path: register the row and arm it in one step.
     fn begin_load(&mut self, slot: usize, entry: ModelEntry, waiters: Vec<Waiter>) {
+        let job_id = self.register_queued_load(slot, &entry, waiters);
+        self.start_queued_load(job_id, slot, entry);
+    }
+
+    /// Creates the ledger row of a load that has not started yet — `kind: Load`,
+    /// non-terminal, state `Idle`, holding its waiters. Every load begins here, so a
+    /// parked one is already on the ledger while its caller waits, instead of being a
+    /// request with no row and no answer (FINDINGS-02 [3]).
+    ///
+    /// # Arguments
+    ///
+    /// * `slot` - the slot the load is queued on (its `pending` place).
+    /// * `entry` - the catalog entry, whose keys pre-fill the booking fields.
+    /// * `waiters` - the callers attached to this load (F-6: duplicates share one row).
+    ///
+    /// # Returns
+    ///
+    /// The id of the row just registered, which is what `pending` stores.
+    fn register_queued_load(
+        &mut self,
+        slot: usize,
+        entry: &ModelEntry,
+        waiters: Vec<Waiter>,
+    ) -> JobId {
         let job_id = JobId(self.next_job);
         self.next_job += 1;
-        let t0 = Instant::now();
-        let mut job = Job {
+        let job = Job {
             kind: JobKind::Load,
             model: entry.name.clone(),
             engine: entry.engine.clone(),
@@ -1291,7 +1367,7 @@ impl ActorState {
             observed_at_admit: None,
             container: None,
             timings: JobTimings::default(),
-            t0,
+            t0: Instant::now(),
             waiters,
             tasks: Vec::new(),
             spawned: None,
@@ -1309,6 +1385,18 @@ impl ActorState {
             load_timeout_s: entry.load_timeout_s,
             gate_target: None,
         };
+        self.jobs.insert(job_id, job);
+        self.set_timing(job_id, |t| &mut t.queue_ms);
+        job_id
+    }
+
+    /// Arms a registered load row: takes over its slot, books the need, records the
+    /// occupant it must release, and starts the witness sample that drives `Admit`.
+    /// Arming clears any unload still queued behind a cancelled swap on that slot
+    /// (FINDINGS-02 [2]): a load the operator asked for after pressing Unload is the
+    /// later instruction.
+    fn start_queued_load(&mut self, job_id: JobId, slot: usize, entry: ModelEntry) {
+        self.unload_after_finish.remove(&slot);
         // One decision (`ModelEntry::cost_source`) drives the gate; the page's Cost
         // column reads the same one, so the two cannot drift.
         let need = match entry.cost_source() {
@@ -1331,26 +1419,21 @@ impl ActorState {
                 entry.gguf_size_gb.map(Gibibytes),
             ),
         };
-        let error = match need {
-            Ok(need) => {
-                job.need = Some(need);
-                None
-            }
-            // A greedy load's nominal size never binds — it offloads instead —
-            // so an unknown size is allowed (booking uses the room at admit).
+        // A greedy load's nominal size never binds — it offloads instead — so an
+        // unknown size is allowed (booking uses the room at admit).
+        let booking = match need {
+            Ok(need) => Some(need),
             Err(_) if entry.cost == crate::model::CostClass::Greedy => None,
-            Err(error) => Some(SchedulerError::Admission(error)),
+            Err(error) => {
+                let error = SchedulerError::Admission(error);
+                self.slots[slot].job = Some(job_id);
+                self.step(job_id, SwapState::Admit);
+                self.step(job_id, SwapState::AdmitFail);
+                self.log_refusal(job_id, &error, "need");
+                self.finish(job_id, Err(error), "under-specified");
+                return;
+            }
         };
-        if let Some(error) = error {
-            job.error = Some(error.clone());
-            self.jobs.insert(job_id, job);
-            self.slots[slot].job = Some(job_id);
-            self.step(job_id, SwapState::Admit);
-            self.step(job_id, SwapState::AdmitFail);
-            self.log_refusal(job_id, &error, "need");
-            self.finish(job_id, Err(error), "under-specified");
-            return;
-        }
         let victim = self.slots[slot].occupant.as_ref().map(|o| Victim {
             model: o.model.clone(),
             ticket: o.ticket.clone(),
@@ -1358,10 +1441,11 @@ impl ActorState {
             evicted: false,
             cost: o.need.0,
         });
-        job.victim = victim.clone();
-        self.jobs.insert(job_id, job);
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.need = booking;
+            job.victim = victim;
+        }
         self.slots[slot].job = Some(job_id);
-        self.set_timing(job_id, |t| &mut t.queue_ms);
         self.step(job_id, SwapState::Admit);
         // Step 4 (as amended 2026-10-26): the gate is evaluated against the card's own
         // reading, sampled on a task — never inline in the actor, which must not stall
@@ -2455,14 +2539,24 @@ impl ActorState {
 
     fn cancel_job(&mut self, job_id: JobId, reason: &str) {
         let error = SchedulerError::Cancelled(reason.to_string());
+        let queued = match self.jobs.get(&job_id) {
+            Some(job) if job.terminal => return,
+            Some(job) => job.state == SwapState::Idle,
+            None => return,
+        };
+        if queued {
+            // A load still queued — registered at park time, never armed — spawned
+            // nothing and owes no release, so the `Reap -> Idle` edges the graph
+            // requires of a working state do not apply: answer it from `Idle` and let
+            // go of its queue place, or it could still start on a later finish (FINDINGS-02 [3]).
+            self.finish_queued_load(job_id, Err(error), "cancelled");
+            return;
+        }
         let spawned;
         {
             let Some(job) = self.jobs.get_mut(&job_id) else {
                 return;
             };
-            if job.terminal {
-                return;
-            }
             for task in job.tasks.drain(..) {
                 task.abort();
             }
@@ -2537,35 +2631,77 @@ impl ActorState {
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
-        if let Some(slot) = slot {
-            if self.slots[slot].job == Some(job_id) {
-                self.slots[slot].job = None;
-            }
+        let owned = slot.filter(|&s| self.slots[s].job == Some(job_id));
+        if let Some(s) = owned {
+            self.slots[s].job = None;
         }
-        // Supersede: a parked load starts when its slot is free again (T3.4).
-        if let Some(slot) = slot {
-            if self.slots[slot].job.is_none() && self.slots[slot].occupant.is_none() {
-                if let Some(pending) = self.pending.remove(&slot) {
-                    self.start_pending(slot, pending);
+        // Both the parked-load drain and the unload that follows a cancel belong to the
+        // job that owned this slot: a row that never armed (a queued load terminalizing)
+        // must not drive either.
+        if let Some(slot) = owned {
+            if let Some(queued) = self.pending.remove(&slot) {
+                if self.slots[slot].occupant.is_none() {
+                    self.start_pending(slot, queued);
+                } else {
+                    // The predecessor did not free the slot, so the queued load will
+                    // never start on its own: answer it and take its queue place, or it
+                    // would fire unbidden on some later finish of this slot
+                    // (FINDINGS-02 [3]).
+                    self.finish_queued_load(
+                        queued,
+                        Err(SchedulerError::Cancelled(PARKED_SLOT_NOT_FREED.to_string())),
+                        "cancelled",
+                    );
                 }
+            }
+            // The unload the operator asked for while this job was in flight takes the
+            // occupant the cancel could not free (FINDINGS-02 [2]). The cancel's own
+            // release may already have done that, in which case the flag is only
+            // consumed: a slot is never unloaded twice.
+            if self.unload_after_finish.remove(&slot) && self.slots[slot].occupant.is_some() {
+                self.begin_unload_slot(slot, "unloaded");
             }
         }
     }
 
-    fn start_pending(&mut self, slot: usize, pending: PendingSwap) {
-        match self
-            .catalog
-            .iter()
-            .find(|m| m.name == pending.model)
-            .cloned()
-        {
-            Some(entry) => self.begin_load(slot, entry, pending.waiters),
-            None => {
-                for waiter in pending.waiters {
-                    let _ = waiter.send(Err(SchedulerError::UnknownModel(pending.model.clone())));
-                }
+    /// Arms the load queued on `slot` (T3.4), reusing the ledger row registered at
+    /// park time. A model that left the catalog since it parked is answered and
+    /// terminalized like any other load that never started.
+    fn start_pending(&mut self, slot: usize, job_id: JobId) {
+        let Some(model) = self.jobs.get(&job_id).map(|job| job.model.clone()) else {
+            return;
+        };
+        match self.catalog.iter().find(|m| m.name == model).cloned() {
+            Some(entry) => self.start_queued_load(job_id, slot, entry),
+            None => self.finish_queued_load(
+                job_id,
+                Err(SchedulerError::UnknownModel(model)),
+                "unknown model",
+            ),
+        }
+    }
+
+    /// Terminalizes a load row that never left `Idle`: parked, then superseded,
+    /// unloaded, cancelled, refused as an unknown model, or stranded by a predecessor
+    /// that kept the occupant. Its waiters are answered and the row recorded with the
+    /// note the caller gives, so `/har/jobs` shows what became of a queued load
+    /// (FINDINGS-02 [3]). `finish` performs no state steps, which is what keeps this
+    /// legal from `Idle`: the reap edges belong to jobs that actually started.
+    ///
+    /// Removes the slot's queue place when it still points at this row, so a queued
+    /// load cannot be started after it has been answered.
+    fn finish_queued_load(
+        &mut self,
+        job_id: JobId,
+        result: Result<Reply, SchedulerError>,
+        note: &str,
+    ) {
+        if let Some(slot) = self.jobs.get(&job_id).and_then(|job| job.slot) {
+            if self.pending.get(&slot) == Some(&job_id) {
+                self.pending.remove(&slot);
             }
         }
+        self.finish(job_id, result, note);
     }
 
     /// Publishes a snapshot to event subscribers after every mutation (Step 12).
