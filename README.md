@@ -104,7 +104,7 @@ If an atomic write ever fails its own post-write validation, the harness first w
 | `serve_model` | Expected engine-reported id; mismatch = recorded warning, never trusted |
 | `measured_gb` | High end of the footprint the harness measured from the witness while this model served (`total - used` diff against the free memory its load was admitted at, sampled every `measured_sample_s`). Written back after a load; `fixed` admission books it when `vram_gb` is absent, and a large divergence from `vram_gb` logs a verification warning |
 | `measured_gb_min` | Low end of that range: the smallest total-diff seen while serving. The spread is the KV cache growing during a session, which is why one number would be false precision. Must not exceed `measured_gb` |
-| `measured_offload` | The `cpu_offload` setting the pair was measured under, written with it on `cpu_offload`-capable (llama) rows only — the witness pair itself mints for every engine. An offloaded launch has no comparable footprint, so flipping `cpu_offload` on such a row voids both values at scan; the stamp itself survives in the file and in the `/har/models` payload (the page renders the range, not the stamp) |
+| `measured_offload` | The `cpu_offload` setting the pair was measured under, written with it on `cpu_offload`-capable (llama) rows only — the witness pair itself mints for every engine. Captured **when the engine spawns**, so flipping the knob while that engine serves cannot restamp the range to agree with the new yaml — and the mismatch is then what the scan's void rule is for. An offloaded launch has no comparable footprint, so flipping `cpu_offload` on such a row voids both values at scan; the stamp itself survives in the file and in the `/har/models` payload (the page renders the range, not the stamp) |
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `context`, `batch`, `flash_attn`, … | Mapped to the corresponding `llama-server` flags |
 | `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata/ninfer cold starts use 600–1200) |
@@ -153,7 +153,13 @@ weights stream in). There is no preload anywhere in this harness: a strata engin
 starts only when an operator loads it (or a client request names it through the
 proxy); booting the harness spawns nothing.
 
-After editing files, press **Rescan** (or `POST /har/rescan`).
+After editing files, press **Rescan** (or `POST /har/rescan`). A rescan re-reads the
+catalog and nothing else: a model that is serving keeps the launch it was spawned with
+(its argv, its booked size, its measured range and `measured_offload` stamp), so an edit
+to a live model's yaml takes effect on its next load, not under its running engine. Two
+files whose names collapse to one identity are both reported in `catalog_errors` as
+`duplicate_name` — both publish, and every load of that name stays refused as ambiguous
+until one is renamed.
 
 ## Control page
 

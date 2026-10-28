@@ -61,6 +61,13 @@ pub enum ScanKind {
     /// A yaml file carried at least one problem line (Fork C doctrine): the entry
     /// was **never** published and the `reason` names every offending line.
     InvalidYaml,
+    /// Two published rows collapse to one harness identity, so every name-keyed
+    /// path — `/har/load`, the write-back, the measured fold — would silently prefer
+    /// whichever row the scan order happened to put first (FINDINGS-13 [3]). Warn-only
+    /// like the other report classes: **both** files publish and **both** are reported,
+    /// naming every claimant; the API's `409` stays the refusal, so nothing here is a
+    /// boot-style rejection of a file that is otherwise loadable.
+    DuplicateName,
     /// Every pre-existing report shape: unreadable files or dirs, typed field
     /// rejects, duplicate containers, unresolved `default_model`s.
     Other,
@@ -635,6 +642,45 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                     reason: error.to_string(),
                 });
             }
+        }
+    }
+    // One identity may belong to exactly one row (FINDINGS-13 [3]). `from_flat` trims
+    // the stem it is handed, so two files can collapse to one name — `qwen3.yaml`
+    // beside `qwen3 .yaml` — and every name-keyed path would then answer for the model
+    // with whichever row the scan order put first: `/har/load` would load one engine
+    // and the measured fold would book this launch's footprint into the other's bytes.
+    // Report every claimant and publish every claimant — the scan's posture is "name
+    // the problem, keep the file visible" (FINDINGS-13 [1] Fork A), never a boot-style
+    // rejection — and the API's `409` stays the place an ambiguous query is refused.
+    let mut claimants: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for model in &catalog.models {
+        if let Some(file) = model
+            .file
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+        {
+            claimants
+                .entry(model.name.to_ascii_lowercase())
+                .or_default()
+                .push(file);
+        }
+    }
+    for (identity, files) in claimants {
+        if files.len() < 2 {
+            continue;
+        }
+        for file in &files {
+            catalog.errors.push(ScanError {
+                kind: ScanKind::DuplicateName,
+                file: file.clone(),
+                reason: format!(
+                    "name `{identity}` is claimed by {} files ({}) \u{2014} identity is the \
+                     file stem: rename one, or every load of it stays refused as ambiguous",
+                    files.len(),
+                    files.join(", ")
+                ),
+            });
         }
     }
     catalog.models.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2107,6 +2153,67 @@ mod tests {
         );
     }
 
+    /// Two files, one identity: `from_flat` trims the stem it is handed, so
+    /// `qwen3.yaml` beside `qwen3 .yaml` publishes twice under one name — the shape
+    /// FINDINGS-13 [3] named when it asked for the `seen_names` twin of
+    /// `seen_containers`. Both rows publish (the scan reports, it never silences:
+    /// FINDINGS-13 [1] Fork A keeps the old bytes visible) and **both** files are
+    /// reported, each naming every claimant, so neither wins by scan order. Falsifier:
+    /// delete the post-pass and the error list is empty with two rows under one name;
+    /// report only the later claimant (the `seen_containers` shape) and the first file
+    /// vanishes from the report, leaving it the silent favourite.
+    #[test]
+    fn two_files_claiming_one_name_are_both_reported_and_both_publish() {
+        let dir = crate::testutil::temp_dir("dupname");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("qwen3.yaml"), "engine: llama\nvram_gb: 2\n").expect("write");
+        // A stem whose trailing space the identity trim swallows: two distinct files,
+        // one harness name. A `name:` key cannot do this — it must equal the stem.
+        std::fs::write(dir.join("qwen3 .yaml"), "engine: llama\nvram_gb: 3\n").expect("write");
+
+        let catalog = scan_dir(&dir);
+        assert_eq!(
+            catalog.models.len(),
+            2,
+            "a collision is reported, never silenced: {:?}",
+            catalog.errors
+        );
+        assert!(
+            catalog.models.iter().all(|m| m.name == "qwen3"),
+            "both rows really share one identity: {:?}",
+            catalog
+                .models
+                .iter()
+                .map(|m| m.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let offenders: Vec<&ScanError> = catalog
+            .errors
+            .iter()
+            .filter(|e| e.kind == ScanKind::DuplicateName)
+            .collect();
+        assert_eq!(
+            offenders.len(),
+            2,
+            "every claimant is reported: {offenders:?}"
+        );
+        for (error, own) in offenders.iter().zip(["qwen3 .yaml", "qwen3.yaml"]) {
+            assert_eq!(error.file, own, "one line per claiming file");
+            assert!(
+                error.reason.contains("qwen3.yaml") && error.reason.contains("qwen3 .yaml"),
+                "the line names every claimant, not only the other one: {}",
+                error.reason
+            );
+            assert!(
+                error.reason.contains("name `qwen3`"),
+                "the identity the two files collided on is named: {}",
+                error.reason
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `kind` is part of the wire contract (`/har/status` and `/har/rescan` both
     /// serialize `catalog_errors`): the JSON field names are pinned here.
     #[test]
@@ -2128,6 +2235,7 @@ mod tests {
             (ScanKind::UnknownKey, "unknown_key"),
             (ScanKind::InertKey, "inert_key"),
             (ScanKind::InvalidYaml, "invalid_yaml"),
+            (ScanKind::DuplicateName, "duplicate_name"),
             (ScanKind::Other, "other"),
         ] {
             let value = serde_json::to_value(ScanError {
