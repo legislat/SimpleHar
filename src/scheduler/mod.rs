@@ -700,9 +700,12 @@ fn state_last_used(occupant: &Occupant, last_used: &HashMap<String, Instant>) ->
 /// does**, before it takes any message: commands, ticks and reads queue behind it on
 /// the unbounded channel, exactly as when the scan ran synchronously in
 /// [`ActorState::new`] — but it now runs on the actor task, not on the boot thread
-/// (FINDINGS-14 [1]; A6 precedent, `main.rs`: a stalled `modelconf_dir` volume must
-/// never delay bind, `/har/status` or the tray, especially while the already-held
-/// single-instance guard refuses a relaunch).
+/// (FINDINGS-14 [1]; A6 precedent, `main.rs`). What a stalled `modelconf_dir`
+/// volume can no longer delay: the listener bind, the tray's start, and boot
+/// readiness. What still queues behind the first scan: every actor command,
+/// `/har/status` polls included (`api`: `handle.status` round-trips this loop) and
+/// the tray's refresh (which `block_on`s that status) — bounded by the volume
+/// answering, the same exposure [`Command::Reload`] has always had.
 async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
     state.refresh_catalog();
     while let Some(msg) = rx.recv().await {

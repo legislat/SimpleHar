@@ -27,12 +27,17 @@ const SMI_TIMEOUT: Duration = Duration::from_secs(5);
 /// failures, and a refill lock so concurrent callers share one sampling round.
 ///
 /// NVML init is **lazy**: the native `Nvml::init()` runs on the first sample, never
-/// in [`NvmlWitness::new`]. A dying driver must not wedge boot before `/har/status`
-/// exists (FINDINGS-14 [1]: init was on the main thread before the first bind, the
-/// same pre-bind stall the A6 banner precedent in `main.rs` moved off the critical
-/// path). The first sample pays the init; concurrent callers share it on the
-/// `OnceLock`, and a failed init is remembered, not retried — the `nvidia-smi`
-/// fallback arms exactly as when init failed eagerly.
+/// in [`NvmlWitness::new`]. That keeps boot AND the first status poll off the hook
+/// in the normal case (FINDINGS-14 [1]: init was on the main thread before the
+/// first bind, the same pre-bind stall the A6 banner precedent in `main.rs` moved
+/// off the critical path; FINDINGS-FIXROUND2 [3]: `main` pays the init on the
+/// blocking pool via [`NvmlWitness::prime`] at boot, so normally no first poll
+/// pays it). The laziness is the honest worst case: a status poll arriving before
+/// priming completes still pays the init on that worker thread — the stall is
+/// MOVED off the async paths, not eliminated. The first unprimed sample pays the
+/// init; concurrent callers share it on the `OnceLock`, and a failed init is
+/// remembered, not retried — the `nvidia-smi` fallback arms exactly as when init
+/// failed eagerly.
 pub struct NvmlWitness {
     nvml: OnceLock<Option<nvml_wrapper::Nvml>>,
     cache: Mutex<Option<(Instant, MemorySample)>>,
@@ -74,9 +79,19 @@ impl NvmlWitness {
             .as_ref()
     }
 
+    /// Runs the lazy `Nvml::init()` to completion, paying it off the async paths;
+    /// safe to call from `spawn_blocking` (FINDINGS-FIXROUND2 [3]). Concurrent
+    /// [`NvmlWitness::nvml`] callers block until it lands — documented `OnceLock`
+    /// behaviour. `main` spawns this at boot so the first `/har/status` normally
+    /// finds the init already done; if a poll wins the race, laziness still applies
+    /// unchanged.
+    pub fn prime(&self) {
+        let _ = self.nvml();
+    }
+
     /// Whether the lazy NVML init has already run. Test-only observability for the
-    /// laziness pin: false after [`NvmlWitness::new`], true after the first sample
-    /// that reached the driver path.
+    /// laziness pin: false after [`NvmlWitness::new`], true after [`NvmlWitness::prime`]
+    /// or after the first sample that reached the driver path.
     #[cfg(test)]
     fn nvml_initialized_for_test(&self) -> bool {
         self.nvml.get().is_some()
@@ -299,6 +314,23 @@ mod tests {
             !witness.nvml_initialized_for_test(),
             "NvmlWitness::new() must not run Nvml::init()"
         );
+    }
+
+    #[test]
+    fn prime_initialises_without_sample() {
+        // FINDINGS-FIXROUND2 [3]: `prime()` runs the lazy init to completion with no
+        // sample. Deterministic on every machine shape: an init that fails stores the
+        // remembered `None`, so `nvml_initialized_for_test()` is true either way and
+        // the source stays on the fallback — driver-less boxes pass too.
+        let witness = NvmlWitness::new();
+        witness.prime();
+        assert!(
+            witness.nvml_initialized_for_test(),
+            "prime() must run Nvml::init() to completion"
+        );
+        if witness.nvml.get().expect("init ran").is_none() {
+            assert_eq!(witness.source(), "nvidia-smi (fallback)");
+        }
     }
 
     #[tokio::test]

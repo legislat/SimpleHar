@@ -96,10 +96,11 @@ async fn main() -> ExitCode {
     let config_ms = boot_started.elapsed().as_millis() as u64;
     let adapters = simplehar_se::engine::default_adapters(&config);
     // Witness/runtime/scheduler are bind-cheap (FINDINGS-14 [1]): the NVML witness
-    // defers Nvml::init to its first sample and the scheduler defers the catalog
-    // scan to its actor task, so no driver or `modelconf_dir` volume can stall the
-    // bind below. Accepted pre-bind cost here: ProcessRuntime::new's one local
-    // std::fs::read of ninfer-claims.json beside the exe — microseconds, not a stall.
+    // defers Nvml::init to its first sample (or the priming task below) and the
+    // scheduler defers the catalog scan to its actor task, so no driver or
+    // `modelconf_dir` volume can stall the bind below. Accepted pre-bind cost here:
+    // ProcessRuntime::new's one local std::fs::read of ninfer-claims.json beside
+    // the exe — microseconds, not a stall.
     let runtime = ProcessRuntime::new().with_wsl(
         config.wsl_distro.clone(),
         config.wsl_account().unwrap_or_default(),
@@ -108,14 +109,23 @@ async fn main() -> ExitCode {
     // shared container-claim ledger (chunk 10 [1]).
     let boot_runtime = runtime.clone();
     let runtime: Arc<dyn EngineRuntime> = Arc::new(runtime);
-    let witness: Arc<dyn simplehar_se::budget::VramWitness> =
-        Arc::new(simplehar_se::witness::NvmlWitness::new());
+    let witness = simplehar_se::witness::NvmlWitness::new();
+    let witness = Arc::new(witness);
+    // FINDINGS-FIXROUND2 [3]: pay the lazy `Nvml::init()` on the blocking pool,
+    // where it can hold neither an async worker, the witness `refill` guard, nor a
+    // OnceLock caller on the first `/har/status`. Concurrent samples share the
+    // init via the OnceLock; the normal case leaves no init for the first poll.
+    {
+        let priming = Arc::clone(&witness);
+        tokio::task::spawn_blocking(move || priming.prime());
+    }
     let scheduler = Scheduler::start(
         config.clone(),
         config.modelconf_dir.clone(),
         adapters,
         runtime,
-        Arc::clone(&witness),
+        // Unsized coercion of the shared concrete witness to the trait object.
+        Arc::clone(&witness) as Arc<dyn simplehar_se::budget::VramWitness>,
     );
     if !config.modelconf_dir.exists() {
         // Friendly default: a missing ModelConf dir is created, not reported —
@@ -133,7 +143,7 @@ async fn main() -> ExitCode {
             ),
         }
     }
-    let scan_ms = boot_started.elapsed().as_millis() as u64;
+    let scheduler_spawn_ms = boot_started.elapsed().as_millis() as u64;
     // A6: inventory is observability, never a boot gate (review finding 3): the
     // per-model stat loop runs off the critical path so a sleeping or removed
     // drive can never delay the listeners, the tray, or `/har/status`.
@@ -149,14 +159,14 @@ async fn main() -> ExitCode {
     let listeners = simplehar_se::listeners::ListenerRegistry::new();
     let boot = simplehar_se::api::BootTimings {
         config_ms,
-        scan_ms,
+        scheduler_spawn_ms,
         ..simplehar_se::api::BootTimings::default()
     };
     let state = Arc::new(ApiState::new(
         config.clone(),
         scheduler.clone(),
         listeners.clone(),
-        witness,
+        Arc::clone(&witness) as Arc<dyn simplehar_se::budget::VramWitness>,
         boot,
     ));
 
@@ -494,7 +504,7 @@ async fn run(
                 .values()
                 .filter(|s| matches!(s, simplehar_se::listeners::ListenerState::Serving))
                 .count(),
-            "boot ready (0.2): config validated, catalog scanned, listeners resolved"
+            "boot ready (0.2): config validated, catalog scan queued, listeners resolved"
         );
     }
     // Boot reclaim (deploy review, 2026-10-26; scoped per chunk 10 [1], 2026-10-27):

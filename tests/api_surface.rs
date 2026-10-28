@@ -198,6 +198,11 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
 /// Absolute URLs (the Google-Fonts link) and `#` anchors are excluded by the leading-slash
 /// rule, so the result is the browser's own fetch set — the client's truth, not the guard's
 /// copy of it.
+///
+/// FINDINGS-FIXROUND2 [6]: the scanner matches only the exact double-quoted lowercase
+/// forms, so single-quoted, uppercase, spaced, or unquoted attribute forms evade it; the
+/// trio floor below keeps today's scan non-vacuous, and hardening is deferred to the card
+/// window.
 fn linked_assets(html: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for attr in ["href=\"", "src=\""] {

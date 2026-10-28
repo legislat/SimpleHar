@@ -71,7 +71,10 @@ async fn health_and_status_answer_on_default_config() {
     assert_eq!(status["slots"].as_array().map(Vec::len), Some(4));
     // §0.2 boot measures are observable at /har/status.
     assert!(status["boot"]["config_ms"].is_u64(), "boot: {status}");
-    assert!(status["boot"]["scan_ms"].is_u64(), "boot: {status}");
+    assert!(
+        status["boot"]["scheduler_spawn_ms"].is_u64(),
+        "boot: {status}"
+    );
 }
 
 #[tokio::test]

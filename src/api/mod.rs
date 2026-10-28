@@ -199,8 +199,9 @@ impl From<SchedulerError> for ApiError {
 pub struct BootTimings {
     /// Config load + validation duration.
     pub config_ms: u64,
-    /// Catalog scan duration (measured at scheduler start).
-    pub scan_ms: u64,
+    /// Time to construct + spawn the scheduler; the initial catalog scan runs on
+    /// the actor task and is NOT measured here — 4389a0a.
+    pub scheduler_spawn_ms: u64,
     /// Wall time until every listener was Serving or Down (set by `main`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_ms: Option<u64>,

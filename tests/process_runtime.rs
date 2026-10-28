@@ -175,6 +175,22 @@ fn ticket(port: u16) -> SpawnTicket {
     }
 }
 
+/// True only when a spawn error is the OS saying the program itself is absent —
+/// the single legitimate reason to skip these tests (FINDINGS-FIXROUND2 [5]).
+/// `ProcessRuntime::spawn` wraps `std::process::Command::spawn`'s error in
+/// `SpawnFailed { reason: "cannot spawn {program}: {e}" }` (src/process.rs:638),
+/// and on Windows a missing program yields `NotFound`, `raw_os_error() == None`,
+/// Display "program not found" (verified by executing that exact spawn shape on
+/// this box). Every other `Err` — a log-file collision included — must panic,
+/// never skip: a green run must never hide the flagship kill-path tests.
+fn python_is_missing(error: &SpawnError) -> bool {
+    matches!(
+        error,
+        SpawnError::SpawnFailed { reason }
+            if reason.contains("cannot spawn python") && reason.contains("program not found")
+    )
+}
+
 async fn wait_ready(runtime: &ProcessRuntime, port: u16, seconds: u64) -> Probe {
     let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
     loop {
@@ -232,14 +248,18 @@ async fn bind_foreign_listener(port: u16) -> std::net::TcpListener {
 async fn spawns_a_real_child_probes_ready_and_confirms_release() {
     let runtime = ProcessRuntime::new();
     let spawned: Spawned = match runtime
-        .spawn(&spec(TEST_PORT, "process-runtime-test"), ticket(TEST_PORT))
+        .spawn(
+            &spec(TEST_PORT, "process-runtime-release"),
+            ticket(TEST_PORT),
+        )
         .await
     {
         Ok(spawned) => spawned,
-        Err(error) => {
-            eprintln!("python unavailable or spawn failed ({error}); skipping");
+        Err(error) if python_is_missing(&error) => {
+            eprintln!("python unavailable ({error}); skipping");
             return;
         }
+        Err(error) => panic!("spawn failed for a reason other than a missing python: {error}"),
     };
     assert_eq!(
         spawned.port, TEST_PORT,
@@ -303,7 +323,7 @@ async fn probe_fails_fast_when_the_child_already_exited() {
         ],
         cwd: PathBuf::from("."),
         env: BTreeMap::new(),
-        log_name: "process-runtime-dies".to_string(),
+        log_name: "process-runtime-exited-early".to_string(),
         readiness: ReadinessSpec::Http {
             path: "/health".to_string(),
             expect_status: 200,
@@ -311,9 +331,12 @@ async fn probe_fails_fast_when_the_child_already_exited() {
         container: None,
     };
     let ticket = ticket(TEST_PORT + 1);
-    if runtime.spawn(&spec, ticket.clone()).await.is_err() {
-        eprintln!("python unavailable; skipping");
-        return;
+    if let Err(error) = runtime.spawn(&spec, ticket.clone()).await {
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
     }
     let started = std::time::Instant::now();
     let probe = loop {
@@ -369,8 +392,11 @@ async fn child_output_lands_in_a_new_non_empty_log_file() {
         .spawn(&spec(port, CAPTURE_PREFIX), ticket(port))
         .await
     {
-        eprintln!("python unavailable or spawn failed ({error}); skipping");
-        return;
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
     }
     let found = await_new_log_with_output(&before, CAPTURE_PREFIX, 15).await;
     runtime.kill(&ticket(port)).await.expect("cleanup kill");
@@ -395,13 +421,15 @@ async fn release_is_not_confirmed_while_the_port_still_answers() {
     let runtime = ProcessRuntime::new();
     let port = TEST_PORT + 3;
     let t = ticket(port);
-    if runtime
-        .spawn(&spec(port, "process-runtime-test"), t.clone())
+    if let Err(error) = runtime
+        .spawn(&spec(port, "process-runtime-foreign-port"), t.clone())
         .await
-        .is_err()
     {
-        eprintln!("python unavailable; skipping");
-        return;
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
     }
     assert_eq!(wait_ready(&runtime, port, 15).await, Probe::Ready);
     assert!(
@@ -426,6 +454,10 @@ async fn release_is_not_confirmed_while_the_port_still_answers() {
         "the foreign listener must be answering the port"
     );
 
+    // FINDINGS-FIXROUND2 [4]: this window hammers the foreign listener's 128-entry
+    // accept backlog (one unaccepted connect per poll, no sleep). Bounded per
+    // attempt by the 800 ms wall; the 50-run `polls`-counting experiment that would
+    // settle the backlog risk is deferred to the card window.
     let held = std::time::Instant::now() + Duration::from_millis(800);
     let mut polls = 0;
     while std::time::Instant::now() < held {
@@ -465,13 +497,15 @@ async fn release_confirmed_refuses_a_stale_ticket_as_a_typed_error() {
     // reported, never silently answered.
     let runtime = ProcessRuntime::new();
     let port = TEST_PORT + 4;
-    if runtime
-        .spawn(&spec(port, "process-runtime-test"), ticket(port))
+    if let Err(error) = runtime
+        .spawn(&spec(port, "process-runtime-stale-ticket"), ticket(port))
         .await
-        .is_err()
     {
-        eprintln!("python unavailable; skipping");
-        return;
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
     }
     let stale = SpawnTicket {
         generation: 2,
@@ -513,13 +547,15 @@ async fn a_stale_ticket_cannot_confirm_away_the_successor_on_its_port() {
     // — an optimistic `true` here would let the scheduler spawn onto a busy card.
     let runtime = ProcessRuntime::new();
     let port = TEST_PORT + 6;
-    if runtime
-        .spawn(&spec(port, "process-runtime-test"), ticket(port))
+    if let Err(error) = runtime
+        .spawn(&spec(port, "process-runtime-successor"), ticket(port))
         .await
-        .is_err()
     {
-        eprintln!("python unavailable; skipping");
-        return;
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
     }
     runtime.kill(&ticket(port)).await.expect("first kill runs");
     assert!(
@@ -531,13 +567,15 @@ async fn a_stale_ticket_cannot_confirm_away_the_successor_on_its_port() {
         generation: 2,
         ..ticket(port)
     };
-    if runtime
-        .spawn(&spec(port, "process-runtime-test"), second.clone())
+    if let Err(error) = runtime
+        .spawn(&spec(port, "process-runtime-successor2"), second.clone())
         .await
-        .is_err()
     {
-        eprintln!("python unavailable; skipping");
-        return;
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
     }
     assert_eq!(wait_ready(&runtime, port, 15).await, Probe::Ready);
     assert_eq!(
