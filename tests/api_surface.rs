@@ -193,6 +193,78 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
     }
 }
 
+/// Every local asset reference the page itself makes (`href="/..."` / `src="/..."`).
+///
+/// Absolute URLs (the Google-Fonts link) and `#` anchors are excluded by the leading-slash
+/// rule, so the result is the browser's own fetch set — the client's truth, not the guard's
+/// copy of it.
+fn linked_assets(html: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for attr in ["href=\"", "src=\""] {
+        let mut rest = html;
+        while let Some(at) = rest.find(attr) {
+            let after = &rest[at + attr.len()..];
+            let Some(end) = after.find('"') else {
+                break;
+            };
+            let value = &after[..end];
+            if value.starts_with('/') && !value.starts_with("//") {
+                found.push(value.to_string());
+            }
+            rest = after;
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+#[tokio::test]
+async fn every_page_linked_asset_is_public() {
+    // FINDINGS-16 [1] / FINDINGS-18 [1]: the served-asset set is hand-maintained in three
+    // copies (the webui router, PUBLIC_PATHS, index.html's tags) and the loop in the test
+    // above asks only for what the guard already exempts — delete an entry there and the
+    // request disappears instead of failing. `/pico.min.css` shipped exactly that way: a
+    // token-protected deploy served an unstyled page through green gates. Iterating
+    // index.html (what the client actually fetches) covers the direction the guard's own
+    // list cannot see, so a linked-but-not-exempt asset fails here.
+    let config = AppConfig {
+        control_token: Some("s3cret".to_string()),
+        ..AppConfig::default()
+    };
+    let (control, _, _, _, _runtime, _modelconf) = app(config, &[]);
+
+    let (status, page) = get_json_html(&control, "/").await;
+    assert_eq!(status, StatusCode::OK, "the page must answer tokenless");
+
+    let assets = linked_assets(&page);
+    assert!(
+        assets.len() >= 3,
+        "scanner found only {assets:?} in index.html; a short or empty scan must fail loudly"
+    );
+    let joined = assets.join(" ");
+    assert!(
+        joined.contains(".css") && joined.contains(".js"),
+        "scanned set {assets:?} holds neither a stylesheet nor a script: the scanner is broken"
+    );
+    for known in ["/style.css", "/app.js", "/pico.min.css"] {
+        assert!(
+            assets.iter().any(|path| path == known),
+            "index.html links {known}; the scanner missed it (found {assets:?})"
+        );
+    }
+
+    for path in &assets {
+        let (status, body) = get_json_html(&control, path).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "linked asset {path} refused tokenless — is it missing from PUBLIC_PATHS?"
+        );
+        assert!(!body.is_empty(), "linked asset {path} served an empty body");
+    }
+}
+
 #[tokio::test]
 async fn load_flow_populates_jobs_and_status() {
     let (control, _work, _rp, _, runtime, _modelconf) = app(
