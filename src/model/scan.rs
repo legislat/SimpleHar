@@ -58,8 +58,10 @@ pub enum ScanKind {
     /// publishes. The only key scoped this way today: `cpu_offload` on a
     /// non-offload row (§20-9 Fork C knob-table row 1).
     InertKey,
-    /// A yaml file carried at least one problem line (Fork C doctrine): the entry
-    /// was **never** published and the `reason` names every offending line.
+    /// A yaml file the scan refuses to publish (Fork C doctrine): it carried at
+    /// least one problem line — then the `reason` names every offending line — or it
+    /// parsed clean but yielded **no keys at all**, which the `reason` says outright
+    /// (FINDINGS2-13 [2]; the shape `commit_verified` refuses as `EmptyFile`).
     InvalidYaml,
     /// Two published rows collapse to one harness identity, so every name-keyed
     /// path — `/har/load`, the write-back, the measured fold — would silently prefer
@@ -241,8 +243,10 @@ pub fn parse_flat_yaml(text: &str) -> (BTreeMap<String, String>, Vec<String>) {
 /// scan parses through here and the write-back compares a line's value text
 /// through here, so no caller can hand the rule a differently-normalized text and
 /// the reader and the writer cannot disagree about where the value ends. The
-/// incoming word a caller asks to write goes through [`canonical_value`], which
-/// applies exactly this value half without the comment cut. Normalization
+/// incoming word a caller asks to write is NOT pre-normalized at all: it is the
+/// byte-exact target that a candidate line form must read back to
+/// (`crate::model::writeback::emit_form` feeds candidates through this same
+/// helper). Normalization
 /// (surrounding whitespace, a line's trailing `\r`, a leading BOM) happens
 /// **inside**, before the walk: the comment begins at the first space `#`
 /// **outside** quotes of the *normalized* text and is returned verbatim from that
@@ -320,17 +324,6 @@ fn strip_comment(value: &str) -> String {
     split_value_comment(value).0.to_string()
 }
 
-/// The canonical form of a value a caller **already holds** (FINDINGS-BATCH-2026-10-28B
-/// [4]): exactly the value half of [`split_value_comment`]'s normalization — the same
-/// [`normalize_value_text`] plus one surrounding quote pair — but with **no comment
-/// cut**. A value is not a line: cutting one at ` #` would report the word
-/// `a # b` as `a`, and comparing that against a file holding `"a # b"` would call an
-/// identical write a change and rewrite the line unquoted, corrupting it on the next
-/// scan. This is the only entry point the write-back may use on an incoming word.
-pub(crate) fn canonical_value(value: &str) -> &str {
-    unquote(normalize_value_text(value))
-}
-
 /// The torture set both layers are pinned against (FINDINGS-BATCH-2026-10-28B
 /// [2]): every value-text shape whose boundary the reader and the writer must
 /// agree on, paired with the value the reader publishes. The cross-layer pins in
@@ -365,6 +358,16 @@ pub(crate) const TORTURE_SHAPES: &[(&str, &str)] = &[
     (" \u{540d}\u{524d}", "\u{540d}\u{524d}"),
     (" \u{2192}\u{2192} 4096 # arrows", "\u{2192}\u{2192} 4096"),
     (" caf\u{65}\u{301} # morning", "caf\u{65}\u{301}"),
+    // The peel-edge class FINDINGS2-13 [1] found: the quote peel happens AFTER the
+    // slice is trimmed, so a published value may legitimately carry edge whitespace
+    // or a residual quote pair. Every one of these must round-trip byte-exactly.
+    (" \"a b \" # tail", "a b "),
+    (" \" a\"", " a"),
+    (" 'a ' # tail", "a "),
+    (" \"a\t\" # tail", "a\t"),
+    (" \"\"\"\" # tail", "\"\""),
+    (" '''' # tail", "''"),
+    (" \"\u{feff}x\" # tail", "\u{feff}x"),
 ];
 
 /// The 13[5] Fork B acceptance gate: a config is exactly a **regular file** whose
@@ -443,8 +446,11 @@ pub fn scan_dir(dir: &Path) -> Catalog {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         // Identity is the file stem (FINDINGS-13 [3]/[7]): the stem is the only
-        // name-shaped value that reaches a `File::create` path as `log_name`, and
-        // tying identity to the file is what makes a same-name twin unconstructable.
+        // name-shaped value that reaches a `File::create` path as `log_name`. Tying
+        // identity to the file is what makes a `name:`-key twin unconstructable; it
+        // does NOT stop a whitespace-suffixed stem (`qwen3.yaml` beside `qwen3 .yaml`,
+        // which `from_flat` trims to one name) from collapsing, and that case is what
+        // the `DuplicateName` post-pass below reports (FINDINGS2-13 [3]).
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -482,6 +488,24 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                     "yaml not loaded \u{2014} problem lines: {}",
                     problems.join("; ")
                 ),
+            });
+            continue;
+        }
+        if map.is_empty() {
+            // The same Fork C voice as the gate above, and the mirror of
+            // `commit_verified`'s `EmptyFile` refusal (FINDINGS2-13 [2]): the
+            // write-back will not produce a zero-key model file, so the scan must
+            // not invent one either. Without this, `blank.yaml` publishes as a
+            // spawnable-looking `engine: llama` row named by its file stem with no
+            // `model:` at all — the existence check cannot fire because the key is
+            // absent, not wrong — and reports nothing. Silently skipping would be
+            // the blind-publish this doctrine already rejected; it is reported.
+            catalog.errors.push(ScanError {
+                kind: ScanKind::InvalidYaml,
+                file: file_name.clone(),
+                reason: "yaml not loaded \u{2014} no `key: value` lines: an empty or \
+                         comment-only .yaml is not a model config"
+                    .to_string(),
             });
             continue;
         }
@@ -1127,6 +1151,55 @@ mod tests {
             catalog.errors[0].reason
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS2-13 [2] — the zero-key hole, closed in the direction the doctrine
+    /// points: a `.yaml` the acceptance gate treats as a config but which yields no
+    /// keys at all publishes nothing **and is reported**, exactly as
+    /// `commit_verified` refuses to write it (`EmptyFile`). Before the gate these two
+    /// files entered the catalog as `engine: llama` rows named by their stems with
+    /// `errors` empty — spawnable-shaped phantoms. Falsifier: delete the
+    /// `map.is_empty()` gate and both rows come back while `errors` empties.
+    #[test]
+    fn an_empty_or_comment_only_yaml_is_reported_and_never_publishes() {
+        let dir = crate::testutil::temp_dir("scan-zero-key");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("blank.yaml"), "").expect("seed blank");
+        std::fs::write(dir.join("notes.yaml"), "# only a comment\n\n").expect("seed notes");
+        std::fs::write(dir.join("real.yaml"), "engine: mock\nvram_gb: 4\n").expect("seed real");
+
+        let catalog = scan_dir(&dir);
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["real"],
+            "a file with no keys must not publish a row, phantom or otherwise"
+        );
+        assert_eq!(catalog.errors.len(), 2, "{:?}", catalog.errors);
+        for name in ["blank.yaml", "notes.yaml"] {
+            let Some(report) = catalog.errors.iter().find(|e| e.file.contains(name)) else {
+                panic!(
+                    "{name} was neither published nor reported: {:?}",
+                    catalog.errors
+                );
+            };
+            assert_eq!(report.kind, ScanKind::InvalidYaml, "{report:?}");
+            assert!(
+                report.reason.contains("no `key: value` lines"),
+                "the reason must say which zero-key shape this is: {:?}",
+                report.reason
+            );
+            assert!(
+                !report.reason.contains("problem lines"),
+                "the problem-line sentence belongs to the other gate: {:?}",
+                report.reason
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -4,9 +4,10 @@
 //! by hand), so page edits are read-modify-write of the *raw lines*: ordering,
 //! CRLF endings, and unknown keys survive, and comments survive — every untouched
 //! line always; an edited line passes through byte-verbatim on an identical-value
-//! write (identical **as the scanner reads the value**, both sides of that test
-//! normalized by scan's own rule — `split_value_comment` for the line's value
-//! text, `canonical_value` for the incoming word), and a real change
+//! write (identical means the reader's published value, compared **byte-exactly**
+//! against the caller's word — the line's value text goes through scan's one
+//! `split_value_comment`, and the incoming word is taken as it arrived), and a real
+//! change
 //! drops the line's own inline comment (a stale note beside a new value is a lie;
 //! operator ruling 2026-10-28, FINDINGS-13 [8] Fork B; FINDINGS-BATCH-2026-10-28B
 //! [1]/[4]). A real change also writes the new value in a form the reader confirms
@@ -34,7 +35,7 @@
 //! [`crate::api::ApiError::from_writeback`] — a caller's impossible value or absent
 //! key is a 4xx, never a 500.
 
-use crate::model::scan::{canonical_value, normalized_line, parse_flat_yaml, split_value_comment};
+use crate::model::scan::{normalized_line, parse_flat_yaml, split_value_comment};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -128,7 +129,8 @@ pub enum WritebackError {
     UnrepresentableValue {
         /// The key the value was being written under.
         key: String,
-        /// The caller's word, exactly as it arrived (trimmed at entry).
+        /// The caller's word, exactly as it arrived (there is no entry
+        /// normalization — FINDINGS2-13 [1]).
         value: String,
     },
 }
@@ -232,16 +234,23 @@ pub(crate) fn next_temp_seq() -> u64 {
 /// arms of [`set_key_in_text`]; the keep branch never calls it, so 13[8] Fork B's
 /// byte-verbatim pass-through is untouched.
 ///
-/// The **reader is the definition** — [`split_value_comment`]'s value half decides,
-/// with no second parser and no hardcoded ` #` rules — in three steps:
+/// The **reader is the definition, taken literally**: each candidate line body is
+/// handed to [`split_value_comment`] and kept only if the value half comes back
+/// byte-equal to `want`. Not a canonical-equality shortcut — the peel can expose
+/// edge whitespace a bare emit would lose (`"a b "` publishes `a b `, and only
+/// `k: "a b "` reads back as it), which is what FINDINGS2-13 [1] found. No second
+/// parser, no hardcoded ` #` rules. Three steps:
 ///
 /// 1. **as-is if faithful**: the word alone, placed after `key: `, reads back
-///    exactly equal, so every plain value (`WORK`, `true`, `4.2`, `F:/m.gguf`) is
-///    emitted byte-identically to before this ruling;
+///    byte-exactly, so every plain value (`WORK`, `true`, `4.2`, `F:/m.gguf`) and
+///    every word the reader publishes that needs no protection is emitted
+///    byte-identically to before this ruling (`4096#c`, `#lead`, `# tail` all live
+///    here — a `#` at position 0 is never a comment under the locked boundary rule);
 /// 2. **quote if that fixes it**: otherwise one `"` pair around it, iff THAT reads
-///    back exactly equal — the one-pair peel [`split_value_comment`]'s `unquote`
-///    does — which is what saves every word the space-`#`-outside-quotes cut would
-///    truncate (`a # b`, `#lead`);
+///    back byte-exactly — the one-pair peel [`split_value_comment`]'s `unquote`
+///    does. This is what saves every word the space-`#`-outside-quotes cut would
+///    truncate (`a # b`, `x #y`) and every word whose first or last character is
+///    whitespace or a quote the peel would otherwise swallow (`a b `, ` a`, `""`);
 /// 3. **refuse if neither works**: an error naming the key and the value, never a
 ///    line the scanner would misread.
 ///
@@ -258,59 +267,68 @@ pub(crate) fn next_temp_seq() -> u64 {
 /// # Arguments
 ///
 /// * `key` - the yaml key the value is being written under, named in the refusal.
-/// * `value` - the caller's word, already trimmed by [`set_key_in_text`].
+/// * `want` - the caller's word, exactly as it arrived: no trimming, no peeling
+///   (FINDINGS2-13 [1]) — this function's job is to find a line form the reader
+///   hands back unchanged, so it must see the bytes the caller asked for.
 ///
 /// # Returns
 ///
 /// The text to write after `key: `, or the refusal.
-fn emit_form(key: &str, value: &str) -> Result<String, WritebackError> {
-    if !value.contains('\n') {
-        if split_value_comment(value).0 == value {
-            return Ok(value.to_string());
+fn emit_form(key: &str, want: &str) -> Result<String, WritebackError> {
+    if !want.contains('\n') {
+        if split_value_comment(want).0 == want {
+            return Ok(want.to_string());
         }
-        let wrapped = format!("\"{value}\"");
-        if split_value_comment(&wrapped).0 == value {
+        let wrapped = format!("\"{want}\"");
+        if split_value_comment(&wrapped).0 == want {
             return Ok(wrapped);
         }
     }
     Err(WritebackError::UnrepresentableValue {
         key: key.to_string(),
-        value: value.to_string(),
+        value: want.to_string(),
     })
 }
 
 /// Sets `key: value` in a flat yaml document, preserving everything else.
 ///
 /// - a matching key line (first one) is rewritten in place only when the value
-///   actually changes. Identity is decided **as the scanner reads values**: the
-///   line's value text goes through [`split_value_comment`] and the incoming word
-///   through [`canonical_value`] — the same normalization, the value half of that
-///   helper (BOM/`\r`/whitespace trim + one quote pair) with no comment cut, which
-///   is what keeps a word like `a # b` a word and not a line. So an
+///   actually changes. Identity is the **reader's published value compared
+///   byte-exactly against the caller's word**: the line's value text goes through
+///   [`split_value_comment`] and that result must equal `value` as it arrived. So an
 ///   identical-value write passes the line through
 ///   **byte-verbatim** — BOM, indentation, raw quoted value, inline comment and
 ///   trailing `\r` all stay exactly as authored, and the whole document comes back
 ///   byte-identical (operator ruling 2026-10-28, FINDINGS-13 [8] Fork B: nothing
-///   changes when the value does not change; FINDINGS-BATCH-2026-10-28B [1]/[4]
-///   for why both sides must be normalized by the same helper). A real change
+///   changes when the value does not change). A real change
 ///   harness-formats the line and drops the old inline comment (a stale note
 ///   beside a new value is a lie), and every later rewrite of the new value is
-///   then stable — the fixed point is the same one step further on;
-/// - `value` is trimmed once at entry, so all arms see one canonical word (the
-///   harness writes single words: an enum name, `true`/`false`, a `{:.1}` float).
-///   Surrounding whitespace is never a fact about a value, and comparing a trimmed
-///   word while emitting a padded one was the drift FINDINGS-BATCH-2026-10-28B [4]
-///   reported;
+///   then stable — the fixed point is the same one step further on. Deliberately
+///   NOT an "equal after trim-and-peel" test: the peel exposes edge whitespace and
+///   residual quote pairs (`"a b "` publishes `a b `), so canonical-equality called
+///   a republish of the reader's own value a change and rewrote
+///   `k: "a b " # tail` as `k: a b` — comment gone, value mutated
+///   (FINDINGS2-13 [1]);
+/// - `value` is never normalized: no trim, no peel, at entry or in the comparison
+///   (FINDINGS2-13 [1], superseding the entry-trim that
+///   FINDINGS-BATCH-2026-10-28B [4] introduced — its compare/emit symmetry was
+///   bought by destroying information the reader publishes, and the asymmetry it
+///   fixed is now fixed the other way, by emitting exactly what was asked). The
+///   harness's own vocabulary needs none of it: an enum name, `true`/`false` and a
+///   `{:.1}` float are byte-faithful as-is, pinned by
+///   `the_live_value_vocabulary_never_reaches_the_quote_or_refuse_branch`, so every
+///   current caller is unaffected;
 /// - the change and append arms write the word through [`emit_form`], which asks
 ///   the **reader** whether it survives (operator ruling 2026-10-28, closing the
 ///   open triage item FINDINGS-BATCH-2026-10-28B left): as-is when that is
 ///   faithful, one `"` pair when that is what makes it faithful, and a refusal
 ///   naming the key and the value when neither would read back. So a value
 ///   containing ` #` can no longer land a line that rescans to its pre-`#` prefix,
-///   and a value containing `\n` is refused rather than injecting lines. The keep
-///   branch is not involved: 13[8] Fork B's byte-verbatim pass-through stands, and
-///   it never refuses (a write of the value the reader already publishes is by
-///   definition one it can read back).
+///   a word with edge whitespace lands quoted rather than trimmed, and a value
+///   containing `\n` is refused rather than injecting lines. The keep
+///   branch is not involved: 13[8] Fork B's byte-verbatim pass-through stands, and a
+///   write of the value the reader publishes never reaches `emit_form` at all — it is
+///   identical under the byte-exact test above.
 /// - a matching key inside a *commented block* is never touched (v3.3 clobbered
 ///   these) — only real, non-comment lines count as occurrences;
 /// - a key that appears nowhere is appended at the end;
@@ -338,26 +356,28 @@ pub fn set_key_in_text(
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut out: Vec<String> = body.split('\n').map(str::to_string).collect();
     let bom = text.starts_with('\u{feff}');
-    // One canonical incoming word for all three arms (FINDINGS-BATCH-2026-10-28B
-    // [4]): trimming here, not per arm, is what keeps the identity test below and
-    // the bytes the emit arms write in agreement.
-    let value = value.map(str::trim);
+    // No entry normalization of the incoming word at all (FINDINGS2-13 [1]): the
+    // old `trim` here plus a peel in the comparison normalized AWAY bytes the
+    // reader's own published value carries (the peel exposes `"a b "` as `a b `),
+    // so an identical write was classified a change and the value mutated. The
+    // single contract is byte-exact: both arms below compare against, and emit,
+    // the caller's word as it arrived.
     match (find_key_line(out.iter().map(String::as_str), key), value) {
         (Some(index), Some(value)) => {
             // Ruling B's strongest form: an identical value changes NOTHING about the
             // line — it is never reformatted, so BOM, indentation, raw quoting, the
-            // comment and the '\r' all stay exactly as authored. "Identical" is the
-            // scanner's own reading: both sides go through scan's rule, so the writer
-            // cannot disagree with the reader about where the value ends and no shape
-            // can churn on a write of the value the reader just published
-            // (FINDINGS-BATCH-2026-10-28B [1]/[4]). A real change harness-formats the
-            // line, which is what drops the stale comment.
+            // comment and the '\r' all stay exactly as authored. "Identical" means the
+            // reader's published value IS the caller's word, byte for byte — not
+            // "equal after trimming and peeling", which is what let a republish of the
+            // reader's own value churn the line and drop the comment
+            // (FINDINGS2-13 [1]). A real change harness-formats the line, which is
+            // what drops the stale comment.
             let line = normalized_line(&out[index]);
             let colon = line.find(':').expect(
                 "invariant: find_key_line matched this line only because it has a key: value colon",
             );
             let (old_value, _comment) = split_value_comment(&line[colon + 1..]);
-            if old_value != canonical_value(value) {
+            if old_value != value {
                 // A real change re-emits the line, so it goes through the reader's
                 // own round-trip test (auto-quote, or refuse).
                 let emit = emit_form(key, value)?;
@@ -378,7 +398,9 @@ pub fn set_key_in_text(
         (None, Some(value)) => {
             // A new line is a real change too, so it shares the emit rule exactly.
             let emit = emit_form(key, value)?;
-            // Match the file's dominant line ending so a CRLF file gets a CRLF line.
+            // Any CRLF in the file makes the appended line CRLF too — "any", not
+            // dominant (FINDINGS2-13 [5]): a single CRLF line among LFs matches here,
+            // and the new line joins the majority style in every real file.
             let ending = if text.contains("\r\n") { "\r" } else { "" };
             out.push(format!("{key}: {emit}{ending}"));
         }
@@ -713,9 +735,13 @@ fn forensic_copy(target: &Path, original: &str) -> Bak {
         );
         set_key_in_text(original, "bak", Some(&stamp)).expect(
             "invariant: the node was just found by find_key_line, so no removal can fail; \
-             and the stamp is harness-built from a file name (no line break, no quote \
-             character) plus an ISO-8601 UTC stamp, so `emit_form`'s refuse branch is \
-             unreachable \u{2014} a name containing ` #` simply lands quoted",
+             and the stamp is harness-built from a `file_name()` on this platform (NTFS \
+             forbids `\"` and a newline in a name) plus an ISO-8601 UTC stamp, so \
+             `emit_form`'s refuse branch is unreachable \u{2014} a name containing ` #` \
+             simply lands quoted. The only theoretical path to a quote or line break is \
+             the `unwrap_or_else` below, which shows the whole path when a name cannot be \
+             read \u{2014} unreachable for any target the catalog published, since a \
+             published entry always has a file name",
         )
     } else {
         original.to_string()
@@ -1528,16 +1554,18 @@ mod tests {
     }
 
     /// FINDINGS-BATCH-2026-10-28G [1]: the quoted-incoming class is a **byte fixed
-    /// point on the second write**. Pin 2 pins that for the plain ` #` class (where
-    /// the keep branch takes over); this class never matches the keep test — the
-    /// reader publishes `"a"` while `canonical_value` peels the caller's `"a"` down
-    /// to `a` — so the second write re-enters the change arm and `emit_form` again,
-    /// and must reproduce the identical bytes. Pinned for the `"`-wrapped word and
-    /// the `'` twin, on the text path and through the file (where the
-    /// `updated == original` short-circuit means nothing reaches disk at all).
-    /// Falsifier: an emit that derives from the line it is rewriting instead of the
-    /// caller's word re-wraps the file's own text (`""a""` → `""""a""""`) and this
-    /// pin is the sole failure.
+    /// point on the second write**. Pinned for the `"`-wrapped word and the `'`
+    /// twin, on the text path and through the file (where the `updated == original`
+    /// short-circuit means nothing reaches disk at all).
+    ///
+    /// Status after FINDINGS2-13 [1]: the second write is now a genuine keep-branch
+    /// no-op (the reader publishes `"a"` for `note: ""a""`, which equals the caller's
+    /// word byte-exactly), where before it re-entered the change arm and relied on
+    /// `emit_form` being a pure function of that word. It is therefore a **property
+    /// lock with no unique falsifier left** — both arms reproduce the same bytes, and
+    /// the neuter that used to isolate it (an emit deriving from the line being
+    /// rewritten) is now unreachable for this class. Its first leg still fails if
+    /// `emit_form` step 2 is deleted, which pins 2 and 6 also catch.
     #[test]
     fn the_quoted_incoming_class_is_a_byte_fixed_point_on_the_second_write() {
         for incoming in ["\"a\"", "'a # b'"] {
@@ -1761,46 +1789,110 @@ mod tests {
         }
     }
 
-    /// FINDINGS-BATCH-2026-10-28B [4]: one canonical incoming word, decided before
-    /// any arm runs. Padded input is identity-equal to the clean word (so the line
-    /// passes through byte-verbatim) and lands trimmed on the change and append
-    /// arms — never raw, which is what let the compare and the emit disagree. A
-    /// quoting-only difference is parsed-equal in BOTH directions, so the
-    /// operator's note survives it: the ruling's "identical" is the scanner's.
+    /// FINDINGS2-13 [1], superseding this pin's earlier form (which pinned the
+    /// entry `trim` introduced by FINDINGS-BATCH-2026-10-28B [4]): the caller's word
+    /// is honored **byte-exactly** — nothing is trimmed or peeled on the way in,
+    /// because the reader's own published values can legitimately carry edge
+    /// whitespace and residual quote pairs, and normalizing them away made an
+    /// identical write a change. So a padded word is a different value and lands
+    /// quoted (step 2 is the only form the reader reads back whole), a word with a
+    /// line break is refused instead of silently trimmed, and a quoting-only
+    /// difference is a real change the file must reproduce. What survives from the
+    /// old pin unchanged: writing the value the reader itself publishes is a
+    /// byte-verbatim no-op, note and all.
     #[test]
-    fn incoming_words_are_normalized_once_before_any_arm_decides() {
+    fn incoming_words_are_honored_byte_exact() {
         let doc = "k: 4096 # the note\nname: q\n";
         assert_eq!(
-            set_key_in_text(doc, "k", Some(" 4096 ")).expect("padded identical"),
+            set_key_in_text(doc, "k", Some("4096")).expect("identical"),
             doc,
-            "a padded identical word must not touch a byte"
+            "the reader's own value stays a byte-verbatim no-op"
         );
         assert_eq!(
-            set_key_in_text(doc, "k", Some("\t4096\n")).expect("padded edges"),
-            doc
+            set_key_in_text(doc, "k", Some(" 4096 ")).expect("padded word"),
+            "k: \" 4096 \"\nname: q\n",
+            "a padded word is not `4096`; it lands quoted, the only faithful form"
+        );
+        assert!(
+            set_key_in_text(doc, "k", Some("\t4096\n")).is_err(),
+            "a line break cannot be quoted onto one line — refuse, never trim away"
         );
         assert_eq!(
             set_key_in_text(doc, "k", Some(" 8192 ")).expect("padded change"),
-            "k: 8192\nname: q\n",
-            "padded bytes never land"
+            "k: \" 8192 \"\nname: q\n",
+            "padded bytes land, protected by quotes"
         );
         assert_eq!(
             set_key_in_text("name: q\n", "k", Some(" 8192  ")).expect("padded append"),
-            "name: q\nk: 8192\n",
-            "no padded word in the file"
+            "name: q\nk: \" 8192  \"\n",
+            "the append arm honors the caller's bytes too"
         );
-        let quoted_line = "k: \"a b\" # the note\n";
         assert_eq!(
-            set_key_in_text(quoted_line, "k", Some("a b")).expect("unquoted in"),
-            quoted_line,
-            "file quoted, caller plain: parsed-equal keeps the note"
+            set_key_in_text("k: \"a b\" # the note\n", "k", Some("a b")).expect("unquoted in"),
+            "k: \"a b\" # the note\n",
+            "the reader publishes `a b` for that line, so the write is identical"
         );
-        let plain_line = "k: a b # the note\n";
         assert_eq!(
-            set_key_in_text(plain_line, "k", Some("\"a b\"")).expect("quoted in"),
-            plain_line,
-            "file plain, caller quoted: parsed-equal keeps the note"
+            set_key_in_text("k: a b # the note\n", "k", Some("\"a b\"")).expect("quoted in"),
+            "k: \"\"a b\"\"\n",
+            "a caller that asks for the quoted word gets the quoted word, not a keep"
         );
+    }
+
+    /// FINDINGS2-13 [1] — the keep-branch hole itself, at the exact shapes the
+    /// review broke: republishing the value the reader hands back must be a
+    /// byte-verbatim no-op (line untouched, comment alive, value unchanged) and the
+    /// same must hold through the file path, not just the text helper. Falsifier:
+    /// restore the canonical-equality identity test (`old_value !=
+    /// canonical_value(value)`) plus the entry trim and every leg here fails.
+    #[test]
+    fn republishing_the_readers_own_value_is_always_byte_verbatim() {
+        for line in [
+            "k: \"a b \" # operator note",
+            "k: \" a\" # operator note",
+            "k: 'a ' # operator note",
+            "k: \"a\t\" # operator note",
+            "k: \"\"\"\" # operator note",
+            "k: '''' # operator note",
+            "k: \"\u{feff}x\" # operator note",
+            "k: 4096 # operator note",
+        ] {
+            let doc = format!("{line}\nname: q\n");
+            let (map, problems) = parse_flat_yaml(&doc);
+            assert!(problems.is_empty(), "{problems:?}");
+            let published = map.get("k").expect("key present").clone();
+            let back = set_key_in_text(&doc, "k", Some(&published)).expect("no-op write");
+            assert_eq!(
+                back, doc,
+                "republishing the reader's value `{published:?}` churned the line"
+            );
+            let (again, problems) = parse_flat_yaml(&back);
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(
+                again.get("k").map(String::as_str),
+                Some(published.as_str()),
+                "and the re-scan must still hand back exactly what it published"
+            );
+        }
+
+        // End to end through the file path, where the review observed mtime churn
+        // and the note destroyed: a no-op must not touch a byte.
+        let dir = crate::testutil::temp_dir("writeback-republish");
+        let path = seed(&dir, "title: \"a b \" # operator note\nname: q\n");
+        let (map, _) = parse_flat_yaml(&std::fs::read_to_string(&path).expect("read"));
+        set_flag_on_file(
+            &path,
+            "title",
+            Some(map.get("title").expect("title").as_str()),
+        )
+        .expect("no-op file write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "title: \"a b \" # operator note\nname: q\n",
+            "the operator's quoting and note must survive their own value being republished"
+        );
+        assert_no_temp_leftovers(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FINDINGS-BATCH-2026-10-28B [6]: a true no-op never reaches the disk. The
@@ -2308,6 +2400,78 @@ mod tests {
             WITH_NODE,
             "the restore puts back the operator's own bytes, node included"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS2-13 [6]: the two `Bak::Absent` sentences — the anti-lie module's most
+    /// alarming ones — had no pin, because every seam disturbed the bak's confirming
+    /// READ while nothing could fail its WRITE. A directory squatting the `.bak` path
+    /// fails the write itself, which is exactly the state those messages describe.
+    /// Restore works, so the report is the honest "restored, but no backup exists".
+    /// Falsifier: change the `Bak::Absent(io) => format!("no backup written: {io}")`
+    /// arm (word it differently, or drop it into the verified form) and this fails.
+    #[test]
+    fn a_failed_backup_is_reported_as_no_backup_written_beside_the_honest_restore() {
+        let dir = crate::testutil::temp_dir("writeback-bak-absent");
+        let path = seed(&dir, CLEAN);
+        std::fs::create_dir(dir.join("qwen3.yaml.bak")).expect("squat the bak path");
+        arm_post_write_corrupt(&path, false);
+        let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
+            .expect_err("the seam must fail post-write validation")
+            .to_string();
+        assert!(
+            error.starts_with(
+                "post-write validation failed; original restored (no backup written: "
+            ),
+            "{error}"
+        );
+        assert!(
+            !error.contains("backup:"),
+            "a copy that was never written may not be claimed: {error}"
+        );
+        assert!(
+            std::fs::metadata(dir.join("qwen3.yaml.bak"))
+                .map(|m| m.is_dir())
+                .unwrap_or(false),
+            "the squatting directory is the proof no copy exists"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("target"),
+            CLEAN,
+            "the original bytes came back despite the missing backup"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS2-13 [6]: the second `Bak::Absent` shape — the restore ALSO failed and
+    /// there is no trustworthy copy anywhere, so the message must say "in nowhere"
+    /// and name only the target to re-check. Falsifier: break the
+    /// `Bak::Absent(_) => ... "in nowhere"` arm and this fails.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_backup_and_failed_restore_says_the_bytes_are_nowhere() {
+        let dir = crate::testutil::temp_dir("writeback-bak-absent-restore-fail");
+        let path = seed(&dir, CLEAN);
+        std::fs::create_dir(dir.join("qwen3.yaml.bak")).expect("squat the bak path");
+        arm_post_write_corrupt(&path, true);
+        let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
+            .expect_err("the restore rename must be refused")
+            .to_string();
+        assert!(
+            error.starts_with("post-write validation failed; RESTORE FAILED: "),
+            "{error}"
+        );
+        assert!(error.contains("original bytes are in nowhere"), "{error}");
+        assert!(error.contains("re-check"), "{error}");
+        assert!(
+            !error.contains("original restored"),
+            "anti-lie: nothing was restored: {error}"
+        );
+        assert!(
+            !error.contains("backup:"),
+            "no copy may be claimed as fact: {error}"
+        );
+        release_post_write_locks(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
