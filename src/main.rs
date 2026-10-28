@@ -17,14 +17,19 @@ use std::time::Duration;
 ///
 /// A missing file yields defaults ("no config file" is usable, §0.1); an invalid file
 /// or any validation failure is fatal and every problem is logged (never silently
-/// defaulted — defect D1).
-fn boot_config() -> Result<AppConfig, Vec<ConfigError>> {
+/// defaulted — defect D1). `env_config_path` is the effective value of
+/// `SIMPLEHAR_CONFIG` (passed in, not read here, so tests never mutate process env):
+/// naming a path that is not an existing file is fatal (FINDINGS-14 [3]), and a
+/// legacy-migration copy that fails is fatal too — the operator has a config the
+/// boot cannot honour (FINDINGS-14 [2]).
+fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigError>> {
     // The test harness (and operators) can point at a config anywhere; otherwise
     // the config lives beside the executable.
-    let path = std::env::var("SIMPLEHAR_CONFIG")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(config::default_config_path);
+    let explicit = env_config_path.map(PathBuf::from);
+    let path = match &explicit {
+        Some(path) => Some(path.clone()),
+        None => config::default_config_path(),
+    };
     // One-time migration from the shared v3.3 name. The legacy file is copied, never
     // moved or rewritten: the rollback exe must still find what it expects there
     // (deploy review, 2026-10-26 — SE's full-struct persist writes `protected_ports`,
@@ -36,21 +41,37 @@ fn boot_config() -> Result<AppConfig, Vec<ConfigError>> {
                 .is_some_and(|name| name == config::CONFIG_FILE)
         {
             let legacy = path.with_file_name(config::LEGACY_CONFIG_FILE);
-            if legacy.is_file() {
-                match std::fs::copy(&legacy, path) {
-                    Ok(_) => tracing::warn!(
-                        "migrated {} -> {} (the legacy file is left untouched for rollback)",
-                        legacy.display(),
-                        path.display()
-                    ),
-                    Err(error) => tracing::warn!(
-                        error = %error,
-                        "could not copy {} to {}; booting defaults",
-                        legacy.display(),
-                        path.display()
-                    ),
+            if legacy.exists() {
+                if let Err(error) = std::fs::copy(&legacy, path) {
+                    // FINDINGS-14 [2]: a failed copy must not warn-and-continue — the
+                    // operator has a config and this boot cannot honour it, so serving
+                    // built-in defaults would be a security/admission posture nobody
+                    // authored. `exists()` (not `is_file()`) so a legacy path that is
+                    // present but uncopiable reaches this same fatal arm.
+                    return Err(vec![ConfigError::Invalid {
+                        field: config::LEGACY_CONFIG_FILE.to_string(),
+                        reason: format!(
+                            "could not migrate {} to {}: {error}",
+                            legacy.display(),
+                            path.display()
+                        ),
+                    }]);
                 }
+                tracing::warn!(
+                    "migrated {} -> {} (the legacy file is left untouched for rollback)",
+                    legacy.display(),
+                    path.display()
+                );
             }
+        }
+    }
+    if let Some(path) = &explicit {
+        // FINDINGS-14 [3]: an explicit env path is an instruction, not an absence.
+        if !path.is_file() {
+            return Err(vec![ConfigError::Invalid {
+                field: "SIMPLEHAR_CONFIG".to_string(),
+                reason: format!("no configuration file at {}", path.display()),
+            }]);
         }
     }
     let mut config = match &path {
@@ -84,7 +105,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let config = match boot_config() {
+    let config = match boot_config(std::env::var("SIMPLEHAR_CONFIG").ok()) {
         Ok(config) => config,
         Err(errors) => {
             for error in &errors {
@@ -215,7 +236,9 @@ async fn log_boot_banner(
         let exe = llama_server_exe.to_path_buf();
         tokio::task::spawn_blocking(move || !exe.exists())
             .await
-            .unwrap_or(false)
+            // FINDINGS-14 [8]: fail toward warning — a check that could not run must
+            // not report the reassuring "exe is present" verdict.
+            .unwrap_or(true)
     };
     if exe_missing {
         tracing::warn!(
@@ -248,7 +271,9 @@ async fn log_boot_banner(
             .collect::<Vec<_>>()
     })
     .await
-    .unwrap_or_else(|_| vec![" "; catalog.models.len()]);
+    // FINDINGS-14 [8]: the `!` filler, not the neutral marker: a banner whose stat
+    // loop could not run must look like a machine full of landmines, not a clean one.
+    .unwrap_or_else(|_| vec!["!"; catalog.models.len()]);
     for (entry, marker) in catalog.models.iter().zip(markers) {
         let path = entry.model_ref.as_deref().unwrap_or("-");
         tracing::info!(
@@ -345,24 +370,32 @@ async fn supervise_listener(
                 // A4: the classic Windows "busy with nothing listening" cause is a
                 // Hyper-V/WinNAT-reserved port range — probe once per outage (the
                 // resolved hint persists for every retry until a successful bind).
+                // FINDINGS-14 [6]: a failed probe does NOT set `hinted`, so the next
+                // rebind attempt probes again instead of losing the hint for the
+                // outage; the retry cadence stays the supervisor's own backoff below.
                 if !hinted {
-                    hinted = true;
-                    match tokio::time::timeout(
+                    let attempt = tokio::time::timeout(
                         LISTENER_RETRY,
                         reserved_range_hint(category.public_port),
                     )
                     .await
-                    {
-                        Ok(Some(h)) => {
-                            hint = Some(h.clone());
-                            tracing::warn!(%addr, category = %category.id, "{h}");
-                            listeners.mark_down(
-                                category.id,
-                                format!("cannot bind {addr}: {error}; {h}"),
-                            );
-                        }
-                        Ok(None) => {}
-                        Err(_) => tracing::debug!(%addr, "netsh excludedportrange probe timed out"),
+                    .map_err(|_| ());
+                    let fresh_hint = match &attempt {
+                        Ok(Some(h)) => Some(h.clone()),
+                        _ => None,
+                    };
+                    let (now_hinted, resolved) = probe_outcome(hint.clone(), attempt);
+                    hinted = now_hinted;
+                    hint = resolved;
+                    if let Some(h) = fresh_hint {
+                        tracing::warn!(%addr, category = %category.id, "{h}");
+                        listeners
+                            .mark_down(category.id, format!("cannot bind {addr}: {error}; {h}"));
+                    } else if !hinted {
+                        tracing::debug!(
+                            %addr,
+                            "netsh excludedportrange probe failed or timed out; retrying on the next attempt"
+                        );
                     }
                 }
             }
@@ -399,6 +432,23 @@ async fn reserved_range_hint(port: u16) -> Option<String> {
                  (netsh interface ipv4 show excludedportrange protocol=tcp)"
             )
         })
+}
+
+/// FINDINGS-14 [6]: the hint decision, isolated so it is unit-testable.
+///
+/// Returns `(hinted, hint)`: `hinted` becomes true only when the probe obtained an
+/// answer — `Ok(Some)` or `Ok(None)`; an `Err` (the 5 s timeout or a failed spawn)
+/// leaves it false so the next rebind attempt probes again instead of losing the
+/// hint for the whole outage. A hint already held survives a failed probe. `()`
+/// stands in for the timeout error, whose payload the caller only logs.
+fn probe_outcome(
+    current_hint: Option<String>,
+    attempt: Result<Option<String>, ()>,
+) -> (bool, Option<String>) {
+    match attempt {
+        Ok(answer) => (true, answer.or(current_hint)),
+        Err(()) => (false, current_hint),
+    }
 }
 
 /// Decodes `netsh` output: console tools emit UTF-16LE (BOM) on some locales and
@@ -558,7 +608,116 @@ mod tests {
     //! unit-reachable — it takes the single-instance guard, binds every listener and
     //! starts the NVML witness.
 
-    use super::{decode_console_output, parse_excluded_ranges};
+    use super::{boot_config, decode_console_output, parse_excluded_ranges, probe_outcome};
+    use simplehar_se::config::{self, AppConfig, ConfigError};
+
+    fn error_text(errors: &[ConfigError]) -> String {
+        errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn failed_legacy_migration_copy_is_fatal() {
+        // FINDINGS-14 [2]: a present-but-uncopiable legacy config must fail the boot,
+        // never warn and fall through to built-in defaults. The legacy path is a
+        // directory: `exists()` passes but `std::fs::copy` fails deterministically.
+        let dir = simplehar_se::testutil::temp_dir("legacy-copy-fail");
+        let target = dir.join(config::CONFIG_FILE);
+        let legacy = dir.join(config::LEGACY_CONFIG_FILE);
+        std::fs::create_dir(&legacy).expect("legacy dir");
+        let errors = boot_config(Some(target.display().to_string()))
+            .expect_err("an unmigratable legacy config must be fatal, not defaults");
+        let text = error_text(&errors);
+        assert!(
+            text.contains(&legacy.display().to_string()),
+            "the error must name the legacy path: {text}"
+        );
+        assert!(
+            text.contains(&target.display().to_string()),
+            "the error must name the migration target: {text}"
+        );
+    }
+
+    #[test]
+    fn missing_file_named_by_simplehar_config_is_fatal() {
+        // FINDINGS-14 [3]: the env var is an instruction, not an absence.
+        let dir = simplehar_se::testutil::temp_dir("env-missing");
+        let requested = dir.join("operator-typo.json");
+        let errors = boot_config(Some(requested.display().to_string()))
+            .expect_err("a missing file named by SIMPLEHAR_CONFIG must be fatal");
+        let text = error_text(&errors);
+        assert!(
+            text.contains(&requested.display().to_string()),
+            "the error must name the requested path: {text}"
+        );
+        assert!(
+            !text.contains("simplehar-se.json"),
+            "the honest report names the requested path, not the default file: {text}"
+        );
+    }
+
+    #[test]
+    fn missing_default_config_still_defaults() {
+        // Regression pin for [2]/[3]: unset env + no file beside the exe keeps the
+        // §0.1 defaults path untouched. Guarded: a stray config beside the test
+        // exe is not the case under test.
+        let Some(default) = config::default_config_path() else {
+            return;
+        };
+        if default.exists() || default.with_file_name(config::LEGACY_CONFIG_FILE).exists() {
+            return;
+        }
+        let loaded = boot_config(None).expect("unset env with no file must boot defaults");
+        let expected = AppConfig {
+            source_path: Some(default),
+            ..AppConfig::default()
+        };
+        assert_eq!(loaded, expected);
+    }
+
+    #[test]
+    fn simplehar_config_pointing_at_a_present_file_loads_it() {
+        let dir = simplehar_se::testutil::temp_dir("env-present");
+        let path = dir.join("custom-name.json");
+        std::fs::write(&path, r#"{"vram_total_gb": 42.0}"#).expect("config file");
+        let loaded =
+            boot_config(Some(path.display().to_string())).expect("a present file must load");
+        assert_eq!(loaded.vram_total_gb, 42.0, "the file's value must survive");
+        assert_eq!(loaded.source_path, Some(path));
+    }
+
+    #[test]
+    fn probe_marks_hinted_only_on_an_answer() {
+        // FINDINGS-14 [6]: the four outcomes of one probe attempt.
+        assert_eq!(
+            probe_outcome(None, Ok(Some("range 8000-8100".to_string()))),
+            (true, Some("range 8000-8100".to_string())),
+            "an answer with a hint marks the outage probed"
+        );
+        assert_eq!(
+            probe_outcome(None, Ok(None)),
+            (true, None),
+            "an answer of 'nothing reserved' also marks it probed"
+        );
+        assert_eq!(
+            probe_outcome(None, Err(())),
+            (false, None),
+            "a timeout/failure must NOT mark it probed: the next attempt retries"
+        );
+        assert_eq!(
+            probe_outcome(Some("held".to_string()), Err(())),
+            (false, Some("held".to_string())),
+            "a hint already held survives a failed probe"
+        );
+        assert_eq!(
+            probe_outcome(Some("stale".to_string()), Ok(Some("fresh".to_string()))),
+            (true, Some("fresh".to_string())),
+            "a fresh answer replaces the held hint"
+        );
+    }
 
     const SAMPLE: &str = "
 Protocol tcp Port Exclusion Ranges
