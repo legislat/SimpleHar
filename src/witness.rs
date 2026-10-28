@@ -9,7 +9,7 @@
 
 use crate::budget::{parse_smi_sample, MemorySample, VramWitness};
 use async_trait::async_trait;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// How long a sample stays fresh: status polls every 2 s must not spawn a process
@@ -25,8 +25,16 @@ const SMI_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// NVML-first witness with `nvidia-smi` fallback, a TTL cache for successes *and*
 /// failures, and a refill lock so concurrent callers share one sampling round.
+///
+/// NVML init is **lazy**: the native `Nvml::init()` runs on the first sample, never
+/// in [`NvmlWitness::new`]. A dying driver must not wedge boot before `/har/status`
+/// exists (FINDINGS-14 [1]: init was on the main thread before the first bind, the
+/// same pre-bind stall the A6 banner precedent in `main.rs` moved off the critical
+/// path). The first sample pays the init; concurrent callers share it on the
+/// `OnceLock`, and a failed init is remembered, not retried — the `nvidia-smi`
+/// fallback arms exactly as when init failed eagerly.
 pub struct NvmlWitness {
-    nvml: Option<nvml_wrapper::Nvml>,
+    nvml: OnceLock<Option<nvml_wrapper::Nvml>>,
     cache: Mutex<Option<(Instant, MemorySample)>>,
     failure: Mutex<Option<(Instant, String)>>,
     /// Held across a refill: the TTL check and the store straddle an `await`, so
@@ -36,18 +44,12 @@ pub struct NvmlWitness {
 }
 
 impl NvmlWitness {
-    /// Creates the witness; NVML init failure is not an error — the fallback arms.
+    /// Creates the witness without touching the driver: allocation-cheap and bind-safe
+    /// (FINDINGS-14 [1]); NVML init failure is not an error — the fallback arms, on
+    /// the first [`VramWitness::sample`], never on the boot thread.
     pub fn new() -> Self {
-        let nvml = match nvml_wrapper::Nvml::init() {
-            Ok(nvml) => Some(nvml),
-            Err(error) => {
-                tracing::warn!(error = %error,
-                    "NVML unavailable; the witness falls back to nvidia-smi (item 5)");
-                None
-            }
-        };
         NvmlWitness {
-            nvml,
+            nvml: OnceLock::new(),
             cache: Mutex::new(None),
             failure: Mutex::new(None),
             refill: tokio::sync::Mutex::new(()),
@@ -55,8 +57,33 @@ impl NvmlWitness {
         }
     }
 
+    /// The lazy `Nvml::init()`, paid once on first use. The match and the
+    /// warn-on-error below are the former body of `new()` verbatim: whichever way
+    /// init went, behaviour after the first sample is exactly what it was when init
+    /// happened at construction.
+    fn nvml(&self) -> Option<&nvml_wrapper::Nvml> {
+        self.nvml
+            .get_or_init(|| match nvml_wrapper::Nvml::init() {
+                Ok(nvml) => Some(nvml),
+                Err(error) => {
+                    tracing::warn!(error = %error,
+                        "NVML unavailable; the witness falls back to nvidia-smi (item 5)");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// Whether the lazy NVML init has already run. Test-only observability for the
+    /// laziness pin: false after [`NvmlWitness::new`], true after the first sample
+    /// that reached the driver path.
+    #[cfg(test)]
+    fn nvml_initialized_for_test(&self) -> bool {
+        self.nvml.get().is_some()
+    }
+
     fn sample_nvml(&self) -> Result<MemorySample, String> {
-        let nvml = self.nvml.as_ref().ok_or("nvml not initialized")?;
+        let nvml = self.nvml().ok_or("nvml not initialized")?;
         let index = match nvml.device_count() {
             Ok(count) if count > 0 => 0,
             Ok(_) => return Err("nvml reports no devices".to_string()),
@@ -142,7 +169,9 @@ impl VramWitness for NvmlWitness {
     fn source(&self) -> String {
         // Naming the source is the point: a fallback reading must never be
         // displayed as an in-process NVML one (F-7).
-        if self.nvml.is_none() || *self.fell_back.lock().expect("witness lock") {
+        if self.nvml.get().is_none_or(Option::is_none)
+            || *self.fell_back.lock().expect("witness lock")
+        {
             "nvidia-smi (fallback)".to_string()
         } else {
             "NVML".to_string()
@@ -261,11 +290,48 @@ mod tests {
     }
 
     #[test]
-    fn source_labels_nvml_and_the_fallback_apart() {
-        // F-7: a fallback reading must never be displayed as an in-process NVML one,
-        // so the two cases cannot collapse into one label.
+    fn new_leaves_nvml_uninitialised() {
+        // FINDINGS-14 [1]: construction must never touch the driver — a dying NVML
+        // may not wedge boot before `/har/status` exists. Deterministic on every
+        // machine, driver present or not: the OnceLock stays untouched by `new()`.
         let witness = NvmlWitness::new();
-        let expected = if witness.nvml.is_some() {
+        assert!(
+            !witness.nvml_initialized_for_test(),
+            "NvmlWitness::new() must not run Nvml::init()"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_sample_pays_the_nvml_init() {
+        // The other half of the laziness pin: `sample()` still reaches the driver
+        // exactly as before — both machine shapes are asserted explicitly, so
+        // neither can pass vacuously.
+        let witness = NvmlWitness::new();
+        let _ = witness.sample().await;
+        if witness.nvml_initialized_for_test() {
+            match witness.nvml.get().expect("init ran") {
+                // The driver answered the init: the sample path ran NVML-first.
+                Some(_) => {}
+                // Init ran and failed: the witness fell back, and F-7 demands the
+                // source never claims NVML in that case.
+                None => {
+                    assert_eq!(witness.source(), "nvidia-smi (fallback)");
+                }
+            }
+        } else {
+            panic!("sample() must pay the lazy Nvml::init() on every machine shape");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_labels_nvml_and_the_fallback_apart() {
+        // F-7: a fallback reading must never be displayed as an in-process NVML one,
+        // so the two cases cannot collapse into one label. With the init lazy, the
+        // distinction only exists after the first sample — that is when it is pinned.
+        let witness = NvmlWitness::new();
+        let _ = witness.sample().await;
+        let initialized = witness.nvml.get().is_some_and(|slot| slot.is_some());
+        let expected = if initialized {
             "NVML"
         } else {
             "nvidia-smi (fallback)"

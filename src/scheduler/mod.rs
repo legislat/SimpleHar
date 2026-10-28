@@ -459,8 +459,18 @@ impl SchedulerHandle {
 pub struct Scheduler;
 
 impl Scheduler {
-    /// Spawns the actor task and returns its handle. The catalog is scanned from
-    /// `models_dir` at construction (§0.2 step 6) and re-scanned by [`Command::Reload`].
+    /// Spawns the actor task and returns its handle, without touching the catalog:
+    /// the scan of `models_dir` (§0.2 step 6, re-run by [`Command::Reload`]) happens
+    /// **on the actor task, never on the boot thread** — `start()` returns while it
+    /// is still pending, so the boot thread reaches `TcpListener::bind` unblocked
+    /// (FINDINGS-14 [1]: an operator-chosen `modelconf_dir` can live on a sleeping
+    /// USB or a disconnected `\\NAS` volume, and a wedged pre-bind scan would stall
+    /// the listeners and `/har/status` while the already-held single-instance guard
+    /// refuses the operator's relaunch — the same stall the A6 precedent in
+    /// `main.rs` moved the banner's stat loop off the critical path for). Command
+    /// ordering is identical to a pre-bind scan: the channel is unbounded and the
+    /// scan is the first thing the actor does, so everything sent before it lands
+    /// queues behind it.
     pub fn start(
         cfg: AppConfig,
         models_dir: PathBuf,
@@ -686,7 +696,15 @@ fn state_last_used(occupant: &Occupant, last_used: &HashMap<String, Instant>) ->
         .max(occupant.loaded_at)
 }
 
+/// The actor's message loop. The initial catalog scan is the **first thing this task
+/// does**, before it takes any message: commands, ticks and reads queue behind it on
+/// the unbounded channel, exactly as when the scan ran synchronously in
+/// [`ActorState::new`] — but it now runs on the actor task, not on the boot thread
+/// (FINDINGS-14 [1]; A6 precedent, `main.rs`: a stalled `modelconf_dir` volume must
+/// never delay bind, `/har/status` or the tray, especially while the already-held
+/// single-instance guard refuses a relaunch).
 async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
+    state.refresh_catalog();
     while let Some(msg) = rx.recv().await {
         match msg {
             ActorMsg::Command { cmd, reply } => state.on_command(cmd, reply),
@@ -717,6 +735,10 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
 }
 
 impl ActorState {
+    /// Builds the actor state **without scanning**: the initial catalog scan belongs
+    /// to [`actor_loop`], never to the thread that calls [`Scheduler::start`]
+    /// (FINDINGS-14 [1]). Identical to [`ActorState::empty`]; kept as the canonical
+    /// constructor the boot path funnels through.
     fn new(
         cfg: AppConfig,
         models_dir: PathBuf,
@@ -725,9 +747,7 @@ impl ActorState {
         witness: Arc<dyn crate::budget::VramWitness>,
         tx: mpsc::UnboundedSender<ActorMsg>,
     ) -> Self {
-        let mut state = Self::empty(cfg, models_dir, adapters, runtime, witness, tx);
-        state.refresh_catalog();
-        state
+        Self::empty(cfg, models_dir, adapters, runtime, witness, tx)
     }
 
     fn empty(
@@ -773,6 +793,8 @@ impl ActorState {
     }
 
     /// Rescans `ModelConf` and cross-checks `default_model`s (§0.2 step 6, Step 9).
+    /// Runs on the actor task: at boot as the first thing [`actor_loop`] does, and on
+    /// every [`Command::Reload`] (never on the boot thread — FINDINGS-14 [1]).
     fn refresh_catalog(&mut self) {
         let catalog = crate::model::scan::scan_dir(&self.models_dir);
         let mut errors = catalog.errors;
@@ -2853,14 +2875,182 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
-    use super::{headline_fault, JobId, JobKind, JobStatus, SwapState};
+    use super::{headline_fault, ActorState, JobId, JobKind, JobStatus, Scheduler, SwapState};
+    use crate::budget::LedgerOnlyWitness;
     use crate::config::CategoryId;
+    use crate::engine::mock::MockAdapter;
+    use crate::engine::EngineAdapter;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Constructor-only stand-in for the never-called runtime half of an
+    /// [`ActorState`]: the boot-thread pin builds state and reads its catalog field,
+    /// it never spawns, kills or probes, so any call reaching here is a test bug.
+    struct NeverRuntime;
+
+    #[async_trait::async_trait]
+    impl crate::engine::EngineRuntime for NeverRuntime {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: crate::ownership::SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            panic!("the boot-thread pin must never call the runtime");
+        }
+        async fn kill(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<(), crate::engine::SpawnError> {
+            panic!("the boot-thread pin must never call the runtime");
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            panic!("the boot-thread pin must never call the runtime");
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            panic!("the boot-thread pin must never call the runtime");
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("the boot-thread pin must never call the runtime");
+        }
+    }
+
+    struct BootWiring {
+        adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
+        runtime: Arc<dyn crate::engine::EngineRuntime>,
+        witness: Arc<dyn crate::budget::VramWitness>,
+        tx: tokio::sync::mpsc::UnboundedSender<super::ActorMsg>,
+    }
+
+    fn boot_stub_wiring() -> BootWiring {
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        BootWiring {
+            adapters,
+            runtime: Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            witness: Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx: tokio::sync::mpsc::unbounded_channel().0,
+        }
+    }
+
+    fn seed_one_model(dir: &std::path::Path, name: &str) {
+        std::fs::write(
+            dir.join(format!("{name}.yaml")),
+            format!("name: {name}\nengine: mock\ncategory: work\n"),
+        )
+        .expect("model yaml");
+    }
+
+    #[test]
+    fn actor_state_construction_never_scans_the_catalog() {
+        // FINDINGS-14 [1], boot-thread pin: the constructor that `Scheduler::start`
+        // funnels through — including the `ActorState::empty` path it delegates to —
+        // must return against a dir holding a valid model with the catalog still
+        // empty. Re-introducing the scan into the constructor (the pre-bind stall)
+        // fails this assertion. Deterministic: no task has run, so nothing can have
+        // scanned yet.
+        let dir = crate::testutil::temp_dir("bootscan");
+        seed_one_model(&dir, "boot-stub");
+        let wiring = boot_stub_wiring();
+        let state = ActorState::new(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            wiring.adapters,
+            wiring.runtime,
+            wiring.witness,
+            wiring.tx,
+        );
+        assert!(
+            state.catalog.is_empty(),
+            "the constructor must not scan: a pre-bind catalog read is the \
+             FINDINGS-14 [1] stall; {:?}",
+            state
+                .catalog
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let wiring = boot_stub_wiring();
+        let state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            wiring.adapters,
+            wiring.runtime,
+            wiring.witness,
+            wiring.tx,
+        );
+        assert!(
+            state.catalog.is_empty(),
+            "ActorState::empty must not scan either; {:?}",
+            state
+                .catalog
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn actor_task_performs_the_initial_scan() {
+        // FINDINGS-14 [1], actor-side pin: the scan `ActorState::new` no longer runs
+        // must still happen — as the first thing the actor task does. A command sent
+        // immediately after `start()` (here the catalog read) queues behind the scan
+        // on the unbounded channel and observes its result; no sleep or timing
+        // assumption is involved, only a bounded poll for the eventual occupancy of
+        // the seeded model.
+        let dir = crate::testutil::temp_dir("bootscan");
+        seed_one_model(&dir, "boot-model");
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let handle = Scheduler::start(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let catalog = handle.catalog().await.expect("actor alive");
+            if catalog
+                .models
+                .iter()
+                .any(|entry| entry.name == "boot-model")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the actor-side initial scan never populated the catalog: {:?}",
+                catalog
+                    .models
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_stale_reap_target_does_not_abort_the_rest() {
         // Chunk 2: aborting the reap on a stale victim ticket stranded the job's own live
         // engine — the very orphan the multi-target reap exists to prevent.
-        use super::ActorState;
         use crate::engine::SpawnError;
         assert!(
             ActorState::reap_should_continue(&SpawnError::StaleTicket {

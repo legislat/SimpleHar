@@ -95,6 +95,11 @@ async fn main() -> ExitCode {
     };
     let config_ms = boot_started.elapsed().as_millis() as u64;
     let adapters = simplehar_se::engine::default_adapters(&config);
+    // Witness/runtime/scheduler are bind-cheap (FINDINGS-14 [1]): the NVML witness
+    // defers Nvml::init to its first sample and the scheduler defers the catalog
+    // scan to its actor task, so no driver or `modelconf_dir` volume can stall the
+    // bind below. Accepted pre-bind cost here: ProcessRuntime::new's one local
+    // std::fs::read of ninfer-claims.json beside the exe — microseconds, not a stall.
     let runtime = ProcessRuntime::new().with_wsl(
         config.wsl_distro.clone(),
         config.wsl_account().unwrap_or_default(),
