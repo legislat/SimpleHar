@@ -50,8 +50,8 @@ the config.
 
 Each public listener answers OpenAI-style `/v1/models` (category-filtered),
 `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. A request naming no
-model (or the engine's default id) loads that category's `default_model` instead of
-erroring.
+model is served by the category's loaded occupant (the MRU one at AUX ×N); only with
+nothing loaded does it load that category's `default_model` instead of erroring.
 
 ## Configuration: `simplehar-se.json`
 
@@ -115,7 +115,7 @@ If an atomic write ever fails its own post-write validation, the harness first w
 | `ninfer_autostart` | **Required for ninfer.** Path (inside WSL) of the operator's autostart script; invoked as `bash <script> <profile> <key\|nokey> <port>` via `wsl.exe` |
 | `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload — strictly scoped to the name this harness claimed at spawn (`ninfer-claims.json` beside the harness exe). Must be docker-legal and must not look like a container ID (4+ hex chars): docker would resolve such an argument as an id prefix and delete someone else's container |
 | `ninfer_profile` | Profile passed as the script's `$1` (default `b`) |
-| `ninfer_key` | `true` sends `key` as `$2`; anything else sends `nokey` |
+| `ninfer_key` | Truthy — `true`/`1`/`yes`/`on`, case-insensitive, the shared truthy table — sends `key` as `$2`; anything else sends `nokey` |
 
 Unknown keys are preserved for reference and reported as `unknown_key` warnings in `catalog_errors` — the model still loads. `host` and `port` are harness-owned and inert: the engine bind is forced to loopback (§5) and the port is assigned from the category config, so those keys do nothing.
 
@@ -144,8 +144,10 @@ name. As with strata: no preload, booting spawns nothing.
 ### Strata engines
 
 Strata models (`engine: strata`) launch `python -m serve.server --engine strata
---config <strata_config> --port <assigned>` in `strata_cwd`; the harness-assigned
-engine port always wins over anything in the profile. Readiness requires `/health`
+--config <strata_config> --port <assigned>` in `strata_cwd`; the harness passes the
+assigned `--port` last, after the profile — whether the pinned strata server lets that
+beat a port in the profile is an owed live check (HANDOFF §4), not a harness guarantee.
+Readiness requires `/health`
 200 **and** the JSON `loaded` flag not being `false` (strata answers 200 while
 weights stream in). There is no preload anywhere in this harness: a strata engine
 starts only when an operator loads it (or a client request names it through the
@@ -198,7 +200,8 @@ before spawn), `witness_unavailable` (503, card unreadable), `upstream` (502),
 
 ## Autostart
 
-`autostart.vbs` (adapt paths), registered per-user:
+No `autostart.vbs` ships with the harness — create it at the path the `Run` key below
+names, with this content (adapt paths):
 
 ```vb
 ' runs the harness hidden at logon, once (WMI guards double-launch)
@@ -228,8 +231,12 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
   `port N lies in the reserved range` (`netsh interface ipv4 show
   excludedportrange protocol=tcp` shows them all; reserve yours permanently with
   `netsh int ipv4 add excludedportrange protocol=tcp startport=N numberofports=1`).
-- **"model file MISSING" at boot** — the banner (`simplehar_se::boot` lines in
-  the log panel) flags models whose GGUF is gone before the first load tries it.
+- **Missing model file at boot** — the banner (`simplehar_se::boot` lines in
+  the log panel) names it two ways: a `llama` row whose GGUF is gone is **dropped by the
+  scan** and reported as `! <file>.yaml: model file not found: <path>`, while a row that
+  does publish but cannot load (`llama` with no `model:` at all, or a non-llama row whose
+  `model:` path is gone) leads its `marker/category/engine/path` line with `!`. Either way
+  you see it before the first load tries it.
 - **Refusals** — every rejection names the blockers and the numbers
   (`/har/status` jobs + `last_error`); nothing over-admits, so a refusal means
   unload something or raise nothing — the card's own reading (the witness) is the truth.
