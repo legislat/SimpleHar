@@ -9,7 +9,11 @@
 //! text, `canonical_value` for the incoming word), and a real change
 //! drops the line's own inline comment (a stale note beside a new value is a lie;
 //! operator ruling 2026-10-28, FINDINGS-13 [8] Fork B; FINDINGS-BATCH-2026-10-28B
-//! [1]/[4]). An edit whose result equals the input never reaches the disk at all —
+//! [1]/[4]). A real change also writes the new value in a form the reader confirms
+//! — `emit_form`'s three steps: as-is if faithful, one `"` pair if that is what
+//! makes it faithful, refusal if neither would read back (operator ruling
+//! 2026-10-28, closing the change-side non-round-trip seam).
+//! An edit whose result equals the input never reaches the disk at all —
 //! no temp, no rename, no mtime churn on a file nobody changed ([6]). The file is
 //! replaced atomically (temp + rename, every publish write flushed with
 //! `File::sync_all` before its handle closes — volume submission, not durability:
@@ -123,6 +127,59 @@ pub(crate) fn next_temp_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The form a value is written in (operator ruling 2026-10-28: **auto-quote on
+/// change + refuse-unquotable**, closing the change-side seam
+/// FINDINGS-BATCH-2026-10-28B left as open triage). Used by the change and append
+/// arms of [`set_key_in_text`]; the keep branch never calls it, so 13[8] Fork B's
+/// byte-verbatim pass-through is untouched.
+///
+/// The **reader is the definition** — [`split_value_comment`]'s value half decides,
+/// with no second parser and no hardcoded ` #` rules — in three steps:
+///
+/// 1. **as-is if faithful**: the word alone, placed after `key: `, reads back
+///    exactly equal, so every plain value (`WORK`, `true`, `4.2`, `F:/m.gguf`) is
+///    emitted byte-identically to before this ruling;
+/// 2. **quote if that fixes it**: otherwise one `"` pair around it, iff THAT reads
+///    back exactly equal — the one-pair peel [`split_value_comment`]'s `unquote`
+///    does — which is what saves every word the space-`#`-outside-quotes cut would
+///    truncate (`a # b`, `#lead`);
+/// 3. **refuse if neither works**: an error naming the key and the value, never a
+///    line the scanner would misread.
+///
+/// Two corners that follow from letting the reader define the rule, both pinned:
+/// a word that is **itself quote-wrapped is literal data, not a directive** — `"a"`
+/// goes out as `""a""` (step 2 reads it back exactly), while `"a # b"` is
+/// **refused** (step 2 yields `""a` — the added pair shifts the quote parity so the
+/// ` #` lands outside the quotes); and a word containing `\n` is refused before
+/// either step, because the reader splits the *document* on `\n` long before
+/// `split_value_comment` sees a value, so no quoting can make a line break
+/// round-trip — a `\r` needs no such guard, it survives as data (the D4 promise
+/// that endings are never normalized).
+///
+/// # Arguments
+///
+/// * `key` - the yaml key the value is being written under, named in the refusal.
+/// * `value` - the caller's word, already trimmed by [`set_key_in_text`].
+///
+/// # Returns
+///
+/// The text to write after `key: `, or the refusal.
+fn emit_form(key: &str, value: &str) -> Result<String, String> {
+    if !value.contains('\n') {
+        if split_value_comment(value).0 == value {
+            return Ok(value.to_string());
+        }
+        let wrapped = format!("\"{value}\"");
+        if split_value_comment(&wrapped).0 == value {
+            return Ok(wrapped);
+        }
+    }
+    Err(format!(
+        "cannot write `{key}`: the value {value:?} cannot be put on one yaml line in a \
+         form the scanner reads back unchanged"
+    ))
+}
+
 /// Sets `key: value` in a flat yaml document, preserving everything else.
 ///
 /// - a matching key line (first one) is rewritten in place only when the value
@@ -140,18 +197,21 @@ pub(crate) fn next_temp_seq() -> u64 {
 ///   harness-formats the line and drops the old inline comment (a stale note
 ///   beside a new value is a lie), and every later rewrite of the new value is
 ///   then stable — the fixed point is the same one step further on;
-/// - `value` is trimmed once at entry, so all three arms see one canonical word
-///   (the harness writes single words: an enum name, `true`/`false`, a `{:.1}`
-///   float). Surrounding whitespace is never a fact about a value, and comparing
-///   a trimmed word while emitting a padded one was the drift FINDINGS-BATCH-2026-10-28B
-///   [4] reported. Values are trusted **caller-produced single words**: a value
-///   containing `\n` would inject further lines into the document (and one
-///   containing ` #` meets the open triage item below), so the trust boundary of
-///   this function is its callers — production passes no free-form text;
-/// - open triage item, deliberately NOT fixed by this ruling: the change-side
-///   emit writes the incoming value verbatim, so a quoted value loses its
-///   quotes — setting a value containing ` #` through a real change lands a
-///   line that rescans to the pre-`#` prefix;
+/// - `value` is trimmed once at entry, so all arms see one canonical word (the
+///   harness writes single words: an enum name, `true`/`false`, a `{:.1}` float).
+///   Surrounding whitespace is never a fact about a value, and comparing a trimmed
+///   word while emitting a padded one was the drift FINDINGS-BATCH-2026-10-28B [4]
+///   reported;
+/// - the change and append arms write the word through [`emit_form`], which asks
+///   the **reader** whether it survives (operator ruling 2026-10-28, closing the
+///   open triage item FINDINGS-BATCH-2026-10-28B left): as-is when that is
+///   faithful, one `"` pair when that is what makes it faithful, and a refusal
+///   naming the key and the value when neither would read back. So a value
+///   containing ` #` can no longer land a line that rescans to its pre-`#` prefix,
+///   and a value containing `\n` is refused rather than injecting lines. The keep
+///   branch is not involved: 13[8] Fork B's byte-verbatim pass-through stands, and
+///   it never refuses (a write of the value the reader already publishes is by
+///   definition one it can read back).
 /// - a matching key inside a *commented block* is never touched (v3.3 clobbered
 ///   these) — only real, non-comment lines count as occurrences;
 /// - a key that appears nowhere is appended at the end;
@@ -195,12 +255,15 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
             );
             let (old_value, _comment) = split_value_comment(&line[colon + 1..]);
             if old_value != canonical_value(value) {
+                // A real change re-emits the line, so it goes through the reader's
+                // own round-trip test (auto-quote, or refuse).
+                let emit = emit_form(key, value)?;
                 // CRLF files: the '\r' rides at the end of the line.
                 let ending = if out[index].ends_with('\r') { "\r" } else { "" };
                 // Line 1 is the only place a real file-leading BOM can ride; re-emit
                 // it so overwriting that key does not strip the file's BOM.
                 let lead = if index == 0 && bom { "\u{feff}" } else { "" };
-                out[index] = format!("{lead}{key}: {value}{ending}");
+                out[index] = format!("{lead}{key}: {emit}{ending}");
             }
         }
         (Some(index), None) => {
@@ -210,9 +273,11 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
             out.remove(index);
         }
         (None, Some(value)) => {
+            // A new line is a real change too, so it shares the emit rule exactly.
+            let emit = emit_form(key, value)?;
             // Match the file's dominant line ending so a CRLF file gets a CRLF line.
             let ending = if text.contains("\r\n") { "\r" } else { "" };
-            out.push(format!("{key}: {value}{ending}"));
+            out.push(format!("{key}: {emit}{ending}"));
         }
         (None, None) => {
             return Err(format!("cannot remove `{key}`: the key is not in the file"));
@@ -523,9 +588,10 @@ fn forensic_copy(target: &Path, original: &str) -> Bak {
             utc_stamp()
         );
         set_key_in_text(original, "bak", Some(&stamp)).expect(
-            "invariant: the node was just found by find_key_line, and set_key_in_text \
-             only fails when a removal targets an absent key \u{2014} a set on a present \
-             key cannot fail",
+            "invariant: the node was just found by find_key_line, so no removal can fail; \
+             and the stamp is harness-built from a file name (no line break, no quote \
+             character) plus an ISO-8601 UTC stamp, so `emit_form`'s refuse branch is \
+             unreachable \u{2014} a name containing ` #` simply lands quoted",
         )
     } else {
         original.to_string()
@@ -1096,7 +1162,9 @@ mod tests {
     /// The boundary is scan's own rule, not a hand-copied parser: a `#` inside
     /// quotes is VALUE, not comment. An identical (post-unquote) write passes
     /// the line through byte-verbatim — and the line still RESCANS to the quoted
-    /// value, not its pre-`#` prefix; a different value drops the comment. A
+    /// value, not its pre-`#` prefix; a different value drops the comment and is
+    /// itself quoted, so the new value rescans whole too (operator ruling
+    /// 2026-10-28). A
     /// writeback-local split at the first `#` would compute the old value as
     /// `"a` and fail the keep direction here. Falsifies any keep-side reformat:
     /// reconstructing `{key}: {value}` from the parts strips the protective
@@ -1118,8 +1186,8 @@ mod tests {
         );
         assert_eq!(
             set_key_in_text(line, "title", Some("a # c")).expect("changed write"),
-            "title: a # c\n",
-            "a real change drops the tail"
+            "title: \"a # c\"\n",
+            "a real change drops the tail and quotes the new value so it round-trips"
         );
     }
 
@@ -1134,6 +1202,296 @@ mod tests {
             doc,
             "a no-op write may not touch a single byte of the line"
         );
+    }
+
+    /// PIN 1 of the auto-quote ruling (operator 2026-10-28): a plain value still
+    /// goes out **unquoted**, byte-identical to the pre-ruling emit, in both the
+    /// change and the append arm — this is what makes the ruling zero-impact for
+    /// every current caller. Falsifier: delete step 1 (always quote) and every
+    /// line here gains a `"` pair.
+    #[test]
+    fn a_plain_value_change_and_append_are_still_emitted_unquoted() {
+        for value in ["4.2", "WORK", "true", "false", "F:/models/qwen3.gguf", ""] {
+            let changed =
+                set_key_in_text("x: old\nname: q\n", "x", Some(value)).expect("plain change");
+            assert_eq!(
+                changed,
+                format!("x: {value}\nname: q\n"),
+                "the change arm quoted a faithful value {value:?}"
+            );
+            let appended = set_key_in_text("name: q\n", "x", Some(value)).expect("plain append");
+            assert_eq!(
+                appended,
+                format!("name: q\nx: {value}\n"),
+                "the append arm quoted a faithful value {value:?}"
+            );
+        }
+    }
+
+    /// PINS 2 (+3): every word the reader would **truncate** — a space-`#` inside
+    /// it — leaves the writer quoted, rescans to exactly the caller's word, and the
+    /// write is then a fixed point (the keep branch takes over). Falsifier: revert
+    /// the change arm to the raw emit and the rescan yields the pre-`#` prefix
+    /// (`a`, not `a # b`).
+    #[test]
+    fn a_value_the_reader_would_truncate_is_quoted_and_round_trips() {
+        for value in ["a # b", "4096 # 32k", "x #y", "a\t# b # c"] {
+            let changed = set_key_in_text("title: old\nname: q\n", "title", Some(value))
+                .expect("quoting change");
+            assert_eq!(
+                changed,
+                format!("title: \"{value}\"\nname: q\n"),
+                "a truncating value must leave the writer quoted"
+            );
+            let (map, problems) = parse_flat_yaml(&changed);
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(
+                map.get("title").map(String::as_str),
+                Some(value),
+                "the rescan must yield the caller's word, not a prefix: {changed}"
+            );
+            assert_eq!(
+                set_key_in_text(&changed, "title", Some(value)).expect("fixed point"),
+                changed,
+                "the second write is the keep branch's byte-verbatim no-op"
+            );
+        }
+    }
+
+    /// PIN 3: a leading-`#` value. Under the locked boundary rule (13[8] round,
+    /// FINDINGS-BATCH-2026-10-28B [1]) a `#` opens a comment only after a space in
+    /// the *normalized* value text, so `#lead` is **not** truncated by our reader —
+    /// step 1 is faithful and the word goes out unquoted, which is also what the
+    /// writer/reader agreement demands: the emitted line must be exactly the form
+    /// the reader already reads back as the caller's word. Pinned in both arms so
+    /// nobody "fixes" it into a quote (which would be a different, also-round-tripping
+    /// choice, but not this ruling's step 1).
+    #[test]
+    fn a_leading_hash_value_round_trips_under_the_locked_boundary_rule() {
+        for value in ["#lead", "# tail", "#"] {
+            let changed = set_key_in_text("title: old\n", "title", Some(value)).expect("change");
+            assert_eq!(changed, format!("title: {value}\n"), "{value:?}");
+            let (map, problems) = parse_flat_yaml(&changed);
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(map.get("title").map(String::as_str), Some(value));
+            let appended = set_key_in_text("name: q\n", "title", Some(value)).expect("append");
+            assert_eq!(appended, format!("name: q\ntitle: {value}\n"), "{value:?}");
+        }
+    }
+
+    /// PIN 4 (auto-quote ruling): the append arm shares the rule with the change
+    /// arm — a brand-new key whose value the reader would truncate lands quoted and
+    /// round-trips, in LF and CRLF form. Falsifier: revert the append arm to the
+    /// raw emit and the appended line rescans to its prefix.
+    #[test]
+    fn the_append_arm_shares_the_quote_rule() {
+        for ending in ["\n", "\r\n"] {
+            let doc = format!("name: q{ending}");
+            let appended = set_key_in_text(&doc, "note", Some("x #y")).expect("append");
+            assert_eq!(
+                appended,
+                format!("name: q{ending}note: \"x #y\"{ending}"),
+                "the append arm must quote what the reader would cut"
+            );
+            let (map, problems) = parse_flat_yaml(&appended);
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(map.get("note").map(String::as_str), Some("x #y"));
+        }
+    }
+
+    /// PIN 5 (auto-quote ruling): a word that needs quoting and cannot survive it
+    /// is **refused**, never written. Both shapes here defeat the reader's
+    /// round-trip under either form, and the refusal is the module's existing
+    /// `String` voice naming the key and the value; on disk nothing changes — no
+    /// bytes, no temp, no incident copy. Falsifier: delete the refuse tail (return
+    /// `Ok(wrapped)` unconditionally) and the misread lands, which the rescan half
+    /// of this pin catches.
+    #[test]
+    fn a_value_that_no_form_round_trips_is_refused_and_the_file_stays_untouched() {
+        for value in ["\"a # b\"", "\"a # b\" # c"] {
+            let error = set_key_in_text("name: q\n", "note", Some(value))
+                .expect_err("no faithful and no quotable form exists");
+            assert!(error.contains("note"), "the key must be named: {error}");
+            assert!(
+                error.contains(&format!("{value:?}")),
+                "the value must be named: {error}"
+            );
+            assert!(error.contains("cannot be put on one yaml line"), "{error}");
+        }
+        // And the file-facing proof: a refused edit never reaches the disk.
+        let dir = crate::testutil::temp_dir("writeback-refuse");
+        let path = seed(&dir, CLEAN);
+        let error = set_flag_on_file(&path, "note", Some("\"a # b\""))
+            .expect_err("the refusal must surface to the caller");
+        assert!(
+            error.contains("note") && error.contains(&format!("{:?}", "\"a # b\"")),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("target"),
+            CLEAN,
+            "a refused write leaves the operator's bytes exactly as they were"
+        );
+        assert_no_temp_leftovers(&dir);
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["qwen3.yaml".to_string()],
+            "a refusal writes nothing at all: {entries:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A value containing a line break is refused outright: the reader splits the
+    /// document on `\n` before `split_value_comment` sees any value, so quoting
+    /// cannot rescue it. (A bare `\r` is NOT refused — it survives as data, the D4
+    /// promise — and the second half of this pin holds that line.)
+    #[test]
+    fn a_value_with_a_line_break_is_refused_and_a_bare_carriage_return_survives() {
+        let error = set_key_in_text("name: q\n", "note", Some("a\nb"))
+            .expect_err("a line break cannot be quoted away");
+        assert!(
+            error.contains("note") && error.contains("\"a\\nb\""),
+            "{error}"
+        );
+        let injected = set_key_in_text("name: q\n", "note", Some("a\nname: forged"))
+            .expect_err("the injection shape is the same refusal");
+        assert!(injected.contains("note"), "{injected}");
+        let cr = set_key_in_text("name: q\n", "note", Some("a\rb")).expect("bare CR is data");
+        assert_eq!(cr, "name: q\nnote: a\rb\n", "{cr}");
+        let (map, problems) = parse_flat_yaml(&cr);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(map.get("note").map(String::as_str), Some("a\rb"));
+    }
+
+    /// PIN 6 (the documented corner): an incoming word that is **itself
+    /// quote-wrapped is literal data, not a directive**. If double-wrapping makes
+    /// it faithful, that is the answer (`"a"` → `""a""`, `'a # b'` →
+    /// `"'a # b'"`); if the added pair shifts the quote parity so a ` #` lands
+    /// outside the quotes, it is refused (`"a # b"` → refusal, because `""a # b""`
+    /// reads back as `""a`). No undocumented corner: both outcomes are pinned, and
+    /// a caller that wants the value `a # b` passes `a # b` and gets protective
+    /// quotes.
+    #[test]
+    fn an_incoming_word_that_is_itself_quoted_is_literal_data() {
+        for (incoming, want) in [("\"a\"", "\"\"a\"\""), ("'a # b'", "\"'a # b'\"")] {
+            let changed = set_key_in_text("note: old\n", "note", Some(incoming))
+                .expect("double-wrap is faithful");
+            assert_eq!(
+                changed,
+                format!("note: {want}\n"),
+                "literal quoted word {incoming:?} must land as {want:?}"
+            );
+            let (map, problems) = parse_flat_yaml(&changed);
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(
+                map.get("note").map(String::as_str),
+                Some(incoming),
+                "the reader must hand back the caller's literal word: {changed}"
+            );
+        }
+        assert!(set_key_in_text("note: old\n", "note", Some("\"a # b\"")).is_err());
+        let plain = set_key_in_text("note: old\n", "note", Some("a # b")).expect("plain word");
+        assert_eq!(plain, "note: \"a # b\"\n", "{plain}");
+    }
+
+    /// FINDINGS-BATCH-2026-10-28G [1]: the quoted-incoming class is a **byte fixed
+    /// point on the second write**. Pin 2 pins that for the plain ` #` class (where
+    /// the keep branch takes over); this class never matches the keep test — the
+    /// reader publishes `"a"` while `canonical_value` peels the caller's `"a"` down
+    /// to `a` — so the second write re-enters the change arm and `emit_form` again,
+    /// and must reproduce the identical bytes. Pinned for the `"`-wrapped word and
+    /// the `'` twin, on the text path and through the file (where the
+    /// `updated == original` short-circuit means nothing reaches disk at all).
+    /// Falsifier: an emit that derives from the line it is rewriting instead of the
+    /// caller's word re-wraps the file's own text (`""a""` → `""""a""""`) and this
+    /// pin is the sole failure.
+    #[test]
+    fn the_quoted_incoming_class_is_a_byte_fixed_point_on_the_second_write() {
+        for incoming in ["\"a\"", "'a # b'"] {
+            let once = set_key_in_text("note: old\nname: q\n", "note", Some(incoming))
+                .expect("first write");
+            let twice = set_key_in_text(&once, "note", Some(incoming)).expect("second write");
+            assert_eq!(
+                twice, once,
+                "re-writing the same quoted word must not touch a byte: {twice}"
+            );
+            let (map, problems) = parse_flat_yaml(&twice);
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(
+                map.get("note").map(String::as_str),
+                Some(incoming),
+                "and it must still read back as the caller's word: {twice}"
+            );
+
+            let dir = crate::testutil::temp_dir("writeback-quoted-fixed-point");
+            let path = seed(&dir, CLEAN);
+            set_flag_on_file(&path, "note", Some(incoming)).expect("file write 1 (append)");
+            let first = std::fs::read_to_string(&path).expect("read 1");
+            set_flag_on_file(&path, "note", Some(incoming)).expect("file write 2 (change)");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read 2"),
+                first,
+                "the second file write must be the no-op the short-circuit skips"
+            );
+            assert_no_temp_leftovers(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// PIN 7 (zero-caller-impact): every word the product actually writes — the
+    /// category names, the offload truth words, the `{:.1}` measured floats, model
+    /// names and paths, the empty value, and the incident-stamp shape — takes step
+    /// 1: emitted as-is, never quoted, never refused, in either arm. Together with
+    /// the untouched writeback/scheduler/api suites this is the proof the ruling
+    /// changes nothing for live callers. Falsifier: delete step 1 and every
+    /// assertion here gains a quote pair.
+    #[test]
+    fn the_live_value_vocabulary_never_reaches_the_quote_or_refuse_branch() {
+        // The shape `forensic_copy` builds; a name containing ` #` would take step
+        // 2, and this one — what the live incident path writes — must not.
+        const STAMP: &str = concat!(
+            "incident copy of qwen3.yaml at 2026-10-28T08:50:42Z \u{2014} ",
+            "post-write validation failed"
+        );
+        for value in [
+            "WORK",
+            "RP",
+            "AUX",
+            "EMB",
+            "true",
+            "false",
+            "0.0",
+            "4.2",
+            "20.0",
+            "128.5",
+            "qwen3-32b",
+            "F:/models/qwen3.gguf",
+            "strata/main",
+            "mock",
+            "llama",
+            STAMP,
+        ] {
+            assert_eq!(
+                emit_form("k", value).as_deref(),
+                Ok(value),
+                "a live value fell to the quote or refuse branch"
+            );
+            assert_eq!(
+                set_key_in_text("k: old\n", "k", Some(value)).expect("change"),
+                format!("k: {value}\n"),
+                "change arm diverged from the pre-ruling emit"
+            );
+            assert_eq!(
+                set_key_in_text("name: q\n", "k", Some(value)).expect("append"),
+                format!("name: q\nk: {value}\n"),
+                "append arm diverged from the pre-ruling emit"
+            );
+        }
     }
 
     /// The rule composes with CRLF: a no-op write keeps tail and `\r`; a
