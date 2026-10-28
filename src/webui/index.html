@@ -16,6 +16,9 @@
   </head>
   <body>
     <button id="sh-theme-toggle" class="sh-mini sh-theme-toggle outline">Light</button>
+    <!-- Static, like the theme toggle: an operator holding a wrong token never gets a
+         rendered header, and this is their way back in (app.js signIn). -->
+    <button id="sh-token-toggle" class="sh-mini sh-token-toggle outline">Sign in</button>
     <header class="sh-header" id="sh-header">
       <!-- rendered by app.js: title, loaded count, endpoints, slot cards, memory -->
     </header>

@@ -82,6 +82,10 @@ header.sh-header {
 
 .sh-badge[data-tone="none"] { background: transparent; color: var(--pico-muted-color); }
 .sh-badge[data-tone="bad"] { background: #c0392b40; color: var(--sh-bad); }
+/* Amber = the no-verdict state, the tray's own precedence colour (FINDINGS-14 [7] +
+ * 15 [2] "A + amber"): a category whose supervisor has not spoken is neither green
+ * nor red. Same ink as the loading dot, so one amber exists on the page. */
+.sh-badge[data-tone="warn"] { background: #d89b1d40; color: var(--sh-warn); }
 
 .sh-endpoints {
   display: flex;
@@ -270,7 +274,7 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
 
 .sh-catalog-errors { color: var(--sh-bad); font-size: 0.8rem; margin: 0.4rem 0 0; }
 
-/* Small controls: unload buttons and the theme toggle. */
+/* Small controls: unload buttons and the two static header-corner buttons. */
 .sh-mini {
   padding: 0.2rem 0.6rem;
   font-size: 0.75rem;
@@ -281,6 +285,14 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
 /* Above the sticky header (z-index 10) so its own corner is clickable: the header
  * subtree otherwise intercepts the toggle's pointer events (Playwright-found). */
 .sh-theme-toggle { position: absolute; right: 1rem; top: 0.7rem; z-index: 11; }
+
+/* The token control (FINDINGS-16 [2]) shares the toggle's corner and its stacking
+ * rule, offset clear of the toggle's widest label; static in index.html so it stays
+ * reachable on a page that has never completed one harness read. Standard Pico button
+ * colours (the `outline` variant), never a transparent custom one: Pico pins
+ * --pico-color to #fff on every <button>, so a transparent background here would
+ * paint white ink on the card. */
+.sh-token-toggle { position: absolute; right: 6rem; top: 0.7rem; z-index: 11; }
 
 footer.sh-footer {
   color: var(--pico-muted-color);

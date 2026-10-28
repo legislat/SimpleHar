@@ -653,6 +653,8 @@
     "RP": "Serving",
     "WORK": "Serving"
   },
+  "listeners_down": false,
+  "listeners_pending": false,
   "mem": {
     "observed_used_gb": 70.18306350708008,
     "ram_total_gb": 95.08486938476562,

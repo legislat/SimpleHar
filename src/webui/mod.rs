@@ -68,7 +68,7 @@ pub fn router(_state: Arc<ApiState>) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use super::APP_JS;
+    use super::{APP_JS, STYLE_CSS};
     use crate::engine::llama::OFFLOAD_ENGINES;
 
     /// C of the `cpu_offload` scoping ruling: the served page — the exact
@@ -118,6 +118,63 @@ mod tests {
         assert!(
             APP_JS[gate_at..].contains("text(\"\u{2014}\")"),
             "non-offload rows must render a dash, not a control"
+        );
+    }
+
+    /// FINDINGS-16 [4]: the header badge reads the two verdicts `/har/status` computes
+    /// and no longer decodes the serde shape of `listeners` in the browser.
+    ///
+    /// Nature, declared: a source-content assertion over the exact `include_str!`
+    /// bytes `/app.js` and `/style.css` answer, so an `include_str!`-stale exe cannot
+    /// hide a page bug (GOTCHAS [ui]); it is not a render test. The render legs — one
+    /// per badge state — live in `tests/webui/webui_dom_test.mjs`, and CSS application
+    /// and stacking stay untestable there (GOTCHAS [ui][test]), which is why the amber
+    /// rule's existence is pinned at the byte level here.
+    ///
+    /// # Falsifier
+    ///
+    /// Restore the `Object.values(status.listeners).some((l) => typeof l === "object")`
+    /// derivation in `renderHeader` and the two absence asserts fail; read a differently
+    /// named field (or drop the `=== true`, letting `undefined` through as truthy) and
+    /// the presence asserts fail; delete the amber tone from either asset and its assert
+    /// fails while the red one stays green.
+    #[test]
+    fn served_app_js_reads_the_server_computed_listener_verdicts() {
+        const SHAPE_SCAN: &str = "typeof listener === \"object\"";
+        const SHAPE_USE: &str = "Object.values(status.listeners)";
+        assert!(
+            !APP_JS.contains(SHAPE_SCAN),
+            "the page must not decide a verdict from the JSON shape of `listeners`"
+        );
+        assert!(
+            !APP_JS.contains(SHAPE_USE),
+            "and must not scan that map at all: the verdicts are `/har/status` fields"
+        );
+        for field in [
+            "status.listeners_down === true",
+            "status.listeners_pending === true",
+        ] {
+            assert!(
+                APP_JS.contains(field),
+                "the header must read the server's own boolean exactly: missing {field}"
+            );
+        }
+        const RED: &str = "\"data-tone\": \"bad\"";
+        const AMBER: &str = "\"data-tone\": \"warn\"";
+        assert_eq!(
+            APP_JS.matches(RED).count(),
+            1,
+            "one red badge, for a listener the harness reports down"
+        );
+        assert_eq!(
+            APP_JS.matches(AMBER).count(),
+            1,
+            "one amber badge, for the no-verdict state (the tray's colour, page-side)"
+        );
+        assert!(
+            STYLE_CSS.contains(".sh-badge[data-tone=\"warn\"]") && STYLE_CSS.contains("--sh-warn"),
+            "the amber badge needs a rule in the served stylesheet or it renders as the \
+             default green badge"
         );
     }
 }

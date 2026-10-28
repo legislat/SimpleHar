@@ -615,8 +615,9 @@ async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
 }
 
 /// The full `/har/status` document: config categories, mem, boot, listener
-/// health, slots, jobs, and catalog errors — one call (G13). Also the body of
-/// every SSE `har_state` event (Step 14: one push replaces the page's state).
+/// health (raw verdicts plus the two derived booleans), slots, jobs, and catalog
+/// errors — one call (G13). Also the body of every SSE `har_state` event
+/// (Step 14: one push replaces the page's state).
 async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
     let scheduler = state.scheduler.status().await.map_err(ApiError::from)?;
     let categories: Vec<Value> = state
@@ -652,6 +653,15 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
         "boot": boot,
         "categories": categories,
         "listeners": state.listeners.snapshot(),
+        // The header badge's two truths, computed here from the registry's own
+        // predicates (FINDINGS-16 [4]). `listeners` above is the raw verdict map; a
+        // page that decoded "is any listener down" out of its serde shape would be a
+        // second brain for the rule the registry owns, and a `Down`/`Pending` that
+        // ever changed representation would hide behind a green badge. Total over the
+        // four seeded categories: `down` is some supervisor that could not serve a
+        // port, `pending` is a category nobody has spoken for (the tray's amber).
+        "listeners_down": state.listeners.any_down(),
+        "listeners_pending": !state.listeners.pending().is_empty(),
         "mem": mem_section(state, &scheduler).await,
         "slots": scheduler.slots,
         "jobs": scheduler.jobs,
@@ -2321,6 +2331,69 @@ mod tests {
         assert!(
             after["listeners"].get("NOSUCH").is_none(),
             "an absent category is a MISSING key — which seeding makes unrepresentable"
+        );
+    }
+
+    /// The two `/har/status` booleans the header badge reads, pinned as exact JSON for
+    /// each of the three shapes that distinguish them (FINDINGS-16 [4]): four times
+    /// `Serving`, one `Down`, one `Pending`. Every field carries both a true and a
+    /// false leg, so neither verdict can be hardcoded in the other's place.
+    ///
+    /// # Falsifier
+    ///
+    /// Swap the two sources (`listeners_down` from `pending()`, or both from
+    /// `any_down()`) and two of the three fixtures fail the exact compare; drop either
+    /// field and it reads `null` against `false`/`true` and fails too — the page has no
+    /// fallback able to absorb that, because `renderHeader` reads these booleans and no
+    /// longer decodes `listeners` at all (pinned by
+    /// `served_app_js_reads_the_server_computed_listener_verdicts`).
+    #[tokio::test]
+    async fn status_document_emits_the_two_listener_verdicts_exactly() {
+        fn listener_verdicts(doc: &Value) -> Value {
+            json!({
+                "listeners_down": doc["listeners_down"].clone(),
+                "listeners_pending": doc["listeners_pending"].clone(),
+            })
+        }
+
+        let all_serving = live_state(BootTimings::default());
+        for category in CategoryId::all() {
+            all_serving.listeners.mark_serving(category);
+        }
+        let doc = status_document(&all_serving)
+            .await
+            .expect("status document");
+        assert_eq!(
+            listener_verdicts(&doc),
+            json!({ "listeners_down": false, "listeners_pending": false }),
+            "four times Serving is the only all-clear: {doc}"
+        );
+
+        let one_down = live_state(BootTimings::default());
+        for category in CategoryId::all() {
+            one_down.listeners.mark_serving(category);
+        }
+        one_down
+            .listeners
+            .mark_down(CategoryId::Aux, "address in use".to_string());
+        let doc = status_document(&one_down).await.expect("status document");
+        assert_eq!(
+            listener_verdicts(&doc),
+            json!({ "listeners_down": true, "listeners_pending": false }),
+            "one Down is red, and a Down is a verdict — never also a pending: {doc}"
+        );
+
+        let one_pending = live_state(BootTimings::default());
+        for category in [CategoryId::Work, CategoryId::Rp, CategoryId::Emb] {
+            one_pending.listeners.mark_serving(category);
+        }
+        let doc = status_document(&one_pending)
+            .await
+            .expect("status document");
+        assert_eq!(
+            listener_verdicts(&doc),
+            json!({ "listeners_down": false, "listeners_pending": true }),
+            "the category nobody has spoken for is pending, not down: {doc}"
         );
     }
 

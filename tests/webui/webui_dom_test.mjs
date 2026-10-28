@@ -58,9 +58,65 @@ globalThis.document = {
   documentElement: new El("html"),
   addEventListener: () => {},
 };
-globalThis.window = { location: { hostname: "127.0.0.1" }, matchMedia: () => ({ matches: false }) };
-globalThis.localStorage = { getItem: () => null, setItem: () => {} };
-globalThis.fetch = async (path) => {
+// The driver below is eval'd in GLOBAL scope, so every switch the legs flip lives on
+// globalThis (a module-level `let` would be invisible to it, and a stale local copy
+// would let a leg "pass" without ever reaching the code under test).
+// A real key/value store, so the token legs can prove what the page removes. It is
+// installed as BOTH `localStorage` (what the theme code reads) and
+// `window.localStorage` (what the token code reads) — in a browser they are the same
+// object, and app.js would otherwise throw into its own catch and never exercise the
+// token path at all.
+globalThis.store = new Map();
+globalThis.removedKeys = [];
+globalThis.promptSawKeys = null;
+const storage = {
+  getItem: (k) => (globalThis.store.has(k) ? globalThis.store.get(k) : null),
+  setItem: (k, v) => { globalThis.store.set(k, String(v)); },
+  removeItem: (k) => { globalThis.removedKeys.push(k); globalThis.store.delete(k); },
+};
+
+globalThis.window = {
+  location: { hostname: "127.0.0.1" },
+  matchMedia: () => ({ matches: false }),
+  localStorage: storage,
+  prompt: (message) => {
+    globalThis.promptLog.push(message);
+    globalThis.promptSawKeys = [...globalThis.store.keys()].join(",");
+    return globalThis.promptAnswers.length > 0 ? globalThis.promptAnswers.shift() : null;
+  },
+};
+globalThis.localStorage = storage;
+
+// Harness-side switches for the token and refusal legs: `requireToken` makes every
+// /har/* answer 401 unless the header carries that value, `failNextPost` makes POSTs
+// answer 400 with the server's refusal message, and `statusFetches` proves that a
+// handler re-read the server. `sentTokens` records the `x-har-token` the requests
+// ACTUALLY carried (every request, gated or not): a leg that only counts prompts can
+// satisfy its assertion with a request that never reached the storage path at all, so
+// the token legs must read the wire, not just the dialog.
+globalThis.requireToken = null;
+globalThis.failNextPost = null;
+globalThis.statusFetches = 0;
+globalThis.promptLog = [];
+globalThis.promptAnswers = [];
+globalThis.sentTokens = [];
+
+globalThis.fetch = async (path, init) => {
+  if (path === "/har/status") globalThis.statusFetches += 1;
+  const sent = (init && init.headers && init.headers["x-har-token"]) || "";
+  globalThis.sentTokens.push(sent);
+  if (globalThis.requireToken !== null) {
+    if (sent !== globalThis.requireToken) {
+      return { ok: false, status: 401, json: async () => ({ error: { code: "unauthorized" } }) };
+    }
+  }
+  if (init && init.method === "POST") {
+    if (globalThis.failNextPost !== null) {
+      const message = globalThis.failNextPost;
+      return { ok: false, status: 400, json: async () => ({ message }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }
   const doc = fixtures[path];
   if (!doc) throw new Error(`unexpected fetch: ${path}`);
   return { ok: true, status: 200, json: async () => doc };
@@ -286,6 +342,146 @@ const driver = `
     cpuBoxes["measuredone"] === 1 && cpuBoxes["rangeone"] === 1,
     JSON.stringify(cpuBoxes));
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+
+  // ---- FINDINGS-16 [4]: the header badge reads the server-computed verdicts ----
+  // Red when the harness says a listener is down, amber when one is still without a
+  // verdict (the tray's precedence, page-side), and never amber over red. The stub sees
+  // the tone ATTRIBUTE only: CSS application and stacking cannot be seen from here at
+  // all (GOTCHAS [ui][test]) — the amber rule's existence in the served stylesheet is
+  // pinned byte-level by served_app_js_reads_the_server_computed_listener_verdicts.
+  const flush = async () => {
+    for (let i = 0; i < 8; i += 1) await new Promise((r) => setTimeout(r, 0));
+  };
+  const listenerBadges = () =>
+    findAll(document.getElementById("sh-header"), "span", "sh-badge")
+      .filter((b) => textOf(b).indexOf("listener") === 0)
+      .map((b) => b.attrs["data-tone"] + "=" + textOf(b));
+  const verdictDoc = (down, pending) => ({
+    ...fixtures["/har/status"],
+    models: fixtures["/har/models"].data,
+    listeners_down: down,
+    listeners_pending: pending,
+  });
+  check("fixture starts all-clear",
+    fixtures["/har/status"].listeners_down === false &&
+      fixtures["/har/status"].listeners_pending === false,
+    JSON.stringify([fixtures["/har/status"].listeners_down, fixtures["/har/status"].listeners_pending]));
+  applyState(verdictDoc(false, false));
+  check("all-clear shows no listener badge", listenerBadges().length === 0,
+    listenerBadges().join(" | "));
+  applyState(verdictDoc(true, false));
+  check("listeners_down renders the red badge",
+    listenerBadges().join("|") === "bad=listener down", listenerBadges().join(" | "));
+  applyState(verdictDoc(false, true));
+  check("listeners_pending renders the amber badge",
+    listenerBadges().join("|") === "warn=listener pending", listenerBadges().join(" | "));
+  applyState(verdictDoc(true, true));
+  check("red outranks amber", listenerBadges().join("|") === "bad=listener down",
+    listenerBadges().join(" | "));
+  applyState(verdictDoc(undefined, undefined));
+  check("absent verdicts render no badge (no verdict is not a verdict)",
+    listenerBadges().length === 0, listenerBadges().join(" | "));
+  applyState(verdictDoc(false, false));
+
+  // ---- FINDINGS-16 [3]: a refused config-default write flashes AND re-reads ----
+  const flashBox = document.getElementById("sh-flash");
+  const quietFlash = () => { flashBox.textContent = ""; flashBox.hidden = true; };
+  const rowButton = (label) =>
+    findAll(document.getElementById("sh-main"), "button").find((b) => textOf(b) === label);
+  quietFlash();
+  const quote = String.fromCharCode(96);
+  const refusal = "model " + quote + "qwen3.5-4b" + quote + " belongs to RP, not WORK";
+  globalThis.failNextPost = refusal;
+  const setDefault = rowButton("Set default");
+  check("row offers Set default", !!setDefault);
+  const beforeSet = globalThis.statusFetches;
+  setDefault.dispatch("click", {});
+  await flush();
+  check("refused Set default flashes the server's reason",
+    flashBox.hidden === false && String(flashBox.textContent) === refusal,
+    JSON.stringify(flashBox.textContent));
+  check("refused Set default re-reads the server", globalThis.statusFetches > beforeSet,
+    beforeSet + " -> " + globalThis.statusFetches);
+  const clearDefault = rowButton("Clear default");
+  check("panel offers Clear default", !!clearDefault);
+  quietFlash();
+  const beforeClear = globalThis.statusFetches;
+  clearDefault.dispatch("click", {});
+  await flush();
+  check("refused Clear default flashes and re-reads",
+    flashBox.hidden === false && String(flashBox.textContent) === refusal &&
+      globalThis.statusFetches > beforeClear,
+    JSON.stringify(flashBox.textContent) + " " + beforeClear + " -> " + globalThis.statusFetches);
+  globalThis.failNextPost = null;
+  quietFlash();
+  const beforeAccepted = globalThis.statusFetches;
+  setDefault.dispatch("click", {});
+  await flush();
+  check("accepted Set default re-reads the server",
+    globalThis.statusFetches > beforeAccepted && flashBox.hidden !== false,
+    beforeAccepted + " -> " + globalThis.statusFetches + " flash=" + JSON.stringify(flashBox.textContent));
+
+  // ---- FINDINGS-16 [2]: a stored-but-wrong token must not re-prompt per tick ----
+  const tokenControl = document.getElementById("sh-token-toggle");
+  initTokenControl();
+  check("no stored token: control reads Sign in", tokenControl.textContent === "Sign in",
+    JSON.stringify(tokenControl.textContent));
+  globalThis.requireToken = "s3cret";
+  globalThis.store.set("sh-control-token", "wrong");
+  const wrongSecret = globalThis.store.get("sh-control-token");
+  globalThis.promptLog.length = 0;
+  globalThis.sentTokens.length = 0;
+  globalThis.promptAnswers = ["wrong", "wrong", "wrong", "wrong", "wrong", "wrong"];
+  quietFlash();
+  await refresh();
+  await refresh();
+  await refresh();
+  // The wire is asserted, not just the dialog: a stub whose window.localStorage
+  // install is missing sends no token at all, still prompts exactly once (the dedup
+  // guard fires on ""), and would PASS this leg blind (FINDINGS-BATCH-2026-10-28K [K-1]).
+  check("wrong token prompts once, not per tick",
+    globalThis.promptLog.length === 1 && !!wrongSecret &&
+      globalThis.sentTokens.indexOf(wrongSecret) >= 0,
+    "prompts=" + globalThis.promptLog.length + " store=" + JSON.stringify(wrongSecret) +
+      " sent=" + JSON.stringify(globalThis.sentTokens));
+  check("401 is flashed, never swallowed",
+    flashBox.hidden === false && String(flashBox.textContent).indexOf("401") >= 0,
+    JSON.stringify(flashBox.textContent));
+  check("stored token: control reads Clear token", tokenControl.textContent === "Clear token",
+    JSON.stringify(tokenControl.textContent));
+  globalThis.promptAnswers = ["s3cret"];
+  globalThis.removedKeys.length = 0;
+  globalThis.promptSawKeys = "unset";
+  tokenControl.dispatch("click", {});
+  await flush();
+  check("clear control removes the stored token key",
+    globalThis.removedKeys.indexOf("sh-control-token") >= 0 &&
+      globalThis.promptSawKeys === "",
+    "removed=" + JSON.stringify(globalThis.removedKeys) +
+      " promptSawKeys=" + JSON.stringify(globalThis.promptSawKeys));
+  check("the prompt after clearing signs the page back in",
+    globalThis.store.get("sh-control-token") === "s3cret",
+    JSON.stringify(globalThis.store.get("sh-control-token")));
+  globalThis.promptLog.length = 0;
+  globalThis.sentTokens.length = 0;
+  const beforeSignedIn = globalThis.statusFetches;
+  await refresh();
+  const signedInSecret = globalThis.store.get("sh-control-token");
+  // Same non-vacuity rule as the per-tick leg: the tick must be served by the token
+  // the store holds, so a page reading a storage object it was never given cannot
+  // "fetch without prompting" its way to green.
+  check("signed-in ticks fetch without prompting",
+    globalThis.promptLog.length === 0 && globalThis.statusFetches > beforeSignedIn &&
+      !!signedInSecret && globalThis.sentTokens.length > 0 &&
+      globalThis.sentTokens.every(function (t) { return t === signedInSecret; }),
+    "prompts=" + globalThis.promptLog.length + " fetches=" + beforeSignedIn + " -> " +
+      globalThis.statusFetches + " store=" + JSON.stringify(signedInSecret) +
+      " sent=" + JSON.stringify(globalThis.sentTokens));
+  check("a correct token needs no clear-control visit", tokenControl.textContent === "Clear token",
+    JSON.stringify(tokenControl.textContent));
+  globalThis.requireToken = null;
+  globalThis.store.clear();
+  quietFlash();
 
   for (const [name, ok, extra] of results)
     console.log((ok ? "PASS " : "FAIL ") + name + (ok || !extra ? "" : " :: " + extra));

@@ -28,6 +28,11 @@ let state = {
 // URL, where it would land in the harness request log.
 const TOKEN_KEY = "sh-control-token";
 
+// The value behind the harness's last 401. A 401 re-prompts only for a token this
+// is not, so a stored-but-wrong secret cannot open the modal on every poll tick
+// (FINDINGS-16 [2]); the operator recovers through the header's Sign in control.
+let rejectedToken = null;
+
 function controlToken() {
   try {
     return window.localStorage.getItem(TOKEN_KEY) || "";
@@ -60,11 +65,24 @@ function promptForToken() {
   return true;
 }
 
+// One request with the 401 dance, shared by GET and POST. The retry rebuilds its
+// headers so it carries the token entered just now, never the one the first attempt
+// went out with, and it skips the prompt when a sibling request on the same tick
+// (status and models are fetched together) has already collected one.
+async function authorizedFetch(path, init) {
+  const sent = controlToken();
+  const attempt = () => fetch(path, { ...init, headers: authHeaders(init && init.headers) });
+  let response = await attempt();
+  if (response.status !== 401) return response;
+  if (controlToken() !== sent) return attempt();
+  if (rejectedToken === sent) return response;
+  rejectedToken = sent;
+  if (!promptForToken()) return response;
+  return attempt();
+}
+
 async function getJson(path) {
-  let response = await fetch(path, { headers: authHeaders() });
-  if (response.status === 401 && promptForToken()) {
-    response = await fetch(path, { headers: authHeaders() });
-  }
+  const response = await authorizedFetch(path);
   if (!response.ok) {
     throw new Error(`${path} -> ${response.status}`);
   }
@@ -72,15 +90,11 @@ async function getJson(path) {
 }
 
 async function postJson(path, body) {
-  const init = {
+  const response = await authorizedFetch(path, {
     method: "POST",
-    headers: authHeaders({ "content-type": "application/json" }),
+    headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-  };
-  let response = await fetch(path, init);
-  if (response.status === 401 && promptForToken()) {
-    response = await fetch(path, { ...init, headers: authHeaders({ "content-type": "application/json" }) });
-  }
+  });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(data.message || `${path} -> ${response.status}`);
@@ -123,6 +137,39 @@ function initTheme() {
     const current = document.documentElement.getAttribute("data-theme");
     applyTheme(current === "dark" ? "light" : "dark");
   });
+}
+
+// ---------- control token entry point (static header control) ----------
+
+// The operator's way out of a mistyped secret (FINDINGS-16 [2]). It sits beside the
+// theme toggle in index.html rather than in the rendered header because a page that
+// has never completed a `/har/*` read renders no header at all: a control inside
+// `renderHeader` would be exactly as unreachable as devtools was.
+function paintTokenControl() {
+  const control = document.getElementById("sh-token-toggle");
+  if (control) control.textContent = controlToken() ? "Clear token" : "Sign in";
+}
+
+function signIn() {
+  let cleared = true;
+  try {
+    window.localStorage.removeItem(TOKEN_KEY);
+  } catch (error) {
+    cleared = false;
+  }
+  if (!cleared) {
+    flashError(new Error("the browser refused to forget the stored control token"));
+  }
+  // The stored value is gone, so the next 401 is about a different token and may ask.
+  rejectedToken = null;
+  refresh();
+}
+
+function initTokenControl() {
+  const control = document.getElementById("sh-token-toggle");
+  if (!control) return;
+  control.addEventListener("click", signIn);
+  paintTokenControl();
 }
 
 // ---------- rendering ----------
@@ -253,9 +300,13 @@ function renderMemory(status) {
 
 function renderHeader(status) {
   const loaded = status.slots.filter((slot) => slot.model).length;
-  const anyDown = Object.values(status.listeners).some(
-    (listener) => typeof listener === "object",
-  );
+  // Both verdicts are computed by the harness (`status_document` reads the registry's
+  // own `any_down` / `pending`) and read here as booleans. The page used to decode
+  // them from the serde shape of `listeners` — a second brain for a rule the server
+  // owns, which pinned the badge green the moment a verdict changed representation or
+  // a category went missing from the map (FINDINGS-16 [4]).
+  const anyDown = status.listeners_down === true;
+  const anyPending = status.listeners_pending === true;
   const headline = el(
     "div",
     { class: "sh-headline" },
@@ -267,7 +318,9 @@ function renderHeader(status) {
     ),
     anyDown
       ? el("span", { class: "sh-badge", "data-tone": "bad" }, text("listener down"))
-      : null,
+      : anyPending
+        ? el("span", { class: "sh-badge", "data-tone": "warn" }, text("listener pending"))
+        : null,
   );
   const endpoints = el(
     "div",
@@ -375,8 +428,17 @@ function modelRow(status, model, category) {
       "button",
       {
         class: "sh-mini",
+        // A refused default (the 400 for a model from another category) must reach
+        // the flash, and the tab's `default: …` settles only by re-reading the
+        // server: no `har_state` push follows a config-only write (FINDINGS-16 [3]).
+        // Same shape as the seven other mutating handlers.
         onclick: () =>
-          postJson("/har/config/default", { category, model: model.id }).catch(() => {}),
+          postJson("/har/config/default", { category, model: model.id })
+            .then(refresh)
+            .catch((error) => {
+              flashError(error);
+              refresh();
+            }),
       },
       text("Set default"),
     ),
@@ -493,8 +555,15 @@ function renderTab(status, category) {
         "button",
         {
           class: "sh-mini",
+          // Refused (e.g. the row raced a retag from another tab) it must flash and
+          // re-read, exactly like `Set default` (FINDINGS-16 [3]).
           onclick: () =>
-            postJson("/har/config/default", { category, model: null }).catch(() => {}),
+            postJson("/har/config/default", { category, model: null })
+              .then(refresh)
+              .catch((error) => {
+                flashError(error);
+                refresh();
+              }),
         },
         text("Clear default"),
       ),
@@ -601,6 +670,7 @@ function flashError(error) {
 }
 
 function render() {
+  paintTokenControl();
   const status = state.status;
   if (!status) return;
   const headerHost = document.getElementById("sh-header");
@@ -661,6 +731,9 @@ async function refresh() {
         ? new Error(`cannot reach the harness at ${location.host} — is it running?`)
         : error,
     );
+    // Nothing rendered on this path, so the header control repaints itself: it is the
+    // operator's only way out of a token the harness just refused.
+    paintTokenControl();
     return;
   }
   state.status = status;
@@ -711,6 +784,7 @@ function connectEvents() {
 
 document.addEventListener("DOMContentLoaded", () => {
   initTheme();
+  initTokenControl();
   refresh(); // first paint without waiting for the stream
   connectEvents();
 });
