@@ -54,6 +54,12 @@ pub const EDITABLE_FLAGS: &[(&str, &str)] = &[("category", "category"), ("cpu", 
 /// - the split is on `\n` only, so every `\r` of a CRLF file stays attached to its
 ///   line and re-emerges on join — endings never get normalized (the D4 fix).
 ///
+/// BOM semantics: bytes the operator authored survive, except the edited line
+/// itself. A file-leading UTF-8 BOM is kept when it rides a line the edit does
+/// not target, and re-emitted when the rewrite lands on that first line (an
+/// unrelated edit must not churn the operator's BOM); removing the first line
+/// takes the BOM with it, which the scanner accepts either way.
+///
 /// # Returns
 ///
 /// The new document text, or an error naming the problem.
@@ -61,11 +67,15 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
     // Split on '\n' keeping every byte: each element keeps its own trailing '\r'.
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut out: Vec<String> = body.split('\n').map(str::to_string).collect();
+    let bom = text.starts_with('\u{feff}');
     match (find_key_line(out.iter().map(String::as_str), key), value) {
         (Some(index), Some(value)) => {
             // CRLF files: the '\r' rides at the end of the line.
             let ending = if out[index].ends_with('\r') { "\r" } else { "" };
-            out[index] = format!("{key}: {value}{ending}");
+            // Line 1 is the only place a real file-leading BOM can ride; re-emit
+            // it so overwriting that key does not strip the file's BOM.
+            let lead = if index == 0 && bom { "\u{feff}" } else { "" };
+            out[index] = format!("{lead}{key}: {value}{ending}");
         }
         (Some(index), None) => {
             // Drop exactly the key's own line — blanking-then-filtering would
@@ -91,9 +101,17 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
 
 /// Index of the first real `key:` line — comments and blanks never count
 /// (v3.3 clobbered commented-out blocks; the D3 fix).
+///
+/// The BOM strip mirrors the scan parser (`scan.rs`'s `parse_flat_yaml` trims
+/// `\u{feff}` the same way): `str::trim` does not remove U+FEFF (it is category
+/// Cf, not White_Space), so without this a BOM'd first line is invisible here
+/// while scan happily reads its key. The asymmetry is what FINDINGS-13 [1]
+/// reports: a batch retag reads the missing match as "absent key", silently
+/// no-ops the `is_embedding_model` removal, and the next scan drops the whole
+/// model with `EmbeddingCategoryConflict` — after the edit answered success.
 fn find_key_line<'a>(mut lines: impl Iterator<Item = &'a str>, key: &str) -> Option<usize> {
     lines.position(|line| {
-        let trimmed = line.trim();
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
         !trimmed.starts_with('#')
             && !trimmed.is_empty()
             && trimmed
@@ -340,6 +358,93 @@ mod tests {
             std::fs::read_to_string(&path).expect("read back"),
             "name: plain\ncategory: AUX\n"
         );
+    }
+
+    #[test]
+    fn a_bom_prefixed_first_line_is_visible_to_batch_writeback() {
+        // FINDINGS-13 [1]: scan.rs strips a UTF-8 BOM before matching a key, so
+        // `find_key_line` must too. Without that symmetry the batch probe reads
+        // the BOM'd `is_embedding_model` as "absent key", the removal no-ops, and
+        // the retagged file keeps an alias+WORK pair the next scan hard-drops.
+        let dir = crate::testutil::temp_dir("writeback-bom-retag");
+        let path = dir.join("emb-bom.yaml");
+        std::fs::write(
+            &path,
+            "\u{feff}is_embedding_model: true\nname: emb1\nengine: mock\ncategory: EMB\nvram_gb: 1\n",
+        )
+        .expect("seed");
+        set_flags_on_file(
+            &path,
+            &[("category", Some("WORK")), ("is_embedding_model", None)],
+        )
+        .expect("batch retag of a BOM'd file");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !text.contains("is_embedding_model"),
+            "the alias on the BOM'd first line must not survive: {text}"
+        );
+        assert!(text.contains("category: WORK"), "{text}");
+        assert_eq!(
+            text.matches("category:").count(),
+            1,
+            "the category was rewritten in place, never appended beside: {text}"
+        );
+        assert!(text.contains("name: emb1"), "unrelated key lost: {text}");
+        // Removing line 1 takes the BOM with it — scan tolerates both shapes.
+        assert!(
+            !text.starts_with('\u{feff}'),
+            "removal drops the BOM: {text:?}"
+        );
+        let (map, problems) = parse_flat_yaml(&text);
+        assert!(problems.is_empty(), "{problems:?}");
+        let entry = crate::model::ModelEntry::from_flat(&map).expect("must scan");
+        assert_eq!(entry.category, crate::config::CategoryId::Work);
+    }
+
+    #[test]
+    fn editing_a_later_key_keeps_a_bom_prefixed_name_line_in_place() {
+        // Pre-fix, the BOM'd `name:` line matched no key and the set appended a
+        // duplicate `engine:` — a file with no duplicate until the harness
+        // created one, then refused by the commit gate. Post-fix, the BOM'd key
+        // line is found, the later key is rewritten in place, and the first
+        // line's bytes (BOM included) survive an edit that never targets them.
+        let dir = crate::testutil::temp_dir("writeback-bom-later");
+        let path = dir.join("name-bom.yaml");
+        std::fs::write(&path, "\u{feff}name: emb1\nengine: mock\ncategory: EMB\n").expect("seed");
+        set_flag_on_file(&path, "engine", Some("llama")).expect("edit a later key");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            text.starts_with("\u{feff}name: emb1\n"),
+            "the file-leading BOM survives an unrelated edit: {text:?}"
+        );
+        assert!(text.contains("engine: llama"), "{text}");
+        assert_eq!(
+            text.matches("engine:").count(),
+            1,
+            "the BOM'd file's own engine line was rewritten, not appended beside: {text}"
+        );
+        assert_eq!(text.matches("name:").count(), 1, "{text}");
+        let (map, problems) = parse_flat_yaml(&text);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(map.get("engine").map(String::as_str), Some("llama"));
+    }
+
+    #[test]
+    fn rewriting_a_bom_prefixed_first_line_re_emits_the_bom() {
+        // The overwrite case of the documented BOM semantics: the edit lands on
+        // the BOM'd line itself, so the only line whose bytes change is the value
+        // after the colon — the operator's BOM stays the file's first bytes.
+        let updated = set_key_in_text(
+            "\u{feff}category: EMB\nname: emb1\n",
+            "category",
+            Some("WORK"),
+        )
+        .expect("edit");
+        assert!(
+            updated.starts_with("\u{feff}category: WORK\n"),
+            "BOM preserved through the overwrite: {updated:?}"
+        );
+        assert_eq!(updated, "\u{feff}category: WORK\nname: emb1\n");
     }
 
     #[test]

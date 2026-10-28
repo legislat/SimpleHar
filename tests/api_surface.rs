@@ -797,6 +797,73 @@ async fn retagging_an_embedding_model_out_of_emb_keeps_it_in_the_catalog() {
 }
 
 #[tokio::test]
+async fn retagging_a_bom_prefixed_embedding_model_keeps_it_in_the_catalog() {
+    // FINDINGS-13 [1], the finding's falsifier as a test: writeback's key matcher
+    // did not strip a UTF-8 BOM while the scan parser does, so on a file whose
+    // BOM'd FIRST line is `is_embedding_model: true` the batch retag treated the
+    // removal as a no-op, published `category: WORK` beside the surviving alias,
+    // answered `{"status":"edited"}` — and the next scan dropped the model with
+    // EmbeddingCategoryConflict. Pre-fix this fails: the alias line survives the
+    // retag and the rescan reports models=2 with the conflict naming the file.
+    let (control, _, _, _, _, modelconf) = app(
+        AppConfig::default(),
+        &[("plain", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let bom_file = modelconf.join("gemma-bom.yaml");
+    std::fs::write(
+        &bom_file,
+        "\u{feff}is_embedding_model: true\nname: gemma-bom\nengine: mock\ncategory: EMB\nvram_gb: 2\n",
+    )
+    .expect("seed BOM'd embedding fixture");
+
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["models"], 2, "all fixtures catalogued: {body}");
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"gemma-bom","category":"WORK"}"#,
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "retag must answer 2xx: {status} {body}"
+    );
+
+    let edited = std::fs::read_to_string(&bom_file).expect("read back");
+    assert!(
+        !edited.contains("is_embedding_model"),
+        "the alias on the BOM'd first line survives the retag: {edited}"
+    );
+    assert!(edited.contains("category: WORK"), "{edited}");
+    assert_eq!(
+        edited.matches("category:").count(),
+        1,
+        "exactly one category line: {edited}"
+    );
+
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["models"], 2,
+        "the retagged model must survive the scan: {body}"
+    );
+    assert!(
+        body["catalog_errors"].as_array().is_some_and(Vec::is_empty),
+        "no conflict after the retag: {body}"
+    );
+    let (_, models) = get_json(&control, "/har/models").await;
+    let entry = models["data"]
+        .as_array()
+        .expect("list")
+        .iter()
+        .find(|m| m["id"] == "gemma-bom")
+        .expect("model dropped by the scan after a retag answered success");
+    assert_eq!(entry["category"], "WORK");
+}
+
+#[tokio::test]
 async fn moving_the_default_model_clears_its_old_category_default() {
     // Operator finding #1 (2026-10-26): moving the default model out of a category
     // must not leave the old listener defaulting to a model it no longer serves.
