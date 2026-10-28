@@ -17,9 +17,6 @@ use thiserror::Error;
 /// time and exposed at `/har/status` — a bad file is skipped and named, never fatal.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ModelError {
-    /// The `name:` key is absent or empty; the harness name is the canonical id (Step 10).
-    #[error("missing or empty `name` key")]
-    MissingName,
     /// `category:` is not one of WORK|RP|AUX|EMB.
     #[error("bad `category` value `{value}`")]
     BadCategory {
@@ -77,10 +74,13 @@ pub enum CostClass {
     Exact,
 }
 
-/// One model from `ModelConf/`, typed (Step 10: harness name is canonical).
+/// One model from `ModelConf/`, typed (Step 10: the harness name is canonical, and
+/// since FINDINGS-13 [3]/[7] it is the yaml file stem, which `scan` supplies as the
+/// `name` argument of [`ModelEntry::from_flat`]).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ModelEntry {
-    /// Canonical harness name (`name:`); the `model` field clients send.
+    /// Canonical harness identity: the yaml file stem (a `name:` key that
+    /// contradicts it is refused at scan); the `model` field clients send.
     pub name: String,
     /// Engine id (`engine:`), defaulting to `llama`; may name a template (Step 7).
     pub engine: String,
@@ -275,23 +275,28 @@ impl ModelEntry {
 }
 
 impl ModelEntry {
-    /// Builds an entry from a flat `key: value` map (the v3.3 yaml shape), applying the
-    /// documented alias `is_embedding_model: true` → EMB; the default category is WORK
-    /// (Step 5, Step 9). The older app's `sticky:` alias is gone: a model is placed by
-    /// its own `category:`, never by an inherited label.
+    /// Builds an entry from a flat `key: value` map (the v3.3 yaml shape) and the
+    /// identity the caller vouches for — at scan that is the file stem (`name:` is
+    /// legacy-optional and only legal when it equals the stem, so identity cannot be
+    /// a yaml value's claim). Applies the documented alias `is_embedding_model:
+    /// true` → EMB; the default category is WORK (Step 5, Step 9). The older app's
+    /// `sticky:` alias is gone: a model is placed by its own `category:`, never by
+    /// an inherited label.
+    ///
+    /// # Arguments
+    ///
+    /// * `keys` - the parsed flat map, verbatim (a `name:` key rides along in
+    ///   `raw` but no longer selects the identity).
+    /// * `name` - the canonical identity (file stem at scan; synthetic entries pass
+    ///   their test name).
     ///
     /// # Errors
     ///
-    /// - [`ModelError::MissingName`] when `name` is absent/empty.
     /// - [`ModelError::BadCategory`] / [`ModelError::EmbeddingCategoryConflict`] on an
     ///   unusable category combination.
     /// - [`ModelError::BadNumber`] when `vram_gb` is not a positive number (0 books
     ///   a model free) or another size key holds a non-number.
-    pub fn from_flat(keys: &BTreeMap<String, String>) -> Result<Self, ModelError> {
-        let name = keys.get("name").map(String::as_str).unwrap_or_default();
-        if name.trim().is_empty() {
-            return Err(ModelError::MissingName);
-        }
+    pub fn from_flat(keys: &BTreeMap<String, String>, name: &str) -> Result<Self, ModelError> {
         let embedding = keys.get("is_embedding_model").is_some_and(|v| truthy(v));
         let category = match keys.get("category") {
             Some(raw) => {
@@ -411,8 +416,9 @@ mod tests {
 
     #[test]
     fn defaults_to_work_and_llama() {
-        let entry = ModelEntry::from_flat(&flat(&[("name", "qwen3"), ("model", "F:/m.gguf")]))
-            .expect("valid entry");
+        let entry =
+            ModelEntry::from_flat(&flat(&[("name", "qwen3"), ("model", "F:/m.gguf")]), "qwen3")
+                .expect("valid entry");
         assert_eq!(entry.category, CategoryId::Work);
         assert_eq!(entry.engine, "llama");
         assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
@@ -420,13 +426,16 @@ mod tests {
 
     #[test]
     fn measured_range_parses_and_books_its_high_end() {
-        let entry = ModelEntry::from_flat(&flat(&[
-            ("name", "m"),
-            ("measured_gb", "41.7"),
-            ("measured_gb_min", "24.3"),
-            ("measured_offload", "false"),
-            ("cpu_offload", "false"),
-        ]))
+        let entry = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("measured_gb", "41.7"),
+                ("measured_gb_min", "24.3"),
+                ("measured_offload", "false"),
+                ("cpu_offload", "false"),
+            ]),
+            "m",
+        )
         .expect("valid range");
         assert_eq!(entry.measured_gb, Some(41.7));
         assert_eq!(entry.measured_min_gb, Some(24.3));
@@ -436,17 +445,20 @@ mod tests {
 
     #[test]
     fn an_inverted_or_orphan_low_end_is_a_scan_error() {
-        let inverted = ModelEntry::from_flat(&flat(&[
-            ("name", "m"),
-            ("measured_gb", "10"),
-            ("measured_gb_min", "30"),
-        ]));
+        let inverted = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("measured_gb", "10"),
+                ("measured_gb_min", "30"),
+            ]),
+            "m",
+        );
         assert!(
             matches!(inverted, Err(ModelError::BadNumber { ref field, .. }) if field == "measured_gb_min"),
             "an inverted pair would silently widen every range read from it"
         );
         assert!(
-            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb_min", "10")])).is_err(),
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb_min", "10")]), "m").is_err(),
             "a low end with no high end books nothing"
         );
     }
@@ -455,13 +467,16 @@ mod tests {
     fn a_cpu_offload_flip_voids_the_range_but_keeps_its_stamp() {
         // The pair describes a different launch: an offloaded run has no comparable
         // footprint, so it must be neither booked nor displayed (§0.4 invalidation).
-        let entry = ModelEntry::from_flat(&flat(&[
-            ("name", "m"),
-            ("measured_gb", "41.7"),
-            ("measured_gb_min", "24.3"),
-            ("measured_offload", "true"),
-            ("cpu_offload", "false"),
-        ]))
+        let entry = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("measured_gb", "41.7"),
+                ("measured_gb_min", "24.3"),
+                ("measured_offload", "true"),
+                ("cpu_offload", "false"),
+            ]),
+            "m",
+        )
         .expect("still a valid entry");
         assert_eq!(entry.measured_gb, None);
         assert_eq!(entry.measured_min_gb, None);
@@ -473,19 +488,23 @@ mod tests {
         assert_eq!(entry.cost_source(), CostSource::Estimate);
         // A flip is judged with the engine's truth set, so `on` is `true` here too —
         // a third reading of the token would let a flip hide (HANDOFF §6).
-        let agreed = ModelEntry::from_flat(&flat(&[
-            ("name", "m"),
-            ("measured_gb", "41.7"),
-            ("measured_offload", "true"),
-            ("cpu_offload", "on"),
-        ]))
+        let agreed = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("measured_gb", "41.7"),
+                ("measured_offload", "true"),
+                ("cpu_offload", "on"),
+            ]),
+            "m",
+        )
         .expect("valid");
         assert_eq!(agreed.measured_gb, Some(41.7));
     }
 
     #[test]
     fn an_unreadable_offload_stamp_is_a_scan_error_not_a_silent_false() {
-        let err = ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_offload", "maybe")]));
+        let err =
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_offload", "maybe")]), "m");
         assert!(
             matches!(err, Err(ModelError::BadBool { ref field, .. }) if field == "measured_offload")
         );
@@ -494,27 +513,25 @@ mod tests {
     #[test]
     fn cost_source_mirrors_the_booking_precedence() {
         let declared =
-            ModelEntry::from_flat(&flat(&[("name", "m"), ("vram_gb", "10")])).expect("valid");
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("vram_gb", "10")]), "m").expect("valid");
         assert_eq!(declared.cost_source(), CostSource::Declared);
         // `fixed` honours a measured footprint; `greedy` never does (a post-spill
         // measurement is not a nominal size).
-        let measured = ModelEntry::from_flat(&flat(&[
-            ("name", "m"),
-            ("cost", "fixed"),
-            ("measured_gb", "7"),
-        ]))
+        let measured = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("cost", "fixed"), ("measured_gb", "7")]),
+            "m",
+        )
         .expect("valid");
         assert_eq!(measured.cost_source(), CostSource::Measured);
-        let greedy = ModelEntry::from_flat(&flat(&[
-            ("name", "m"),
-            ("cost", "greedy"),
-            ("measured_gb", "7"),
-        ]))
+        let greedy = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("cost", "greedy"), ("measured_gb", "7")]),
+            "m",
+        )
         .expect("valid");
         assert_eq!(greedy.cost_source(), CostSource::Estimate);
         // `exact` without a declared number is refused, never estimated.
         let exact =
-            ModelEntry::from_flat(&flat(&[("name", "m"), ("cost", "exact")])).expect("valid");
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("cost", "exact")]), "m").expect("valid");
         assert_eq!(exact.cost_source(), CostSource::Undeclared);
     }
 
@@ -523,36 +540,36 @@ mod tests {
         // v3.3 `external: true` is scrapped: it must not survive into the raw
         // passthrough, where it would advertise a meaning nothing has and be written
         // back out as if it were live config. Every other key still passes through.
-        let entry = ModelEntry::from_flat(&flat(&[("name", "m"), ("external", "true")]))
+        let entry = ModelEntry::from_flat(&flat(&[("name", "m"), ("external", "true")]), "m")
             .expect("valid entry");
         assert!(!entry.raw.contains_key("external"));
-        let kept =
-            ModelEntry::from_flat(&flat(&[("name", "m"), ("custom", "x")])).expect("valid entry");
+        let kept = ModelEntry::from_flat(&flat(&[("name", "m"), ("custom", "x")]), "m")
+            .expect("valid entry");
         assert_eq!(kept.raw.get("custom").map(String::as_str), Some("x"));
     }
 
     #[test]
     fn measured_gb_parses_and_rejects_garbage() {
-        let e = ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "70.5")]))
+        let e = ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "70.5")]), "m")
             .expect("valid entry");
         assert_eq!(e.measured_gb, Some(70.5));
         assert!(matches!(
-            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "abc")]))
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "abc")]), "m")
                 .expect_err("garbage"),
             ModelError::BadNumber { .. }
         ));
         assert!(matches!(
-            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0")]))
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0")]), "m")
                 .expect_err("zero is not a measurement"),
             ModelError::BadNumber { .. }
         ));
         assert!(matches!(
-            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0.04")]))
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0.04")]), "m")
                 .expect_err("sub-quantum is not a measurement"),
             ModelError::BadNumber { .. }
         ));
         assert_eq!(
-            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0.05")]))
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("measured_gb", "0.05")]), "m")
                 .expect("one quantum is")
                 .measured_gb,
             Some(0.05)
@@ -561,11 +578,11 @@ mod tests {
 
     #[test]
     fn load_timeout_parses_and_bounds() {
-        let entry = ModelEntry::from_flat(&flat(&[("name", "s"), ("load_timeout", "1200")]))
+        let entry = ModelEntry::from_flat(&flat(&[("name", "s"), ("load_timeout", "1200")]), "s")
             .expect("valid entry");
         assert_eq!(entry.load_timeout_s, Some(1200));
         for bad in ["0", "86401", "abc", "-5", "nan", "1e400"] {
-            let err = ModelEntry::from_flat(&flat(&[("name", "s"), ("load_timeout", bad)]))
+            let err = ModelEntry::from_flat(&flat(&[("name", "s"), ("load_timeout", bad)]), "s")
                 .expect_err("{bad} must be refused");
             assert!(
                 matches!(err, ModelError::BadNumber { ref field, .. } if field == "load_timeout"),
@@ -576,39 +593,45 @@ mod tests {
 
     #[test]
     fn embedding_alias_forces_emb_and_no_category_means_work() {
-        let embed = ModelEntry::from_flat(&flat(&[("name", "b"), ("is_embedding_model", "true")]))
-            .expect("valid entry");
+        let embed =
+            ModelEntry::from_flat(&flat(&[("name", "b"), ("is_embedding_model", "true")]), "b")
+                .expect("valid entry");
         assert_eq!(embed.category, CategoryId::Emb);
 
         // The removed `sticky:` alias must not quietly keep working: an entry naming no
         // category lands in WORK whatever else it carries.
-        let unplaced = ModelEntry::from_flat(&flat(&[("name", "a"), ("sticky", "true")]))
+        let unplaced = ModelEntry::from_flat(&flat(&[("name", "a"), ("sticky", "true")]), "a")
             .expect("unknown keys are preserved, not rejected");
         assert_eq!(unplaced.category, CategoryId::Work);
     }
 
     #[test]
     fn explicit_category_wins_and_embedding_conflicts_are_errors() {
-        let rp = ModelEntry::from_flat(&flat(&[("name", "a"), ("category", "RP")]))
+        let rp = ModelEntry::from_flat(&flat(&[("name", "a"), ("category", "RP")]), "a")
             .expect("valid entry");
         assert_eq!(rp.category, CategoryId::Rp);
 
-        let err = ModelEntry::from_flat(&flat(&[
-            ("name", "b"),
-            ("category", "WORK"),
-            ("is_embedding_model", "true"),
-        ]))
+        let err = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "b"),
+                ("category", "WORK"),
+                ("is_embedding_model", "true"),
+            ]),
+            "b",
+        )
         .expect_err("embedding model must live in EMB");
         assert!(matches!(err, ModelError::EmbeddingCategoryConflict { .. }));
     }
 
     #[test]
-    fn missing_name_and_bad_numbers_are_errors() {
-        assert_eq!(
-            ModelEntry::from_flat(&flat(&[])),
-            Err(ModelError::MissingName)
-        );
-        let err = ModelEntry::from_flat(&flat(&[("name", "a"), ("vram_gb", "big")]))
+    fn bad_numbers_are_errors() {
+        // Identity is the caller's (the scan's stem); `from_flat` no longer reads
+        // the `name` key at all — an empty map with a vouched name is a valid
+        // default entry, not a missing-name error.
+        let defaulted = ModelEntry::from_flat(&flat(&[]), "m").expect("name comes from the caller");
+        assert_eq!(defaulted.name, "m");
+        assert_eq!(defaulted.category, CategoryId::Work);
+        let err = ModelEntry::from_flat(&flat(&[("name", "a"), ("vram_gb", "big")]), "a")
             .expect_err("vram_gb must be numeric");
         assert!(matches!(err, ModelError::BadNumber { .. }));
     }
@@ -616,35 +639,41 @@ mod tests {
     #[test]
     fn cost_classes_and_launch_floor_parse() {
         // Operator design note 2026-10-26: graded admission per engine kind.
-        let entry = ModelEntry::from_flat(&flat(&[
-            ("name", "g"),
-            ("cost", "Greedy"),
-            ("launch_only_with_at_least_vram_free", "6"),
-        ]))
+        let entry = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "g"),
+                ("cost", "Greedy"),
+                ("launch_only_with_at_least_vram_free", "6"),
+            ]),
+            "g",
+        )
         .expect("greedy parses");
         assert_eq!(entry.cost, CostClass::Greedy);
         assert_eq!(entry.launch_floor_gb, Some(6.0));
 
-        let exact = ModelEntry::from_flat(&flat(&[("name", "e"), ("cost", "exact")]))
+        let exact = ModelEntry::from_flat(&flat(&[("name", "e"), ("cost", "exact")]), "e")
             .expect("exact parses");
         assert_eq!(exact.cost, CostClass::Exact);
 
-        let fixed = ModelEntry::from_flat(&flat(&[("name", "f")])).expect("default cost");
+        let fixed = ModelEntry::from_flat(&flat(&[("name", "f")]), "f").expect("default cost");
         assert_eq!(fixed.cost, CostClass::Fixed);
         assert_eq!(fixed.launch_floor_gb, None);
 
-        let bad = ModelEntry::from_flat(&flat(&[("name", "x"), ("cost", "hoarder")]))
+        let bad = ModelEntry::from_flat(&flat(&[("name", "x"), ("cost", "hoarder")]), "x")
             .expect_err("unknown cost class is a scan error, never a silent default");
         assert!(matches!(bad, ModelError::BadCost { .. }), "{bad}");
 
         for value in ["eight", "-2", "nan", "inf", "1e400"] {
-            let err = ModelEntry::from_flat(&flat(&[
-                ("name", "x"),
-                ("launch_only_with_at_least_vram_free", value),
-            ]))
+            let err = ModelEntry::from_flat(
+                &flat(&[
+                    ("name", "x"),
+                    ("launch_only_with_at_least_vram_free", value),
+                ]),
+                "x",
+            )
             .expect_err("floor must be a finite non-negative number");
             assert!(matches!(err, ModelError::BadNumber { .. }), "{err}");
-            let err = ModelEntry::from_flat(&flat(&[("name", "x"), ("vram_gb", value)]))
+            let err = ModelEntry::from_flat(&flat(&[("name", "x"), ("vram_gb", value)]), "x")
                 .expect_err("vram_gb must be a finite non-negative number");
             assert!(matches!(err, ModelError::BadNumber { .. }), "{err}");
         }
@@ -656,7 +685,7 @@ mod tests {
         // books the model free — the gate deficit, the ledger and the in-flight sum
         // all read 0, so the next load spends the same bytes on top.
         for value in ["0", "0.0", "-0", "-0.0"] {
-            let err = ModelEntry::from_flat(&flat(&[("name", "x"), ("vram_gb", value)]))
+            let err = ModelEntry::from_flat(&flat(&[("name", "x"), ("vram_gb", value)]), "x")
                 .expect_err("a declared 0 GiB is not a declared cost");
             assert!(
                 matches!(err, ModelError::BadNumber { ref field, .. } if field == "vram_gb"),
@@ -665,23 +694,29 @@ mod tests {
         }
         // The sibling opt-out keeps its documented zero (README: "set `0` per-model
         // to opt out explicitly"); killing it here would break greedy launches.
-        let opt_out = ModelEntry::from_flat(&flat(&[
-            ("name", "g"),
-            ("cost", "greedy"),
-            ("launch_only_with_at_least_vram_free", "0"),
-        ]))
+        let opt_out = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "g"),
+                ("cost", "greedy"),
+                ("launch_only_with_at_least_vram_free", "0"),
+            ]),
+            "g",
+        )
         .expect("zero is the floor's explicit opt-out, not a typo");
         assert_eq!(opt_out.launch_floor_gb, Some(0.0));
-        let full = ModelEntry::from_flat(&flat(&[
-            ("name", "full"),
-            ("engine", "llama"),
-            ("category", "RP"),
-            ("model", "F:/m.gguf"),
-            ("vram_gb", "6.5"),
-            ("cost", "fixed"),
-            ("launch_only_with_at_least_vram_free", "12"),
-            ("load_timeout", "300"),
-        ]))
+        let full = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "full"),
+                ("engine", "llama"),
+                ("category", "RP"),
+                ("model", "F:/m.gguf"),
+                ("vram_gb", "6.5"),
+                ("cost", "fixed"),
+                ("launch_only_with_at_least_vram_free", "12"),
+                ("load_timeout", "300"),
+            ]),
+            "full",
+        )
         .expect("a full valid yaml still parses under the new rule");
         assert_eq!(full.vram_gb, Some(6.5));
         assert_eq!(full.cost_source(), CostSource::Declared);

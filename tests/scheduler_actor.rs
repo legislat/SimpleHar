@@ -1968,3 +1968,44 @@ async fn a_swap_whose_victim_never_proves_its_release_times_out_and_keeps_the_oc
     );
     assert_eq!(runtime.spawn_count(), 1, "recovery spawns nothing either");
 }
+
+#[tokio::test]
+async fn a_nameless_yaml_loads_by_its_file_stem_end_to_end() {
+    // FINDINGS-13 [3]/[7] end-to-end: the yaml carries no `name:` key at all.
+    // The file stem is the identity the client loads by, the identity the actor
+    // books into the slot, and (through `ModelEntry::name`) the engine log name.
+    let dir = simplehar_se::testutil::temp_dir("modelconf");
+    std::fs::write(
+        dir.join("stemonly.yaml"),
+        "engine: mock\ncategory: work\nvram_gb: 4\n",
+    )
+    .expect("seed nameless model");
+    let runtime = MockRuntime::new();
+    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+    adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+    let handle = Scheduler::start(
+        config(5),
+        dir,
+        adapters,
+        Arc::new(runtime.clone()) as Arc<dyn simplehar_se::engine::EngineRuntime>,
+        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+    );
+    let reply = handle
+        .swap("stemonly", CategoryId::Work)
+        .await
+        .expect("the stem is the loadable identity");
+    match reply {
+        Reply::Loaded(receipt) => assert_eq!(receipt.model, "stemonly"),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    let catalog = handle.catalog().await.expect("actor alive");
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stemonly"],
+        "and the catalog carries the stem"
+    );
+}

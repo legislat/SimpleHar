@@ -23,6 +23,7 @@ use crate::config::{AppConfig, CategoryId};
 use crate::engine::{
     EngineAdapter, EngineRuntime, LaunchSpec, Probe, ReadinessSpec, SpawnError, Spawned,
 };
+use crate::model::scan::{Catalog, ScanError, ScanKind};
 use crate::model::ModelEntry;
 use crate::ownership::{ResourceKind, SpawnTicket};
 use serde::Serialize;
@@ -510,6 +511,21 @@ enum ActorMsg {
         cmd: Command,
         reply: Waiter,
     },
+    /// The off-thread scan dispatched by [`Command::Reload`] finished; apply it
+    /// with the same wholesale replace as the boot scan and resolve the queued
+    /// reload waiters — their reply means "the new catalog is applied", never
+    /// "the scan was dispatched" (FINDINGS-13 [6] keeps the API-visible semantics).
+    CatalogLoaded {
+        catalog: Catalog,
+        seq: u64,
+    },
+    /// The blocking scan task itself failed (panic or cancel): the previous
+    /// catalog stays in place, the failure is reported, and the reload waiters
+    /// are still answered — a wedged scan thread must not strand callers.
+    ReloadFailed {
+        seq: u64,
+        reason: String,
+    },
     /// Last-use hint from the proxy paths (fire-and-forget; feeds the idle check).
     Touch {
         model: String,
@@ -674,6 +690,14 @@ struct ActorState {
     /// Slots whose occupant an operator's unload must still free once the in-flight
     /// job it cancelled terminalizes (FINDINGS-02 [2]: unload = cancel *and* unload).
     unload_after_finish: HashSet<usize>,
+    /// Waiters attached to rescans whose off-thread scan has not landed yet, each
+    /// stamped with the dispatch sequence of the scan they wait behind.
+    pending_reload: Vec<(u64, Waiter)>,
+    /// Dispatch counter for reload scans; the apply side records the newest
+    /// sequence it honored, so an out-of-order completion never replaces the
+    /// catalog with an older filesystem snapshot.
+    next_reload: u64,
+    last_reload_applied: u64,
     next_job: u64,
     next_gen: u64,
 }
@@ -696,21 +720,67 @@ fn state_last_used(occupant: &Occupant, last_used: &HashMap<String, Instant>) ->
         .max(occupant.loaded_at)
 }
 
+/// Runs `scan_dir`'s synchronous filesystem work on a blocking thread (the
+/// reactor-offload rule: `read_dir`, one read per yaml, one stat per model must
+/// never park a task that answers the control plane). `Err` names the failed
+/// blocking task itself (panic/cancel), not a scan report — scan failures travel
+/// inside the [`Catalog`].
+async fn scan_models_dir(dir: PathBuf) -> Result<Catalog, String> {
+    let reported = dir.clone();
+    tokio::task::spawn_blocking(move || crate::model::scan::scan_dir(&dir))
+        .await
+        .map_err(|error| format!("{error} scanning {}", reported.display()))
+}
+
 /// The actor's message loop. The initial catalog scan is the **first thing this task
 /// does**, before it takes any message: commands, ticks and reads queue behind it on
 /// the unbounded channel, exactly as when the scan ran synchronously in
-/// [`ActorState::new`] — but it now runs on the actor task, not on the boot thread
-/// (FINDINGS-14 [1]; A6 precedent, `main.rs`). What a stalled `modelconf_dir`
-/// volume can no longer delay: the listener bind, the tray's start, and boot
-/// readiness. What still queues behind the first scan: every actor command,
-/// `/har/status` polls included (`api`: `handle.status` round-trips this loop) and
-/// the tray's refresh (which `block_on`s that status) — bounded by the volume
-/// answering, the same exposure [`Command::Reload`] has always had.
+/// [`ActorState::new`] — but its filesystem work runs on a blocking thread
+/// (FINDINGS-13 [6]) while the actor task still *awaits* it before entering the
+/// loop (the 4389a0a ordering: scan first, everything queues behind). What a
+/// stalled `modelconf_dir` volume can no longer delay: the listener bind, the
+/// tray's start, and boot readiness. What still queues behind the first scan:
+/// every actor command, `/har/status` polls included (`api`: `handle.status`
+/// round-trips this loop) and the tray's refresh (which `block_on`s that status) —
+/// bounded by the volume answering, the same exposure [`Command::Reload`] used to
+/// have inline. A reload, by contrast, never blocks this loop: its scan lands back
+/// here as [`ActorMsg::CatalogLoaded`] and is applied with the same wholesale
+/// replace.
 async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
-    state.refresh_catalog();
+    let boot_dir = state.models_dir.clone();
+    let catalog = state
+        .scan_blocking()
+        .await
+        .unwrap_or_else(|reason| Catalog {
+            models: Vec::new(),
+            errors: vec![ScanError {
+                kind: ScanKind::Other,
+                file: boot_dir.display().to_string(),
+                reason: format!("cannot scan ModelConf: {reason}"),
+            }],
+        });
+    state.apply_catalog(catalog);
     while let Some(msg) = rx.recv().await {
         match msg {
             ActorMsg::Command { cmd, reply } => state.on_command(cmd, reply),
+            ActorMsg::CatalogLoaded { catalog, seq } => {
+                if seq > state.last_reload_applied {
+                    state.apply_catalog(catalog);
+                    state.last_reload_applied = seq;
+                    state.publish();
+                }
+                state.drain_reload_waiters(seq);
+            }
+            ActorMsg::ReloadFailed { seq, reason } => {
+                tracing::error!(reason = %reason, "rescan task failed; the previous catalog stays in place");
+                state.catalog_errors.push(ScanError {
+                    kind: ScanKind::Other,
+                    file: state.models_dir.display().to_string(),
+                    reason: format!("rescan failed: {reason}"),
+                });
+                state.publish();
+                state.drain_reload_waiters(seq);
+            }
             ActorMsg::Touch { model } => state.touch_model(&model),
             ActorMsg::Measured {
                 model,
@@ -790,21 +860,70 @@ impl ActorState {
             last_used: HashMap::new(),
             pending: HashMap::new(),
             unload_after_finish: HashSet::new(),
+            pending_reload: Vec::new(),
+            // Reloads are sequenced from 1: `last_reload_applied` starts at 0 and
+            // the newest-wins gate is `seq > last`, so the very first reload (the
+            // only scan whose completion may replace the boot catalog) must clear
+            // it.
+            next_reload: 1,
+            last_reload_applied: 0,
             next_job: 0,
             next_gen: 0,
         }
     }
 
-    /// Rescans `ModelConf` and cross-checks `default_model`s (§0.2 step 6, Step 9).
-    /// Runs on the actor task: at boot as the first thing [`actor_loop`] does, and on
-    /// every [`Command::Reload`] (never on the boot thread — FINDINGS-14 [1]).
-    fn refresh_catalog(&mut self) {
-        let catalog = crate::model::scan::scan_dir(&self.models_dir);
+    /// Rescans `ModelConf` and cross-checks `default_model`s (§0.2 step 6, Step 9)
+    /// off the actor's own thread: the whole synchronous filesystem walk
+    /// (`read_dir`, one read per yaml, one stat per model) runs on a blocking
+    /// thread so the single writer never parks on disk (FINDINGS-13 [6]). The
+    /// caller applies the result with [`ActorState::apply_catalog`] — at boot
+    /// before the first message, on reload when the result returns as
+    /// [`ActorMsg::CatalogLoaded`].
+    async fn scan_blocking(&self) -> Result<Catalog, String> {
+        scan_models_dir(self.models_dir.clone()).await
+    }
+
+    /// Applies a scanned catalog with the single-writer wholesale replace, adding
+    /// the actor-side cross-checks the scan cannot see: every scan error gets a
+    /// `tracing::warn!` (the scan module itself stays log-free — lib purity),
+    /// entries naming an engine with no adapter are **dropped** and reported (the
+    /// audit for that verdict shipped with this batch: no fixture publishes an
+    /// engine its adapter map lacks, and a load for one could only ever die later
+    /// as `no adapter registered`, so early refusal is strictly better), the
+    /// configured `llama-server.exe` is existence-checked once per scan, and every
+    /// `default_model` must resolve.
+    fn apply_catalog(&mut self, catalog: Catalog) {
         let mut errors = catalog.errors;
+        let known: Vec<&str> = self.adapters.keys().map(String::as_str).collect();
+        let models: Vec<ModelEntry> = catalog
+            .models
+            .into_iter()
+            .filter(|entry| {
+                if self.adapters.contains_key(&entry.engine) {
+                    return true;
+                }
+                errors.push(ScanError {
+                    kind: ScanKind::EngineUnavailable,
+                    file: entry
+                        .file
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| format!("<synthetic `{}`>", entry.name)),
+                    reason: format!(
+                        "engine \"{}\" is not available to this harness (known: {})",
+                        entry.engine,
+                        known.join(", ")
+                    ),
+                });
+                false
+            })
+            .collect();
         for category in &self.cfg.categories {
             if let Some(default) = &category.default_model {
-                if !catalog.models.iter().any(|m| &m.name == default) {
-                    errors.push(crate::model::scan::ScanError {
+                if !models.iter().any(|m| &m.name == default) {
+                    errors.push(ScanError {
+                        kind: ScanKind::Other,
                         file: "config".to_string(),
                         reason: format!(
                             "default_model `{default}` for {} is not in the catalog",
@@ -814,13 +933,49 @@ impl ActorState {
                 }
             }
         }
+        // Page-visible twin of the boot banner's warn (`main.rs`): the banner says
+        // it once, this says it on every scan, so a binary configured away mid-day
+        // is visible on `/har/status` rather than only in the boot log.
+        if !self.cfg.llama_server_exe.exists() {
+            errors.push(ScanError {
+                kind: ScanKind::EngineBinaryMissing,
+                file: "config".to_string(),
+                reason: format!(
+                    "llama-server.exe not found at {}; llama loads will fail",
+                    self.cfg.llama_server_exe.display()
+                ),
+            });
+        }
+        for error in &errors {
+            tracing::warn!(
+                kind = ?error.kind,
+                file = %error.file,
+                reason = %error.reason,
+                "catalog scan error"
+            );
+        }
         tracing::info!(
-            models = catalog.models.len(),
+            models = models.len(),
             errors = errors.len(),
             "catalog scanned"
         );
-        self.catalog = catalog.models;
+        self.catalog = models;
         self.catalog_errors = errors;
+    }
+
+    /// Resolves every reload waiter dispatched at or before `seq`: whichever
+    /// landing covers a waiter's dispatch can answer it, even if a newer scan
+    /// superseded its own (both are complete snapshots of the same disk).
+    fn drain_reload_waiters(&mut self, seq: u64) {
+        let mut keep = Vec::new();
+        for (waiter_seq, waiter) in std::mem::take(&mut self.pending_reload) {
+            if waiter_seq <= seq {
+                let _ = waiter.send(Ok(Reply::Done));
+            } else {
+                keep.push((waiter_seq, waiter));
+            }
+        }
+        self.pending_reload = keep;
     }
 
     fn on_command(&mut self, cmd: Command, reply: Waiter) {
@@ -850,9 +1005,26 @@ impl ActorState {
                 self.publish();
             }
             Command::Reload => {
-                self.refresh_catalog();
-                self.publish();
-                let _ = reply.send(Ok(Reply::Done));
+                // FINDINGS-13 [6]: dispatch the scan off-thread and park the
+                // waiter; the actor keeps answering ticks, events and every other
+                // command against the old catalog until the result lands as
+                // `ActorMsg::CatalogLoaded`, which is also what resolves the
+                // waiter — so `/har/rescan` still means "new catalog applied".
+                let tx = self.tx.clone();
+                let dir = self.models_dir.clone();
+                let seq = self.next_reload;
+                self.next_reload += 1;
+                tokio::spawn(async move {
+                    match scan_models_dir(dir).await {
+                        Ok(catalog) => {
+                            let _ = tx.send(ActorMsg::CatalogLoaded { catalog, seq });
+                        }
+                        Err(reason) => {
+                            let _ = tx.send(ActorMsg::ReloadFailed { seq, reason });
+                        }
+                    }
+                });
+                self.pending_reload.push((seq, reply));
             }
         }
     }
@@ -2878,7 +3050,9 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
-    use super::{headline_fault, ActorState, JobId, JobKind, JobStatus, Scheduler, SwapState};
+    use super::{
+        headline_fault, ActorState, JobId, JobKind, JobStatus, Reply, Scheduler, SwapState,
+    };
     use crate::budget::LedgerOnlyWitness;
     use crate::config::CategoryId;
     use crate::engine::mock::MockAdapter;
@@ -3047,6 +3221,144 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_command_during_an_in_flight_rescan_is_answered() {
+        // FINDINGS-13 [6]: the reload scan parks on a test-only seam; while it is
+        // in flight the actor must keep answering commands, and the reload reply
+        // may resolve only when the new catalog is APPLIED (never when the scan
+        // was dispatched — the /har/rescan contract). Pre-fix (the inline scan),
+        // the parked scan holds the actor thread and the status poll below times
+        // out — which is exactly why this test runs on a multi-thread runtime:
+        // the timer has to survive a thread that a blocking scan has parked.
+        let dir = crate::testutil::temp_dir("reloadresp");
+        seed_one_model(&dir, "resident");
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let handle = Scheduler::start(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+        );
+        // The boot scan must have landed before the seam is armed: the seam is
+        // single-shot for this dir and belongs to the reload alone.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let catalog = handle.catalog().await.expect("actor alive");
+            if catalog.models.iter().any(|entry| entry.name == "resident") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the boot scan never landed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::write(
+            dir.join("late.yaml"),
+            "engine: mock\ncategory: work\nvram_gb: 2\n",
+        )
+        .expect("seed late model");
+
+        let (started, release) = crate::model::scan::arm_scan_pause(&dir);
+        let client = handle.clone();
+        let reload = tokio::spawn(async move { client.reload().await });
+        let grabbed = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || started.recv().is_ok()),
+        )
+        .await;
+        assert!(
+            matches!(grabbed, Ok(Ok(true))),
+            "the reload scan never parked on the seam (is scan_dir off-thread?)"
+        );
+
+        let answered = tokio::time::timeout(Duration::from_secs(2), handle.status()).await;
+        assert!(
+            matches!(answered, Ok(Ok(_))),
+            "the actor stopped answering while a rescan was in flight"
+        );
+        assert!(
+            !reload.is_finished(),
+            "the reload reply resolved before the scan even completed"
+        );
+
+        drop(release);
+        let reply = tokio::time::timeout(Duration::from_secs(10), reload)
+            .await
+            .expect("the reload resolves once released")
+            .expect("join")
+            .expect("reply");
+        assert_eq!(reply, Reply::Done);
+        let catalog = handle.catalog().await.expect("actor alive");
+        assert!(
+            catalog.models.iter().any(|entry| entry.name == "late"),
+            "the reply meant applied: the new model must be in the catalog"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_engine_is_dropped_and_named() {
+        // The audit verdict shipped with this batch (FINDINGS-13 [3] follow-up): no
+        // fixture publishes an engine its adapter map lacks, and such an entry can
+        // only ever die later as `no adapter registered` — so the actor refuses it
+        // at apply time, DROPPING it with a typed, page-visible reason.
+        let dir = crate::testutil::temp_dir("engineunavail");
+        std::fs::write(
+            dir.join("ghost.yaml"),
+            "engine: phantom\ncategory: work\nvram_gb: 2\n",
+        )
+        .expect("seed ghost");
+        seed_one_model(&dir, "resident");
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let handle = Scheduler::start(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let catalog = loop {
+            let catalog = handle.catalog().await.expect("actor alive");
+            let reported = catalog
+                .errors
+                .iter()
+                .any(|e| e.kind == crate::model::scan::ScanKind::EngineUnavailable);
+            let settled = catalog.models.iter().any(|entry| entry.name == "resident");
+            assert!(
+                Instant::now() < deadline,
+                "scan never reported: {catalog:?}"
+            );
+            if reported && settled {
+                break catalog;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            !catalog.models.iter().any(|entry| entry.name == "ghost"),
+            "an engine with no adapter must be dropped from the catalog"
+        );
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == crate::model::scan::ScanKind::EngineUnavailable)
+            .expect("the drop must be reported");
+        assert_eq!(error.file, "ghost.yaml");
+        assert!(
+            error.reason == "engine \"phantom\" is not available to this harness (known: mock)",
+            "{}",
+            error.reason
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

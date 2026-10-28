@@ -597,3 +597,72 @@ async fn a_stale_ticket_cannot_confirm_away_the_successor_on_its_port() {
     runtime.kill(&second).await.expect("cleanup kill");
     assert!(confirm_release(&runtime, &second, 15).await);
 }
+
+#[tokio::test]
+async fn probe_names_the_missing_model_file_when_a_child_exits_early() {
+    // FINDINGS-13 [2]'s load-path companion, end to end on the real runtime: the
+    // argv is llama-shaped (-m <missing path>), the child is a real command that
+    // exits at once, and the fast-fail reason must name the doomed file rather
+    // than only the exit status. Pre-fix this fails: the reason is the bare
+    // `engine process exited early (...)`.
+    let runtime = ProcessRuntime::new();
+    // +5: the next free offset below the protected 18203/18204 window.
+    let port = TEST_PORT + 5;
+    let missing = "Z:\\definitely-not-here\\doomed.gguf";
+    let spec = LaunchSpec {
+        argv: vec![
+            "python".to_string(),
+            "-c".to_string(),
+            "import sys; sys.exit(3)".to_string(),
+            "-m".to_string(),
+            missing.to_string(),
+        ],
+        cwd: PathBuf::from("."),
+        env: BTreeMap::new(),
+        log_name: "process-runtime-missing-model".to_string(),
+        readiness: ReadinessSpec::Http {
+            path: "/health".to_string(),
+            expect_status: 200,
+        },
+        container: None,
+    };
+    let t = ticket(port);
+    if let Err(error) = runtime.spawn(&spec, t.clone()).await {
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
+    }
+    let started = std::time::Instant::now();
+    let reason = loop {
+        let probe = runtime
+            .probe(
+                t.port,
+                &ReadinessSpec::Http {
+                    path: "/health".to_string(),
+                    expect_status: 200,
+                },
+            )
+            .await;
+        if let Probe::Failed { reason } = probe {
+            if reason.contains("exited early") {
+                break reason;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "dead child must fail readiness fast"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        reason.starts_with(&format!("model file not found: {missing}")),
+        "the reason must name the missing file first: {reason}"
+    );
+    assert!(
+        reason.contains("(engine exited early:") && reason.ends_with(')'),
+        "the exit status is still quoted: {reason}"
+    );
+    runtime.kill(&t).await.expect("cleanup kill");
+}

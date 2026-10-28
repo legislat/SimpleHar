@@ -976,19 +976,22 @@ async fn moving_the_default_model_clears_its_old_category_default() {
     );
 }
 
-/// Two yamls that both claim `name: twin` — the FINDINGS-11 [4] shape: distinct
-/// models, distinct categories, distinct ggufs, one identity. Neither file may win.
-fn seed_duplicate_name(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+/// Two yamls whose `model:` paths share one GGUF basename in different dirs —
+/// the reviewer's `F:\...\MID\X.gguf` vs `F:\...\BIG\X.gguf` shape. Same-name
+/// twins became unconstructable with file-stem identity (FINDINGS-13 [3]), so the
+/// surviving ambiguity class is the alias tier of `catalog::resolve`: neither file
+/// may win the shared GGUF name. The files carry no `name:` key at all.
+fn seed_alias_twins(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let work = dir.join("twin-work.yaml");
     let aux = dir.join("twin-aux.yaml");
     std::fs::write(
         &work,
-        "name: twin\nengine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_MID/twin-q4.gguf\n",
+        "engine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_MID/twin.gguf\n",
     )
     .expect("seed twin-work");
     std::fs::write(
         &aux,
-        "name: twin\nengine: mock\ncategory: AUX\nvram_gb: 4\nmodel: F:/MODELS_BIG/twin-q8.gguf\n",
+        "engine: mock\ncategory: AUX\nvram_gb: 4\nmodel: F:/MODELS_BIG/twin.gguf\n",
     )
     .expect("seed twin-aux");
     (work, aux)
@@ -1006,16 +1009,17 @@ async fn ambiguous_app() -> (
         AppConfig::default(),
         &[("filler", "mock", CategoryId::Work, Some(4.0))],
     );
-    seed_duplicate_name(&routers.5);
+    seed_alias_twins(&routers.5);
     let (status, _) = post_json(&routers.0, "/har/rescan", "{}").await;
     assert_eq!(status, StatusCode::OK, "both twins must be in the catalog");
     routers
 }
 
 #[tokio::test]
-async fn load_of_a_duplicate_name_is_409_naming_both_yamls() {
-    // FINDINGS-11 [4]: before the fix this answered 200 having spawned whichever
-    // quantization sorted first, under the identity the client asked for.
+async fn load_of_an_ambiguous_gguf_alias_is_409_naming_both_yamls() {
+    // FINDINGS-11 [4] survives stem identity on the alias tier: before the fix
+    // this answered 200 having spawned whichever quantization sorted first, under
+    // the identity the client asked for.
     let (control, _, _, _, runtime, _) = ambiguous_app().await;
     let (status, body) = post_json(&control, "/har/load", r#"{"model":"twin"}"#).await;
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
@@ -1033,12 +1037,12 @@ async fn load_of_a_duplicate_name_is_409_naming_both_yamls() {
     assert_eq!(
         runtime.server_count(),
         0,
-        "an ambiguous name spawns nothing"
+        "an ambiguous alias spawns nothing"
     );
 }
 
 #[tokio::test]
-async fn named_proxy_on_a_duplicate_name_is_the_same_409_not_a_misdirected_404() {
+async fn named_proxy_on_an_ambiguous_gguf_alias_is_the_same_409_not_a_misdirected_404() {
     // The twins straddle WORK and AUX: the old first-match-wins answer depended on
     // which yaml sorted first, and a wrong-category hit 404'd naming the OTHER
     // entry's public port. The client cannot fix that, so it is a 409.
@@ -1058,7 +1062,7 @@ async fn named_proxy_on_a_duplicate_name_is_the_same_409_not_a_misdirected_404()
     assert_eq!(
         runtime.server_count(),
         0,
-        "an ambiguous name ensures nothing"
+        "an ambiguous alias ensures nothing"
     );
 
     // A no-`model` request never resolves a name, so the twins cannot affect it.
@@ -1069,35 +1073,62 @@ async fn named_proxy_on_a_duplicate_name_is_the_same_409_not_a_misdirected_404()
 }
 
 #[tokio::test]
-async fn alias_unique_hit_on_a_shared_name_is_refused_before_the_actors_find_first() {
-    // Review FINDINGS-FIXTRACK [1]: the query `twin-q4.gguf` matches exactly ONE
-    // entry on the alias tier, so `resolve` says Found — but that entry's NAME
-    // is shared, and the API hands only the name to the actor, which re-resolves
-    // name→entry find-first and can arm the OTHER twin (wrong GGUF, wrong
-    // category) with a green 200. The refusal belongs at the API boundary, where
-    // the whole catalog is still visible.
-    let (control, _, _, _, runtime, _) = ambiguous_app().await;
-    let (status, body) = post_json(&control, "/har/load", r#"{"model":"twin-q4.gguf"}"#).await;
+async fn a_name_contradicting_the_stem_is_dropped_at_scan_and_the_first_file_loads_by_stem() {
+    // 6667c84's shared-name-handoff class, relocated by file-stem identity
+    // (FINDINGS-13 [3]): a second file carrying the FIRST file's name can no
+    // longer reach the catalog at all — the scan drops it with the InvalidName
+    // mismatch, and the twin shape never arrives at the API to be picked.
+    let (control, _, _, _, runtime, dir) = app(
+        AppConfig::default(),
+        &[("filler", "mock", CategoryId::Work, Some(4.0))],
+    );
+    std::fs::write(
+        dir.join("twin-work.yaml"),
+        "engine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_MID/twin-q4.gguf\n",
+    )
+    .expect("seed twin-work");
+    std::fs::write(
+        dir.join("twin-aux.yaml"),
+        "name: twin-work\nengine: mock\ncategory: AUX\nvram_gb: 4\nmodel: F:/MODELS_BIG/twin-q8.gguf\n",
+    )
+    .expect("seed name-twin");
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["models"], 2,
+        "filler + the stem-named file only: {body}"
+    );
+    assert!(
+        body["catalog_errors"]
+            .as_array()
+            .expect("errors")
+            .iter()
+            .any(|e| e["kind"] == "invalid_name"
+                && e["file"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("twin-aux.yaml"))
+                && e["reason"]
+                    == "name: \"twin-work\" does not match file twin-aux.yaml \u{2014} identity \
+                        is the file stem; rename the file or delete the key"),
+        "the second file must be dropped with the exact mismatch reason: {body}"
+    );
+
+    // The first file stays individually addressable by its stem, and the wrong
+    // twin is gone rather than waiting behind a 409.
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"twin-work"}"#).await;
+    assert_eq!(status, StatusCode::OK, "the stem loads: {body}");
+    assert_eq!(runtime.server_count(), 1, "exactly one engine");
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"twin-aux"}"#).await;
     assert_eq!(
         status,
-        StatusCode::CONFLICT,
-        "an alias-unique twin must still be refused: {body}"
-    );
-    let message = body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("twin-work.yaml") && message.contains("twin-aux.yaml"),
-        "both twins named: {message}"
-    );
-    assert_eq!(
-        runtime.server_count(),
-        0,
-        "a shared name must never reach the actor at all"
+        StatusCode::NOT_FOUND,
+        "the dropped twin is unknown: {body}"
     );
 }
 
 #[tokio::test]
 async fn colliding_gguf_file_names_are_409_on_the_alias_tier() {
-    // Reviewer's example: distinct names, one shared gguf file name across two
+    // Reviewer's example: distinct stems, one shared gguf file name across two
     // directories, so the alias tier is claimed twice.
     let (control, _, _, _, _, dir) = app(
         AppConfig::default(),
@@ -1107,12 +1138,12 @@ async fn colliding_gguf_file_names_are_409_on_the_alias_tier() {
     let big = dir.join("qwen3-big.yaml");
     std::fs::write(
         &mid,
-        "name: qwen3-mid\nengine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_MID/Qwen3-0.6B-Q8_0.gguf\n",
+        "engine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_MID/Qwen3-0.6B-Q8_0.gguf\n",
     )
     .expect("seed mid");
     std::fs::write(
         &big,
-        "name: qwen3-big\nengine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_BIG/Qwen3-0.6B-Q8_0.gguf\n",
+        "engine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS_BIG/Qwen3-0.6B-Q8_0.gguf\n",
     )
     .expect("seed big");
     post_json(&control, "/har/rescan", "{}").await;
@@ -1134,7 +1165,7 @@ async fn colliding_gguf_file_names_are_409_on_the_alias_tier() {
 }
 
 #[tokio::test]
-async fn setting_the_default_model_on_a_duplicate_name_is_refused_and_not_persisted() {
+async fn setting_the_default_model_on_an_ambiguous_alias_is_refused_and_not_persisted() {
     // The write-back half of the finding: `/har/config/default` persists the name it
     // validated, so an ambiguity must stop before `persist_default_model`.
     let (control, _, _, _, _, _) = ambiguous_app().await;
@@ -1159,12 +1190,12 @@ async fn setting_the_default_model_on_a_duplicate_name_is_refused_and_not_persis
         .expect("WORK");
     assert!(
         work_cat["default_model"].is_null(),
-        "an ambiguous name never becomes a category default: {status_body}"
+        "an ambiguous alias never becomes a category default: {status_body}"
     );
 }
 
 #[tokio::test]
-async fn editing_a_duplicate_name_refuses_the_writeback_rather_than_picking_a_victim_file() {
+async fn editing_an_ambiguous_alias_refuses_the_writeback_rather_than_picking_a_victim_file() {
     // Chunk 7 [9]: `/har/config/model` resolves a name to choose WHICH yaml to edit.
     // Under ambiguity it must refuse; editing the first match silently rewrites one
     // operator file for a model the client did not necessarily name.
@@ -1826,4 +1857,124 @@ async fn retagging_an_unloaded_aux_model_leaves_the_loaded_aux_occupant_alive() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "aux1 is still answering: {body}");
+}
+
+#[tokio::test]
+async fn an_unknown_key_warns_on_the_page_and_the_model_still_loads() {
+    // FINDINGS-13 [8]: the warning is real (visible in `catalog_errors`, `kind`
+    // round-tripping through the JSON) and harmless (README doctrine: preserved
+    // for reference — the entry publishes and loads).
+    let (control, _, _, _, runtime, dir) = app(
+        AppConfig::default(),
+        &[("filler", "mock", CategoryId::Work, Some(4.0))],
+    );
+    std::fs::write(
+        dir.join("typo.yaml"),
+        "engine: mock\ncategory: WORK\nvram_gb: 4\ncontex: 4096\nhost: 0.0.0.0\nport: 8123\n",
+    )
+    .expect("seed typo fixture");
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let errors = body["catalog_errors"].as_array().expect("errors");
+    let typo = errors
+        .iter()
+        .find(|e| {
+            e["kind"] == "unknown_key" && e["reason"].as_str().is_some_and(|r| r.contains("contex"))
+        })
+        .unwrap_or_else(|| panic!("the typo must be reported: {body}"));
+    assert!(
+        typo["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("(did you mean 'context'?)")),
+        "one unique edit away: {typo}"
+    );
+    assert!(
+        errors.iter().any(|e| e["kind"] == "unknown_key"
+            && e["reason"].as_str()
+                == Some("engine host is harness-forced (loopback, \u{a7}5) \u{2014} this key does nothing")),
+        "the host policy hint must be exact: {body}"
+    );
+    assert!(
+        errors.iter().any(|e| e["kind"] == "unknown_key"
+            && e["reason"].as_str()
+                == Some("engine port is harness-assigned from category config \u{2014} this key does nothing")),
+        "the port policy hint must be exact: {body}"
+    );
+
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"typo"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a warning never unmakes a model: {body}"
+    );
+    assert_eq!(runtime.server_count(), 1);
+}
+
+#[tokio::test]
+async fn a_bogus_llama_server_exe_is_a_page_visible_engine_binary_missing_error() {
+    // FINDINGS-13 [2]'s cross-check twin of the boot banner: the missing binary
+    // is not only said once at boot, it is IN `catalog_errors` with its kind on
+    // the wire (file `config`, kind `engine_binary_missing`).
+    let config = AppConfig {
+        llama_server_exe: std::path::PathBuf::from("Z:/definitely-not-here/llama-server.exe"),
+        ..AppConfig::default()
+    };
+    let (control, _, _, _, _, _) = app(config, &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
+    let (status, body) = get_json(&control, "/har/status").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let error = body["catalog_errors"]
+        .as_array()
+        .expect("errors")
+        .iter()
+        .find(|e| e["kind"] == "engine_binary_missing")
+        .unwrap_or_else(|| panic!("the missing binary must be page-visible: {body}"));
+    assert_eq!(error["file"], "config");
+    let reason = error["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("llama-server.exe not found at Z:/definitely-not-here/llama-server.exe")
+            && reason.contains("llama loads will fail"),
+        "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_gguf_is_dropped_by_the_scan_and_named_on_the_page() {
+    // FINDINGS-13 [2] through the API surface: a llama entry pointed at a GGUF
+    // that is not on disk never reaches the catalog (so it cannot evict anything),
+    // and `/har/rescan` names the file and the path with its kind.
+    let (control, _, _, _, _, dir) = app(
+        AppConfig::default(),
+        &[("filler", "mock", CategoryId::Work, Some(4.0))],
+    );
+    std::fs::write(
+        dir.join("doomed.yaml"),
+        "engine: llama\nmodel: Z:/definitely-not-here/doomed.gguf\nvram_gb: 4\n",
+    )
+    .expect("seed doomed");
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["models"], 1, "only the mock filler survived: {body}");
+    let error = body["catalog_errors"]
+        .as_array()
+        .expect("errors")
+        .iter()
+        .find(|e| e["kind"] == "model_path_missing")
+        .unwrap_or_else(|| panic!("the missing file must be named: {body}"));
+    assert!(error["file"]
+        .as_str()
+        .is_some_and(|f| f.contains("doomed.yaml")));
+    assert!(
+        error["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("model file not found: ") && r.contains("doomed.gguf")),
+        "{}",
+        error["reason"]
+    );
+
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"doomed"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a dropped entry is unknown: {body}"
+    );
 }

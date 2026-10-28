@@ -68,8 +68,10 @@ fn check_extra_args(extra: &str, model_name: &str) -> Result<(), EngineError> {
 }
 
 /// yaml key -> llama-server flag, in `start.ps1` order. Empty values are skipped,
-/// exactly like the script's `if ($v)`.
-const FLAG_TABLE: &[(&str, &str)] = &[
+/// exactly like the script's `if ($v)`. `pub(crate)` so the scan's consumed-keys
+/// const test can assert every table key is a consumed key (FINDINGS-13 [8]): a
+/// flag added here without joining `scan::CONSUMED_KEYS` fails that test.
+pub(crate) const FLAG_TABLE: &[(&str, &str)] = &[
     ("mmproj", "--mmproj"),
     ("context", "-c"),
     ("ngl", "-ngl"),

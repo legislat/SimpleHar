@@ -337,7 +337,8 @@ mod tests {
         assert!(text.contains("vram_gb: 2"), "unrelated key lost: {text}");
         let (map, problems) = parse_flat_yaml(&text);
         assert!(problems.is_empty(), "{problems:?}");
-        let entry = crate::model::ModelEntry::from_flat(&map).expect("the retagged file must scan");
+        let entry =
+            crate::model::ModelEntry::from_flat(&map, "emb").expect("the retagged file must scan");
         assert_eq!(entry.category, crate::config::CategoryId::Work);
     }
 
@@ -397,7 +398,7 @@ mod tests {
         );
         let (map, problems) = parse_flat_yaml(&text);
         assert!(problems.is_empty(), "{problems:?}");
-        let entry = crate::model::ModelEntry::from_flat(&map).expect("must scan");
+        let entry = crate::model::ModelEntry::from_flat(&map, "emb1").expect("must scan");
         assert_eq!(entry.category, crate::config::CategoryId::Work);
     }
 

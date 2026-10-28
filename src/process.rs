@@ -216,6 +216,10 @@ struct EngineProc {
     /// ticket that identified the original child can outlive it — a stale ticket must
     /// never terminate the successor that inherited the port.
     generation: u64,
+    /// The launch argv, kept only so the probe fast-fail can say WHICH path the
+    /// early-exited engine was launched against (FINDINGS-13 [2]'s companion: an
+    /// engine that dies on a deleted model must name it, not just its exit code).
+    argv: Vec<String>,
 }
 
 /// Owned Job Object handle. `Send` because the runtime owns it exclusively: it is
@@ -677,6 +681,7 @@ impl EngineRuntime for ProcessRuntime {
                     terminated: false,
                     container,
                     generation: ticket.generation,
+                    argv: spec.argv.clone(),
                 },
             );
         }
@@ -811,15 +816,61 @@ impl EngineRuntime for ProcessRuntime {
                     .try_wait()
                     .ok()
                     .flatten()
-                    .map(|status| status.to_string())
+                    .map(|status| (status.to_string(), engine.argv.clone()))
             })
         };
-        if let Some(status) = exited {
-            return Probe::Failed {
-                reason: format!("engine process exited early ({status})"),
-            };
+        if let Some((status, argv)) = exited {
+            let (reason, missing) = early_exit_report(&argv, &status);
+            if let Some(path) = missing {
+                tracing::error!(
+                    port,
+                    path = %path,
+                    "engine process exited early against a model file that is not on disk"
+                );
+            }
+            return Probe::Failed { reason };
         }
         http_probe(&self.client, port, readiness).await
+    }
+}
+
+/// The argv positions that carry a model file to the engine: llama takes
+/// `-m <path>`, strata takes its profile as `--config <path>` (its `-m` names the
+/// Python module, which [`looks_like_local_path`] rejects as a path candidate).
+/// A missing file at one of these slots turns the bare exit status of a fast-fail
+/// into the file the operator must restore (FINDINGS-13 [2]'s load-path companion);
+/// the catalog is never mutated from here (operator ruling — a transient deletion
+/// must not silently rewrite the page).
+const PATH_FLAGS: &[&str] = &["-m", "--config"];
+
+/// Whether an argv word is a local path a missing-file diagnosis may name:
+/// `scheme://` sentinels name no local file, and a bare module token
+/// (`serve.server`) has no path shape at all — checking it would misname the
+/// strata module as a missing model.
+fn looks_like_local_path(candidate: &str) -> bool {
+    !candidate.contains("://")
+        && (candidate.contains('/')
+            || candidate.contains('\\')
+            || candidate.as_bytes().get(1) == Some(&b':'))
+}
+
+/// The fast-fail verdict: `(reason, missing path)`. When the launched spec named
+/// a local model/profile file that is gone, the reason names it; otherwise the
+/// pre-existing text is preserved verbatim. Pure given the filesystem — the stat
+/// is its only effect-free input — so the decision is testable without a spawn.
+fn early_exit_report(argv: &[String], status: &str) -> (String, Option<String>) {
+    let missing = argv.windows(2).find_map(|window| {
+        (PATH_FLAGS.contains(&window[0].as_str())
+            && looks_like_local_path(&window[1])
+            && std::path::Path::new(&window[1]).metadata().is_err())
+        .then(|| window[1].clone())
+    });
+    match missing {
+        Some(path) => (
+            format!("model file not found: {path} (engine exited early: {status})"),
+            Some(path),
+        ),
+        None => (format!("engine process exited early ({status})"), None),
     }
 }
 
@@ -969,6 +1020,74 @@ mod tests {
         assert!(!release_ready(false, false, true));
         assert!(release_ready(true, false, true));
         assert!(!release_ready(true, false, false));
+    }
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn early_exit_names_the_missing_llama_model_file() {
+        let dir = crate::testutil::temp_dir("early-exit");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let spec_argv = argv(&[
+            "llama-server.exe",
+            "-m",
+            "Z:\\definitely-not-here\\doomed.gguf",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "18199",
+        ]);
+        let (reason, missing) = early_exit_report(&spec_argv, "exit code: 1");
+        assert_eq!(
+            reason,
+            "model file not found: Z:\\definitely-not-here\\doomed.gguf (engine exited early: \
+             exit code: 1)"
+        );
+        assert_eq!(
+            missing.as_deref(),
+            Some("Z:\\definitely-not-here\\doomed.gguf")
+        );
+
+        // A profile-shaped strata argv names its --config when the profile is gone,
+        // and never the Python module token after `-m`.
+        let strata = argv(&[
+            "python.exe",
+            "-m",
+            "serve.server",
+            "--engine",
+            "strata",
+            "--config",
+            "Z:\\nope\\profile.json",
+            "--port",
+            "18199",
+        ]);
+        let (reason, missing) = early_exit_report(&strata, "exit code: 1");
+        assert!(
+            reason.starts_with("model file not found: Z:\\nope\\profile.json"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("serve.server"),
+            "the module is not a model path"
+        );
+        assert_eq!(missing.as_deref(), Some("Z:\\nope\\profile.json"));
+
+        // An existing file must NOT be named: the reason stays the bare status.
+        let real = dir.join("here.gguf");
+        std::fs::write(&real, b"x").expect("seed");
+        let ok_argv = argv(&["llama-server.exe", "-m", real.to_str().expect("utf8")]);
+        let (reason, missing) = early_exit_report(&ok_argv, "exit code: 3");
+        assert_eq!(reason, "engine process exited early (exit code: 3)");
+        assert_eq!(missing, None);
+
+        // `scheme://` sentinels name no local file: exempt, bare status.
+        let sentinel = argv(&["llama-server.exe", "-m", "hf://org/repo/x.gguf"]);
+        let (reason, missing) = early_exit_report(&sentinel, "0x1");
+        assert_eq!(reason, "engine process exited early (0x1)");
+        assert_eq!(missing, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

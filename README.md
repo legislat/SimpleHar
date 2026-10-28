@@ -88,7 +88,7 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 
 | Key | Notes |
 |---|---|
-| `name` | Canonical harness name; also matched by file-stem/path aliases |
+| `name` | Legacy/optional; identity is the file stem and a mismatching `name` is refused (the file is renamed or the key deleted) |
 | `model` | GGUF path (or `scheme://` engine sentinel). **Required for llama** |
 | `engine` | `llama` (default), `strata`, `ninfer`, or `mock` |
 | `category` | `WORK`/`RP`/`AUX`/`EMB` |
@@ -111,6 +111,8 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload — strictly scoped to the name this harness claimed at spawn (`ninfer-claims.json` beside the harness exe). Must be docker-legal and must not look like a container ID (4+ hex chars): docker would resolve such an argument as an id prefix and delete someone else's container |
 | `ninfer_profile` | Profile passed as the script's `$1` (default `b`) |
 | `ninfer_key` | `true` sends `key` as `$2`; anything else sends `nokey` |
+
+Unknown keys are preserved for reference and reported as `unknown_key` warnings in `catalog_errors` — the model still loads. `host` and `port` are harness-owned and inert: the engine bind is forced to loopback (§5) and the port is assigned from the category config, so those keys do nothing.
 
 ### Ninfer engines
 
