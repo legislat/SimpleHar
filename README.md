@@ -84,7 +84,7 @@ partial files are completed, an invalid file is fatal with every problem logged
 
 ## Model files: `ModelConf/*.yaml`
 
-One flat `key: value` file per model (comments via `#` preserved on write-back):
+One flat `key: value` file per model (comments via `#` are preserved on write-back: an untouched line always keeps its comments; an **identical-value** write — identical *as the scanner reads the value*, which is the one rule both sides share — passes the edited line through byte-verbatim, BOM, indentation, raw quoting, comment and `\r` all intact, and the file is not rewritten at all; a real change rewrites the line in harness form and drops its inline comment, because a stale note beside a new value is a lie; a `#` opens a comment only when an ASCII **space** precedes it outside quotes, so a tab never opens one and a `#` at the very start of the value text is part of the value — write `"# tail"` if you mean it literally; operator ruling 2026-10-28, FINDINGS-13 [8]):
 
 **Acceptance (strict — 13[5] Fork B):** a config is exactly a **regular file** whose final extension is `.yaml`, case-insensitively. `.yml` is **not** a config extension (repo convention) — `foo.yml` is silently inert, not broken: rename it to `.yaml` when you want it live. Everything else in `ModelConf` is silently inert with **zero `catalog_errors`**: `README.md`, `Thumbs.db`, a directory named `x.yaml`, incident copies `x.yaml.bak`. Symlinks are skipped as themselves — never followed, never opened — so a linked tree or a pipe can neither publish nor hang a scan. Parse reports (`invalid_yaml`) are reserved for actual `*.yaml` files: stray files do not talk.
 

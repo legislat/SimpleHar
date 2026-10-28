@@ -156,11 +156,20 @@ const PORT_POLICY_HINT: &str =
 /// Rules: `key: value` with `key` matching `[A-Za-z_][A-Za-z0-9_-]*`; surrounding
 /// single/double quotes stripped; ` # ...` inline comments removed outside quotes;
 /// blank/comment lines skipped; anything else is reported, never dropped silently.
+///
+/// The comment rule, exactly ([`split_value_comment`] is the one owner of it):
+/// a `#` opens a comment only when an ASCII **space** precedes it outside quotes.
+/// Two deliberate consequences, symmetric on both sides of the reader/writer pair
+/// (FINDINGS-BATCH-2026-10-28B [1]/[7]): a **tab never opens a comment**
+/// (`key:\t# note` publishes `# note` as the value), and leading whitespace is
+/// trimmed *before* the walk, so a `#` at the very start of the value text is
+/// value too (`key: # tail` publishes `# tail`). Quote such a value (`"# tail"`)
+/// when you mean it literally and want nothing read as a comment after it.
 pub fn parse_flat_yaml(text: &str) -> (BTreeMap<String, String>, Vec<String>) {
     let mut map = BTreeMap::new();
     let mut problems = Vec::new();
     for (index, raw_line) in text.lines().enumerate() {
-        let line = raw_line.trim_start_matches('\u{feff}').trim();
+        let line = normalized_line(raw_line);
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -184,7 +193,7 @@ pub fn parse_flat_yaml(text: &str) -> (BTreeMap<String, String>, Vec<String>) {
             problems.push(format!("line {}: invalid key `{key}`", index + 1));
             continue;
         }
-        let value = strip_comment(line[colon + 1..].trim());
+        let value = strip_comment(&line[colon + 1..]);
         if map.contains_key(key) {
             problems.push(format!(
                 "line {}: duplicate key `{key}` (first value kept)",
@@ -197,37 +206,138 @@ pub fn parse_flat_yaml(text: &str) -> (BTreeMap<String, String>, Vec<String>) {
     (map, problems)
 }
 
-/// Removes an inline ` # comment` (outside quotes) and surrounding quote pairs.
-fn strip_comment(value: &str) -> String {
+/// Splits a raw `key:` value text into (parsed value, verbatim inline comment).
+///
+/// This is THE boundary rule **and the only normalizer of value text** (operator
+/// ruling 2026-10-28, FINDINGS-13 [8] Fork B; FINDINGS-BATCH-2026-10-28B [1]):
+/// scan parses through here and the write-back compares a line's value text
+/// through here, so no caller can hand the rule a differently-normalized text and
+/// the reader and the writer cannot disagree about where the value ends. The
+/// incoming word a caller asks to write goes through [`canonical_value`], which
+/// applies exactly this value half without the comment cut. Normalization
+/// (surrounding whitespace, a line's trailing `\r`, a leading BOM) happens
+/// **inside**, before the walk: the comment begins at the first space `#`
+/// **outside** quotes of the *normalized* text and is returned verbatim from that
+/// cut (so its ` #` opening and inner spacing survive); the value is what precedes
+/// the cut, trimmed, with one surrounding quote pair stripped. `None` when no such
+/// cut exists. Trimming first has two pinned consequences: a `#` that only looked
+/// space-preceded because of leading whitespace is value, and a tab never opens a
+/// comment.
+/// Walking `char_indices` (never a char vector indexed by a byte length, which is
+/// what panicked on non-ASCII before this rewrite) keeps every cut a char
+/// boundary and needs no allocation; the final character is visited with no
+/// successor, which can never form a ` #` cut, so no rule depends on looking one
+/// character ahead.
+pub(crate) fn split_value_comment(raw_value: &str) -> (&str, Option<&str>) {
+    let text = normalize_value_text(raw_value);
     let mut in_quote: Option<char> = None;
-    let mut cut = value.len();
-    let bytes: Vec<char> = value.chars().collect();
-    for (index, window) in bytes.windows(2).enumerate() {
-        let (current, next) = (window[0], window[1]);
+    let mut cut: Option<usize> = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, current)) = chars.next() {
         match in_quote {
             Some(q) if current == q => in_quote = None,
             Some(_) => {}
             None => {
                 if current == '"' || current == '\'' {
                     in_quote = Some(current);
-                } else if current == ' ' && next == '#' {
-                    cut = index;
+                } else if current == ' ' && chars.peek().is_some_and(|&(_, next)| next == '#') {
+                    cut = Some(index);
                     break;
                 }
             }
         }
     }
-    let cleaned: String = bytes[..cut].iter().collect();
-    let trimmed = cleaned.trim();
+    match cut {
+        Some(index) => (unquote(text[..index].trim()), Some(&text[index..])),
+        None => (unquote(text), None),
+    }
+}
+
+/// The single normalization a value text passes through, so the walk sees one
+/// shape no matter which caller produced it: surrounding whitespace (including a
+/// CRLF line's trailing `\r`) and a leading BOM, which `str::trim` leaves alone.
+/// Trimmed twice because a BOM can ride inside the leading whitespace, and the
+/// helper must still return slices of the caller's own bytes.
+fn normalize_value_text(raw_value: &str) -> &str {
+    raw_value.trim().trim_start_matches('\u{feff}').trim()
+}
+
+/// The one line normalizer both sides of the reader/writer pair use: a document
+/// line is its BOM-stripped, trimmed text. `str::trim` alone does not remove
+/// U+FEFF (category Cf, not White_Space), so the explicit strip is what keeps a
+/// BOM'd first line visible to the reader and the writer alike; the rule lives
+/// here and nowhere else, so the two cannot disagree about which line a key is on.
+pub(crate) fn normalized_line(line: &str) -> &str {
+    line.trim_start_matches('\u{feff}').trim()
+}
+
+/// Strips one surrounding quote pair (`"…"` / `'…'`) from a trimmed value.
+///
+/// Sound by assumption: both accepted quotes are one ASCII byte, so peeling one
+/// byte per side always lands on a char boundary — `unquote_peels_ascii_quotes_
+/// around_multibyte_content` pins that with multi-byte content between the quotes.
+fn unquote(trimmed: &str) -> &str {
     if trimmed.len() >= 2 {
         let first = trimmed.chars().next().expect("non-empty checked");
         let last = trimmed.chars().next_back().expect("non-empty checked");
         if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-            return trimmed[1..trimmed.len() - 1].to_string();
+            return &trimmed[1..trimmed.len() - 1];
         }
     }
-    trimmed.to_string()
+    trimmed
 }
+
+/// Removes an inline ` # comment` (outside quotes) and surrounding quote pairs.
+fn strip_comment(value: &str) -> String {
+    split_value_comment(value).0.to_string()
+}
+
+/// The canonical form of a value a caller **already holds** (FINDINGS-BATCH-2026-10-28B
+/// [4]): exactly the value half of [`split_value_comment`]'s normalization — the same
+/// [`normalize_value_text`] plus one surrounding quote pair — but with **no comment
+/// cut**. A value is not a line: cutting one at ` #` would report the word
+/// `a # b` as `a`, and comparing that against a file holding `"a # b"` would call an
+/// identical write a change and rewrite the line unquoted, corrupting it on the next
+/// scan. This is the only entry point the write-back may use on an incoming word.
+pub(crate) fn canonical_value(value: &str) -> &str {
+    unquote(normalize_value_text(value))
+}
+
+/// The torture set both layers are pinned against (FINDINGS-BATCH-2026-10-28B
+/// [2]): every value-text shape whose boundary the reader and the writer must
+/// agree on, paired with the value the reader publishes. The cross-layer pins in
+/// `writeback` feed each published value back through the writer and demand a
+/// byte-identical document, so a writer-local comment parser cannot survive the
+/// suite — the acceptance criterion the self-comparison it replaces could not
+/// meet (that loop was `strip_comment` asserted against `split_value_comment`,
+/// one function in two faces, and stayed green with a private parser in the
+/// writer).
+#[cfg(test)]
+pub(crate) const TORTURE_SHAPES: &[(&str, &str)] = &[
+    (" 4096 # 32k", "4096"),
+    (" \"a # b\" # tail", "a # b"),
+    (" 'a # b' # tail", "a # b"),
+    (" \"4096\"", "4096"),
+    (" 'a'", "a"),
+    (" 4096#c", "4096#c"),
+    (" 4096 #32k", "4096"),
+    (" plain", "plain"),
+    (" 4096   ", "4096"),
+    (" 4096   # c", "4096"),
+    ("", ""),
+    (" ", ""),
+    (" #", "#"),
+    (" #tail", "#tail"),
+    (" # tail", "# tail"),
+    ("  # a # b", "# a"),
+    (" 4096\t# c", "4096\t# c"),
+    (" 4096\t# c # tail", "4096\t# c"),
+    (" \"unclosed # x", "\"unclosed # x"),
+    (" caf\u{e9} # morning", "caf\u{e9}"),
+    (" \u{540d}\u{524d}", "\u{540d}\u{524d}"),
+    (" \u{2192}\u{2192} 4096 # arrows", "\u{2192}\u{2192} 4096"),
+    (" caf\u{65}\u{301} # morning", "caf\u{65}\u{301}"),
+];
 
 /// The 13[5] Fork B acceptance gate: a config is exactly a **regular file** whose
 /// final extension is `.yaml`, case-insensitively. Never a symlink — the caller
@@ -658,6 +768,77 @@ mod tests {
     fn hash_inside_quotes_is_not_a_comment() {
         let (map, _) = parse_flat_yaml("model: \"F:/a#b.gguf\"\n");
         assert_eq!(map.get("model").map(String::as_str), Some("F:/a#b.gguf"));
+    }
+
+    /// THE boundary rule at the helper level (FINDINGS-13 [8] Fork B, tightened by
+    /// FINDINGS-BATCH-2026-10-28B [1]): the comment begins at the first space-`#`
+    /// of the **normalized** value text, outside quotes, and the tail is verbatim
+    /// from that cut; the value is trimmed and unquoted. Leading whitespace can
+    /// therefore never manufacture a comment (` # tail` is the value `# tail`), a
+    /// tab never opens one, and a trailing `\r`/leading BOM is invisible to the
+    /// rule because the helper owns that normalization. Non-ASCII is pinned on
+    /// both paths (the pre-Fork-B code indexed a char vector with a byte length
+    /// and panicked on the no-cut path). The reader/writer agreement half of this
+    /// property is NOT tested here — a helper cannot audit its own callers; see
+    /// `writeback::tests::the_torture_shapes_round_trip_reader_to_writer_and_back`.
+    #[test]
+    fn the_shared_value_comment_split_cuts_only_outside_quotes() {
+        assert_eq!(split_value_comment(" 4096 # 32k"), ("4096", Some(" # 32k")));
+        assert_eq!(
+            split_value_comment(" \"a # b\" # tail"),
+            ("a # b", Some(" # tail"))
+        );
+        assert_eq!(split_value_comment(" 4096#c"), ("4096#c", None));
+        assert_eq!(split_value_comment(" plain"), ("plain", None));
+        assert_eq!(split_value_comment(""), ("", None));
+        assert_eq!(
+            split_value_comment(" \"unclosed # x"),
+            ("\"unclosed # x", None)
+        );
+        assert_eq!(
+            split_value_comment(" caf\u{e9} # morning"),
+            ("caf\u{e9}", Some(" # morning"))
+        );
+        assert_eq!(
+            split_value_comment(" \u{540d}\u{524d}"),
+            ("\u{540d}\u{524d}", None)
+        );
+        assert_eq!(split_value_comment(" # tail"), ("# tail", None));
+        assert_eq!(split_value_comment("  # a # b"), ("# a", Some(" # b")));
+        assert_eq!(split_value_comment(" #"), ("#", None));
+        assert_eq!(split_value_comment(" 4096\t# c"), ("4096\t# c", None));
+        assert_eq!(split_value_comment(" 4096   # c"), ("4096", Some(" # c")));
+        assert_eq!(split_value_comment(" 4096   "), ("4096", None));
+        assert_eq!(split_value_comment(" 4096 # c\r"), ("4096", Some(" # c")));
+        assert_eq!(
+            split_value_comment("\u{feff} 4096 # c"),
+            ("4096", Some(" # c"))
+        );
+        assert_eq!(split_value_comment("  \"a\""), ("a", None));
+        // The helper against an independent expected table (not against its own
+        // other face): the reader's published value for every shape.
+        for &(raw, expected) in TORTURE_SHAPES {
+            assert_eq!(
+                split_value_comment(raw).0,
+                expected,
+                "reader's value for `{raw}`"
+            );
+        }
+    }
+
+    /// FINDINGS-BATCH-2026-10-28B [10]: `unquote` peels one byte per side, which
+    /// is only a char-boundary-safe operation because the accepted quotes are
+    /// ASCII. Pinned with multi-byte content between the quotes so the assumption
+    /// is tested, not just documented.
+    #[test]
+    fn unquote_peels_ascii_quotes_around_multibyte_content() {
+        assert_eq!(unquote("\"\u{540d}\u{524d}\""), "\u{540d}\u{524d}");
+        assert_eq!(unquote("'\u{540d}\u{524d}'"), "\u{540d}\u{524d}");
+        assert_eq!(unquote("\"\u{2192}\""), "\u{2192}");
+        assert_eq!(unquote("\""), "\"");
+        assert_eq!(unquote("\"\""), "");
+        assert_eq!(unquote("\"\u{540d}\""), "\u{540d}");
+        assert_eq!(unquote("'\u{540d}\""), "'\u{540d}\"");
     }
 
     #[test]

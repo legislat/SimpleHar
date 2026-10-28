@@ -1,19 +1,27 @@
 //! Byte-preserving write-back of per-model yaml flags (DESIGN Step 9, choice B).
 //!
 //! The yaml file stays the single source of truth (the operator edits these files
-//! by hand), so page edits are read-modify-write of the *raw lines*: comments,
-//! ordering, CRLF endings, and unknown keys all survive. The file is replaced
-//! atomically (temp + rename) and revalidated after write — on failure the old
-//! bytes are restored **and** kept forensically: a single-slot `<stem>.yaml.bak`
-//! incident copy is written first, every claimed byte location is confirmed by
-//! its own read-back, and the error string tells the truth about where the
-//! original bytes ended up (restored, backed up, believed to be at the copy, or
-//! nowhere). Fixes v3.3 defects D3/D4 (non-atomic, CRLF-normalizing, comment-clobbering
-//! write-back whose failure still answered 200) and FINDINGS-13 [5] (the restore
-//! was the one non-atomic write and its failure was discarded behind an
-//! unconditional "original restored" claim).
+//! by hand), so page edits are read-modify-write of the *raw lines*: ordering,
+//! CRLF endings, and unknown keys survive, and comments survive — every untouched
+//! line always; an edited line passes through byte-verbatim on an identical-value
+//! write (identical **as the scanner reads the value**, both sides of that test
+//! normalized by scan's own rule — `split_value_comment` for the line's value
+//! text, `canonical_value` for the incoming word), and a real change
+//! drops the line's own inline comment (a stale note beside a new value is a lie;
+//! operator ruling 2026-10-28, FINDINGS-13 [8] Fork B; FINDINGS-BATCH-2026-10-28B
+//! [1]/[4]). An edit whose result equals the input never reaches the disk at all —
+//! no temp, no rename, no mtime churn on a file nobody changed ([6]). The file is
+//! replaced atomically (temp + rename) and revalidated after write — on failure
+//! the old bytes are restored **and** kept forensically: a single-slot
+//! `<stem>.yaml.bak` incident copy is written first, every claimed byte location
+//! is confirmed by its own read-back, and the error string tells the truth about
+//! where the original bytes ended up (restored, backed up, believed to be at the
+//! copy, or nowhere). Fixes v3.3 defects D3/D4 (non-atomic, CRLF-normalizing,
+//! comment-clobbering write-back whose failure still answered 200) and
+//! FINDINGS-13 [5] (the restore was the one non-atomic write and its failure was
+//! discarded behind an unconditional "original restored" claim).
 
-use crate::model::scan::parse_flat_yaml;
+use crate::model::scan::{canonical_value, normalized_line, parse_flat_yaml, split_value_comment};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -53,11 +61,39 @@ pub const EDITABLE_FLAGS: &[(&str, &str)] = &[("category", "category"), ("cpu", 
 
 /// Sets `key: value` in a flat yaml document, preserving everything else.
 ///
-/// - a matching key line (first one) is rewritten in place;
+/// - a matching key line (first one) is rewritten in place only when the value
+///   actually changes. Identity is decided **as the scanner reads values**: the
+///   line's value text goes through [`split_value_comment`] and the incoming word
+///   through [`canonical_value`] — the same normalization, the value half of that
+///   helper (BOM/`\r`/whitespace trim + one quote pair) with no comment cut, which
+///   is what keeps a word like `a # b` a word and not a line. So an
+///   identical-value write passes the line through
+///   **byte-verbatim** — BOM, indentation, raw quoted value, inline comment and
+///   trailing `\r` all stay exactly as authored, and the whole document comes back
+///   byte-identical (operator ruling 2026-10-28, FINDINGS-13 [8] Fork B: nothing
+///   changes when the value does not change; FINDINGS-BATCH-2026-10-28B [1]/[4]
+///   for why both sides must be normalized by the same helper). A real change
+///   harness-formats the line and drops the old inline comment (a stale note
+///   beside a new value is a lie), and every later rewrite of the new value is
+///   then stable — the fixed point is the same one step further on;
+/// - `value` is trimmed once at entry, so all three arms see one canonical word
+///   (the harness writes single words: an enum name, `true`/`false`, a `{:.1}`
+///   float). Surrounding whitespace is never a fact about a value, and comparing
+///   a trimmed word while emitting a padded one was the drift FINDINGS-BATCH-2026-10-28B
+///   [4] reported. Values are trusted **caller-produced single words**: a value
+///   containing `\n` would inject further lines into the document (and one
+///   containing ` #` meets the open triage item below), so the trust boundary of
+///   this function is its callers — production passes no free-form text;
+/// - open triage item, deliberately NOT fixed by this ruling: the change-side
+///   emit writes the incoming value verbatim, so a quoted value loses its
+///   quotes — setting a value containing ` #` through a real change lands a
+///   line that rescans to the pre-`#` prefix;
 /// - a matching key inside a *commented block* is never touched (v3.3 clobbered
 ///   these) — only real, non-comment lines count as occurrences;
 /// - a key that appears nowhere is appended at the end;
-/// - `value: None` removes an existing key line rather than writing an empty one;
+/// - `value: None` removes an existing key line rather than writing an empty one
+///   (the key's own comment rides the line away — the ruling is about surviving
+///   values, not preserved corpses);
 /// - the split is on `\n` only, so every `\r` of a CRLF file stays attached to its
 ///   line and re-emerges on join — endings never get normalized (the D4 fix).
 ///
@@ -75,14 +111,33 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut out: Vec<String> = body.split('\n').map(str::to_string).collect();
     let bom = text.starts_with('\u{feff}');
+    // One canonical incoming word for all three arms (FINDINGS-BATCH-2026-10-28B
+    // [4]): trimming here, not per arm, is what keeps the identity test below and
+    // the bytes the emit arms write in agreement.
+    let value = value.map(str::trim);
     match (find_key_line(out.iter().map(String::as_str), key), value) {
         (Some(index), Some(value)) => {
-            // CRLF files: the '\r' rides at the end of the line.
-            let ending = if out[index].ends_with('\r') { "\r" } else { "" };
-            // Line 1 is the only place a real file-leading BOM can ride; re-emit
-            // it so overwriting that key does not strip the file's BOM.
-            let lead = if index == 0 && bom { "\u{feff}" } else { "" };
-            out[index] = format!("{lead}{key}: {value}{ending}");
+            // Ruling B's strongest form: an identical value changes NOTHING about the
+            // line — it is never reformatted, so BOM, indentation, raw quoting, the
+            // comment and the '\r' all stay exactly as authored. "Identical" is the
+            // scanner's own reading: both sides go through scan's rule, so the writer
+            // cannot disagree with the reader about where the value ends and no shape
+            // can churn on a write of the value the reader just published
+            // (FINDINGS-BATCH-2026-10-28B [1]/[4]). A real change harness-formats the
+            // line, which is what drops the stale comment.
+            let line = normalized_line(&out[index]);
+            let colon = line.find(':').expect(
+                "invariant: find_key_line matched this line only because it has a key: value colon",
+            );
+            let (old_value, _comment) = split_value_comment(&line[colon + 1..]);
+            if old_value != canonical_value(value) {
+                // CRLF files: the '\r' rides at the end of the line.
+                let ending = if out[index].ends_with('\r') { "\r" } else { "" };
+                // Line 1 is the only place a real file-leading BOM can ride; re-emit
+                // it so overwriting that key does not strip the file's BOM.
+                let lead = if index == 0 && bom { "\u{feff}" } else { "" };
+                out[index] = format!("{lead}{key}: {value}{ending}");
+            }
         }
         (Some(index), None) => {
             // Drop exactly the key's own line — blanking-then-filtering would
@@ -109,16 +164,16 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
 /// Index of the first real `key:` line — comments and blanks never count
 /// (v3.3 clobbered commented-out blocks; the D3 fix).
 ///
-/// The BOM strip mirrors the scan parser (`scan.rs`'s `parse_flat_yaml` trims
-/// `\u{feff}` the same way): `str::trim` does not remove U+FEFF (it is category
-/// Cf, not White_Space), so without this a BOM'd first line is invisible here
+/// The line is read through [`normalized_line`], the same normalizer the scan
+/// parser uses: `str::trim` does not remove U+FEFF (it is category Cf, not
+/// White_Space), so without that strip a BOM'd first line is invisible here
 /// while scan happily reads its key. The asymmetry is what FINDINGS-13 [1]
 /// reports: a batch retag reads the missing match as "absent key", silently
 /// no-ops the `is_embedding_model` removal, and the next scan drops the whole
 /// model with `EmbeddingCategoryConflict` — after the edit answered success.
 fn find_key_line<'a>(mut lines: impl Iterator<Item = &'a str>, key: &str) -> Option<usize> {
     lines.position(|line| {
-        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        let trimmed = normalized_line(line);
         !trimmed.starts_with('#')
             && !trimmed.is_empty()
             && trimmed
@@ -195,6 +250,15 @@ fn commit_verified(path: &Path, original: &str, updated: &str) -> Result<(), Str
     }
     if map.is_empty() {
         return Err("edit would produce an empty model file".to_string());
+    }
+    // True no-op: the edit produced the bytes that are already on disk, so there
+    // is nothing to commit (FINDINGS-BATCH-2026-10-28B [6]). Deliberately *after*
+    // the two checks above, so a no-op against a file that already has problem
+    // lines or would parse empty still refuses exactly as before (13[4] Fork C
+    // kept `commit_verified` blanket) — the short-circuit removes the temp write,
+    // the rename and the mtime churn on a wedged drive, never a refusal.
+    if updated == original {
+        return Ok(());
     }
     let tmp = temp_beside(path);
     std::fs::write(&tmp, updated.as_bytes())
@@ -882,6 +946,308 @@ mod tests {
             "BOM preserved through the overwrite: {updated:?}"
         );
         assert_eq!(updated, "\u{feff}category: WORK\nname: emb1\n");
+    }
+
+    /// Operator ruling 2026-10-28 (FINDINGS-13 [8] Fork B), drop direction: a
+    /// value-changing write must not leave the old note lying beside the new
+    /// value. Passes at HEAD too — this is a policy pin, declared as such: it
+    /// stops any future "improvement" from silently restoring the stale-comment
+    /// side of the ruling.
+    #[test]
+    fn a_changed_value_drops_the_edited_keys_inline_comment() {
+        let updated = set_key_in_text(
+            "cpu_offload: false # tested -ngl 0, thrashes at 24k ctx\n",
+            "cpu_offload",
+            Some("true"),
+        )
+        .expect("edit");
+        assert_eq!(
+            updated, "cpu_offload: true\n",
+            "the note described the old value and is gone: {updated}"
+        );
+    }
+
+    /// The ruling's keep direction — the falsifier against pre-ruling code (the
+    /// always-drop overwrite arm fails this): an identical-value write preserves
+    /// the comment byte-verbatim, including its inner `#` and the spacing from
+    /// the cut, and the no-op write is a fixed point.
+    #[test]
+    fn an_unchanged_value_keeps_the_edited_keys_inline_comment_verbatim() {
+        let line = "cpu_offload: false # tested -ngl 0, thrashes at 24k ctx # twice\n";
+        let updated = set_key_in_text(line, "cpu_offload", Some("false")).expect("no-op write");
+        assert_eq!(
+            updated, line,
+            "a note beside the value it describes survives: {updated}"
+        );
+        assert_eq!(
+            set_key_in_text(&updated, "cpu_offload", Some("false")).expect("again"),
+            line,
+            "the identical write is a fixed point"
+        );
+    }
+
+    /// The boundary is scan's own rule, not a hand-copied parser: a `#` inside
+    /// quotes is VALUE, not comment. An identical (post-unquote) write passes
+    /// the line through byte-verbatim — and the line still RESCANS to the quoted
+    /// value, not its pre-`#` prefix; a different value drops the comment. A
+    /// writeback-local split at the first `#` would compute the old value as
+    /// `"a` and fail the keep direction here. Falsifies any keep-side reformat:
+    /// reconstructing `{key}: {value}` from the parts strips the protective
+    /// quotes and corrupts the value on the next scan.
+    #[test]
+    fn a_hash_inside_quotes_is_value_so_only_an_identical_write_keeps_the_tail() {
+        let line = "title: \"a # b\" # the tail\n";
+        let kept = set_key_in_text(line, "title", Some("a # b")).expect("identical write");
+        assert_eq!(
+            kept, line,
+            "a no-op write of a quoted value must be byte-verbatim, quotes intact"
+        );
+        let (map, problems) = parse_flat_yaml(&kept);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(
+            map.get("title").map(String::as_str),
+            Some("a # b"),
+            "the rescan must yield the quoted value, not the pre-# prefix: {kept}"
+        );
+        assert_eq!(
+            set_key_in_text(line, "title", Some("a # c")).expect("changed write"),
+            "title: a # c\n",
+            "a real change drops the tail"
+        );
+    }
+
+    /// The keep branch's byte-verbatim promise is strictly stronger than
+    /// reassembling the parts: indentation, raw quoting and value-to-comment
+    /// spacing all survive untouched on a no-op write.
+    #[test]
+    fn an_indented_quoted_annotated_line_passes_through_a_no_op_write_byte_identical() {
+        let doc = "  title:  \"a # b\"   # operator spacing\nname: q\n";
+        assert_eq!(
+            set_key_in_text(doc, "title", Some("a # b")).expect("no-op"),
+            doc,
+            "a no-op write may not touch a single byte of the line"
+        );
+    }
+
+    /// The rule composes with CRLF: a no-op write keeps tail and `\r`; a
+    /// value-changing write drops the tail and keeps the `\r` form intact.
+    #[test]
+    fn the_comment_rule_composes_with_crlf_endings() {
+        let doc = "batch: 512 # tuned on 2026-10-01\r\nname: q\r\n";
+        assert_eq!(
+            set_key_in_text(doc, "batch", Some("512")).expect("no-op"),
+            doc,
+            "no-op write keeps the tail and the '\\r'"
+        );
+        assert_eq!(
+            set_key_in_text(doc, "batch", Some("256")).expect("change"),
+            "batch: 256\r\nname: q\r\n",
+            "the change drops the tail and keeps the CRLF form"
+        );
+    }
+
+    /// The rule composes with BOM re-emission: a no-op write to the BOM'd first
+    /// line keeps the BOM and the comment together.
+    #[test]
+    fn an_unchanged_value_on_a_bom_prefixed_first_line_keeps_bom_and_comment() {
+        assert_eq!(
+            set_key_in_text(
+                "\u{feff}category: WORK # the operator's note\nname: emb1\n",
+                "category",
+                Some("WORK"),
+            )
+            .expect("no-op"),
+            "\u{feff}category: WORK # the operator's note\nname: emb1\n",
+            "BOM re-emit and tail preservation compose"
+        );
+    }
+
+    /// The removal arm is unchanged by the ruling: deleting the key's line still
+    /// takes the key's own comment down with it.
+    #[test]
+    fn removal_still_takes_the_edited_keys_comment_with_the_line() {
+        let updated = set_key_in_text("name: q\nfit: true # keep the reasoning\n", "fit", None)
+            .expect("remove");
+        assert_eq!(
+            updated, "name: q\n",
+            "the comment rode its line away: {updated}"
+        );
+    }
+
+    /// The batch path inherits the rule through the same helper: re-persisting an
+    /// unchanged measured value keeps the operator's note; a real change drops it.
+    #[test]
+    fn the_batch_path_inherits_the_comment_rule() {
+        let dir = crate::testutil::temp_dir("writeback-comment-batch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("m.yaml");
+        std::fs::write(
+            &path,
+            "name: m\nengine: mock\nmeasured_gb: 20.0 # peak of the session\n",
+        )
+        .expect("seed");
+        set_flags_on_file(&path, &[("measured_gb", Some("20.0"))]).expect("no-op batch");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "name: m\nengine: mock\nmeasured_gb: 20.0 # peak of the session\n",
+            "the batch path keeps the tail through the identical helper"
+        );
+        set_flags_on_file(&path, &[("measured_gb", Some("21.0"))]).expect("changed batch");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !text.contains("peak of the session"),
+            "the batch change drops the stale note: {text}"
+        );
+        assert!(text.contains("measured_gb: 21.0"), "{text}");
+        // A mixed batch (one identical edit + one real edit) is still ONE rewrite:
+        // the identical key's note survives next to the changed key's new value.
+        std::fs::write(
+            &path,
+            "name: m\nengine: mock\nmeasured_gb: 21.0\nmeasured_min_gb: 19.0 # floor note\n",
+        )
+        .expect("reseed");
+        set_flags_on_file(
+            &path,
+            &[
+                ("measured_gb", Some("22.0")),
+                ("measured_min_gb", Some("19.0")),
+            ],
+        )
+        .expect("mixed batch");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("measured_gb: 22.0"), "{text}");
+        assert!(
+            text.contains("measured_min_gb: 19.0 # floor note"),
+            "the no-op member of the batch kept its note: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS-BATCH-2026-10-28B [2] — THE reader/writer agreement pin, through
+    /// the product path rather than a helper auditing itself. For every torture
+    /// shape, in both LF and CRLF form: (a-b) the scan reader publishes exactly the
+    /// pinned value, (c) writing that published value back leaves the document
+    /// byte-identical, (d) the document still rescans to the same value, and the
+    /// negative direction: a real change harness-formats the line, drops the tail
+    /// and rescans to the new value. A writer-local comment parser cannot survive
+    /// this — that is the acceptance criterion the
+    /// `strip_comment == split_value_comment` self-comparison it replaces could
+    /// never meet.
+    #[test]
+    fn the_torture_shapes_round_trip_reader_to_writer_and_back() {
+        for &(raw, expected) in crate::model::scan::TORTURE_SHAPES {
+            for ending in ["\n", "\r\n"] {
+                let doc = format!("k:{raw}{ending}name: q{ending}");
+                let (map, problems) = parse_flat_yaml(&doc);
+                assert!(problems.is_empty(), "reader reports {doc:?}: {problems:?}");
+                assert_eq!(
+                    map.get("k").map(String::as_str),
+                    Some(expected),
+                    "reader's published value for {raw:?}"
+                );
+                let back = set_key_in_text(&doc, "k", Some(expected)).expect("identical write");
+                assert_eq!(back, doc, "an identical-value write churned {raw:?}");
+                let (again, problems) = parse_flat_yaml(&back);
+                assert!(problems.is_empty(), "rescan of {back:?}: {problems:?}");
+                assert_eq!(
+                    again.get("k").map(String::as_str),
+                    Some(expected),
+                    "the no-op must not change what the reader sees for {raw:?}"
+                );
+                let changed = set_key_in_text(&doc, "k", Some("zzz-other")).expect("change");
+                let want = format!("k: zzz-other{ending}name: q{ending}");
+                assert_eq!(
+                    changed, want,
+                    "a real change harness-formats and drops the tail for {raw:?}"
+                );
+                let (map2, problems2) = parse_flat_yaml(&changed);
+                assert!(problems2.is_empty(), "{problems2:?}");
+                assert_eq!(map2.get("k").map(String::as_str), Some("zzz-other"));
+            }
+        }
+    }
+
+    /// FINDINGS-BATCH-2026-10-28B [4]: one canonical incoming word, decided before
+    /// any arm runs. Padded input is identity-equal to the clean word (so the line
+    /// passes through byte-verbatim) and lands trimmed on the change and append
+    /// arms — never raw, which is what let the compare and the emit disagree. A
+    /// quoting-only difference is parsed-equal in BOTH directions, so the
+    /// operator's note survives it: the ruling's "identical" is the scanner's.
+    #[test]
+    fn incoming_words_are_normalized_once_before_any_arm_decides() {
+        let doc = "k: 4096 # the note\nname: q\n";
+        assert_eq!(
+            set_key_in_text(doc, "k", Some(" 4096 ")).expect("padded identical"),
+            doc,
+            "a padded identical word must not touch a byte"
+        );
+        assert_eq!(
+            set_key_in_text(doc, "k", Some("\t4096\n")).expect("padded edges"),
+            doc
+        );
+        assert_eq!(
+            set_key_in_text(doc, "k", Some(" 8192 ")).expect("padded change"),
+            "k: 8192\nname: q\n",
+            "padded bytes never land"
+        );
+        assert_eq!(
+            set_key_in_text("name: q\n", "k", Some(" 8192  ")).expect("padded append"),
+            "name: q\nk: 8192\n",
+            "no padded word in the file"
+        );
+        let quoted_line = "k: \"a b\" # the note\n";
+        assert_eq!(
+            set_key_in_text(quoted_line, "k", Some("a b")).expect("unquoted in"),
+            quoted_line,
+            "file quoted, caller plain: parsed-equal keeps the note"
+        );
+        let plain_line = "k: a b # the note\n";
+        assert_eq!(
+            set_key_in_text(plain_line, "k", Some("\"a b\"")).expect("quoted in"),
+            plain_line,
+            "file plain, caller quoted: parsed-equal keeps the note"
+        );
+    }
+
+    /// FINDINGS-BATCH-2026-10-28B [6]: a true no-op never reaches the disk. The
+    /// honest falsifier is a target the rename cannot touch — a delete-blocking
+    /// handle, the same `share_mode(0x3)` trick the restore seam uses: the no-op
+    /// must SUCCEED, leave the bytes and the directory alone (no temp, no `.bak`),
+    /// while a real edit on that very same locked target must still be refused in
+    /// the rename. Removing the short-circuit turns the first assert red.
+    #[cfg(windows)]
+    #[test]
+    fn a_true_no_op_edit_never_reaches_the_disk() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = crate::testutil::temp_dir("writeback-noop-no-disk");
+        let path = seed(&dir, CLEAN);
+        let _lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE: DELETE refused
+            .open(&path)
+            .expect("lock the target against rename");
+        set_flag_on_file(&path, "category", Some("WORK")).expect("a no-op needs no rename");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("target"),
+            CLEAN,
+            "the no-op left the bytes alone"
+        );
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["qwen3.yaml".to_string()],
+            "a no-op writes no temp and no incident copy: {entries:?}"
+        );
+        let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
+            .expect_err("a real edit on the locked target must still be refused");
+        assert!(error.contains("cannot replace"), "{error}");
+        drop(_lock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
