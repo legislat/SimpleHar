@@ -996,10 +996,12 @@ pub async fn guard(
     let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
     response = with_request_id(response, &request_id);
-    // The page polls /har/status continuously; those lines would evict real
-    // evidence from the ring during long boots. Extended logging restores them
-    // (operator, 2026-10-26).
-    let routine_poll = path == "/har/status" && method == axum::http::Method::GET;
+    // The page polls /har/status continuously and opens the log panel repeatedly;
+    // those lines would evict real evidence from the ring during long boots — and
+    // reading the log must not be an event that pushes the log's own evidence out
+    // (FINDINGS-15 [10]). Extended logging restores them (operator, 2026-10-26).
+    let routine_poll =
+        method == axum::http::Method::GET && matches!(path.as_str(), "/har/status" | "/har/log");
     if !routine_poll || crate::observability::extended_logging() {
         tracing::info!(
             %request_id,
@@ -1740,6 +1742,8 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
 mod tests {
     use super::*;
     use crate::scheduler::SlotStatus;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     #[test]
     fn config_write_path_follows_boot_and_never_the_legacy_file() {
@@ -2097,6 +2101,107 @@ mod tests {
             again["boot"]["first_bind_at"],
             json!(1),
             "and it is still first-write-wins through the API handle"
+        );
+    }
+
+    /// FINDINGS-14 [7] + the 2026-10-28 "A + amber" ruling: a category whose
+    /// supervisor never spoke must be PRESENT in the `listeners` object and LABELED
+    /// `Pending`, so the page can never read "no verdict" as "no such category" (the
+    /// old shape made the two indistinguishable). Falsifier: return the registry to an
+    /// unseeded `new()` and the four `Pending` assertions fail on a missing key.
+    #[tokio::test]
+    async fn a_category_with_no_verdict_is_present_and_labeled_pending() {
+        let api = live_state(BootTimings::default());
+        let fresh = status_document(&api).await.expect("status document");
+        assert_eq!(
+            fresh["listeners"].as_object().map(|m| m.len()),
+            Some(4),
+            "the passthrough serializes every configured category, not only the marked ones: {fresh}"
+        );
+        for name in ["WORK", "RP", "AUX", "EMB"] {
+            assert_eq!(
+                fresh["listeners"][name],
+                json!("Pending"),
+                "a never-marked category is present AND labeled: {fresh}"
+            );
+        }
+
+        api.listeners.mark_serving(CategoryId::Work);
+        api.listeners.mark_down(
+            CategoryId::Emb,
+            "cannot bind 127.0.0.1:8711: address in use".to_string(),
+        );
+        let after = status_document(&api).await.expect("status document");
+        assert_eq!(after["listeners"]["WORK"], json!("Serving"));
+        assert_eq!(
+            after["listeners"]["RP"],
+            json!("Pending"),
+            "neighbours keep their no-verdict label while the boot is incomplete"
+        );
+        assert_eq!(
+            after["listeners"]["EMB"]["Down"]["reason"],
+            json!("cannot bind 127.0.0.1:8711: address in use"),
+            "the four verdicts stay three distinct shapes"
+        );
+        assert!(
+            after["listeners"].get("AUX").is_some(),
+            "a category nobody marked is never the same as a removed one: {after}"
+        );
+        assert!(
+            after["listeners"].get("NOSUCH").is_none(),
+            "an absent category is a MISSING key — which seeding makes unrepresentable"
+        );
+    }
+
+    /// FINDINGS-15 [10]: reading the ring must not append to the ring, or the act of
+    /// asking "why did the last load fail" evicts the answer. Falsifier: drop
+    /// `/har/log` from the routine-poll exemption and the two-reads assertion fails
+    /// with two `request complete` lines.
+    #[tokio::test]
+    async fn reading_the_log_never_appends_to_the_log() {
+        // The switch is process-global and off at boot; state it explicitly so this
+        // pin means "exempted", not "someone turned the logging off".
+        crate::observability::set_extended_logging(false);
+        let api = Arc::new(unit_state());
+        let session = crate::tray::testlog::Session::start();
+        for _ in 0..2 {
+            let response = control_router(Arc::clone(&api))
+                .oneshot(
+                    Request::get("/har/log")
+                        .body(Body::empty())
+                        .expect("log request"),
+                )
+                .await
+                .expect("in-process log read");
+            assert_eq!(response.status(), StatusCode::OK, "/har/log must answer");
+        }
+        // And a GET that is not a routine poll still reports, so the exemption is
+        // scoped rather than an accidental mute of the whole request line.
+        let other = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::get("/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("in-process health read");
+        assert_eq!(other.status(), StatusCode::OK, "/health must answer");
+        let lines = session.stop();
+        let log_lines = lines
+            .iter()
+            .filter(|line| line.contains("request complete") && line.contains("/har/log"))
+            .count();
+        assert_eq!(
+            log_lines, 0,
+            "the log's own reads may not evict its own evidence: {lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("request complete") && line.contains("/health"))
+                .count(),
+            1,
+            "non-routine GETs stay in the ring (the exemption is scoped): {lines:?}"
         );
     }
 

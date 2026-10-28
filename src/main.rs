@@ -532,6 +532,47 @@ fn parse_excluded_ranges(text: &str) -> Vec<(u16, u16)> {
         .collect()
 }
 
+/// What the §0.2 ready gate concluded from one registry snapshot.
+///
+/// `Pending` is not a verdict: a category still waiting on its supervisor keeps
+/// `bind_ms` unrecorded and stops the boot line from claiming "resolved"
+/// (FINDINGS-14 [7]). Extracted from [`run`] so the decision is unit-testable without
+/// a live supervisor, and so the gate cannot be quietly re-inverted to counting map
+/// entries.
+struct GateVerdict {
+    /// Categories that are bound and serving.
+    serving: usize,
+    /// Categories with no verdict yet, in canonical order.
+    pending: Vec<simplehar_se::config::CategoryId>,
+}
+
+impl GateVerdict {
+    /// Whether every configured category has a verdict (`Serving` or `Down`).
+    fn resolved(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// The ready gate's verdict for one snapshot of the listener registry.
+fn gate_verdict(
+    snapshot: &std::collections::BTreeMap<
+        simplehar_se::config::CategoryId,
+        simplehar_se::listeners::ListenerState,
+    >,
+) -> GateVerdict {
+    GateVerdict {
+        serving: snapshot
+            .values()
+            .filter(|state| matches!(state, simplehar_se::listeners::ListenerState::Serving))
+            .count(),
+        pending: snapshot
+            .iter()
+            .filter(|(_, state)| state.is_pending())
+            .map(|(category, _)| *category)
+            .collect(),
+    }
+}
+
 /// Starts one supervisor per category listener and waits for shutdown.
 ///
 /// `boot_runtime` is the same [`ProcessRuntime`] instance the scheduler drives:
@@ -576,33 +617,48 @@ async fn run(
             first_bind.clone(),
         )));
     }
-    // §0.2 "ready": every listener is Serving or Down. Wait (bounded) for the
-    // supervisors' first verdict, then record the boot measures.
+    // §0.2 "ready": every listener carries a verdict (Serving or Down). Wait
+    // (bounded) for the supervisors' first verdict, then record the boot measures.
+    // The gate counts VERDICTS, not entries: the registry is seeded `Pending` at
+    // construction, so `len()` says nothing about readiness (FINDINGS-14 [7]).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let snapshot = state.listeners.snapshot();
-        if snapshot.len() >= state.config.categories.len()
-            || tokio::time::Instant::now() >= deadline
-        {
+        if state.listeners.pending().is_empty() || tokio::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     {
-        let all = state.listeners.snapshot();
-        state
-            .boot
-            .write()
-            .expect("boot timings lock poisoned by a writer panic")
-            .set_bound(boot_started.elapsed().as_millis() as u64);
-        tracing::info!(
-            bind_ms = boot_started.elapsed().as_millis() as u64,
-            serving = all
-                .values()
-                .filter(|s| matches!(s, simplehar_se::listeners::ListenerState::Serving))
-                .count(),
-            "boot ready (0.2): config validated, catalog scan queued, listeners resolved"
-        );
+        let verdict = gate_verdict(&state.listeners.snapshot());
+        let bind_ms = boot_started.elapsed().as_millis() as u64;
+        if verdict.resolved() {
+            state
+                .boot
+                .write()
+                .expect("boot timings lock poisoned by a writer panic")
+                .set_bound(bind_ms);
+            tracing::info!(
+                bind_ms,
+                serving = verdict.serving,
+                "boot ready (0.2): config validated, catalog scan queued, listeners resolved"
+            );
+        } else {
+            // The deadline path: a supervisor never published. `bind_ms` stays
+            // unrecorded — the measure means "every category has a verdict", and
+            // recording it here would certify a boot whose ports are unproven — and
+            // the word "resolved" is not printed (FINDINGS-14 [7]).
+            let names = verdict
+                .pending
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::error!(
+                categories = %names,
+                serving = verdict.serving,
+                "listeners UNRESOLVED: [{names}] after the 10 s boot gate; they are amber (no verdict), not healthy"
+            );
+        }
         // FINDINGS-14 [5] seam: the reclaim below is only legal AFTER this line.
         #[cfg(test)]
         boot_order::log_ready();
@@ -679,13 +735,13 @@ mod tests {
     //! (FINDINGS-14 [4]/[5]) with every listener on an ephemeral port.
 
     use super::{
-        boot_config, boot_order, decode_console_output, log_boot_banner, parse_excluded_ranges,
-        probe_outcome, run, supervise_listener,
+        boot_config, boot_order, decode_console_output, gate_verdict, log_boot_banner,
+        parse_excluded_ranges, probe_outcome, run, supervise_listener,
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use simplehar_se::api::{control_router, ApiState};
-    use simplehar_se::config::{self, AppConfig, CategoryConfig, ConfigError};
+    use simplehar_se::config::{self, AppConfig, CategoryConfig, CategoryId, ConfigError};
     use simplehar_se::engine::EngineRuntime;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -797,6 +853,45 @@ mod tests {
             probe_outcome(Some("stale".to_string()), Ok(Some("fresh".to_string()))),
             (true, Some("fresh".to_string())),
             "a fresh answer replaces the held hint"
+        );
+    }
+
+    #[test]
+    fn the_ready_gate_never_calls_no_verdict_resolved() {
+        // FINDINGS-14 [7]: the §0.2 gate decides on verdicts, never on entry counts.
+        // A seeded (all-`Pending`) registry must withhold both `bind_ms` and the word
+        // "resolved", and must be named category by category. Falsifier: count
+        // `snapshot().len()` instead of `pending()` and the first two assertions fail.
+        let registry = simplehar_se::listeners::ListenerRegistry::new();
+        let verdict = gate_verdict(&registry.snapshot());
+        assert!(!verdict.resolved(), "no supervisor has spoken yet");
+        assert_eq!(
+            verdict.pending,
+            CategoryId::all().to_vec(),
+            "the UNRESOLVED line must name every silent category"
+        );
+        assert_eq!(verdict.serving, 0, "nothing may be counted as serving");
+
+        registry.mark_serving(CategoryId::Work);
+        registry.mark_serving(CategoryId::Rp);
+        registry.mark_serving(CategoryId::Aux);
+        let partial = gate_verdict(&registry.snapshot());
+        assert!(
+            !partial.resolved(),
+            "one category without a verdict withholds both bind_ms and 'resolved'"
+        );
+        assert_eq!(partial.pending, vec![CategoryId::Emb]);
+        assert_eq!(partial.serving, 3);
+
+        registry.mark_down(CategoryId::Emb, "cannot bind 127.0.0.1:8711".to_string());
+        let resolved = gate_verdict(&registry.snapshot());
+        assert!(
+            resolved.resolved(),
+            "a `Down` verdict is a verdict: the gate closes and bind_ms may stand"
+        );
+        assert_eq!(
+            resolved.serving, 3,
+            "and the boot line still says how many ports actually serve"
         );
     }
 
@@ -1056,7 +1151,11 @@ Start Port    End Port
             first_bind.clone(),
         ));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while state.listeners.snapshot().is_empty() {
+        // The registry is seeded `Pending`, so "has an entry" is no longer a wait —
+        // this must poll for the actual `Serving` verdict the supervisor publishes.
+        while state.listeners.snapshot().get(&CategoryId::Work)
+            != Some(&simplehar_se::listeners::ListenerState::Serving)
+        {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the supervisor never published a bind verdict"
