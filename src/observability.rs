@@ -96,6 +96,23 @@ pub fn ring_push(entry: LogEntry) {
     ring.entries.push_back(entry);
 }
 
+/// Test-only serialization of the process-global ring (FINDINGS-BATCH-2026-10-28I
+/// [2]). `RING` is one `static` shared by every test in this binary, and
+/// [`ring_caps_at_capacity_and_reports_drops`] drains it and asserts the eviction
+/// counter — so any second writer in the drain..fill window turns `dropped == 10`
+/// into 11 (measured: 18/20 co-scheduled runs failed before this lock existed).
+/// Ring-touching tests take this guard; the lock is poison-tolerant because a
+/// failing test must not cascade into every later ring test.
+#[cfg(test)]
+static RING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_ring_for_test() -> std::sync::MutexGuard<'static, ()> {
+    RING_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The last `limit` events (oldest first) plus how many were dropped overall.
 pub fn ring_tail(limit: usize) -> (Vec<LogEntry>, u64) {
     let ring = ring().lock().expect("log ring lock poisoned by a panic");
@@ -172,6 +189,9 @@ mod tests {
 
     #[test]
     fn ring_caps_at_capacity_and_reports_drops() {
+        // The drain-and-count below is only meaningful while nobody else can push;
+        // the ring is process-global (see `lock_ring_for_test`).
+        let _serial = lock_ring_for_test();
         // The ring is process-global; isolate by draining first.
         let mut ring = ring().lock().expect("lock");
         ring.entries.clear();

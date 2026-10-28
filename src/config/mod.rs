@@ -299,7 +299,13 @@ pub fn default_config_path() -> Option<std::path::PathBuf> {
 }
 
 /// Root of [`CONFIG_FILE`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written, not derived: [`AppConfig::control_token`] renders as a
+/// redaction marker that reports only whether auth is enforced (`REDACTED(present)`
+/// / `REDACTED(absent)`) — presence is reportable, the value never is, so no
+/// `?config` line can ever put the crown jewel into the `/har/log` ring
+/// (FINDINGS-15 [9]).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Address every listener binds on (operator note 2026-10-25): a loopback
@@ -393,6 +399,72 @@ pub struct AppConfig {
     /// builds its own adapter map. Always serialized, like [`CategoryConfig::control`].
     #[serde(default)]
     pub allow_mock_engine: bool,
+}
+
+impl fmt::Debug for AppConfig {
+    /// Prints every field as-is except `control_token`, which renders
+    /// `REDACTED(present)` / `REDACTED(absent)` — the posture the status surface
+    /// already takes: report *whether* auth is enforced, never the secret.
+    ///
+    /// `secrecy` was rejected (operator ruling 2026-10-28, FINDINGS-15 [9]): the fix
+    /// for the class belongs at the owning type plus the guard below, and
+    /// `expose_secret()` ceremony at each reader would buy no behavior change for a
+    /// new dependency AGENTS.md itself polices.
+    ///
+    /// The destructuring below is deliberately **exhaustive** (no `..`): adding a
+    /// field to `AppConfig` is a compile error here until it is named, so a second
+    /// secret can never ride a derived `Debug` into the ring unnoticed. That is
+    /// this impl's whole safety story — do not replace it with a derive or a `..`
+    /// pattern.
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let AppConfig {
+            internal_host,
+            categories,
+            vram_reserve_gb,
+            vram_total_gb,
+            protected_ports,
+            release_timeout_s,
+            load_timeout_s,
+            measured_sample_s,
+            tray_enabled,
+            llama_server_exe,
+            modelconf_dir,
+            settle_timeout_s,
+            witness_tolerance_gb,
+            greedy_launch_min_free_gb,
+            wsl_distro,
+            wsl_user,
+            source_path,
+            control_token,
+            allow_mock_engine,
+        } = self;
+        let presence = if control_token.is_some() {
+            "present"
+        } else {
+            "absent"
+        };
+        out.debug_struct("AppConfig")
+            .field("internal_host", internal_host)
+            .field("categories", categories)
+            .field("vram_reserve_gb", vram_reserve_gb)
+            .field("vram_total_gb", vram_total_gb)
+            .field("protected_ports", protected_ports)
+            .field("release_timeout_s", release_timeout_s)
+            .field("load_timeout_s", load_timeout_s)
+            .field("measured_sample_s", measured_sample_s)
+            .field("tray_enabled", tray_enabled)
+            .field("llama_server_exe", llama_server_exe)
+            .field("modelconf_dir", modelconf_dir)
+            .field("settle_timeout_s", settle_timeout_s)
+            .field("witness_tolerance_gb", witness_tolerance_gb)
+            .field("greedy_launch_min_free_gb", greedy_launch_min_free_gb)
+            .field("wsl_distro", wsl_distro)
+            .field("wsl_user", wsl_user)
+            .field("source_path", source_path)
+            .field("control_token", &format_args!("REDACTED({presence})"))
+            .field("allow_mock_engine", allow_mock_engine)
+            .finish()
+    }
 }
 
 impl Default for AppConfig {
@@ -930,6 +1002,193 @@ mod tests {
                 .iter()
                 .any(|e| e.to_string().contains("control_token")),
             "a blank token would fail open: {blank:?}"
+        );
+    }
+
+    /// FINDINGS-15 [9] pin (a): the crown jewel never rides `Debug`. Falsifier: put
+    /// `Debug` back on the derive list and the sentinel shows up in the text.
+    #[test]
+    fn the_config_debug_never_prints_the_control_token() {
+        const SENTINEL: &str = "TOPSECRET-4b7e1a";
+        let cfg = AppConfig {
+            control_token: Some(SENTINEL.to_string()),
+            ..AppConfig::default()
+        };
+        let text = format!("{cfg:?}");
+        assert!(!text.contains(SENTINEL), "Debug leaked the token: {text}");
+        assert!(
+            text.contains("control_token: REDACTED(present)"),
+            "the marker must report that auth is enforced: {text}"
+        );
+    }
+
+    /// FINDINGS-15 [9] pin (d): the marker encodes presence, so a constant
+    /// placeholder fails here — `None` and `Some` must read differently, and the
+    /// unconfigured config must not claim `present`.
+    #[test]
+    fn the_debug_reports_token_presence_as_information() {
+        let set = format!(
+            "{:?}",
+            AppConfig {
+                control_token: Some("SENTINEL-A".to_string()),
+                ..AppConfig::default()
+            }
+        );
+        let open = format!(
+            "{:?}",
+            AppConfig {
+                control_token: None,
+                ..AppConfig::default()
+            }
+        );
+        assert!(set.contains("control_token: REDACTED(present)"), "{set}");
+        assert!(open.contains("control_token: REDACTED(absent)"), "{open}");
+        assert!(
+            !open.contains("REDACTED(present)"),
+            "an open harness must not read as authed: {open}"
+        );
+        assert_ne!(set, open, "presence is the reportable half of the fact");
+    }
+
+    /// FINDINGS-15 [9] pin (c): the redaction is a needle, not a blackout — every
+    /// other field still prints, by name and with its value. Falsifier: an impl
+    /// that stops listing fields (or redacts more than the token) drops a name, a
+    /// value, or trips the single-marker count.
+    #[test]
+    fn the_config_debug_prints_every_non_secret_field() {
+        let cfg = AppConfig {
+            vram_reserve_gb: 2.5,
+            vram_total_gb: 47.5,
+            protected_ports: [8003, 18203].into_iter().collect(),
+            release_timeout_s: 11,
+            load_timeout_s: 22,
+            measured_sample_s: 33,
+            tray_enabled: true,
+            llama_server_exe: std::path::PathBuf::from("F:/bin/llama-server.exe"),
+            modelconf_dir: std::path::PathBuf::from("F:/modelconf"),
+            settle_timeout_s: 44,
+            witness_tolerance_gb: 1.5,
+            greedy_launch_min_free_gb: 6.5,
+            wsl_distro: "Ubuntu-24.04".to_string(),
+            wsl_user: Some("operator".to_string()),
+            source_path: Some(std::path::PathBuf::from("F:/simplehar-se.json")),
+            control_token: Some("SENTINEL-B".to_string()),
+            allow_mock_engine: true,
+            ..AppConfig::default()
+        };
+        let text = format!("{cfg:?}");
+        for (name, value) in [
+            ("internal_host", "127.0.0.1"),
+            ("categories", "CategoryConfig"),
+            ("vram_reserve_gb", "2.5"),
+            ("vram_total_gb", "47.5"),
+            ("protected_ports", "8003"),
+            ("release_timeout_s", "11"),
+            ("load_timeout_s", "22"),
+            ("measured_sample_s", "33"),
+            ("tray_enabled", "true"),
+            ("llama_server_exe", "llama-server.exe"),
+            ("modelconf_dir", "F:/modelconf"),
+            ("settle_timeout_s", "44"),
+            ("witness_tolerance_gb", "1.5"),
+            ("greedy_launch_min_free_gb", "6.5"),
+            ("wsl_distro", "Ubuntu-24.04"),
+            ("wsl_user", "operator"),
+            ("source_path", "simplehar-se.json"),
+            ("allow_mock_engine", "true"),
+        ] {
+            assert!(
+                text.contains(&format!("{name}:")) && text.contains(value),
+                "field {name} (or its value) vanished from Debug: {text}"
+            );
+        }
+        assert_eq!(
+            text.matches("REDACTED").count(),
+            1,
+            "only the token is redacted, nothing else: {text}"
+        );
+        assert!(
+            !text.contains("SENTINEL-B"),
+            "the value still must not appear: {text}"
+        );
+    }
+
+    /// FINDINGS-15 [9] pin (b): the exposure the finding named is the ring, so this
+    /// pin runs the ring's own storage path. `RingLayer::on_event` records every
+    /// field as `format!("{value:?}")` and hands the entry to `ring_push` — the one
+    /// choke point a captured event passes through — so pushing exactly the field a
+    /// future `debug!(?config)` would store, and reading it back the way `/har/log`
+    /// does, tests real storage rather than a mirrored copy of the layer.
+    ///
+    /// The ring is a single process-global `static` shared with
+    /// `observability::tests::ring_caps_at_capacity_and_reports_drops`, which drains
+    /// it and asserts the eviction counter (FINDINGS-BATCH-2026-10-28I [2]: 18/20
+    /// co-scheduled runs failed before this was fixed). Two defences, both kept: the
+    /// pin takes `lock_ring_for_test` so the two never interleave, and it asserts by
+    /// **set difference** over a before/after snapshot — never by total length,
+    /// position, or a count of what anyone else wrote, so a future ring writer cannot
+    /// make it flaky in either direction.
+    /// Falsifier: restore the derived `Debug` and the stored field carries the
+    /// sentinel.
+    #[test]
+    fn the_log_ring_cannot_capture_the_control_token_from_a_config_debug() {
+        use crate::observability::{
+            lock_ring_for_test, ring_push, ring_tail, LogEntry, RING_CAPACITY,
+        };
+        use std::collections::BTreeSet;
+        const SENTINEL: &str = "RINGSENTINEL-9d2f7c";
+        const TARGET: &str = "config_debug_capture_pin";
+        const MESSAGE: &str = "config snapshot under review";
+        // An entry's identity, timestamp excluded: two entries are the same only if
+        // target, level, message and every field match.
+        type EntryKey = (String, String, String, Vec<(String, String)>);
+        fn key_of(e: &LogEntry) -> EntryKey {
+            (
+                e.target.clone(),
+                e.level.clone(),
+                e.message.clone(),
+                e.fields.clone().into_iter().collect(),
+            )
+        }
+        let cfg = AppConfig {
+            control_token: Some(SENTINEL.to_string()),
+            ..AppConfig::default()
+        };
+        let rendered = format!("{cfg:?}");
+
+        let _serial = lock_ring_for_test();
+        let before: BTreeSet<EntryKey> = ring_tail(RING_CAPACITY).0.iter().map(key_of).collect();
+        let mut entry = LogEntry::now("DEBUG", TARGET, MESSAGE);
+        entry.fields.insert("config".to_string(), rendered);
+        ring_push(entry);
+        let after = ring_tail(RING_CAPACITY).0;
+
+        // (a) the sentinel appears nowhere in the ring at all — every entry,
+        // this pin's and any foreign one, message and every structured field.
+        assert!(
+            after.iter().all(|e| !e.message.contains(SENTINEL)
+                && e.fields.values().all(|v| !v.contains(SENTINEL))),
+            "no ring entry may hold the control token"
+        );
+        // (b) the entry this pin wrote is among the NEW ones (set difference, so
+        // neither the ring's total length nor another writer's traffic matters), and
+        // what it stores still tells the operator that auth is enforced.
+        let mine: Vec<&LogEntry> = after
+            .iter()
+            .filter(|e| e.target == TARGET && e.message == MESSAGE && !before.contains(&key_of(e)))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "this pin's own capture must be among the entries that were not there before"
+        );
+        assert!(
+            mine[0]
+                .fields
+                .values()
+                .any(|v| v.contains("REDACTED(present)")),
+            "the ring must still report that auth is enforced: {:?}",
+            mine[0]
         );
     }
 
