@@ -11,7 +11,10 @@
 //! operator ruling 2026-10-28, FINDINGS-13 [8] Fork B; FINDINGS-BATCH-2026-10-28B
 //! [1]/[4]). An edit whose result equals the input never reaches the disk at all —
 //! no temp, no rename, no mtime churn on a file nobody changed ([6]). The file is
-//! replaced atomically (temp + rename) and revalidated after write — on failure
+//! replaced atomically (temp + rename, every publish write flushed with
+//! `File::sync_all` before its handle closes — volume submission, not durability:
+//! the drive's volatile write cache remains below the software line) and
+//! revalidated after write — on failure
 //! the old bytes are restored **and** kept forensically: a single-slot
 //! `<stem>.yaml.bak` incident copy is written first, every claimed byte location
 //! is confirmed by its own read-back, and the error string tells the truth about
@@ -49,15 +52,76 @@ pub(crate) fn acquire_write_gate() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Test-only lost-update probe (FINDINGS-13 [11]). Armed for a path, the gated
+/// read-modify-write holds its critical section open for a few milliseconds
+/// **after the read and before the commit** — precisely the window [`write_gate`]
+/// exists to close, so an ungated racer is caught inside it rather than by
+/// accident. Under the gate the pause is harmless: writers still serialize and
+/// every key lands. Remove the gate from one entry point and the other writer
+/// reads the pre-edit bytes, renames them over the first writer's committed work,
+/// and the hammer pins see keys swallowed while both callers returned `Ok`. The
+/// probe is **determinism insurance, not the detector**: with the flushing publish
+/// one read-modify-write is already ~10 ms on the measured host, and the hammer
+/// still swallowed keys 5/5 there with the sleep removed
+/// (FINDINGS-BATCH-2026-10-28C [6]) — it is there for faster or quieter machines,
+/// where the real window is microseconds and a naive hammer could pass both ways.
+/// Arms are per-path (concurrent tests never steal one another's probe).
+#[cfg(test)]
+fn wide_window_arms() -> &'static Mutex<Vec<PathBuf>> {
+    static ARMS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    ARMS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// RAII guard for [`wide_window_arms`]: keeps one path's critical-section window
+/// open for the guard's lifetime and disarms it on `Drop`, so a test that panics
+/// mid-hammer cannot leave another test's window widened — and a leaked arm would
+/// still be inert, because every test's file path is unique per process.
+#[cfg(test)]
+struct WideWindow {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl WideWindow {
+    /// Holds `path`'s critical-section window open for this guard's lifetime.
+    fn arm(path: &Path) -> Self {
+        wide_window_arms()
+            .lock()
+            .expect("window arm lock")
+            .push(path.to_path_buf());
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for WideWindow {
+    fn drop(&mut self) {
+        let mut arms = wide_window_arms().lock().expect("window arm lock");
+        arms.retain(|armed| armed != &self.path);
+    }
+}
+
+/// The pause itself, called by the two public entries inside their gate.
+#[cfg(test)]
+fn hold_wide_window_if_armed(path: &Path) {
+    let armed = wide_window_arms()
+        .lock()
+        .expect("window arm lock")
+        .iter()
+        .any(|armed| armed == path);
+    if armed {
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+}
+
 /// Monotonic suffix so two temp files can never collide. Also used by the config
 /// write-back, so every temp this process ever creates is unique process-wide.
 pub(crate) fn next_temp_seq() -> u64 {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
-
-/// One editable flag: the yaml key it maps to.
-pub const EDITABLE_FLAGS: &[(&str, &str)] = &[("category", "category"), ("cpu", "cpu_offload")];
 
 /// Sets `key: value` in a flat yaml document, preserving everything else.
 ///
@@ -194,6 +258,8 @@ pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(
     let _gate = acquire_write_gate();
     let original = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    #[cfg(test)]
+    hold_wide_window_if_armed(path);
     let updated = set_key_in_text(&original, key, value)?;
     commit_verified(path, &original, &updated)
 }
@@ -219,9 +285,14 @@ pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(
 /// As [`set_flag_on_file`]. Nothing reaches the disk unless every edit applied and the
 /// result parsed, so the file keeps its previous complete state.
 pub fn set_flags_on_file(path: &Path, edits: &[(&str, Option<&str>)]) -> Result<(), String> {
+    // The same gate as [`set_flag_on_file`] — one mutex for every public entry, or
+    // the two entries race each other (FINDINGS-13 [11], pinned by
+    // `single_key_and_batch_entries_share_one_gate`).
     let _gate = acquire_write_gate();
     let original = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    #[cfg(test)]
+    hold_wide_window_if_armed(path);
     let mut updated = original.clone();
     for (key, value) in edits {
         if value.is_none() && find_key_line(updated.split('\n'), key).is_none() {
@@ -261,7 +332,7 @@ fn commit_verified(path: &Path, original: &str, updated: &str) -> Result<(), Str
         return Ok(());
     }
     let tmp = temp_beside(path);
-    std::fs::write(&tmp, updated.as_bytes())
+    write_synced(&tmp, updated.as_bytes())
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
@@ -302,6 +373,33 @@ fn temp_beside(path: &Path) -> PathBuf {
         next_temp_seq()
     );
     path.with_extension(extension)
+}
+
+/// Creates (or truncates) `path` with `bytes` and **submits them to the volume
+/// before the handle closes**: open-create-write, `write_all`, then
+/// `File::sync_all()`. This is the module's only file-creating write on a publish
+/// path — the main temp in [`commit_verified`], the restore temp in
+/// [`restore_original_bytes`] and the forensic copy in [`forensic_copy`], which
+/// together are every byte this module ever puts on disk; none of them calls
+/// `std::fs::write` directly, and the source-tripwire pin
+/// (`the_publish_writes_all_go_through_write_synced_tripwire`) holds that shape.
+///
+/// `File` is unbuffered, so `write_all` has already reached the kernel by the time
+/// `sync_all` is asked; what the flush buys is that a rename can no longer expose a
+/// temp whose content the kernel merely buffered — a crash after `Ok` now loses at
+/// most what the *firmware* had not committed. Say exactly that, no more: the
+/// drive's volatile write cache remains below the software line, so nothing here is
+/// a durability guarantee against power loss. The read-back verifiers
+/// ([`compare_read_back`]) are what prove content.
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// The post-write validation failed (unreadable or unparseable re-read): the
@@ -432,7 +530,7 @@ fn forensic_copy(target: &Path, original: &str) -> Bak {
     } else {
         original.to_string()
     };
-    if let Err(io) = std::fs::write(&bak, text.as_bytes()) {
+    if let Err(io) = write_synced(&bak, text.as_bytes()) {
         tracing::warn!(
             error = %io,
             target = %target.display(),
@@ -471,8 +569,7 @@ fn restore_original_bytes(path: &Path, original: &str) -> Result<(), String> {
         .expect("restore probe lock")
         .push((path.to_path_buf(), forensic_bak_path(path).exists()));
     let tmp = temp_beside(path);
-    std::fs::write(&tmp, original.as_bytes())
-        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    write_synced(&tmp, original.as_bytes()).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     let temp_read = std::fs::read_to_string(&tmp);
     if let Err(error) = compare_read_back(temp_read, original, &tmp, "temp read-back") {
         let _ = std::fs::remove_file(&tmp);
@@ -550,8 +647,8 @@ fn post_write_corrupt() -> &'static Mutex<Vec<CorruptArm>> {
 }
 
 #[cfg(all(test, windows))]
-fn post_write_locks() -> &'static Mutex<Vec<std::fs::File>> {
-    static LOCKS: OnceLock<Mutex<Vec<std::fs::File>>> = OnceLock::new();
+fn post_write_locks() -> &'static Mutex<Vec<(PathBuf, std::fs::File)>> {
+    static LOCKS: OnceLock<Mutex<Vec<(PathBuf, std::fs::File)>>> = OnceLock::new();
     LOCKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -570,10 +667,17 @@ pub(crate) fn arm_post_write_corrupt(path: &Path, lock_target: bool) {
         });
 }
 
-/// Drops every `lock_target` handle the seam grabbed, so the temp dir frees.
+/// Releases only the `lock_target` handles the seam grabbed for **`path`**, so that
+/// test's temp dir frees. Keyed by target path exactly as the corrupt arms above:
+/// a wholesale `clear()` let one seam test drop the handle another seam test was
+/// still depending on, and the wedged restore then succeeded and the other test
+/// false-failed (FINDINGS-BATCH-2026-10-28C [4]).
 #[cfg(all(test, windows))]
-pub(crate) fn release_post_write_locks() {
-    post_write_locks().lock().expect("lock vec").clear();
+pub(crate) fn release_post_write_locks(path: &Path) {
+    post_write_locks()
+        .lock()
+        .expect("lock vec")
+        .retain(|(armed, _)| armed != path);
 }
 
 #[cfg(all(test, windows))]
@@ -584,7 +688,10 @@ fn lock_without_delete_share(path: &Path) {
         .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE: DELETE refused
         .open(path)
     {
-        Ok(handle) => post_write_locks().lock().expect("lock vec").push(handle),
+        Ok(handle) => post_write_locks()
+            .lock()
+            .expect("lock vec")
+            .push((path.to_path_buf(), handle)),
         Err(error) => panic!("the seam could not lock {path:?}: {error}"),
     }
 }
@@ -1215,7 +1322,11 @@ mod tests {
     /// handle, the same `share_mode(0x3)` trick the restore seam uses: the no-op
     /// must SUCCEED, leave the bytes and the directory alone (no temp, no `.bak`),
     /// while a real edit on that very same locked target must still be refused in
-    /// the rename. Removing the short-circuit turns the first assert red.
+    /// the rename. Removing the short-circuit turns the first assert red. The
+    /// refused rename doubles as FINDINGS-13 [11]'s residue case: it is the only
+    /// path where a temp can survive a write, so the directory is checked for
+    /// `*.sh.tmp` afterwards — deleting `commit_verified`'s cleanup line turns
+    /// exactly that assert red and nothing else.
     #[cfg(windows)]
     #[test]
     fn a_true_no_op_edit_never_reaches_the_disk() {
@@ -1246,6 +1357,7 @@ mod tests {
         let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
             .expect_err("a real edit on the locked target must still be refused");
         assert!(error.contains("cannot replace"), "{error}");
+        assert_no_temp_leftovers(&dir);
         drop(_lock);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1268,7 +1380,256 @@ mod tests {
             .expect("read back")
             .contains("cpu_offload"));
 
+        // FINDINGS-13 [11]: a completed write never leaves its temp behind. This is
+        // the success-path half; the refused-rename half (the only path on which a
+        // temp can actually survive) is pinned in
+        // `a_true_no_op_edit_never_reaches_the_disk`, which is also what already
+        // caught a direct `fs::write(path)` before this assert existed.
+        // Temp-name uniqueness is operator-ruled vacuous (ledger 13[11], single dir + gate).
+        assert_no_temp_leftovers(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The D4-fix residue property: the directory of a completed write holds no
+    /// `*.sh.tmp`, whatever else it holds.
+    fn assert_no_temp_leftovers(dir: &std::path::Path) {
+        let leftovers: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".sh.tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a completed write never leaves its temp behind: {leftovers:?}"
+        );
+    }
+
+    /// FINDINGS-13 [11] — the lost-update pin the gate had none of. Six writers
+    /// hammer ONE model file through `set_flags_on_file`, each owning a distinct
+    /// key with a fresh value per round, while the window probe holds every
+    /// critical section open between the read and the commit. Under
+    /// [`write_gate`] that is harmless — writers serialize, so each one re-reads
+    /// the file its predecessor renamed into place, and every key must be present
+    /// with its own last value. Take `acquire_write_gate()` out of
+    /// `set_flags_on_file` and two writers read the same pre-edit bytes, the slower
+    /// one renames its stale copy over the faster one's work, and keys vanish while
+    /// both callers returned `Ok`. That detection does not lean on the probe: with
+    /// its sleep removed the hammer still failed 5/5 on the measured host, the
+    /// flushing publish alone widens the window enough (FINDINGS-BATCH-2026-10-28C
+    /// [6]); the probe is insurance for hosts where the window is microseconds.
+    /// Falsifier direction: fails on that neuter (verified in the round report).
+    #[test]
+    fn six_writers_hammering_one_file_never_swallow_a_key() {
+        const WRITERS: usize = 6;
+        const ROUNDS: usize = 12;
+        let dir = crate::testutil::temp_dir("writeback-lost-update");
+        let path = seed(&dir, CLEAN);
+        let _window = WideWindow::arm(&path);
+
+        let threads: Vec<_> = (0..WRITERS)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let key = format!("k{index}");
+                    for round in 0..ROUNDS {
+                        let value = format!("v{index}-r{round}");
+                        set_flags_on_file(&path, &[(key.as_str(), Some(value.as_str()))])
+                            .unwrap_or_else(|error| panic!("a gated write never fails: {error}"));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("a writer thread never panics");
+        }
+        drop(_window);
+
+        let text = std::fs::read_to_string(&path).expect("the file is always present");
+        let (map, problems) = parse_flat_yaml(&text);
+        assert!(problems.is_empty(), "{problems:?}");
+        for index in 0..WRITERS {
+            let want = format!("v{index}-r{}", ROUNDS - 1);
+            assert_eq!(
+                map.get(&format!("k{index}")).map(String::as_str),
+                Some(want.as_str()),
+                "writer {index} lost its update to a concurrent rename:\n{text}"
+            );
+        }
+        assert_no_temp_leftovers(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS-13 [11] (mixed shape) — the two public entries must share the ONE
+    /// mutex. Six writers alternate `set_flag_on_file` (single-key) and
+    /// `set_flags_on_file` (batch) against the same file, each owning its own key,
+    /// window probe held open. `six_writers_hammering_one_file_never_swallow_a_key`
+    /// only drives the batch entry, so this is the pin that sees
+    /// [`set_flag_on_file`]'s gate: drop the gate from either entry and the other
+    /// entry's writer renames stale bytes over it and swallows keys. Falsifier
+    /// direction: fails when the gate is removed from `set_flag_on_file` (verified
+    /// in the round report).
+    ///
+    /// The alternation is offset per **thread** (`(round + index) % 2`), not plain
+    /// `round % 2`: with the plain form every thread's final write is the gated
+    /// batch call, so losing a key hinges on an unlucky schedule rather than on the
+    /// missing gate — measured 4/5 in-suite before the offset, **8/8 after**
+    /// (FINDINGS-BATCH-2026-10-28C [3]). Half the threads now end on the single-key
+    /// entry, which is the entry this pin alone guards.
+    #[test]
+    fn single_key_and_batch_entries_share_one_gate() {
+        const WRITERS: usize = 6;
+        const ROUNDS: usize = 12;
+        let dir = crate::testutil::temp_dir("writeback-mixed-entries");
+        let path = seed(&dir, CLEAN);
+        let _window = WideWindow::arm(&path);
+
+        let threads: Vec<_> = (0..WRITERS)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let key = format!("k{index}");
+                    for round in 0..ROUNDS {
+                        let value = format!("v{index}-r{round}");
+                        if (round + index) % 2 == 0 {
+                            set_flag_on_file(&path, &key, Some(&value))
+                                .unwrap_or_else(|error| panic!("single-key write: {error}"));
+                        } else {
+                            set_flags_on_file(&path, &[(key.as_str(), Some(value.as_str()))])
+                                .unwrap_or_else(|error| panic!("batch write: {error}"));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("a writer thread never panics");
+        }
+        drop(_window);
+
+        let text = std::fs::read_to_string(&path).expect("the file is always present");
+        let (map, problems) = parse_flat_yaml(&text);
+        assert!(problems.is_empty(), "{problems:?}");
+        for index in 0..WRITERS {
+            let want = format!("v{index}-r{}", ROUNDS - 1);
+            assert_eq!(
+                map.get(&format!("k{index}")).map(String::as_str),
+                Some(want.as_str()),
+                "the two public entries raced each other instead of sharing one gate:\n{text}"
+            );
+        }
+        assert_no_temp_leftovers(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Flush-before-publish — **a tripwire by inspection, NOT a behavioral
+    /// falsifier**, and it must never be described as one: power loss cannot be
+    /// simulated in a test suite, and content is proved by the read-back verifiers
+    /// ([`compare_read_back`], pinned by the incident-copy tests), not by this. What
+    /// this pin can hold is the *shape* the durability line is made of: every byte
+    /// this module publishes — the main temp in [`commit_verified`], the restore
+    /// temp in [`restore_original_bytes`], the forensic copy in [`forensic_copy`] —
+    /// goes through [`write_synced`], none of those three functions reaches the
+    /// cache-only `std::fs::write`, and [`write_synced`] itself still asks the volume
+    /// with `sync_all` after an open-create `write_all`. Deleting the flush or
+    /// routing a publish write back through `std::fs::write` turns this red; nothing
+    /// here claims the drive's own volatile write cache was defeated. The scan reads
+    /// the source through [`without_comments`], so a comment mentioning
+    /// `write_synced(` cannot stand in for the call and one mentioning
+    /// `std::fs::write(` cannot convict clean code
+    /// (FINDINGS-BATCH-2026-10-28C [5]). It inspects the three named bodies: a
+    /// publish write hoisted into a *fourth* function is a shape it cannot see,
+    /// while a rename of any named one fails it outright (`function_body` panics
+    /// when a signature disappears).
+    #[test]
+    fn the_publish_writes_all_go_through_write_synced_tripwire() {
+        let source = without_comments(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file!()),
+            )
+            .expect("the module can read its own source"),
+        );
+        for signature in [
+            "fn commit_verified(",
+            "fn restore_original_bytes(",
+            "fn forensic_copy(",
+        ] {
+            let body = function_body(&source, signature);
+            assert!(
+                body.contains("write_synced("),
+                "{signature} must publish through write_synced"
+            );
+            assert!(
+                !body.contains("std::fs::write("),
+                "{signature} must not create its file with the cache-only std::fs::write"
+            );
+        }
+        let primitive = function_body(&source, "fn write_synced(");
+        assert!(
+            primitive.contains("sync_all("),
+            "the volume submission is the entire point of the primitive"
+        );
+        assert!(
+            primitive.contains("create(true)") && primitive.contains("write_all("),
+            "open-create-write before the flush"
+        );
+    }
+
+    /// One top-level `fn`'s text, from `signature` to the next column-0 `}`.
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} vanished from this module"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\n}")
+            .unwrap_or_else(|| panic!("unterminated body for {signature}"))
+            + 2;
+        &rest[..end]
+    }
+
+    /// `source` with every `//` comment (including `///` doc lines) dropped, so the
+    /// tripwire above matches **code** rather than prose: text in a comment must not
+    /// be able to satisfy `contains("write_synced(")` nor to trip
+    /// `contains("std::fs::write(")` (FINDINGS-BATCH-2026-10-28C [5]). Only `"`
+    /// strings are tracked, with their escapes, so a `//` inside a string literal
+    /// survives; char literals are passed through untouched because no two-slash
+    /// sequence can live inside a one-character literal and lifetime names (`'a`,
+    /// `'static`) must not be mistaken for the start of one. Line structure is kept
+    /// (the newline that ends a comment is not eaten), so `function_body`'s
+    /// column-0 `}` cut is unaffected. A future `'"'` literal would desync the
+    /// tracker — and the tripwire would then fail loudly with "vanished from this
+    /// module", never quietly green.
+    fn without_comments(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        let mut chars = source.chars().peekable();
+        let mut in_string = false;
+        let mut escaped = false;
+        while let Some(c) = chars.next() {
+            if in_string {
+                out.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if c == '"' {
+                in_string = true;
+                out.push(c);
+            } else if c == '/' && chars.peek() == Some(&'/') {
+                chars
+                    .by_ref()
+                    .take_while(|next| *next != '\n')
+                    .for_each(drop);
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]
@@ -1327,13 +1688,7 @@ mod tests {
             CLEAN,
             "the original came back"
         );
-        let leftovers: Vec<String> = std::fs::read_dir(&dir)
-            .expect("read dir")
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".sh.tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "no temp survived: {leftovers:?}");
+        assert_no_temp_leftovers(&dir);
         let catalog = crate::model::scan::scan_dir(&dir);
         assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
         assert_eq!(catalog.models[0].name, "qwen3");
@@ -1447,7 +1802,8 @@ mod tests {
             target.contains("cpu_offload: true"),
             "restore failed => the rejected edit is what remains on disk: {target}"
         );
-        release_post_write_locks();
+        assert_no_temp_leftovers(&dir);
+        release_post_write_locks(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1520,7 +1876,8 @@ mod tests {
             target.contains("cpu_offload: true"),
             "restore failed => the rejected edit is what remains on disk: {target}"
         );
-        release_post_write_locks();
+        assert_no_temp_leftovers(&dir);
+        release_post_write_locks(&path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1558,6 +1915,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("qwen3.yaml.bak")).expect("incident copy"),
             CLEAN
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS-BATCH-2026-10-28C [4]: the delete-blocking handles are released
+    /// **per path**. With the store cleared wholesale, one seam test dropped the
+    /// handle another seam test was still wedging, its restore silently succeeded,
+    /// and it false-failed on its message assert while the product was fine. So:
+    /// releasing `first` must leave `second` wedged, and `second` frees only on its
+    /// own release. Falsifier: put `clear()` back into `release_post_write_locks`
+    /// and the `is_err()` assert below is the one that goes red.
+    #[cfg(windows)]
+    #[test]
+    fn releasing_one_targets_lock_leaves_another_targets_lock_held() {
+        let dir = crate::testutil::temp_dir("writeback-lock-scope");
+        let first = seed(&dir, CLEAN);
+        let second = dir.join("second.yaml");
+        std::fs::write(&second, CLEAN).expect("seed second");
+        lock_without_delete_share(&first);
+        lock_without_delete_share(&second);
+        release_post_write_locks(&first);
+        assert!(
+            std::fs::remove_file(&first).is_ok(),
+            "releasing a target's own handle frees it"
+        );
+        assert!(
+            std::fs::remove_file(&second).is_err(),
+            "another test's target stays wedged until its own release"
+        );
+        release_post_write_locks(&second);
+        assert!(
+            std::fs::remove_file(&second).is_ok(),
+            "and frees once its own test releases it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
