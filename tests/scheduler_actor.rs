@@ -14,7 +14,8 @@ use simplehar_se::engine::ninfer::NinferAdapter;
 use simplehar_se::engine::strata::StrataAdapter;
 use simplehar_se::engine::EngineAdapter;
 use simplehar_se::scheduler::{
-    JobId, JobKind, Reply, Scheduler, SchedulerError, SchedulerHandle, SchedulerStatus, SwapState,
+    booking_gibs, JobId, JobKind, Reply, Scheduler, SchedulerError, SchedulerHandle,
+    SchedulerStatus, SwapState,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1786,4 +1787,184 @@ async fn a_parked_load_has_a_queued_ledger_row_before_it_starts() {
         "the row records why the queued load was dropped: {parked:?}"
     );
     assert!(!parked.is_fault, "{parked:?}");
+}
+
+// --- the release-timeout arm: `Dispose` + `Released(Err)` (FINDINGS-19 [2]) ----------
+
+#[tokio::test]
+async fn a_swap_whose_victim_never_proves_its_release_times_out_and_keeps_the_occupant() {
+    // G12's answer to "an engine refused to die", reached the only way the product can
+    // reach it: a swap whose victim's terminate never lands and nobody cancels it. The
+    // four b6b33d1 tests all cancel first, so they only ever enter
+    // `(CancelRequested, Released(Err))`; this arm — the one that must NOT claim the
+    // engine dead, must name the holder, and must leave the slot loaded — had no test.
+    let cfg = AppConfig {
+        // The smallest deadline the validator accepts (a zero one fails its own release).
+        release_timeout_s: 1,
+        ..config(10)
+    };
+    let (handle, runtime) = hold_kill_harness(cfg);
+    let victim = serve_hold_model(&handle).await;
+    // Hold exactly the victim's kill: the release stays unprovable as a *state*, not as
+    // a race against the deadline.
+    runtime.hold_next_kills(1);
+
+    let client = handle.clone();
+    let swapping = tokio::spawn(async move { client.swap(INCOMING_MODEL, CategoryId::Work).await });
+    wait_until(&handle, 10, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.model == INCOMING_MODEL && j.state == SwapState::Dispose)
+    })
+    .await;
+    assert_eq!(
+        runtime.spawn_count(),
+        1,
+        "the gate is release confirmation, not a delay: no spawn may fire before it (F-6)"
+    );
+
+    let reply = tokio::time::timeout(Duration::from_secs(30), swapping)
+        .await
+        .expect("the release deadline must answer the waiter, never leave it hanging")
+        .expect("the swap task must not panic");
+    let error = match reply {
+        Ok(other) => panic!("an unprovable release must refuse the swap, got {other:?}"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, SchedulerError::ReleaseTimeout { holder } if holder == HOLD_MODEL),
+        "the refusal is the typed release timeout naming the holder: {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!("release timeout: {HOLD_MODEL} still holds the slot"),
+        "the operator-facing text of the G12 timeout"
+    );
+
+    let status = handle.status().await.expect("actor alive");
+    let job = status
+        .jobs
+        .iter()
+        .find(|j| j.model == INCOMING_MODEL)
+        .expect("the refused swap is in the ledger");
+    assert!(job.terminal, "{job:?}");
+    assert_eq!(
+        job.kind,
+        JobKind::Load,
+        "a refused load is a fault row, not a silent unload: {job:?}"
+    );
+    assert_eq!(
+        job.state,
+        SwapState::Idle,
+        "the exit funnel walks Failed -> Reap -> Idle: {job:?}"
+    );
+    assert_eq!(
+        job.outcome.as_deref(),
+        Some("kill failed for hold-a: release not confirmed within release_timeout_s"),
+        "the row carries the reaper's own reason for giving up: {job:?}"
+    );
+    assert!(
+        job.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("release timeout: hold-a still holds the slot"),
+        "{job:?}"
+    );
+    assert!(
+        job.timings.release_ms.is_none(),
+        "the release stage never completed: {:?}",
+        job.timings
+    );
+    assert!(
+        job.is_fault,
+        "an engine that refused to die is a fault: {job:?}"
+    );
+
+    // The b6b33d1 rule: an unconfirmed release may not claim a death.
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![Some(HOLD_MODEL.to_string())],
+        "the victim keeps its occupant"
+    );
+    let kept = status
+        .slots
+        .iter()
+        .find(|s| s.category == CategoryId::Work)
+        .expect("WORK slot");
+    assert_eq!(
+        kept.need_gib,
+        Some(4.0),
+        "and it is still debited for what it really holds (the 19[1] ledger half)"
+    );
+    let debited: f64 = status.slots.iter().filter_map(|s| s.need_gib).sum();
+    assert_eq!(
+        debited, 4.0,
+        "one real occupant is debited exactly once: {:?}",
+        status.slots
+    );
+    assert_eq!(
+        booking_gibs(&status.jobs),
+        0.0,
+        "the terminal refused load must not book its own 4.0 GiB on top"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "the engine nobody proved dead is still live"
+    );
+    assert!(
+        !runtime.is_dead(victim.port).await,
+        "and it still answers its port"
+    );
+    assert_eq!(
+        runtime.spawn_count(),
+        1,
+        "the refused swap never spawned its replacement"
+    );
+
+    // Recovery: the held terminate, once freed, must complete the reap the timeout
+    // abandoned — no stranded engine, no slot that reads loaded with nothing behind it.
+    runtime.release_held_kills();
+    assert!(
+        matches!(
+            handle
+                .unload(CategoryId::Work)
+                .await
+                .expect("unload accepted"),
+            Reply::Done
+        ),
+        "the slot the timeout kept is unloadable"
+    );
+    wait_until(&handle, 10, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let unload = status
+        .jobs
+        .iter()
+        .find(|j| j.kind == JobKind::Unload && j.model == HOLD_MODEL)
+        .expect("the follow-up unload ran and is on the ledger");
+    assert_eq!(unload.outcome.as_deref(), Some("unloaded"), "{unload:?}");
+    assert!(
+        unload.timings.release_ms.is_some(),
+        "this time the release was proven: {:?}",
+        unload.timings
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "freeing the held kill must leave no stranded engine"
+    );
+    assert!(
+        runtime.is_dead(victim.port).await,
+        "and no engine answering on the freed slot's port"
+    );
+    assert_eq!(
+        booking_gibs(&status.jobs),
+        0.0,
+        "and no debit left for a slot that is now empty"
+    );
+    assert_eq!(runtime.spawn_count(), 1, "recovery spawns nothing either");
 }

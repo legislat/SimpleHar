@@ -90,23 +90,51 @@ fn write_modelconf(specs: &[Spec]) -> PathBuf {
 }
 
 fn harness(aux_slots: usize, specs: &[Spec], witness: Arc<dyn VramWitness>) -> SchedulerHandle {
+    harness_rt(aux_slots, specs, witness, 5).0
+}
+
+/// `harness` with the settle deadline under test control, returning the runtime so a
+/// test can count what was really killed: every spawn and abort happens behind the
+/// scheduler's `Arc`, and `MockRuntime` shares that state by `Arc` on clone.
+///
+/// # Arguments
+///
+/// * `aux_slots` - `max_models` for AUX (the categories that expand).
+/// * `specs` - Model yamls to write (name, engine, category, per-model VRAM).
+/// * `witness` - The scripted card.
+/// * `settle_timeout_s` - How long a released load may wait for the card to report the
+///   bytes back. A test that stages the card by hand needs it generous: the refusal,
+///   not the deadline, is what a wrong answer must produce.
+///
+/// # Returns
+///
+/// The scheduler handle plus the runtime it drives.
+fn harness_rt(
+    aux_slots: usize,
+    specs: &[Spec],
+    witness: Arc<dyn VramWitness>,
+    settle_timeout_s: u64,
+) -> (SchedulerHandle, MockRuntime) {
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+    // `mock-hold-kill` is the engine id whose kill parks; a release-loop test needs it.
+    adapters.insert("mock-hold-kill".to_string(), Arc::new(MockAdapter));
     let mut cfg = AppConfig {
-        settle_timeout_s: 5,
+        settle_timeout_s,
         ..AppConfig::default()
     };
     cfg.category_mut(CategoryId::Aux)
         .expect("default config has AUX")
         .max_models = aux_slots;
-    Scheduler::start(
+    let handle = Scheduler::start(
         cfg,
         write_modelconf(specs),
         adapters,
-        Arc::new(runtime) as Arc<dyn EngineRuntime>,
+        Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
         witness,
-    )
+    );
+    (handle, runtime)
 }
 
 /// Polls status until `cond` holds (used by suites sharing this harness shape;
@@ -140,6 +168,29 @@ fn model_of(
         .iter()
         .find(|slot| slot.category == category)
         .and_then(|slot| slot.model.clone())
+}
+
+/// The newest ledger row of `model`'s job.
+fn job_row<'a>(
+    status: &'a simplehar_se::scheduler::SchedulerStatus,
+    model: &str,
+) -> &'a simplehar_se::scheduler::JobStatus {
+    status
+        .jobs
+        .iter()
+        .rev()
+        .find(|job| job.model == model)
+        .unwrap_or_else(|| panic!("`{model}` must be in the job ledger: {:?}", status.jobs))
+}
+
+/// Every AUX occupant currently installed.
+fn aux_models(status: &simplehar_se::scheduler::SchedulerStatus) -> Vec<Option<String>> {
+    status
+        .slots
+        .iter()
+        .filter(|slot| slot.category == CategoryId::Aux)
+        .map(|slot| slot.model.clone())
+        .collect()
 }
 
 #[tokio::test]
@@ -247,19 +298,14 @@ async fn eviction_picks_the_cheapest_sufficient_victim() {
     };
 
     let status = handle.status().await.expect("actor alive");
-    let aux_models: Vec<Option<String>> = status
-        .slots
-        .iter()
-        .filter(|slot| slot.category == CategoryId::Aux)
-        .map(|slot| slot.model.clone())
-        .collect();
+    let aux = aux_models(&status);
     assert!(
-        aux_models.contains(&Some("aux12".to_string())),
-        "the cheaper insufficient victim must survive: {aux_models:?}"
+        aux.contains(&Some("aux12".to_string())),
+        "the cheaper insufficient victim must survive: {aux:?}"
     );
     assert!(
-        !aux_models.contains(&Some("aux20".to_string())),
-        "the sufficient victim was evicted: {aux_models:?}"
+        !aux.contains(&Some("aux20".to_string())),
+        "the sufficient victim was evicted: {aux:?}"
     );
     let swap_job = status
         .jobs
@@ -424,20 +470,9 @@ async fn aux_load_cannot_evict_anything_cross_category() {
         "the refusal must name the budget and the observed reading: {message}"
     );
     let status = handle.status().await.expect("actor alive");
-    let aux_models: Vec<Option<String>> = status
-        .slots
-        .iter()
-        .filter(|slot| slot.category == CategoryId::Aux)
-        .map(|slot| slot.model.clone())
-        .collect();
-    assert!(
-        aux_models.contains(&Some("aux30".to_string())),
-        "{aux_models:?}"
-    );
-    assert!(
-        aux_models.contains(&Some("aux20".to_string())),
-        "{aux_models:?}"
-    );
+    let aux = aux_models(&status);
+    assert!(aux.contains(&Some("aux30".to_string())), "{aux:?}");
+    assert!(aux.contains(&Some("aux20".to_string())), "{aux:?}");
 }
 
 /// ModelConf writer with raw extra lines per model (cost/floor keys).
@@ -643,4 +678,222 @@ async fn fresh_load_refused_on_physically_full_card() {
         model_of(&status, CategoryId::Work).as_deref(),
         Some("resident")
     );
+}
+
+#[tokio::test]
+async fn a_load_two_victims_short_releases_both_least_disposable_first() {
+    // FINDINGS-20 [3]: every planned-victim assertion in the repo was a single element,
+    // so the one-at-a-time release loop, its ordering comparator (least-disposable
+    // first) and `released_cost` across releases ran entirely untested. Neither victim
+    // here covers the deficit alone (12 + 20 against a 24 GiB short), so the load can
+    // only be admitted on the SUM of both credits; the card is scripted to stay busy
+    // with the unreleased victim's bytes until that victim's own release is proven, so
+    // a loop that stops early on an over-credited figure is refused at settle instead
+    // of quietly passing.
+    let witness = FakeWitness::with(vec![sample(72.0, 32.0)]);
+    let (handle, runtime) = harness_rt(
+        1,
+        &[
+            // The first victim's kill parks (`hold_next_kills` below).
+            ("aux12", "mock-hold-kill", CategoryId::Aux, 12.0),
+            ("rp20", "mock", CategoryId::Rp, 20.0),
+            ("work62", "mock", CategoryId::Work, 62.0),
+        ],
+        Arc::new(witness.clone()),
+        15,
+    );
+    handle
+        .swap("aux12", CategoryId::Aux)
+        .await
+        .expect("aux12 loads");
+    handle
+        .swap("rp20", CategoryId::Rp)
+        .await
+        .expect("rp20 loads");
+    // Park the FIRST kill only: "one victim released, the second still loaded" becomes a
+    // state the test holds rather than a window it races at 25 ms per peek.
+    runtime.hold_next_kills(1);
+
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work62", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work62" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    assert!(
+        job_row(&status, "work62").victims_released.is_empty(),
+        "nothing is proven released while the first kill is still in flight: {:?}",
+        job_row(&status, "work62").victims_released
+    );
+    assert_eq!(
+        runtime.server_count(),
+        2,
+        "the loop releases one victim at a time and waits for its evidence"
+    );
+    assert_eq!(
+        runtime.spawn_count(),
+        2,
+        "and spawns nothing before the gate is met"
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Rp).as_deref(),
+        Some("rp20"),
+        "the second victim is untouched"
+    );
+    // How the card will read once that parked terminate lands: aux12's 12 GiB back,
+    // rp20 still holding its 20.
+    witness.set_used(20.0);
+    runtime.release_held_kills();
+
+    wait_until(&handle, 15, |status| {
+        job_row(status, "work62").victims_released == vec!["aux12".to_string(), "rp20".to_string()]
+    })
+    .await;
+    // Only now, with BOTH credits landed, does the card have room for this load.
+    witness.set_used(0.0);
+    let Reply::Loaded(receipt) = loading
+        .await
+        .expect("task alive")
+        .expect("work62 loads only after both releases")
+    else {
+        panic!("expected Loaded");
+    };
+    assert_eq!(receipt.model, "work62");
+
+    let status = handle.status().await.expect("actor alive");
+    let job = job_row(&status, "work62");
+    assert_eq!(
+        job.victims_released,
+        vec!["aux12".to_string(), "rp20".to_string()],
+        "the release ORDER is least-disposable first: AUX (WORK and RP may evict it) \
+         before RP (WORK only)"
+    );
+    assert_eq!(job.gate_target_gib, Some(62.0));
+    assert_eq!(
+        model_of(&status, CategoryId::Work).as_deref(),
+        Some("work62"),
+        "the single load admits on the summed credit"
+    );
+    assert!(
+        !aux_models(&status).contains(&Some("aux12".to_string())),
+        "both victims are gone: {:?}",
+        aux_models(&status)
+    );
+    assert_eq!(model_of(&status, CategoryId::Rp), None);
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "only the admitted load's engine is live"
+    );
+}
+
+#[tokio::test]
+async fn the_release_loop_stops_as_soon_as_the_credits_already_cover_the_gate() {
+    // FINDINGS-20 [3], the early-stop branch (`release sufficient; skipping remaining
+    // victims`, src/scheduler/mod.rs): this load queues three release targets — the
+    // same-slot holder and BOTH AUX victims (15 + 15 against a 16 GiB deficit, so the
+    // planner cannot settle for one) — and the first two credits are what carry the
+    // gate from 40 to 57 GiB against a 56 GiB need. Drop any part of the accumulation
+    // and the third victim is killed as well, which is exactly the harm the branch
+    // exists to prevent (an operator's model dies for nothing).
+    let witness = FakeWitness::with(vec![sample(72.0, 32.0)]);
+    let (handle, runtime) = harness_rt(
+        2,
+        &[
+            ("holder", "mock", CategoryId::Work, 2.0),
+            ("aux_a", "mock", CategoryId::Aux, 15.0),
+            ("aux_b", "mock", CategoryId::Aux, 15.0),
+            ("work56", "mock", CategoryId::Work, 56.0),
+        ],
+        Arc::new(witness.clone()),
+        15,
+    );
+    handle
+        .swap("holder", CategoryId::Work)
+        .await
+        .expect("holder loads");
+    let Reply::Loaded(aux_a) = handle
+        .swap("aux_a", CategoryId::Aux)
+        .await
+        .expect("aux_a loads")
+    else {
+        panic!("expected Loaded");
+    };
+    let Reply::Loaded(aux_b) = handle
+        .swap("aux_b", CategoryId::Aux)
+        .await
+        .expect("aux_b loads")
+    else {
+        panic!("expected Loaded");
+    };
+
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work56", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work56" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    // Admit already happened (it precedes `Dispose`), so this only moves the card for
+    // the settle gate: the holder's 2 GiB and the first victim's 15 have come back, and
+    // the untouched second victim still holds its 15.
+    witness.set_used(15.0);
+    let Reply::Loaded(receipt) = loading
+        .await
+        .expect("task alive")
+        .expect("work56 admits on the first victim's credit alone")
+    else {
+        panic!("expected Loaded");
+    };
+    assert_eq!(receipt.model, "work56");
+
+    let status = handle.status().await.expect("actor alive");
+    let job = job_row(&status, "work56");
+    assert_eq!(
+        job.victims_released,
+        vec!["aux_a".to_string()],
+        "the loop must stop before the third target: the victim nobody needed stays loaded"
+    );
+    assert_eq!(
+        job.free_at_admit_gib,
+        Some(40.0),
+        "the figure the accumulated credits were compared against"
+    );
+    assert_eq!(job.gate_target_gib, Some(56.0));
+    assert_eq!(
+        model_of(&status, CategoryId::Work).as_deref(),
+        Some("work56"),
+        "the same-slot replacement landed"
+    );
+    let aux = aux_models(&status);
+    assert!(
+        !aux.contains(&Some("aux_a".to_string())),
+        "the planned victim was released: {aux:?}"
+    );
+    assert!(
+        aux.contains(&Some("aux_b".to_string())),
+        "the skipped victim survived: {aux:?}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        2,
+        "the kill count is the proof: work56 plus the spared aux_b"
+    );
+    assert!(
+        runtime.is_dead(aux_a.port).await,
+        "the released victim's port refuses"
+    );
+    assert!(
+        !runtime.is_dead(aux_b.port).await,
+        "the skipped victim still answers"
+    );
+    assert_eq!(runtime.spawn_count(), 4, "holder, aux_a, aux_b, work56");
 }
