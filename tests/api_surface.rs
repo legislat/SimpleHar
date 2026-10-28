@@ -20,6 +20,14 @@ use tower::ServiceExt;
 
 type Spec = (&'static str, &'static str, CategoryId, Option<f64>);
 
+/// The per-test stand-in for the boot config file (FINDINGS-18 [2]): `app()` points
+/// every `AppConfig` at `<modelconf dir>/simplehar-se.json` so the persisting
+/// endpoints (`/har/config/default`, the retag default-clear) write INSIDE the test's
+/// own temp dir. Before this they fell through to `default_config_path()` — the exe
+/// dir — so `cargo test` wrote a file the product reads at boot, outside any sandbox,
+/// and no test could read back what the endpoint had written.
+const TEST_CONFIG_NAME: &str = "simplehar-se.json";
+
 fn write_modelconf(specs: &[Spec]) -> std::path::PathBuf {
     let dir = simplehar_se::testutil::temp_dir("api-modelconf");
     for (name, engine, category, vram_gb) in specs {
@@ -40,9 +48,13 @@ category: {category}
     dir
 }
 
-fn app(
-    config: AppConfig,
+/// [`app`] with extra engine adapters (ids `mock-a`/`mock-b` carrying distinct
+/// `/v1/models` ids, `mock-nodiscovery`, …).
+#[allow(clippy::type_complexity)]
+fn build_app(
+    mut config: AppConfig,
     specs: &[Spec],
+    extra_adapters: &[(&str, std::sync::Arc<dyn EngineAdapter>)],
 ) -> (
     Router,
     Router,
@@ -59,7 +71,16 @@ fn app(
     adapters.insert("mock-slow".to_string(), Arc::new(MockAdapter));
     adapters.insert("mock-dies-once".to_string(), Arc::new(MockAdapter));
     adapters.insert("mock-dies".to_string(), Arc::new(MockAdapter));
+    adapters.insert("mock-nodiscovery".to_string(), Arc::new(MockAdapter));
+    for (id, adapter) in extra_adapters {
+        adapters.insert((*id).to_string(), Arc::clone(adapter));
+    }
     let dir = write_modelconf(specs);
+    // A hand-stamped `source_path` (the custom-path persist test) is respected;
+    // everything else is sandboxed to this test's temp dir (FINDINGS-18 [2]).
+    if config.source_path.is_none() {
+        config.source_path = Some(dir.join(TEST_CONFIG_NAME));
+    }
     let scheduler = Scheduler::start(
         config.clone(),
         dir.clone(),
@@ -79,6 +100,20 @@ fn app(
     let rp = category_router(Arc::clone(&state), CategoryId::Rp);
     let aux = category_router(state, CategoryId::Aux);
     (control, work, rp, aux, runtime, dir)
+}
+
+fn app(
+    config: AppConfig,
+    specs: &[Spec],
+) -> (
+    Router,
+    Router,
+    Router,
+    Router,
+    MockRuntime,
+    std::path::PathBuf,
+) {
+    build_app(config, specs, &[])
 }
 
 async fn post_json(app: &Router, path: &str, body: &str) -> (StatusCode, Value) {
@@ -309,11 +344,12 @@ async fn load_unknown_model_is_typed_not_found() {
 
 #[tokio::test]
 async fn unload_bodies_are_strict() {
-    let (control, _, _, _, _, _modelconf) = app(
+    let (control, _, _, _, runtime, _modelconf) = app(
         AppConfig::default(),
         &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
     );
     post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(runtime.server_count(), 1, "one engine is loaded");
 
     // No category/model but a NON-EMPTY body: 400 (the object is unrecognized).
     let (status, _) = post_json(&control, "/har/unload", r#"{"unknown":1}"#).await;
@@ -324,14 +360,51 @@ async fn unload_bodies_are_strict() {
     // Model unload of a not-loaded model: accepted (Done), idempotent (T12.2).
     let (status, _) = post_json(&control, "/har/unload", r#"{"model":"never-loaded"}"#).await;
     assert_eq!(status, StatusCode::OK);
-    // Explicit empty object: unload-all (T12.4) - accepted.
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "an idempotent model unload of a never-loaded model frees nothing"
+    );
+    // Explicit empty object: unload-all (T12.4) — accepted AND it really releases
+    // every engine (FINDINGS-18 [5]: the response used to be bound and discarded;
+    // a handler that answered 200 while unloading nothing passed).
     let (status, _) = post_json(&control, "/har/unload", "{}").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        await_server_count(&runtime, 0).await,
+        0,
+        "the empty-object scope actually unloads"
+    );
+
+    // Reload, then the scoped form: `{category: WORK}` must free ITS engine, not
+    // merely answer 200. `await_server_count` polls because the reply arrives at job
+    // START, not when the kill lands (see the helper's note).
+    let (status, _) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "the engine is back for the scoped test"
+    );
     // Valid: accepted and actually unloads.
     let (status, body) = post_json(&control, "/har/unload", r#"{"category":"WORK"}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    let status = get_json(&control, "/har/status").await;
-    let _ = status;
+    assert_eq!(
+        await_server_count(&runtime, 0).await,
+        0,
+        "the category unload frees its engine"
+    );
+    let (_, status) = get_json(&control, "/har/status").await;
+    let work_slot = status["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .find(|slot| slot["category"] == "WORK")
+        .expect("WORK slot");
+    assert!(
+        work_slot["model"].is_null(),
+        "and the slot reads empty afterwards: {status}"
+    );
 }
 
 #[tokio::test]
@@ -404,6 +477,133 @@ async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
     // Alias resolved to the harness name, then rewritten to the engine's
     // self-reported id (F-4: the mock reports `mock-model`).
     assert_eq!(body["body"]["model"], "mock-model");
+
+    // FINDINGS-18 [4]: the "streams" half used to assert nothing. The proxy
+    // contract (src/api/mod.rs `proxy`: upstream headers copied + the body handed
+    // through `Body::from_stream`) is byte-for-byte pass-through — a regression
+    // that buffered and re-serialised the JSON, or dropped the upstream
+    // `content-type`, passed the assertions above. The mock answers a
+    // `"stream": true` request with a fixed SSE literal; this asks for exactly
+    // that literal and demands the content-type and the bytes come back
+    // untouched.
+    let response = work
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"QWEN3","stream":true}"#))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "the upstream content-type must survive the pass-through, got: {content_type}"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    assert_eq!(
+        bytes.as_ref(),
+        mock_runtime::SSE_BODY.as_bytes(),
+        "the streamed body must arrive byte-for-byte, not re-serialised"
+    );
+}
+
+#[tokio::test]
+async fn proxy_rewrites_each_occupant_to_its_own_engine_id() {
+    // FINDINGS-20 [6]: every mock engine used to report the one constant `mock-model`
+    // at `/v1/models`, so every serve_id assertion in the suite compared the same
+    // string and a product bug that forwarded slot A's id for slot B's request — the
+    // crash-retry staleness class fixed in b540c30 — was invisible. These two engines
+    // report DISTINCT ids; each request must be rewritten to ITS OWN engine's id.
+    let adapters: Vec<(&str, Arc<dyn EngineAdapter>)> = vec![
+        (
+            "mock-id-a",
+            Arc::new(mock_runtime::MockIdAdapter {
+                engine: "mock-id-a",
+                serve_id: "engine-alpha",
+            }),
+        ),
+        (
+            "mock-id-b",
+            Arc::new(mock_runtime::MockIdAdapter {
+                engine: "mock-id-b",
+                serve_id: "engine-beta",
+            }),
+        ),
+    ];
+    let mut config = AppConfig::default();
+    config
+        .category_mut(CategoryId::Aux)
+        .expect("default config has AUX")
+        .max_models = 2;
+    let (control, _, _, aux, runtime, _modelconf) = build_app(
+        config,
+        &[
+            ("alpha", "mock-id-a", CategoryId::Aux, Some(3.0)),
+            ("beta", "mock-id-b", CategoryId::Aux, Some(3.0)),
+        ],
+        &adapters,
+    );
+    for name in ["alpha", "beta"] {
+        let body = format!(r#"{{"model":"{name}"}}"#);
+        let (status, reply) = post_json(&control, "/har/load", &body).await;
+        assert_eq!(status, StatusCode::OK, "load {name}: {reply}");
+    }
+    assert_eq!(runtime.server_count(), 2, "both occupants serve");
+
+    for (model, expect_id) in [("alpha", "engine-alpha"), ("beta", "engine-beta")] {
+        let body = format!(r#"{{"model":"{model}","messages":[]}}"#);
+        let (status, reply) = post_json(&aux, "/v1/chat/completions", &body).await;
+        assert_eq!(status, StatusCode::OK, "proxy {model}: {reply}");
+        assert_eq!(
+            reply["body"]["model"].as_str(),
+            Some(expect_id),
+            "{model}'s request must carry {model}'s OWN engine id — a cross-slot \
+             serve_id mix-up is exactly what one shared mock id hid: {reply}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_silent_engine_falls_back_to_the_harness_name_on_the_wire() {
+    // FINDINGS-20 [6], the `serve_id == None` half: when an engine answers nothing at
+    // `/v1/models`, discovery yields `None` and the proxy forwards the HARNESS NAME
+    // (documented `serve_id.unwrap_or_else` fallback at src/api/mod.rs) — previously
+    // untestable because no mock mode could make discovery fail. The mock
+    // `mock-nodiscovery` 404s `/v1/models`; the rewritten `model` field must be the
+    // harness name the operator gave, never an invented engine id.
+    let (control, work, _, _, _runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("quiet", "mock-nodiscovery", CategoryId::Work, Some(4.0))],
+    );
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"quiet"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a silent engine still loads: {body}"
+    );
+
+    let (status, reply) = post_json(
+        &work,
+        "/v1/chat/completions",
+        r#"{"model":"quiet","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "proxy: {reply}");
+    assert_eq!(
+        reply["body"]["model"].as_str(),
+        Some("quiet"),
+        "no discovered id means the documented harness-name fallback on the wire: {reply}"
+    );
 }
 
 #[tokio::test]
@@ -1010,6 +1210,15 @@ async fn ambiguous_app() -> (
         &[("filler", "mock", CategoryId::Work, Some(4.0))],
     );
     seed_alias_twins(&routers.5);
+    // FINDINGS-18 [2]: the twins fixture gets a REAL config file on disk (the `app()`
+    // sandbox path), so the "…and not_persisted" test can assert the claim its name
+    // makes — the refused 409 left the operator's config bytes untouched — instead of
+    // only reading the in-memory `/har/status` categories.
+    std::fs::write(
+        routers.5.join(TEST_CONFIG_NAME),
+        r#"{"seeded": "pre-existing operator bytes"}"#,
+    )
+    .expect("seed config file");
     let (status, _) = post_json(&routers.0, "/har/rescan", "{}").await;
     assert_eq!(status, StatusCode::OK, "both twins must be in the catalog");
     routers
@@ -1167,8 +1376,16 @@ async fn colliding_gguf_file_names_are_409_on_the_alias_tier() {
 #[tokio::test]
 async fn setting_the_default_model_on_an_ambiguous_alias_is_refused_and_not_persisted() {
     // The write-back half of the finding: `/har/config/default` persists the name it
-    // validated, so an ambiguity must stop before `persist_default_model`.
-    let (control, _, _, _, _, _) = ambiguous_app().await;
+    // validated, so an ambiguity must stop BEFORE `persist_default_model`.
+    // FINDINGS-18 [2]: the name promised a file-level claim the body never checked —
+    // it read only the in-memory `/har/status` categories, and a regression that
+    // answered 409 *and still rewrote the config file* passed. The fixture now owns a
+    // seeded config file in the test's temp dir; the refusal must leave its bytes
+    // untouched.
+    let (control, _, _, _, _, dir) = ambiguous_app().await;
+    let config_path = dir.join(TEST_CONFIG_NAME);
+    let before = std::fs::read_to_string(&config_path).expect("seeded config exists");
+
     let (status, body) = post_json(
         &control,
         "/har/config/default",
@@ -1191,6 +1408,13 @@ async fn setting_the_default_model_on_an_ambiguous_alias_is_refused_and_not_pers
     assert!(
         work_cat["default_model"].is_null(),
         "an ambiguous alias never becomes a category default: {status_body}"
+    );
+    // The file half of the claim (the pre-fix hole: an in-memory-only refusal test
+    // passed while the endpoint rewrote the operator's config).
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("config file must still exist"),
+        before,
+        "a refused (409) default-set must leave the config file byte-identical"
     );
 }
 
@@ -1410,6 +1634,7 @@ async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
     // client the state may change so retrying is reasonable, and a security refusal
     // must not say that (T13 is what caught it, 2026-10-27).
     let response = control
+        .clone()
         .oneshot(
             Request::post("/har/unload")
                 .header("host", "127.0.0.1:8708")
@@ -1430,6 +1655,30 @@ async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
     assert_eq!(
         body["error"]["code"], "forbidden",
         "the OpenAI envelope carries the same code"
+    );
+
+    // FINDINGS-18 [3]: the same-authority arm. Browsers send `Origin` on SAME-origin
+    // non-GET requests too, so a guard that refused every Origin-bearing POST — e.g.
+    // comparing Origin against a portless Host — 403s every button on the control
+    // page (unload, load, rescan, default picker) while every refusal-direction test
+    // stays green. This is the only test anywhere that POSTs with a MATCHING Origin:
+    // a valid unload-all (`{}`, nothing loaded) with Origin == Host must be ACCEPTED,
+    // pinned to the exact code rather than `!= FORBIDDEN`.
+    let same_origin = control
+        .oneshot(
+            Request::post("/har/unload")
+                .header("host", "127.0.0.1:8708")
+                .header("origin", "http://127.0.0.1:8708")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(
+        same_origin.status(),
+        StatusCode::OK,
+        "a same-authority Origin must pass the CSRF guard, not 403 the operator's page"
     );
 }
 

@@ -469,10 +469,148 @@ async fn aux_load_cannot_evict_anything_cross_category() {
         message.contains("budget 20.0 GiB") && message.contains("observed free 22.0 GiB"),
         "the refusal must name the budget and the observed reading: {message}"
     );
+    // FINDINGS-20 [11]: the non-empty-evictor-list blocker arm. The two AUX
+    // occupants ARE evictable — just not by AUX (`evictable_by = [WORK, RP]`), so
+    // the operator's only guidance on who could free the memory is this sentence.
+    // A regression to the `nothing may evict AUX` wording (or to printing no
+    // blocker at all) fails here; the `nothing may evict` arm is pinned by
+    // `rp_load_cannot_evict_work_and_refuses_with_blockers`.
+    assert!(
+        message.contains("only WORK and RP can evict AUX"),
+        "the refusal must name who COULD evict the blockers: {message}"
+    );
     let status = handle.status().await.expect("actor alive");
     let aux = aux_models(&status);
     assert!(aux.contains(&Some("aux30".to_string())), "{aux:?}");
     assert!(aux.contains(&Some("aux20".to_string())), "{aux:?}");
+}
+
+#[tokio::test]
+async fn an_aux_load_refused_by_an_emb_occupant_names_who_may_evict_emb() {
+    // FINDINGS-20 [11], second half: EMB appeared in no eviction test at all, yet
+    // EMB refusals are the ones that most often need the blocker sentence (EMB is
+    // evictable only by WORK and RP — never by AUX). The wording is built by
+    // src/scheduler/mod.rs `plan_victims` from the non-empty evictor list; only the
+    // empty-list arm was ever asserted anywhere in the repo.
+    let witness = FakeWitness::with(vec![sample(72.0, 30.0)]);
+    let handle = harness(
+        1,
+        &[
+            ("emb30", "mock", CategoryId::Emb, 30.0),
+            ("aux55", "mock", CategoryId::Aux, 55.0),
+        ],
+        Arc::new(witness),
+    );
+    handle
+        .swap("emb30", CategoryId::Emb)
+        .await
+        .expect("the EMB resident loads");
+    let error = handle
+        .swap("aux55", CategoryId::Aux)
+        .await
+        .expect_err("AUX may not evict EMB");
+    let message = error.to_string();
+    assert!(message.contains("insufficient VRAM"), "was: {message}");
+    assert!(
+        message.contains("only WORK and RP can evict EMB"),
+        "the blocker sentence must name EMB's evictors, not claim nobody can: {message}"
+    );
+
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        model_of(&status, CategoryId::Emb).as_deref(),
+        Some("emb30"),
+        "a refused AUX load may not touch the embedding engine"
+    );
+    assert_eq!(model_of(&status, CategoryId::Aux), None);
+}
+
+#[tokio::test]
+async fn a_successful_eviction_leaves_the_hard_filtered_occupant_untouched() {
+    // FINDINGS-20 [12]: every successful-eviction test so far ran on otherwise-empty
+    // cards, so the `evictable_by` HARD FILTER was only ever proven in the
+    // all-blockers case. Here a protected occupant (WORK: `evictable_by = []`) sits
+    // on the card *while an eviction succeeds*: the plan may count only AUX's bytes.
+    // A filter inversion that credited the protected WORK's 30 GiB as releasable
+    // whenever any candidate existed would either skip the AUX release, kill WORK,
+    // or over-admit onto a card nobody freed — all caught by the exact victim list,
+    // the WORK-survives pin, and the released port checks below.
+    // Card 72, reserve 2. One repeating sample plus explicit `used` overrides: a
+    // multi-element queue would shift with every unrelated reading (the measured
+    // sampler, the settle re-reads), and which phase a sample belongs to must not
+    // depend on how many readings anyone takes. The card tracks the ledger: empty,
+    // then 50 once both occupants are installed, then 30 when the victim is gone.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0)]);
+    let (handle, runtime) = harness_rt(
+        1,
+        &[
+            ("work30", "mock", CategoryId::Work, 30.0),
+            ("aux20", "mock", CategoryId::Aux, 20.0),
+            ("rp35", "mock", CategoryId::Rp, 35.0),
+        ],
+        Arc::new(witness.clone()),
+        15,
+    );
+    let Reply::Loaded(work_port) = handle
+        .swap("work30", CategoryId::Work)
+        .await
+        .expect("the protected occupant loads")
+    else {
+        panic!("expected Loaded");
+    };
+    let Reply::Loaded(aux) = handle
+        .swap("aux20", CategoryId::Aux)
+        .await
+        .expect("the candidate victim loads")
+    else {
+        panic!("expected Loaded");
+    };
+    // Both occupants really hold their bytes now (the card says so).
+    witness.set_used(50.0);
+
+    // 50 booked -> 20 free; RP wants 35, deficit 15. WORK's 30 is filtered out
+    // (WORK evicts nobody), AUX's 20 alone covers: the eviction must succeed with
+    // WORK still installed.
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("rp35", CategoryId::Rp).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "rp35" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    // The card gives the victim's bytes back (WORK keeps holding its 30).
+    witness.set_used(30.0);
+    let Reply::Loaded(_) = loading.await.expect("task alive").expect("rp35 loads") else {
+        panic!("expected Loaded");
+    };
+
+    let status = handle.status().await.expect("actor alive");
+    let job = job_row(&status, "rp35");
+    assert_eq!(
+        job.victims_released,
+        vec!["aux20".to_string()],
+        "only the evictable victim is released — the protected occupant's bytes \
+         were not counted: {:?}",
+        job.victims_released
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Work).as_deref(),
+        Some("work30"),
+        "WORK survives untouched alongside a successful eviction"
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Aux),
+        None,
+        "the victim is gone"
+    );
+    assert!(runtime.is_dead(aux.port).await, "the victim's port refuses");
+    assert!(
+        !runtime.is_dead(work_port.port).await,
+        "the protected engine never even got a kill: it still answers"
+    );
 }
 
 /// ModelConf writer with raw extra lines per model (cost/floor keys).

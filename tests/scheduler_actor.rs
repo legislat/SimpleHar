@@ -92,7 +92,13 @@ fn harness5_witness(
     let mut adapters = BTreeMap::new();
     let adapter: Arc<dyn simplehar_se::engine::EngineAdapter> = Arc::new(MockAdapter);
     adapters.insert("mock".to_string(), adapter);
-    for engine in ["mock-slow", "mock-dies", "mock-never", "mock-hold-kill"] {
+    for engine in [
+        "mock-slow",
+        "mock-dies",
+        "mock-never",
+        "mock-hold-kill",
+        "mock-hold-never",
+    ] {
         adapters.insert(
             engine.to_string(),
             Arc::new(MockAdapter) as Arc<dyn simplehar_se::engine::EngineAdapter>,
@@ -842,6 +848,89 @@ async fn engine_that_never_becomes_ready_fails_within_the_deadline() {
         slot_model(&status, CategoryId::Work)
     );
     assert!(terminal_jobs(&status).iter().any(|j| j.error.is_some()));
+    // FINDINGS-19 [3]: the F-6 funnel is runtime-enforced only by a `debug_assert`
+    // compiled out of the release binary, so the failure tests must pin the STATES,
+    // not just strings. A failed load terminalizes by walking Failed -> Reap -> Idle;
+    // a regression that terminalizes without completing the walk leaves the row in
+    // Failed/Reap/Dispose and `/har/jobs` shows the operator a state that never
+    // happened — that row's state is `Idle` here, exactly once, only if every edge
+    // was stepped.
+    let job = status
+        .jobs
+        .iter()
+        .find(|j| j.model == "broken")
+        .expect("the failed load is in the ledger");
+    assert!(job.terminal, "{job:?}");
+    assert_eq!(
+        job.state,
+        SwapState::Idle,
+        "the funnel walked to Idle: {job:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_spawn_parks_in_failed_then_walks_the_funnel_to_idle() {
+    // FINDINGS-19 [3]: `SwapState::Failed` was asserted by zero tests, so a
+    // regression that terminalized a failure without walking Failed -> Reap -> Idle
+    // (or skipped Quiesce) was green suite-wide while `/har/jobs` — the surface F-5
+    // exists to make honest — showed a state that never happened. The runtime enforces
+    // the walk only with a `debug_assert!` compiled out of the release binary.
+    // `mock-hold-never` makes the observation *deterministic*, not a race: the engine
+    // spawns and never becomes ready, so `fail_job` parks the job in `Failed` and its
+    // own reap kill parks (gate) — the job sits in `Failed` as a state the test reads
+    // — until the test releases the kill, at which point the funnel completes to Idle.
+    let (handle, runtime) = harness(
+        config(1),
+        &[("dying", "mock-hold-never", CategoryId::Work, Some(4.0))],
+    );
+
+    let client = handle.clone();
+    let swapping = tokio::spawn(async move { client.swap("dying", CategoryId::Work).await });
+
+    // The failed spawn parks in `Failed` with its reap unconfirmed: observe the state.
+    wait_until(&handle, 8, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.model == "dying" && j.state == SwapState::Failed)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let job = status
+        .jobs
+        .iter()
+        .find(|j| j.model == "dying")
+        .expect("the failed spawn is in the ledger");
+    assert_eq!(job.state, SwapState::Failed, "cleanup pending: {job:?}");
+    assert!(!job.terminal, "the park in Failed is not terminal: {job:?}");
+    assert!(
+        job.error.as_deref().unwrap_or("").contains("ready"),
+        "the failure names readiness: {job:?}"
+    );
+
+    // Releasing the parked reap lets the funnel complete; the row must land on Idle.
+    runtime.release_held_kills();
+    let answer = tokio::time::timeout(Duration::from_secs(15), swapping)
+        .await
+        .expect("the funnel must answer the waiter")
+        .expect("the swap task must not panic");
+    answer.expect_err("a never-ready engine refuses the swap");
+    let status = handle.status().await.expect("actor alive");
+    let job = status
+        .jobs
+        .iter()
+        .find(|j| j.model == "dying")
+        .expect("the failed spawn keeps its row");
+    assert!(job.terminal, "{job:?}");
+    assert_eq!(
+        job.state,
+        SwapState::Idle,
+        "Failed -> Reap -> Idle completes the funnel: {job:?}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "the funnel reaped the engine it spawned"
+    );
 }
 
 #[tokio::test]
@@ -877,6 +966,11 @@ async fn failed_swap_that_released_its_victim_still_reaps_its_own_engine() {
         .into_iter()
         .find(|job| job.model == "work60")
         .expect("the swap is in the ledger");
+    assert_eq!(
+        swap_job.state,
+        SwapState::Idle,
+        "the failure walked Failed -> Reap -> Idle before terminalizing: {swap_job:?}"
+    );
     assert_eq!(
         swap_job.victims_released,
         vec!["aux30".to_string()],
@@ -1521,11 +1615,14 @@ async fn unload_during_a_swap_frees_the_slot_after_cancelling_the_swap() {
         1,
         "only the resident engine is live"
     );
-    // One held kill: the cancel's reap of the victim stays unprovable (chunk 4 [1]
-    // keeps the engine installed over it) while the unload that must follow gets a
-    // terminate it can prove. Holding by count rather than releasing a gate from the
-    // test keeps the second release inside its own deadline instead of racing it.
-    runtime.hold_next_kills(1);
+    // Hold the victim's kills BY TARGET, and observe what the fake actually parked
+    // (FINDINGS-19 [4]): the scenario used to hinge on a bare kill COUNT from the
+    // fake's budget (`hold_next_kills(1)`), so a correct product change to the reap
+    // path re-armed the fake silently. The cancel's reap of the victim stays
+    // unprovable (chunk 4 [1] keeps the engine installed over it); the test then
+    // releases the gate itself, turning the operator's follow-up unload into a
+    // terminate it can prove.
+    runtime.hold_kill_of(victim.port);
 
     assert!(
         matches!(
@@ -1544,6 +1641,15 @@ async fn unload_during_a_swap_frees_the_slot_after_cancelling_the_swap() {
             .any(|j| j.model == INCOMING_MODEL && j.terminal)
     })
     .await;
+    // What was held unprovable was exactly the victim's reap — the parked SET, not
+    // the fake's arithmetic (FINDINGS-19 [4]).
+    let held = runtime.held_kills();
+    assert!(
+        !held.is_empty() && held.iter().all(|(port, _)| *port == victim.port),
+        "the parked kills are the victim's: {held:?} vs victim port {}",
+        victim.port
+    );
+    runtime.release_held_kills();
     let status = handle.status().await.expect("actor alive");
     let swap = status
         .jobs
@@ -1657,12 +1763,13 @@ async fn a_parked_load_is_answered_when_its_predecessor_keeps_the_occupant() {
     // C's queue place can never be satisfied: it must be answered, not left hanging,
     // and it must not fire later when the operator finally frees the slot.
     let (handle, runtime) = parked_swap_harness();
-    serve_and_submit_frozen_swap(&handle).await;
-    // Two held kills: parking C cancels B once ("superseded by a newer load") and the
-    // operator's cancel below re-issues that same reap. Both stay unprovable, which is
-    // what keeps A installed when B terminalizes; the unload that follows the answer
-    // then gets a terminate it can prove.
-    runtime.hold_next_kills(2);
+    let victim = serve_and_submit_frozen_swap(&handle).await;
+    // Hold the victim's kills BY TARGET (FINDINGS-19 [4]): parking C cancels B once
+    // ("superseded by a newer load") and the operator's cancel below re-issues that
+    // same reap. Both stay unprovable — and the test now ASSERTS the parked set the
+    // fake really holds, instead of trusting a bare `hold_next_kills(2)` budget
+    // whose count tracked the product's internal kill calls rather than the property.
+    runtime.hold_kill_of(victim.port);
 
     let client = handle.clone();
     let parked = tokio::spawn(async move { client.swap(PARKED_MODEL, CategoryId::Work).await });
@@ -1671,7 +1778,47 @@ async fn a_parked_load_is_answered_when_its_predecessor_keeps_the_occupant() {
     let swap = job_of(&handle.status().await.expect("actor alive"), INCOMING_MODEL);
     // Parking C already cancelled B; this is the operator's own cancel of the same job,
     // which must still terminalize it.
+
+    // The parked SET, not the fake's arithmetic (FINDINGS-19 [4]): the supersede
+    // cancel's reap is parked on the victim's ticket the moment C queues — and after
+    // the operator's cancel re-issues that same reap, a victim kill is parked again
+    // (each cancel aborts the previous reap task, so exactly one is parked at any
+    // instant). Both observations are checked: the parked ticket is the victim's,
+    // never some other engine's.
+    let held_deadline = Instant::now() + Duration::from_millis(1_500);
+    let held = loop {
+        let held = runtime.held_kills();
+        if !held.is_empty() {
+            break held;
+        }
+        assert!(
+            Instant::now() < held_deadline,
+            "the supersede cancel must park its reap of the victim: {held:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        held.iter().all(|(port, _)| *port == victim.port),
+        "the parked kills are the victim's, not some other engine's: {held:?}"
+    );
+
     handle.cancel(swap).await.expect("cancel accepted");
+    let held_deadline = Instant::now() + Duration::from_millis(1_500);
+    let held = loop {
+        let held = runtime.held_kills();
+        if !held.is_empty() {
+            break held;
+        }
+        assert!(
+            Instant::now() < held_deadline,
+            "the operator's cancel re-issues the victim's reap and parks it again: {held:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        held.iter().all(|(port, _)| *port == victim.port),
+        "the re-issued parked kill is still the victim's: {held:?}"
+    );
 
     let answer = tokio::time::timeout(Duration::from_secs(8), parked)
         .await
@@ -1687,6 +1834,8 @@ async fn a_parked_load_is_answered_when_its_predecessor_keeps_the_occupant() {
         "the answer must name why, so a client can act on it: {error}"
     );
 
+    // Open the gate so the unload below can prove its terminate.
+    runtime.release_held_kills();
     // Freeing the slot now must not resurrect the load its caller was answered about.
     handle
         .unload_model(HOLD_MODEL)
@@ -1787,6 +1936,218 @@ async fn a_parked_load_has_a_queued_ledger_row_before_it_starts() {
         "the row records why the queued load was dropped: {parked:?}"
     );
     assert!(!parked.is_fault, "{parked:?}");
+}
+
+#[tokio::test]
+async fn a_parked_load_that_starts_runs_on_the_row_it_queued_with() {
+    // FINDINGS-19 [5], the row-identity half: 0fa70eb claims `start_pending` "arms
+    // that same row rather than creating a second one", and `/har/jobs` is the
+    // surface F-5 exists to make honest. B parks behind A's in-flight swap (T3.4)
+    // and is the parked load that ACTUALLY starts; the loaded receipt must carry
+    // the single ledger row B registered at park time. If `start_pending` created
+    // a second row — or armed a different one — the queued row would linger in the
+    // ledger as a second `model-b` load row (length fails) or the receipt would
+    // name an id no queued row ever held (equality fails).
+    let (handle, runtime) = harness(
+        config(10),
+        &[
+            ("model-a", "mock-slow", CategoryId::Work, Some(4.0)),
+            ("model-b", "mock", CategoryId::Work, Some(4.0)),
+        ],
+    );
+    submit_and_vanish(&handle, "model-a", CategoryId::Work).await;
+    let Reply::Loaded(receipt) = handle
+        .swap("model-b", CategoryId::Work)
+        .await
+        .expect("b loads")
+    else {
+        panic!("expected Loaded")
+    };
+    wait_until(&handle, 5, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work) == vec![Some("model-b".to_string())]
+    })
+    .await;
+    assert_eq!(runtime.server_count(), 1, "only B's engine may survive");
+
+    let status = handle.status().await.expect("actor alive");
+    let b_rows: Vec<_> = status
+        .jobs
+        .iter()
+        .filter(|j| j.model == "model-b" && j.kind == JobKind::Load)
+        .collect();
+    assert_eq!(
+        b_rows.len(),
+        1,
+        "queue and start must share ONE row: {:?}",
+        status
+            .jobs
+            .iter()
+            .map(|j| (j.id, j.model.clone(), format!("{:?}", j.kind)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        b_rows[0].id, receipt.job,
+        "the Loaded receipt carries the parked row's id, not a fresh one"
+    );
+    assert_eq!(b_rows[0].state, SwapState::Serving, "{:?}", b_rows[0]);
+}
+
+#[tokio::test]
+async fn restart_during_a_frozen_swap_cancels_the_swap_and_keeps_the_occupant() {
+    // FINDINGS-19 [6]: `on_restart` only takes the replacement path when the slot has
+    // no job; with a swap in flight it silently degrades to `on_swap` — a T10.1
+    // recovery gesture that becomes a supersede. Nobody had observed what that
+    // degradation does. Pinned here, honestly: the in-flight swap is cancelled,
+    // HOLD_MODEL ends still installed on exactly its original live engine, nothing
+    // spawns, and the restart's own queued load is answered (never left hanging)
+    // with the chunk-4 [1] rule — the occupant nobody proved dead stays.
+    let (handle, runtime) = parked_swap_harness();
+    let victim = serve_and_submit_frozen_swap(&handle).await;
+
+    let client = handle.clone();
+    let restarting =
+        tokio::spawn(async move { client.restart(HOLD_MODEL, CategoryId::Work).await });
+
+    wait_until(&handle, 10, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.model == INCOMING_MODEL && j.terminal)
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    let swap = status
+        .jobs
+        .iter()
+        .find(|j| j.model == INCOMING_MODEL)
+        .expect("the superseded swap is on the ledger");
+    assert_eq!(
+        swap.outcome.as_deref(),
+        Some("cancelled"),
+        "the restart's degraded arm cancelled the swap: {swap:?}"
+    );
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![Some(HOLD_MODEL.to_string())],
+        "the model the operator restarted keeps serving on the slot it held"
+    );
+    assert_eq!(runtime.server_count(), 1, "one live engine — the original");
+    assert_eq!(
+        runtime.spawn_count(),
+        1,
+        "the degraded restart spawned nothing"
+    );
+    assert!(
+        !runtime.is_dead(victim.port).await,
+        "and that engine is still answering"
+    );
+
+    let answer = tokio::time::timeout(Duration::from_secs(15), restarting)
+        .await
+        .expect("the restart waiter must be answered, not left hanging")
+        .expect("the restart task must not panic");
+    assert!(
+        matches!(answer, Err(SchedulerError::Cancelled(_))),
+        "the queued restart is answered against the kept occupant, got {answer:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_idle_sweep_never_starts_an_unload_behind_an_in_flight_job() {
+    // FINDINGS-19 [6], the sweep half (and the actor-side twin of FINDINGS-20 [9]):
+    // `on_tick` skips any slot whose `job` is `Some` — the filter that stops the 2 s
+    // idle tick from unloading a slot mid-Quiesce/Dispose/Install (the double-release
+    // / slot-with-no-engine wedge class). It is a guard that can silently disappear:
+    // with the filter inverted, the tick below would unload HOLD_MODEL out from
+    // under the frozen swap and record an `idle timeout` row — both fail here.
+    // WORK carries the nonzero `idle_timeout_s` because the swapping slot is WORK:
+    // the sweep only ever sees a slot whose category opts in, and the guard must
+    // still hold when the age is over the threshold.
+    let mut cfg = AppConfig {
+        release_timeout_s: 2,
+        ..config(10)
+    };
+    cfg.category_mut(CategoryId::Work)
+        .expect("default config has WORK")
+        .idle_timeout_s = 1;
+    let witness = GatedWitness::new(1); // one sample: the resident load's admission
+    let (handle, runtime) = harness5_witness(
+        cfg,
+        &[
+            (
+                HOLD_MODEL,
+                "mock-hold-kill",
+                CategoryId::Work,
+                Some(4.0),
+                "",
+            ),
+            (INCOMING_MODEL, "mock", CategoryId::Work, Some(4.0), ""),
+            (PARKED_MODEL, "mock", CategoryId::Work, Some(4.0), ""),
+        ],
+        Arc::new(witness),
+    );
+    serve_and_submit_frozen_swap(&handle).await;
+    // The frozen swap IS the in-flight job: model-b sits at Admit (GatedWitness
+    // exhausted), so `slot.job` is `Some` for the whole window. (A second parked load
+    // can't co-exist here: parking model-c would supersede-cancel the frozen model-b,
+    // leaving the slot genuinely idle — that parked row's fate is the separate
+    // FINDINGS-02 [3] tests' subject, not the sweep guard.)
+
+    // Past two sweep ticks (IDLE_TICK is 2 s) while the occupant's age is well over
+    // the 1 s threshold: the in-flight job is the only thing that may spare it.
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![Some(HOLD_MODEL.to_string())],
+        "the sweep may not unload a slot that carries a job"
+    );
+    // The swap really is still in flight — otherwise the sweep had no job to spare.
+    assert!(
+        slot_model(&status, CategoryId::Work)[0].is_some()
+            && status.jobs.iter().any(|j| {
+                j.model == INCOMING_MODEL && !j.terminal && j.state == SwapState::Admit
+            }),
+        "premise: the swap must still occupy the slot when the sweep ticks fire: {:?}",
+        status.jobs
+    );
+    assert!(
+        !status
+            .jobs
+            .iter()
+            .any(|j| j.kind == JobKind::Unload && j.model == HOLD_MODEL),
+        "the sweep may not even START an unload for a slot that carries a job: {:?}",
+        status.jobs
+    );
+    assert!(
+        !status
+            .jobs
+            .iter()
+            .any(|j| j.kind == JobKind::Unload && j.outcome.as_deref() == Some("idle timeout")),
+        "no idle-timeout unload may fire behind an in-flight job: {:?}",
+        status.jobs
+    );
+    let swap = status
+        .jobs
+        .iter()
+        .find(|j| j.model == INCOMING_MODEL)
+        .expect("the swap is on the ledger");
+    assert!(
+        !swap.terminal
+            || swap.state == SwapState::Admit
+            || swap.outcome.as_deref() == Some("cancelled"),
+        "the sweep left the swap's own walk alone: {swap:?}"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "the swapping slot kept its engine"
+    );
+    assert_eq!(
+        runtime.spawn_count(),
+        1,
+        "and nothing was spawned or respawned"
+    );
 }
 
 // --- the release-timeout arm: `Dispose` + `Released(Err)` (FINDINGS-19 [2]) ----------

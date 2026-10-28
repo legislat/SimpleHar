@@ -288,8 +288,36 @@ async fn spawns_a_real_child_probes_ready_and_confirms_release() {
 
 #[tokio::test]
 async fn killing_a_port_we_do_not_own_is_a_noop() {
-    // Step 1: never kill what it did not start — an unknown ticket is not an error.
+    // Step 1: never kill what it did not start — FINDINGS-20 [4]: the whole test
+    // used to be `kill().is_ok()` + `release_confirmed()==true`, which stays green
+    // even if `kill` grows an unscoped TerminateProcess path, because nothing in
+    // the outside world was asserted. Now a stand-in foreign engine (a listener the
+    // runtime does not own) AND one of OUR OWN live children are on the board, and
+    // the no-op kill must leave BOTH answering. The `Ok(true)` for the unowned port
+    // is kept deliberately: a wrong-ticket release is indistinguishable from a real
+    // one at this layer either way (src/process.rs `TableVerdict::Unowned`).
     let runtime = ProcessRuntime::new();
+    let owned_port = TEST_PORT + 7;
+    if let Err(error) = runtime
+        .spawn(
+            &spec(owned_port, "process-runtime-noop-kill"),
+            ticket(owned_port),
+        )
+        .await
+    {
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
+    }
+    assert_eq!(
+        wait_ready(&runtime, owned_port, 15).await,
+        Probe::Ready,
+        "the harness's own child must be serving before anyone tests a kill"
+    );
+    let foreign = bind_foreign_listener(59_999).await;
+
     runtime
         .kill(&ticket(59_999))
         .await
@@ -298,6 +326,28 @@ async fn killing_a_port_we_do_not_own_is_a_noop() {
         .release_confirmed(&ticket(59_999))
         .await
         .expect("evidence runs"));
+
+    // The harm check: the foreign engine still accepts (a kill that reached the OS
+    // would have taken it down), and so does the runtime's OWN child — an unscoped
+    // kill path does not get to touch a process it did not start, ticket or not.
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", 59_999))
+            .await
+            .is_ok(),
+        "the foreign listener survived a kill of its port — the harness killed something"
+    );
+    assert_eq!(
+        wait_ready(&runtime, owned_port, 5).await,
+        Probe::Ready,
+        "the kill of an unowned port may not disturb a child the harness owns"
+    );
+
+    drop(foreign);
+    runtime
+        .kill(&ticket(owned_port))
+        .await
+        .expect("cleanup kill");
+    assert!(confirm_release(&runtime, &ticket(owned_port), 15).await);
 }
 
 #[test]
@@ -707,4 +757,52 @@ async fn probe_names_the_missing_model_file_when_a_child_exits_early() {
         "the exit status is still quoted: {reason}"
     );
     runtime.kill(&t).await.expect("cleanup kill");
+}
+
+#[tokio::test]
+async fn dropping_the_runtime_kills_its_child_via_the_job_object() {
+    // FINDINGS-20 [5]: the file header advertises `JOB_OBJECT_LIMIT_KILL_ON_CLOSE`
+    // (src/process.rs `create_kill_on_close_job`) — the guarantee that stops an
+    // orphaned llama-server holding 40+ GiB after a harness crash or a dropped
+    // runtime — but every kill exercised here is the cooperative `kill()` path.
+    // Dropping the KILL_ON_CLOSE limit flag is a one-line typo that no existing
+    // test notices. This drives the abandonment path: spawn, drop the runtime
+    // (closing the job handle, exactly what a crashed harness does), and demand
+    // the kernel take the child down. No cooperative kill is ever called.
+    let runtime = ProcessRuntime::new();
+    let port = TEST_PORT + 8;
+    let t = ticket(port);
+    if let Err(error) = runtime
+        .spawn(&spec(port, "process-runtime-orphan"), t.clone())
+        .await
+    {
+        if python_is_missing(&error) {
+            eprintln!("python unavailable ({error}); skipping");
+            return;
+        }
+        panic!("spawn failed for a reason other than a missing python: {error}");
+    }
+    assert_eq!(
+        wait_ready(&runtime, port, 15).await,
+        Probe::Ready,
+        "the child must be serving while abandoned"
+    );
+
+    drop(runtime); // the crash shape: the job handle closes without any kill()
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let refused = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err();
+        if refused {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "KILL_ON_CLOSE must take the abandoned child down: port {port} still \
+             accepts 10 s after the runtime (and its job handle) died"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
