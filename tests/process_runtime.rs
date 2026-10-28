@@ -302,13 +302,55 @@ async fn killing_a_port_we_do_not_own_is_a_noop() {
 
 #[test]
 fn single_instance_guard_refuses_a_second_holder() {
-    let first = simplehar_se::process::SingleInstanceGuard::acquire();
-    if first.is_err() {
-        eprintln!("a SimpleHar SE instance is running; skipping guard test");
-        return;
+    // A10, pinned in-process. `CreateMutexW` reports `ERROR_ALREADY_EXISTS` for the
+    // named object whenever it already exists — independently of which thread or
+    // process holds it — so the refusal happens at the CALL, before any wait, which
+    // is what makes it kernel-atomic and race-free. The same-process double-acquire
+    // therefore fails cleanly rather than re-owning the mutex (`WAIT_OBJECT_0` is
+    // what a `WaitForSingleObject` on a held mutex would return to its own owner;
+    // this guard never waits, so that semantics is not the one in play). The
+    // cross-process case is covered by the product's own boot (t-suite) and by the
+    // gate-honesty suite's second harness (g03); this test pins the four things the
+    // unit can see.
+    let first = match simplehar_se::process::SingleInstanceGuard::acquire() {
+        Ok(guard) => guard,
+        Err(reason) => {
+            eprintln!("skipping guard test: a SimpleHar SE instance holds the mutex ({reason})");
+            return;
+        }
+    };
+    let error = match simplehar_se::process::SingleInstanceGuard::acquire() {
+        Ok(_) => panic!("a second holder of the named mutex must be refused (A10)"),
+        Err(reason) => reason,
+    };
+    assert!(
+        error.contains("already running"),
+        "the refusal must name the cause the operator acts on: {error}"
+    );
+    // The refused acquire closed ITS OWN handle only: the object survived, so the
+    // guard is still held and a third attempt is refused too.
+    assert!(
+        simplehar_se::process::SingleInstanceGuard::acquire().is_err(),
+        "a refused acquire must not disturb the holder's mutex"
+    );
+    drop(first);
+    // The guard is a real binding, not `let _`: the mutex lives exactly as long as
+    // the value and dies with it, which is why a crash leaves no stale lock. Briefly
+    // retry because an unrelated test binary may grab the free name in the window.
+    let reacquired = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match simplehar_se::process::SingleInstanceGuard::acquire() {
+            Ok(_released_the_guard) => break,
+            Err(reason) => {
+                assert!(
+                    std::time::Instant::now() < reacquired,
+                    "the mutex outlived its guard: dropping the holder must release \
+                     the named object (a stale lock would boot-lock the harness): {reason}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
-    let second = simplehar_se::process::SingleInstanceGuard::acquire();
-    assert!(second.is_err(), "a second harness must be refused (A10)");
 }
 
 #[tokio::test]

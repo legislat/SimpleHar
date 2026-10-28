@@ -27,6 +27,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -194,7 +195,58 @@ impl From<SchedulerError> for ApiError {
     }
 }
 
+/// One §0.2 boot measure that can only complete AFTER [`ApiState`] is shared — a
+/// listener binds, the container reclaim returns — so it is interior-mutable: every
+/// holder of a clone writes the same cell, first-write-wins.
+///
+/// The stored integer is biased by 1 so the atomic's `0` keeps its "never happened"
+/// meaning. `Instant::elapsed` truncates, so an unbiased `0` is what a fast first
+/// bind actually reports; without the bias the honest measurement and the sentinel
+/// would be the same value and the key would silently stay out of
+/// `/har/status.boot`.
+#[derive(Debug, Clone, Default)]
+pub struct BootMsStamp(Arc<AtomicU64>);
+
+impl BootMsStamp {
+    /// Records `ms` unless an earlier stamp already stands.
+    ///
+    /// # Returns
+    ///
+    /// `true` when this call won the race, `false` when a previous value holds —
+    /// every supervisor stamps and only the first bind is the measure.
+    pub fn stamp(&self, ms: u64) -> bool {
+        self.0
+            .compare_exchange(0, ms.saturating_add(1), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// The stamped value, or `None` while the measured event has not happened.
+    #[must_use]
+    pub fn get(&self) -> Option<u64> {
+        match self.0.load(Ordering::Acquire) {
+            0 => None,
+            biased => Some(biased - 1),
+        }
+    }
+
+    /// `skip_serializing_if` predicate: the key is absent, not null, until stamped.
+    fn unset(&self) -> bool {
+        self.get().is_none()
+    }
+
+    /// Serializes as the `Option<u64>` the API promises, un-biasing the raw cell.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.get() {
+            None => serializer.serialize_none(),
+            Some(ms) => serializer.serialize_some(&ms),
+        }
+    }
+}
+
 /// Boot measures (§0.2): the numbers that make "the harness is up" observable.
+/// Every one of them is **milliseconds since the single `boot_started` epoch**
+/// `main` captures before the guard is taken, including the two that complete after
+/// [`ApiState`] is shared and therefore live in [`BootMsStamp`] cells.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct BootTimings {
     /// Config load + validation duration.
@@ -205,6 +257,22 @@ pub struct BootTimings {
     /// Wall time until every listener was Serving or Down (set by `main`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_ms: Option<u64>,
+    /// ms-since-start of the FIRST successful bind across all category supervisors
+    /// (§0.2 step 5): when the harness first became reachable, as opposed to when
+    /// every category had a verdict. Absent from `/har/status.boot` until it happens.
+    #[serde(
+        skip_serializing_if = "BootMsStamp::unset",
+        serialize_with = "BootMsStamp::serialize"
+    )]
+    pub first_bind_at: BootMsStamp,
+    /// Wall ms of the boot container reclaim, from its dispatch (after `boot ready`,
+    /// §0.2 step 4 "off the bind path") to completion. Absent until the reclaim
+    /// returns, which needs docker/WSL to have any owned container to talk about.
+    #[serde(
+        skip_serializing_if = "BootMsStamp::unset",
+        serialize_with = "BootMsStamp::serialize"
+    )]
+    pub reap_ms: BootMsStamp,
 }
 
 impl BootTimings {
@@ -282,6 +350,28 @@ impl ApiState {
     #[must_use]
     pub fn requires_token(&self) -> bool {
         self.control_token.is_some()
+    }
+
+    /// Handle to the §0.2 `first_bind_at` cell, for the supervisor that first binds.
+    /// Cloning the cell out of the lock keeps the stamp off the bind path: no writer
+    /// ever holds that lock across an `.await`.
+    #[must_use]
+    pub fn first_bind_stamp(&self) -> BootMsStamp {
+        self.boot
+            .read()
+            .expect("boot timings lock poisoned by a writer panic")
+            .first_bind_at
+            .clone()
+    }
+
+    /// Handle to the §0.2 `reap_ms` cell, for the boot reclaim to fill on completion.
+    #[must_use]
+    pub fn reap_stamp(&self) -> BootMsStamp {
+        self.boot
+            .read()
+            .expect("boot timings lock poisoned by a writer panic")
+            .reap_ms
+            .clone()
     }
 
     /// Catalog snapshot from the actor (Step 2: one writer, snapshot reads).
@@ -1874,6 +1964,140 @@ mod tests {
             Arc::new(crate::budget::LedgerOnlyWitness),
             BootTimings::default(),
         )
+    }
+
+    /// A state with a LIVE actor: `status_document` asks the scheduler for its
+    /// snapshot, so [`unit_state`]'s dummy handle cannot serve a `/har/status` test.
+    /// The empty catalog dir keeps the actor's scan trivial and engine-free.
+    fn live_state(boot: BootTimings) -> ApiState {
+        let config = AppConfig::default();
+        let mut adapters: BTreeMap<String, Arc<dyn crate::engine::EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(crate::engine::mock::MockAdapter) as Arc<dyn crate::engine::EngineAdapter>,
+        );
+        let scheduler = crate::scheduler::Scheduler::start(
+            config.clone(),
+            crate::testutil::temp_dir("api-boot"),
+            adapters,
+            Arc::new(crate::process::ProcessRuntime::new())
+                as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(crate::budget::LedgerOnlyWitness),
+        );
+        ApiState::new(
+            config,
+            scheduler,
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            boot,
+        )
+    }
+
+    #[test]
+    fn boot_stamp_is_first_write_wins() {
+        // FINDINGS-14 [4]: the two late measures are written by whoever finishes the
+        // work, so the cell must admit exactly one writer. A plain store would let
+        // the last supervisor to bind overwrite the first one's timestamp.
+        let stamp = BootMsStamp::default();
+        assert_eq!(
+            stamp.get(),
+            None,
+            "an unstamped measure is absent, never reported as 0"
+        );
+        assert!(stamp.stamp(3), "the first writer wins");
+        assert!(
+            !stamp.stamp(9_999),
+            "a later writer must be ignored, not overwrite the measure"
+        );
+        assert_eq!(stamp.get(), Some(3));
+        let zero = BootMsStamp::default();
+        assert!(zero.stamp(0), "a sub-millisecond event is still an event");
+        assert_eq!(
+            zero.get(),
+            Some(0),
+            "0 ms is a measurement, not the 'never happened' sentinel"
+        );
+        assert!(
+            !zero.stamp(5),
+            "and it still closes the cell to later writers"
+        );
+    }
+
+    #[test]
+    fn concurrent_boot_stamps_admit_exactly_one_writer() {
+        // The same rule under a real race: three supervisors released together, one
+        // value lands and it is one of the three that were offered.
+        let stamp = BootMsStamp::default();
+        let barrier = std::sync::Barrier::new(3);
+        let winners = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for ms in [11_u64, 22, 33] {
+                let stamp = stamp.clone();
+                let barrier = &barrier;
+                let winners = &winners;
+                scope.spawn(move || {
+                    barrier.wait();
+                    if stamp.stamp(ms) {
+                        winners.lock().expect("winners lock").push(ms);
+                    }
+                });
+            }
+        });
+        let won = winners.lock().expect("winners lock").clone();
+        assert_eq!(won.len(), 1, "exactly one writer may land; got {won:?}");
+        assert_eq!(
+            stamp.get(),
+            Some(*won.first().expect("one winner")),
+            "the value `/har/status.boot` reports is the winner's"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_boot_reports_the_five_measures_as_they_complete() {
+        // FINDINGS-14 [4]: `/har/status.boot` must carry the whole §0.2 measure set.
+        // The three boot-thread fields are present from the start; the two that
+        // complete after `ApiState` is shared are ABSENT (skipped, not null) until
+        // stamped, then present with exactly the stamped value — the same shape
+        // `bind_ms` has always had.
+        let api = live_state(BootTimings {
+            config_ms: 4,
+            scheduler_spawn_ms: 6,
+            ..BootTimings::default()
+        });
+        let before = status_document(&api).await.expect("status document");
+        assert_eq!(before["boot"]["config_ms"], json!(4));
+        assert_eq!(before["boot"]["scheduler_spawn_ms"], json!(6));
+        assert!(
+            before["boot"].get("bind_ms").is_none(),
+            "bind_ms keeps its skip-when-unset shape: {before}"
+        );
+        assert!(
+            before["boot"].get("first_bind_at").is_none(),
+            "an unstamped first bind is absent from the document: {before}"
+        );
+        assert!(
+            before["boot"].get("reap_ms").is_none(),
+            "an unstamped reclaim is absent from the document: {before}"
+        );
+
+        api.first_bind_stamp().stamp(1);
+        api.reap_stamp().stamp(4_321);
+        api.boot.write().expect("boot timings lock").set_bound(20);
+
+        let after = status_document(&api).await.expect("status document");
+        assert_eq!(after["boot"]["first_bind_at"], json!(1), "ms-since-start");
+        assert_eq!(after["boot"]["reap_ms"], json!(4_321));
+        assert_eq!(after["boot"]["bind_ms"], json!(20));
+        assert!(
+            !api.first_bind_stamp().stamp(500),
+            "the shared cell behind the lock is the one the route serializes"
+        );
+        let again = status_document(&api).await.expect("status document");
+        assert_eq!(
+            again["boot"]["first_bind_at"],
+            json!(1),
+            "and it is still first-write-wins through the API handle"
+        );
     }
 
     fn occupied_slot(model: &str, port: u16, loaded_at: Instant) -> SlotStatus {

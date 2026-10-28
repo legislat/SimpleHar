@@ -1,7 +1,7 @@
 //! Entry point: boot order per DESIGN §0.2 — config first, listeners bound before any
 //! engine work (there is none: preload is scrapped), zero engine spawns at boot.
 
-use simplehar_se::api::{category_router, control_router, ApiState};
+use simplehar_se::api::{category_router, control_router, ApiState, BootMsStamp};
 use simplehar_se::config::{self, AppConfig, ConfigError};
 use simplehar_se::engine::EngineRuntime;
 use simplehar_se::observability;
@@ -217,6 +217,42 @@ async fn main() -> ExitCode {
 /// Pause between listener rebind attempts while a port is unavailable.
 const LISTENER_RETRY: Duration = Duration::from_secs(5);
 
+/// Test-only ordering seam (the shape of `model::scan`'s scan pause): `run()` raises
+/// `READY_LOGGED` the instant the `boot ready` line is printed, and the boot-reclaim
+/// closure records what that flag said as it begins. FINDINGS-14 [5] is precisely
+/// this ordering — the reclaim may only run after the boot-ready gate, never on the
+/// bind path — and a test cannot observe it from outside without docker and WSL.
+/// Compiled out of the product entirely: no branch, no switch, no runtime cost.
+#[cfg(test)]
+mod boot_order {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Set by `run()` immediately after the `boot ready` log line.
+    pub(super) static READY_LOGGED: AtomicBool = AtomicBool::new(false);
+    /// Whether the reclaim closure has begun at all (so a test can tell "not yet"
+    /// from "began before ready").
+    pub(super) static RECLAIM_DISPATCHED: AtomicBool = AtomicBool::new(false);
+    /// What `READY_LOGGED` said the moment the reclaim closure began.
+    pub(super) static RECLAIM_SAW_READY: AtomicBool = AtomicBool::new(false);
+
+    /// Clears the three flags; only the single `run()`-driving test calls it, and it
+    /// holds no other boot-order test in parallel with itself.
+    pub(super) fn reset() {
+        for flag in [&READY_LOGGED, &RECLAIM_DISPATCHED, &RECLAIM_SAW_READY] {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn log_ready() {
+        READY_LOGGED.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn reclaim_begins() {
+        RECLAIM_SAW_READY.store(READY_LOGGED.load(Ordering::SeqCst), Ordering::SeqCst);
+        RECLAIM_DISPATCHED.store(true, Ordering::SeqCst);
+    }
+}
+
 /// A6: v3.3-style boot inventory. Logs one line per catalog model (`marker/category/
 /// engine/path`) and warns up front if `llama-server.exe` is absent or if the catalog
 /// holds ninfer models while no WSL account is configured, so the operator sees
@@ -334,6 +370,8 @@ async fn supervise_listener(
     state: Arc<ApiState>,
     category: simplehar_se::config::CategoryConfig,
     listeners: simplehar_se::listeners::ListenerRegistry,
+    boot_started: std::time::Instant,
+    first_bind: BootMsStamp,
 ) {
     let addr = SocketAddr::new(state.config.internal_host, category.public_port);
     let router = if category.control {
@@ -346,6 +384,12 @@ async fn supervise_listener(
     loop {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
+                // §0.2 `first_bind_at`, stamped BEFORE the verdict is published: the
+                // first supervisor to bind wins the cell, and the ready gate below
+                // can never observe "every category has a verdict" without this
+                // measure already standing. `boot_started` is the same epoch the
+                // other four measures use, so `first_bind_at <= bind_ms` holds.
+                first_bind.stamp(boot_started.elapsed().as_millis() as u64);
                 listeners.mark_serving(category.id);
                 tracing::info!(%addr, category = %category.id, "listener serving");
                 hinted = false;
@@ -521,12 +565,15 @@ async fn run(
         }
     }
     let listeners = state.listeners.clone();
+    let first_bind = state.first_bind_stamp();
     let mut supervisors = Vec::new();
     for category in state.config.categories.clone() {
         supervisors.push(tokio::spawn(supervise_listener(
             Arc::clone(&state),
             category,
             listeners.clone(),
+            boot_started,
+            first_bind.clone(),
         )));
     }
     // §0.2 "ready": every listener is Serving or Down. Wait (bounded) for the
@@ -556,6 +603,9 @@ async fn run(
                 .count(),
             "boot ready (0.2): config validated, catalog scan queued, listeners resolved"
         );
+        // FINDINGS-14 [5] seam: the reclaim below is only legal AFTER this line.
+        #[cfg(test)]
+        boot_order::log_ready();
     }
     // Boot reclaim (deploy review, 2026-10-26; scoped per chunk 10 [1], 2026-10-27):
     // a container left by a crashed run keeps the card occupied, and observed-VRAM
@@ -567,7 +617,18 @@ async fn run(
     // running container is warned about and left alone.
     {
         let handle = state.scheduler.clone();
+        let reap = state.reap_stamp();
         tokio::spawn(async move {
+            // FINDINGS-14 [5] seam: records what `READY_LOGGED` said when this
+            // closure began, which is the post-ready ordering the boot contract
+            // promises and nothing else can observe without docker or WSL.
+            #[cfg(test)]
+            boot_order::reclaim_begins();
+            // FINDINGS-14 [4]: §0.2 step 4 says the reclaim is "off the bind path",
+            // which is only auditable once it can say what it cost. Dispatch to
+            // completion, on the wall clock, in the same ms-since-start unit as the
+            // other measures — it used to end in silence.
+            let dispatched = std::time::Instant::now();
             let Ok(catalog) = handle.catalog().await else {
                 return;
             };
@@ -587,6 +648,13 @@ async fn run(
                 })
                 .collect();
             boot_runtime.reclaim_at_boot(&candidates).await;
+            let reap_ms = dispatched.elapsed().as_millis() as u64;
+            reap.stamp(reap_ms);
+            tracing::info!(
+                reap_ms,
+                candidates = candidates.len(),
+                "boot container reclaim finished (§0.2 step 4)"
+            );
         });
     }
     tokio::select! {
@@ -604,12 +672,25 @@ async fn run(
 #[cfg(test)]
 mod tests {
     //! Boot composition lives in `engine::default_adapters` (including the
-    //! `allow_mock_engine` gate), where it is pinned by a test; `main` itself is not
+    //! `allow_mock_engine` gate), where it is pinned by a test. `main` itself is not
     //! unit-reachable — it takes the single-instance guard, binds every listener and
-    //! starts the NVML witness.
+    //! starts the NVML witness — but `run()` and `supervise_listener` are, so the
+    //! §0.2 ordering and the boot measures are pinned against the real code paths
+    //! (FINDINGS-14 [4]/[5]) with every listener on an ephemeral port.
 
-    use super::{boot_config, decode_console_output, parse_excluded_ranges, probe_outcome};
-    use simplehar_se::config::{self, AppConfig, ConfigError};
+    use super::{
+        boot_config, boot_order, decode_console_output, log_boot_banner, parse_excluded_ranges,
+        probe_outcome, run, supervise_listener,
+    };
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use simplehar_se::api::{control_router, ApiState};
+    use simplehar_se::config::{self, AppConfig, CategoryConfig, ConfigError};
+    use simplehar_se::engine::EngineRuntime;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
 
     fn error_text(errors: &[ConfigError]) -> String {
         errors
@@ -820,5 +901,261 @@ Start Port    End Port
             "relative ref present under modelconf_dir is not missing"
         );
         let _ = std::fs::remove_file(dir.join(&name));
+    }
+
+    /// Constructor-only stand-in for the runtime half of the boot wiring, the shape
+    /// of the scheduler's own `NeverRuntime` (4389a0a): the boot side never spawns,
+    /// kills, probes or discovers, so a call reaching here IS the defect.
+    struct NeverRuntime;
+
+    #[async_trait::async_trait]
+    impl EngineRuntime for NeverRuntime {
+        async fn spawn(
+            &self,
+            _spec: &simplehar_se::engine::LaunchSpec,
+            _ticket: simplehar_se::ownership::SpawnTicket,
+        ) -> Result<simplehar_se::engine::Spawned, simplehar_se::engine::SpawnError> {
+            panic!("FINDINGS-14 [5]: boot spawned an engine before the listeners bound");
+        }
+        async fn kill(
+            &self,
+            _ticket: &simplehar_se::ownership::SpawnTicket,
+        ) -> Result<(), simplehar_se::engine::SpawnError> {
+            panic!("FINDINGS-14 [5]: boot killed an engine before the listeners bound");
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &simplehar_se::ownership::SpawnTicket,
+        ) -> Result<bool, simplehar_se::engine::SpawnError> {
+            panic!("FINDINGS-14 [5]: boot released an engine slot before the listeners bound");
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &simplehar_se::engine::ReadinessSpec,
+        ) -> simplehar_se::engine::Probe {
+            panic!("FINDINGS-14 [5]: boot probed an engine port before the listeners bound");
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("FINDINGS-14 [5]: boot discovered an engine model before the listeners bound");
+        }
+    }
+
+    /// A live scheduler and its `ApiState`, over an EMPTY catalog dir and with the
+    /// real boot adapter map: no model can be scanned, so nothing on this path can
+    /// reach an engine or a container even by accident.
+    fn boot_wiring(
+        config: &AppConfig,
+        runtime: Arc<dyn EngineRuntime>,
+    ) -> (simplehar_se::scheduler::SchedulerHandle, Arc<ApiState>) {
+        let scheduler = simplehar_se::scheduler::Scheduler::start(
+            config.clone(),
+            config.modelconf_dir.clone(),
+            simplehar_se::engine::default_adapters(config),
+            runtime,
+            Arc::new(simplehar_se::budget::LedgerOnlyWitness)
+                as Arc<dyn simplehar_se::budget::VramWitness>,
+        );
+        let state = Arc::new(ApiState::new(
+            config.clone(),
+            scheduler.clone(),
+            simplehar_se::listeners::ListenerRegistry::new(),
+            Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+            simplehar_se::api::BootTimings::default(),
+        ));
+        (scheduler, state)
+    }
+
+    /// A config whose catalog is empty and whose four listeners ask the OS for
+    /// ephemeral ports: the whole boot path, without taking 8708-8711 away from a
+    /// harness that may be serving, and without ever naming a container.
+    fn ephemeral_boot_config(tag: &str) -> AppConfig {
+        AppConfig {
+            modelconf_dir: simplehar_se::testutil::temp_dir(tag),
+            ..AppConfig::default()
+        }
+    }
+
+    async fn status_json(state: &Arc<ApiState>) -> serde_json::Value {
+        let response = control_router(Arc::clone(state))
+            .oneshot(
+                Request::get("/har/status")
+                    .body(Body::empty())
+                    .expect("static request"),
+            )
+            .await
+            .expect("in-process request");
+        assert_eq!(response.status(), StatusCode::OK, "/har/status must answer");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bounded body");
+        serde_json::from_slice(&bytes).expect("status is JSON")
+    }
+
+    /// FINDINGS-14 [5], zero-engine-spawns pin. Everything `lib` owns on the boot
+    /// side — the adapter map, `Scheduler::start`, `ApiState::new`, the A6 banner
+    /// inventory, the listener registry and the `/har/status` read the page and tray
+    /// live on — runs against a runtime that panics on contact. `main` is not
+    /// unit-reachable, so this is the closest honest cover of the claim the boot log
+    /// prints ("listeners before engines, zero engine spawns"): whoever moves an
+    /// engine touch (spawn, kill, probe, discover) into any of these steps fails
+    /// here instead of shipping a boot that can stall or start an engine before the
+    /// harness answers. The banner is awaited rather than spawned, so its catalog
+    /// read is inside the pin instead of racing it.
+    #[tokio::test]
+    async fn boot_side_sequence_never_touches_the_engine_runtime() {
+        let config = ephemeral_boot_config("boot-no-engine");
+        let (scheduler, state) = boot_wiring(&config, Arc::new(NeverRuntime));
+        log_boot_banner(
+            &scheduler,
+            &config.llama_server_exe,
+            &config.modelconf_dir,
+            None,
+        )
+        .await;
+        for category in config.categories.clone() {
+            state.listeners.mark_serving(category.id);
+        }
+        let doc = status_json(&state).await;
+        assert_eq!(
+            doc["listeners"].as_object().map(|m| m.len()),
+            Some(4),
+            "the four configured categories resolved: {doc}"
+        );
+        assert!(
+            doc["slots"]
+                .as_array()
+                .is_some_and(|slots| slots.iter().all(|slot| slot["model"].is_null())),
+            "§0.2 step 7: boot leaves every slot Empty, no engine anywhere: {doc}"
+        );
+        assert!(
+            doc["boot"]["config_ms"].is_u64() && doc["boot"]["scheduler_spawn_ms"].is_u64(),
+            "the boot measures the page reads are still there: {doc}"
+        );
+    }
+
+    /// FINDINGS-14 [4]: the real supervisor really binds (port 0, so the OS hands out
+    /// an ephemeral port and the test cannot collide with a serving harness), and the
+    /// first bind is stamped on the same epoch before the verdict is published — so
+    /// the ready gate recording `bind_ms` implies `first_bind_at` already stands, and
+    /// the ordering between the two measures holds.
+    #[tokio::test]
+    async fn the_first_binding_supervisor_stamps_first_bind_at_within_bind_ms() {
+        let config = ephemeral_boot_config("boot-first-bind");
+        let (_scheduler, state) = boot_wiring(&config, Arc::new(NeverRuntime));
+        let boot_started = std::time::Instant::now();
+        let first_bind = state.first_bind_stamp();
+        let supervisor = tokio::spawn(supervise_listener(
+            Arc::clone(&state),
+            CategoryConfig {
+                public_port: 0,
+                ..config.control_category().clone()
+            },
+            state.listeners.clone(),
+            boot_started,
+            first_bind.clone(),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while state.listeners.snapshot().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the supervisor never published a bind verdict"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        supervisor.abort();
+        let bind_ms = boot_started.elapsed().as_millis() as u64;
+        state
+            .boot
+            .write()
+            .expect("boot timings lock")
+            .set_bound(bind_ms);
+        let first_bind_at = first_bind
+            .get()
+            .expect("a listener that bound must have stamped first_bind_at");
+        assert!(
+            first_bind_at <= bind_ms,
+            "bind completion implies the first bind happened: {first_bind_at} <= {bind_ms}"
+        );
+        let doc = status_json(&state).await;
+        assert_eq!(
+            doc["boot"]["first_bind_at"].as_u64(),
+            Some(first_bind_at),
+            "and /har/status.boot reports the same value the supervisor stamped"
+        );
+    }
+
+    /// FINDINGS-14 [5], reclaim ordering pin, chosen over a `probe_outcome`-style
+    /// predicate because the decision under test is an ordering across two `tokio`
+    /// spawns inside `run()`, not a pure function of any value: extracted as a
+    /// predicate it would only restate `assert ready`, which can never fail. This
+    /// drives the REAL `run()` (four ephemeral listeners, empty catalog, then the
+    /// tray/Ctrl+C channel closing) and reads the test-only seam: the reclaim closure
+    /// began, and it began with `boot ready` already logged. It also pins the
+    /// `reap_ms` FIELD mechanism on a real boot. The reclaim's VALUE needs
+    /// docker/WSL — with no catalog-declared container `reclaim_at_boot` stands down
+    /// immediately — so this proves the measure is filled and named, not that a
+    /// reaped container would be timed (that half belongs to a card window).
+    #[tokio::test]
+    async fn boot_reclaim_is_dispatched_only_after_boot_ready() {
+        boot_order::reset();
+        let mut config = ephemeral_boot_config("boot-reclaim-order");
+        for category in &mut config.categories {
+            category.public_port = 0;
+        }
+        let (_scheduler, state) = boot_wiring(&config, Arc::new(NeverRuntime));
+        let boot_runtime = simplehar_se::process::ProcessRuntime::new();
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let running = tokio::spawn(run(
+            Arc::clone(&state),
+            shutdown_rx,
+            std::time::Instant::now(),
+            boot_runtime,
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !boot_order::RECLAIM_DISPATCHED.load(Ordering::SeqCst)
+            || state.reap_stamp().get().is_none()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "run() never dispatched and completed the boot reclaim \
+                 (dispatched={}, reap_ms={:?})",
+                boot_order::RECLAIM_DISPATCHED.load(Ordering::SeqCst),
+                state.reap_stamp().get(),
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            boot_order::RECLAIM_SAW_READY.load(Ordering::SeqCst),
+            "CONFIRMED-14[5]: the boot reclaim began before `boot ready` was logged — \
+             §0.2 step 4 is off the bind path only if that line comes first"
+        );
+        assert!(
+            !state.listeners.any_down(),
+            "every ephemeral listener should have bound: {:?}",
+            state.listeners.snapshot()
+        );
+        let first_bind_at = state
+            .first_bind_stamp()
+            .get()
+            .expect("four listeners bound, so the measure stands");
+        let bind_ms = state
+            .boot
+            .read()
+            .expect("boot timings lock")
+            .bind_ms
+            .expect("the ready gate records bind_ms");
+        assert!(
+            first_bind_at <= bind_ms,
+            "the same boot epoch orders the two measures: {first_bind_at} <= {bind_ms}"
+        );
+        let doc = status_json(&state).await;
+        assert_eq!(
+            doc["boot"]["reap_ms"].as_u64(),
+            state.reap_stamp().get(),
+            "/har/status.boot must carry the measure the reclaim stamped"
+        );
+        drop(shutdown);
+        running.await.expect("run task").expect("run returns Ok");
     }
 }

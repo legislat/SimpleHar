@@ -326,6 +326,13 @@ impl Harness {
         self.child.id()
     }
 
+    /// The config file this harness booted from. G10 points a SECOND instance at
+    /// exactly this path: same exe, same config, so the only thing that can refuse
+    /// it is the single-instance guard.
+    fn config_path(&self) -> PathBuf {
+        self._work_dir.join("simplehar.json")
+    }
+
     async fn get(&self, path: &str) -> Value {
         self.http
             .get(format!("{CONTROL}{path}"))
@@ -517,6 +524,28 @@ async fn port_closed(port: u16, secs: u64) -> bool {
             Ok(Ok(_stream)) => false,
         };
         if refused {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// The mirror of [`port_closed`]: polls until a TCP connect to `port` SUCCEEDS, so
+/// "the listener is still there" is an observation rather than an assumption (G10:
+/// the first harness must be unmoved on its own ports while a second is refused).
+async fn port_open(port: u16, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let accepted = tokio::time::timeout(
+            Duration::from_millis(400),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        if accepted {
             return true;
         }
         if Instant::now() > deadline {
@@ -1050,4 +1079,85 @@ async fn g09_orphan_count_is_parent_scoped() {
          reads {} now — what the old check would charge to us)",
         machine_llama_count()
     );
+}
+
+// ---------------------------------------------------------------- G10 (FINDINGS-14 [5])
+
+/// ADVERSARIAL. A10 / §0.2 step 3 is a boot-order claim: the second harness is
+/// refused by the named mutex BEFORE it can touch any state. The t-suite boot tests
+/// and g03 prove the refusal by construction, but neither observes both processes at
+/// once, which is where the honest form of the claim lives: the refused instance must
+/// EXIT with a failure status while the serving one keeps answering `/health` 200 and
+/// `/har/models` byte-identically, on the same four ports. If the guard were bypassed
+/// the second instance would boot into partial availability — listeners `Down`, tray
+/// red, ports still nominally configured — and the operator could not tell the two
+/// harnesses apart except by killing one. Either half failing is a CONFIRMED.
+///
+/// No engine loads here (the point is the guard, not the card), but the tier is LIGHT
+/// rather than NOLOAD on purpose: this test runs TWO harness processes at once, and a
+/// harness process books driver VRAM of its own (the NVML witness, the tray). Pricing
+/// it at 0 like g08's pure set logic would let it start on a machine with nothing
+/// free, where the failure looks like a guard defect and is really a busy card.
+#[tokio::test]
+#[ignore = "operator-gated via handoff/gate-honesty/RUN.md: real exe + models"]
+async fn g10_second_harness_is_refused_while_first_serves() {
+    let _serial = serial_lock().await;
+    let harness = Harness::spawn_verified("g10", &[Entry::aux("auxA")], 1)
+        .await
+        .expect("verified harness");
+    let models_before = harness.get("/har/models").await;
+    let mut second = Command::new(harness_exe())
+        .env("SIMPLEHAR_CONFIG", harness.config_path())
+        .env_remove("SIMPLEHAR_TOKEN")
+        .spawn()
+        .expect("spawn the second instance of the same exe on the same config");
+    let started = Instant::now();
+    let mut status = None;
+    while status.is_none() && started + Duration::from_secs(20) > Instant::now() {
+        status = second.try_wait().expect("try_wait on the second instance");
+        if status.is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let Some(status) = status else {
+        // A10 is a product-side claim; a surviving duplicate must still be reaped by
+        // the test that spawned it, so the finding never leaves a second harness
+        // holding 8708-8711 for the next group to mistake for its own.
+        let _ = second.kill();
+        let _ = second.wait();
+        panic!(
+            "CONFIRMED-g10: the second harness was still alive 20 s after its own \
+             launch while the first served — A10 does not refuse a second instance"
+        );
+    };
+    assert!(
+        !status.success(),
+        "CONFIRMED-g10: the second harness exited {status:?} — a refused boot reports \
+         failure; success means it booted (or the guard never ran)"
+    );
+    let probe = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("probe client");
+    assert!(
+        wait_health(&probe, 10).await,
+        "CONFIRMED-g10: the refused second boot took the serving harness's /health down with it"
+    );
+    let models_after = harness.get("/har/models").await;
+    assert_eq!(
+        models_after, models_before,
+        "CONFIRMED-g10: the first harness's catalog changed under a refused second boot"
+    );
+    for port in [8708_u16, 8709, 8710, 8711] {
+        assert!(
+            port_open(port, 5).await,
+            "CONFIRMED-g10: the first harness no longer holds its own port {port} \
+             after a second instance was refused"
+        );
+    }
+    println!(
+        "G10 REFUTED: second instance refused (exited {status:?}) while the first still \
+         answered /health 200 with an unchanged /har/models on 8708-8711"
+    );
+    drop(harness);
 }
