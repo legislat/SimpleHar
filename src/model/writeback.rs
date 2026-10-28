@@ -27,12 +27,111 @@
 //! comment-clobbering write-back whose failure still answered 200) and
 //! FINDINGS-13 [5] (the restore was the one non-atomic write and its failure was
 //! discarded behind an unconditional "original restored" claim).
+//!
+//! Failures are typed ([`WritebackError`], FINDINGS-13 [10]) and every variant's
+//! `Display` is the exact sentence the module answered before typing, so nothing
+//! user-visible changed; the HTTP class is the api's call at
+//! [`crate::api::ApiError::from_writeback`] — a caller's impossible value or absent
+//! key is a 4xx, never a 500.
 
 use crate::model::scan::{canonical_value, normalized_line, parse_flat_yaml, split_value_comment};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use thiserror::Error;
+
+/// Every failure this module answers with, typed (FINDINGS-13 [10]; the DEFERRED
+/// line in `DECISIONS.md` released it on the next writeback feature-touch, which
+/// the change-side quote ruling was — a refusal that is a caller error must not
+/// surface as a harness error).
+///
+/// **`Display` is byte-identical to the string each site answered before typing**:
+/// the conversion is type-only at runtime, and the whole corpus of writeback and
+/// api pins asserts on those very substrings (`cannot read`, `edit would break the
+/// file`, `RESTORE FAILED`, `cannot be put on one yaml line`, …). Fields exist only
+/// where the message prints them — the two sites decided by the pure-text
+/// [`set_key_in_text`] carry no `file` because that function has no file in hand,
+/// and no variant carries a field it does not display.
+///
+/// The HTTP class is the consumer's call, made at
+/// [`crate::api::ApiError::from_writeback`]:
+///
+/// | variant | api class | why |
+/// |---|---|---|
+/// | [`Unreadable`](Self::Unreadable) | 500 `internal` | the file the catalog published vanished or became unreadable — environment |
+/// | [`WouldBreakFile`](Self::WouldBreakFile) | 409 `conflict` | the edit's result is a file the scanner would never publish (Fork C blanket) |
+/// | [`EmptyFile`](Self::EmptyFile) | 409 `conflict` | the same refusal in its degenerate form |
+/// | [`KeyNotInFile`](Self::KeyNotInFile) | 400 `bad_request` | the caller asked to remove a key that is not there |
+/// | [`WriteFailed`](Self::WriteFailed) | 500 `internal` | the unique temp could not be written |
+/// | [`RenameFailed`](Self::RenameFailed) | 500 `internal` | the atomic replace was refused (target locked) |
+/// | [`PostWriteValidation`](Self::PostWriteValidation) | 500 `internal` | the renamed bytes did not read back; the message says where the original bytes are |
+/// | [`UnrepresentableValue`](Self::UnrepresentableValue) | 400 `bad_request` | the caller's word has no line form the reader hands back — an input error, never a harness fault |
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WritebackError {
+    /// The target could not be read at all (deleted or wedged since the scan).
+    #[error("cannot read {file}: {io}")]
+    Unreadable {
+        /// The model file that could not be read.
+        file: PathBuf,
+        /// The io failure's own text (kept as text so the type stays
+        /// `Clone + Eq`, which the pins use to assert the class).
+        io: String,
+    },
+    /// The edited document has problem lines: writing it would produce a file the
+    /// scan gate refuses to publish, so the edit is refused (13[4] Fork C blanket).
+    #[error("edit would break the file: {}", .problems.join("; "))]
+    WouldBreakFile {
+        /// The scanner's own problem lines, in report order.
+        problems: Vec<String>,
+    },
+    /// The edited document would parse to nothing publishable.
+    #[error("edit would produce an empty model file")]
+    EmptyFile,
+    /// A strict single-key removal named a key the document does not contain
+    /// (the batch form treats that as already-true and never raises this).
+    #[error("cannot remove `{key}`: the key is not in the file")]
+    KeyNotInFile {
+        /// The key the caller asked to remove.
+        key: String,
+    },
+    /// The unique temp beside the target could not be written.
+    #[error("cannot write {file}: {io}")]
+    WriteFailed {
+        /// The temp path (never the target: the target is untouched by then).
+        file: PathBuf,
+        /// The io failure's own text.
+        io: String,
+    },
+    /// The atomic replace of the target was refused (e.g. a handle open without
+    /// DELETE share) — the temp was cleaned up, the target still holds its bytes.
+    #[error("cannot replace {file}: {io}")]
+    RenameFailed {
+        /// The target whose replace was refused.
+        file: PathBuf,
+        /// The io failure's own text.
+        io: String,
+    },
+    /// The bytes just renamed did not read back as a valid file; the original was
+    /// restored, or the detail says exactly where its bytes ended up (the anti-lie
+    /// contract of FINDINGS-13 [5]).
+    #[error("post-write validation failed; {detail}")]
+    PostWriteValidation {
+        /// What happened to the original bytes and the incident copy, verbatim as
+        /// the module always phrased it.
+        detail: String,
+    },
+    /// The caller's word has no form on one yaml line that
+    /// [`crate::model::scan::split_value_comment`] hands back unchanged, so
+    /// [`emit_form`] refused rather than writing a line that would misread.
+    #[error("cannot write `{key}`: the value {value:?} cannot be put on one yaml line in a form the scanner reads back unchanged")]
+    UnrepresentableValue {
+        /// The key the value was being written under.
+        key: String,
+        /// The caller's word, exactly as it arrived (trimmed at entry).
+        value: String,
+    },
+}
 
 /// Serializes every model-file rewrite process-wide. The harness is now a writer
 /// too (install-time `measured_gb` persist races the operator-initiated flag
@@ -164,7 +263,7 @@ pub(crate) fn next_temp_seq() -> u64 {
 /// # Returns
 ///
 /// The text to write after `key: `, or the refusal.
-fn emit_form(key: &str, value: &str) -> Result<String, String> {
+fn emit_form(key: &str, value: &str) -> Result<String, WritebackError> {
     if !value.contains('\n') {
         if split_value_comment(value).0 == value {
             return Ok(value.to_string());
@@ -174,10 +273,10 @@ fn emit_form(key: &str, value: &str) -> Result<String, String> {
             return Ok(wrapped);
         }
     }
-    Err(format!(
-        "cannot write `{key}`: the value {value:?} cannot be put on one yaml line in a \
-         form the scanner reads back unchanged"
-    ))
+    Err(WritebackError::UnrepresentableValue {
+        key: key.to_string(),
+        value: value.to_string(),
+    })
 }
 
 /// Sets `key: value` in a flat yaml document, preserving everything else.
@@ -230,7 +329,11 @@ fn emit_form(key: &str, value: &str) -> Result<String, String> {
 /// # Returns
 ///
 /// The new document text, or an error naming the problem.
-pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<String, String> {
+pub fn set_key_in_text(
+    text: &str,
+    key: &str,
+    value: Option<&str>,
+) -> Result<String, WritebackError> {
     // Split on '\n' keeping every byte: each element keeps its own trailing '\r'.
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut out: Vec<String> = body.split('\n').map(str::to_string).collect();
@@ -280,7 +383,9 @@ pub fn set_key_in_text(text: &str, key: &str, value: Option<&str>) -> Result<Str
             out.push(format!("{key}: {emit}{ending}"));
         }
         (None, None) => {
-            return Err(format!("cannot remove `{key}`: the key is not in the file"));
+            return Err(WritebackError::KeyNotInFile {
+                key: key.to_string(),
+            });
         }
     }
     let mut joined = out.join("\n");
@@ -316,13 +421,22 @@ fn find_key_line<'a>(mut lines: impl Iterator<Item = &'a str>, key: &str) -> Opt
 ///
 /// # Errors
 ///
-/// Read/parse/write failures as strings; the on-disk file is never left broken —
-/// a failed re-parse restores the original bytes before returning.
-pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(), String> {
+/// Any [`WritebackError`] variant this path can raise — [`Unreadable`](WritebackError::Unreadable)
+/// for the file, [`KeyNotInFile`](WritebackError::KeyNotInFile) /
+/// [`UnrepresentableValue`](WritebackError::UnrepresentableValue) from the text edit,
+/// and [`WouldBreakFile`](WritebackError::WouldBreakFile) /
+/// [`EmptyFile`](WritebackError::EmptyFile) / [`WriteFailed`](WritebackError::WriteFailed)
+/// / [`RenameFailed`](WritebackError::RenameFailed) /
+/// [`PostWriteValidation`](WritebackError::PostWriteValidation) from the publish; the
+/// on-disk file is never left broken — a failed re-parse restores the original bytes
+/// before returning.
+pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(), WritebackError> {
     // One writer at a time, and a unique temp name (see `acquire_write_gate`).
     let _gate = acquire_write_gate();
-    let original = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let original = std::fs::read_to_string(path).map_err(|e| WritebackError::Unreadable {
+        file: path.to_path_buf(),
+        io: e.to_string(),
+    })?;
     #[cfg(test)]
     hold_wide_window_if_armed(path);
     let updated = set_key_in_text(&original, key, value)?;
@@ -349,13 +463,18 @@ pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(
 ///
 /// As [`set_flag_on_file`]. Nothing reaches the disk unless every edit applied and the
 /// result parsed, so the file keeps its previous complete state.
-pub fn set_flags_on_file(path: &Path, edits: &[(&str, Option<&str>)]) -> Result<(), String> {
+pub fn set_flags_on_file(
+    path: &Path,
+    edits: &[(&str, Option<&str>)],
+) -> Result<(), WritebackError> {
     // The same gate as [`set_flag_on_file`] — one mutex for every public entry, or
     // the two entries race each other (FINDINGS-13 [11], pinned by
     // `single_key_and_batch_entries_share_one_gate`).
     let _gate = acquire_write_gate();
-    let original = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let original = std::fs::read_to_string(path).map_err(|e| WritebackError::Unreadable {
+        file: path.to_path_buf(),
+        io: e.to_string(),
+    })?;
     #[cfg(test)]
     hold_wide_window_if_armed(path);
     let mut updated = original.clone();
@@ -374,18 +493,15 @@ pub fn set_flags_on_file(path: &Path, edits: &[(&str, Option<&str>)]) -> Result<
 /// both files truthfully — and only claiming a location its own read-back
 /// confirmed (FINDINGS-BATCH-2026-10-28 [1]/[3]). Called with [`write_gate`]
 /// already held.
-fn commit_verified(path: &Path, original: &str, updated: &str) -> Result<(), String> {
+fn commit_verified(path: &Path, original: &str, updated: &str) -> Result<(), WritebackError> {
     // Validate before touching the file: the result must still parse, and an edit
     // of an "identity" key must leave a parseable, non-empty map.
     let (map, problems) = parse_flat_yaml(updated);
     if !problems.is_empty() {
-        return Err(format!(
-            "edit would break the file: {}",
-            problems.join("; ")
-        ));
+        return Err(WritebackError::WouldBreakFile { problems });
     }
     if map.is_empty() {
-        return Err("edit would produce an empty model file".to_string());
+        return Err(WritebackError::EmptyFile);
     }
     // True no-op: the edit produced the bytes that are already on disk, so there
     // is nothing to commit (FINDINGS-BATCH-2026-10-28B [6]). Deliberately *after*
@@ -397,11 +513,16 @@ fn commit_verified(path: &Path, original: &str, updated: &str) -> Result<(), Str
         return Ok(());
     }
     let tmp = temp_beside(path);
-    write_synced(&tmp, updated.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    write_synced(&tmp, updated.as_bytes()).map_err(|e| WritebackError::WriteFailed {
+        file: tmp.clone(),
+        io: e.to_string(),
+    })?;
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("cannot replace {}: {error}", path.display()));
+        return Err(WritebackError::RenameFailed {
+            file: path.to_path_buf(),
+            io: error.to_string(),
+        });
     }
     // Post-write revalidation: if the renamed file does not parse (fs hiccup),
     // restore the original bytes and fail loudly (D4's silent-200 fix).
@@ -420,7 +541,9 @@ fn commit_verified(path: &Path, original: &str, updated: &str) -> Result<(), Str
         })
         .is_err()
     {
-        return Err(restore_after_failed_validation(path, original));
+        return Err(WritebackError::PostWriteValidation {
+            detail: restore_after_failed_validation(path, original),
+        });
     }
     Ok(())
 }
@@ -470,17 +593,18 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// The post-write validation failed (unreadable or unparseable re-read): the
 /// bytes just renamed cannot be trusted on disk. Order matters (Fork B): the
 /// forensic copy is taken **before** the restore is attempted, then the restore
-/// runs through the same temp+rename machinery as the main write, and the error
-/// string names the outcome of both paths — the anti-lie fix for the old
-/// unconditional "original restored" (FINDINGS-13 [5]). The copy location is
-/// claimed as fact only when the copy's own read-back confirmed the bytes; an
-/// unconfirmed copy degrades the message to a believed-to-be-there form
-/// (FINDINGS-BATCH-2026-10-28 [3]).
+/// runs through the same temp+rename machinery as the main write, and the detail
+/// names the outcome of both paths — the anti-lie fix for the old unconditional
+/// "original restored" (FINDINGS-13 [5]). The copy location is claimed as fact
+/// only when the copy's own read-back confirmed the bytes; an unconfirmed copy
+/// degrades the message to a believed-to-be-there form (FINDINGS-BATCH-2026-10-28
+/// [3]). Returns the detail half of [`WritebackError::PostWriteValidation`], whose
+/// `Display` adds the shared `post-write validation failed; ` opening.
 fn restore_after_failed_validation(path: &Path, original: &str) -> String {
     let bak = forensic_copy(path, original);
     match restore_original_bytes(path, original) {
         Ok(()) => format!(
-            "post-write validation failed; original restored ({})",
+            "original restored ({})",
             match &bak {
                 Bak::Verified(bak_path) => format!("backup: {}", bak_path.display()),
                 Bak::Unverified {
@@ -494,7 +618,7 @@ fn restore_after_failed_validation(path: &Path, original: &str) -> String {
         ),
         Err(io) => match &bak {
             Bak::Verified(bak_path) => format!(
-                "post-write validation failed; RESTORE FAILED: {io}; original bytes are \
+                "RESTORE FAILED: {io}; original bytes are \
                  in {} \u{2014} re-check {}",
                 bak_path.display(),
                 path.display()
@@ -503,13 +627,13 @@ fn restore_after_failed_validation(path: &Path, original: &str) -> String {
                 path: bak_path,
                 fault,
             } => format!(
-                "post-write validation failed; RESTORE FAILED: {io}; original bytes \
+                "RESTORE FAILED: {io}; original bytes \
                  believed to be in {} (copy unconfirmed: {fault}) \u{2014} re-check {}",
                 bak_path.display(),
                 path.display()
             ),
             Bak::Absent(_) => format!(
-                "post-write validation failed; RESTORE FAILED: {io}; original bytes are \
+                "RESTORE FAILED: {io}; original bytes are \
                  in nowhere \u{2014} re-check {}",
                 path.display()
             ),
@@ -1310,7 +1434,8 @@ mod tests {
     fn a_value_that_no_form_round_trips_is_refused_and_the_file_stays_untouched() {
         for value in ["\"a # b\"", "\"a # b\" # c"] {
             let error = set_key_in_text("name: q\n", "note", Some(value))
-                .expect_err("no faithful and no quotable form exists");
+                .expect_err("no faithful and no quotable form exists")
+                .to_string();
             assert!(error.contains("note"), "the key must be named: {error}");
             assert!(
                 error.contains(&format!("{value:?}")),
@@ -1322,7 +1447,8 @@ mod tests {
         let dir = crate::testutil::temp_dir("writeback-refuse");
         let path = seed(&dir, CLEAN);
         let error = set_flag_on_file(&path, "note", Some("\"a # b\""))
-            .expect_err("the refusal must surface to the caller");
+            .expect_err("the refusal must surface to the caller")
+            .to_string();
         assert!(
             error.contains("note") && error.contains(&format!("{:?}", "\"a # b\"")),
             "{error}"
@@ -1353,13 +1479,15 @@ mod tests {
     #[test]
     fn a_value_with_a_line_break_is_refused_and_a_bare_carriage_return_survives() {
         let error = set_key_in_text("name: q\n", "note", Some("a\nb"))
-            .expect_err("a line break cannot be quoted away");
+            .expect_err("a line break cannot be quoted away")
+            .to_string();
         assert!(
             error.contains("note") && error.contains("\"a\\nb\""),
             "{error}"
         );
         let injected = set_key_in_text("name: q\n", "note", Some("a\nname: forged"))
-            .expect_err("the injection shape is the same refusal");
+            .expect_err("the injection shape is the same refusal")
+            .to_string();
         assert!(injected.contains("note"), "{injected}");
         let cr = set_key_in_text("name: q\n", "note", Some("a\rb")).expect("bare CR is data");
         assert_eq!(cr, "name: q\nnote: a\rb\n", "{cr}");
@@ -1713,7 +1841,8 @@ mod tests {
             "a no-op writes no temp and no incident copy: {entries:?}"
         );
         let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
-            .expect_err("a real edit on the locked target must still be refused");
+            .expect_err("a real edit on the locked target must still be refused")
+            .to_string();
         assert!(error.contains("cannot replace"), "{error}");
         assert_no_temp_leftovers(&dir);
         drop(_lock);
@@ -2006,6 +2135,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// FINDINGS-13 [10]: the classes are now branchable **structurally**, which no
+    /// substring assertion could promise while every failure shared one `String` —
+    /// an unwritable word and a wedged volume were the same shape to the api. Each
+    /// site is asserted by variant here; the pre-existing text pins still hold the
+    /// wording, untouched. Falsifier: swap two sites' variants (e.g. raise
+    /// `UnrepresentableValue` as `WriteFailed`) and its row fails.
+    #[test]
+    fn each_failure_site_raises_the_class_the_caller_needs_to_branch_on() {
+        let dir = crate::testutil::temp_dir("writeback-classes");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let missing = dir.join("ghost.yaml");
+        let error = set_flag_on_file(&missing, "category", Some("WORK")).err();
+        assert!(
+            matches!(&error, Some(WritebackError::Unreadable { file, .. }) if file == &missing),
+            "a vanished file is Unreadable, got {error:?}"
+        );
+
+        let path = dir.join("m.yaml");
+        std::fs::write(&path, "name: qwen\nengine: mock\n").expect("seed");
+        assert_eq!(
+            set_flag_on_file(&path, "ghost", None).err(),
+            Some(WritebackError::KeyNotInFile {
+                key: "ghost".to_string()
+            }),
+            "a strict removal of an absent key is the caller's class"
+        );
+        assert_eq!(
+            set_flag_on_file(&path, "name", Some("\"a # b\"")).err(),
+            Some(WritebackError::UnrepresentableValue {
+                key: "name".to_string(),
+                value: "\"a # b\"".to_string(),
+            }),
+            "an unwritable word is a caller error, never a harness fault"
+        );
+
+        std::fs::write(&path, "name: qwen\nnot a key line\n").expect("reseed");
+        let error = set_flag_on_file(&path, "engine", Some("mock")).err();
+        assert!(
+            matches!(&error, Some(WritebackError::WouldBreakFile { problems })
+                if !problems.is_empty()),
+            "a result the scanner would drop is WouldBreakFile, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("intact"),
+            "name: qwen\nnot a key line\n",
+            "and the refusal still wrote nothing"
+        );
+
+        std::fs::write(&path, "name: qwen\n").expect("reseed");
+        assert_eq!(
+            set_flag_on_file(&path, "name", None).err(),
+            Some(WritebackError::EmptyFile),
+            "the degenerate refusal has its own class, distinct from a broken file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A valid model document whose scan stays error-free (mock engine: the
     /// `model:` existence gate is exempt, no stray reports).
     const CLEAN: &str =
@@ -2029,7 +2217,8 @@ mod tests {
         let path = seed(&dir, CLEAN);
         arm_post_write_corrupt(&path, false);
         let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
-            .expect_err("the seam must fail post-write validation");
+            .expect_err("the seam must fail post-write validation")
+            .to_string();
         assert!(
             error.starts_with("post-write validation failed; original restored (backup: "),
             "{error}"
@@ -2070,7 +2259,8 @@ mod tests {
         let path = seed(&dir, WITH_NODE);
         arm_post_write_corrupt(&path, false);
         let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
-            .expect_err("the seam must fail post-write validation");
+            .expect_err("the seam must fail post-write validation")
+            .to_string();
         assert!(error.contains("qwen3.yaml.bak"), "{error}");
         let bak_text = std::fs::read_to_string(dir.join("qwen3.yaml.bak")).expect("incident copy");
         let bak_lines: Vec<&str> = bak_text
@@ -2132,7 +2322,8 @@ mod tests {
         let path = seed(&dir, CLEAN);
         arm_post_write_corrupt(&path, true);
         let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
-            .expect_err("the restore rename must be refused");
+            .expect_err("the restore rename must be refused")
+            .to_string();
         assert!(
             error.starts_with("post-write validation failed; RESTORE FAILED: "),
             "{error}"
@@ -2175,7 +2366,8 @@ mod tests {
         arm_post_write_corrupt(&path, false);
         arm_bak_readback_mismatch(&path);
         let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
-            .expect_err("the seam must fail post-write validation");
+            .expect_err("the seam must fail post-write validation")
+            .to_string();
         assert!(
             error.starts_with(
                 "post-write validation failed; original restored (backup unverified: "
@@ -2211,7 +2403,8 @@ mod tests {
         arm_post_write_corrupt(&path, true);
         arm_bak_readback_mismatch(&path);
         let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
-            .expect_err("the restore rename must be refused");
+            .expect_err("the restore rename must be refused")
+            .to_string();
         assert!(
             error.starts_with("post-write validation failed; RESTORE FAILED: "),
             "{error}"
@@ -2250,7 +2443,8 @@ mod tests {
         arm_post_write_corrupt(&path, false);
         arm_target_readback_mismatch(&path);
         let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
-            .expect_err("the restore must report the unconfirmed re-read");
+            .expect_err("the restore must report the unconfirmed re-read")
+            .to_string();
         assert!(
             error.starts_with("post-write validation failed; RESTORE FAILED: "),
             "{error}"

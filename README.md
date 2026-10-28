@@ -183,13 +183,14 @@ All / per-category, Exit.
 | `POST /har/rescan` | `{}` catalog rescan |
 | `POST /har/config/default` | `{category, model \| null}` — persists to the config file |
 | `POST /har/config/logging` | `{enabled: bool}` — toggles the verbose harness log (answers `extended_logging`) |
-| `POST /har/config/model` | `{model, category?, cpu?}` — writes back to the model yaml |
+| `POST /har/config/model` | `{model, category?, cpu?}` — writes back to the model yaml (400 on an unwritable value or absent key, 409 when the edited file would not be publishable, 500 only for a real io/validation failure) |
 
 Errors carry both a flat `{code, message}` and the OpenAI-style
 `{error:{message,type,code}}` envelope, with the same values in both. The `code` is
 one of: `not_found` (404), `bad_request` (400), `unauthorized` (401, control token),
 `forbidden` (403, cross-site `Origin` on a POST), `conflict` (409, cancelled /
-superseded / port still held), `unsupported_media_type` (415), `unavailable` (503,
+superseded / port still held / a model-yaml edit whose result the scanner would
+refuse to publish), `unsupported_media_type` (415), `unavailable` (503,
 admission refused with the numbers and blockers), `below_launch_floor` (503, refused
 before spawn), `witness_unavailable` (503, card unreadable), `upstream` (502),
 `not_implemented` (501), `internal` (500). Refusals that carry numbers do so in

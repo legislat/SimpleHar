@@ -954,6 +954,113 @@ async fn config_model_writes_back_to_the_yaml_file() {
 }
 
 #[tokio::test]
+async fn config_model_reports_writeback_refusals_by_http_class() {
+    // FINDINGS-13 [10]: the write-back's typed failures decide the status, so a
+    // refusal that is the *file's* state is no longer dressed up as a harness
+    // fault. Both legs reach the endpoint through the window the editor-race
+    // doctrine allows (DECISIONS: the operator edits yamls while the harness is
+    // idle) — the catalog still publishes the entry while the file on disk has
+    // moved under it. Falsifier: send `WouldBreakFile` back to `Internal` in
+    // `ApiError::from_writeback` and the 409 leg answers 500.
+    let (control, _, _, _, _, modelconf) = build_app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+        &[],
+    );
+    let file = modelconf.join("qwen3.yaml");
+    // The actor's cached catalog must hold the row before the file is moved under
+    // it — that cache is exactly what makes the two legs below reachable (and a
+    // request here also waits out the boot scan, so a late scan cannot turn this
+    // pin into a silent 404).
+    let (_, published) = get_json(&control, "/har/models").await;
+    assert!(
+        published["data"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .any(|entry| entry["id"] == "qwen3"),
+        "the row must be published before the file moves: {published}"
+    );
+
+    // 409 conflict: the edited document is one the scan gate would never publish,
+    // so the blanket refusal is a live-state clash — and the scanner's own problem
+    // lines reach the operator, who is the only one who can fix the file.
+    std::fs::write(&file, "name: qwen3\nnot a key line\n").expect("mangle");
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["code"], "conflict");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("edit would break the file"),
+        "the module's own sentence must survive the mapping: {message}"
+    );
+    assert!(
+        message.contains("not a key line"),
+        "the problem lines are the operator's diagnosis: {message}"
+    );
+    // FINDINGS-BATCH-2026-10-28H [1]: the config-state refusal names the file, as a
+    // caller-side PREFIX. The two `contains` legs above already prove the module's
+    // sentence survived; these prove it is intact at both seams — the reason opens
+    // with the path and the module's sentence is its exact tail. Falsifier: drop
+    // the prefix in `ApiError::from_writeback` and the first leg fails; corrupt the
+    // sentence inside the composition and the `contains` legs and this tail leg
+    // fail while the module's own pins stay green.
+    assert!(
+        message.starts_with(&format!("conflict: {}: ", file.display())),
+        "a config-state refusal must name its file first: {message}"
+    );
+    assert!(
+        message.ends_with(
+            "edit would break the file: line 2: not a `key: value` line: `not a key line`"
+        ),
+        "the module's sentence must be the untouched tail of the prefix: {message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read back"),
+        "name: qwen3\nnot a key line\n",
+        "a refused edit writes nothing at all"
+    );
+
+    // 500 internal: the file itself vanished under a still-published entry — that
+    // one genuinely is the harness's/environment's problem, and stays 500.
+    std::fs::write(&file, "name: qwen3\nengine: mock\n").expect("restore");
+    std::fs::remove_file(&file).expect("delete");
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["code"], "internal");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot read"),
+        "{body}"
+    );
+
+    // And the healthy path is untouched by the typing: same endpoint, same 200.
+    std::fs::write(&file, "name: qwen3\nengine: mock\ncategory: WORK\n").expect("reseed");
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(std::fs::read_to_string(&file)
+        .expect("read")
+        .contains("category: AUX"));
+}
+
+#[tokio::test]
 async fn cpu_edit_is_refused_on_models_whose_engine_never_reads_the_key() {
     // FINDINGS-BATCH-2026-10-28F [3]: with B shipped, a scripted `cpu` write to a
     // strata (or mock) row would make the harness itself the #1 producer of the

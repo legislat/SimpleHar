@@ -15,6 +15,7 @@
 //!   idempotency: a double-click attaches to the same job).
 
 use crate::config::{AppConfig, CategoryId};
+use crate::model::writeback::WritebackError;
 use crate::model::ModelEntry;
 use crate::scheduler::{JobId, Reply, SchedulerError, SchedulerHandle, SchedulerStatus};
 use axum::body::Body;
@@ -120,6 +121,49 @@ impl ApiError {
             ApiError::UnsupportedMedia { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ApiError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             ApiError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// Classifies a model-file write-back failure (FINDINGS-13 [10], released from
+    /// DEFERRED by the change-side quote ruling — the ruling added a failure mode
+    /// that is a caller error, and it was surfacing as `500 internal`).
+    ///
+    /// The module's own sentence is never re-worded. For the two **config-state**
+    /// classes the caller still owes what the module deliberately does not carry —
+    /// *which* file refused — so `file` is prepended here, as a **prefix**: the
+    /// reason becomes `<file>: <module sentence>` with the sentence intact to the
+    /// last byte (that is what the endpoint's `contains`/`ends_with` legs prove
+    /// unedited). Every other class answers `reason == error.to_string()` exactly,
+    /// byte-identical to what the endpoint answered before typing.
+    ///
+    /// | writeback class | api | reason | reading |
+    /// |---|---|---|---|
+    /// | `UnrepresentableValue`, `KeyNotInFile` | `400 bad_request` | the module's sentence, verbatim | the request itself is not writable — fix the request |
+    /// | `WouldBreakFile`, `EmptyFile` | `409 conflict` | `<file>: ` + the module's sentence | well-formed request, refused by *this* file's current state (Fork C blanket: the edited file is one the scanner would never publish) |
+    /// | `Unreadable`, `WriteFailed`, `RenameFailed`, `PostWriteValidation` | `500 internal` | the module's sentence, verbatim | the harness or the volume failed; `PostWriteValidation`'s message still tells the truth about where the original bytes are |
+    ///
+    /// Pinned class-by-class (including the prefix/non-prefix split) by
+    /// `writeback_errors_map_to_their_http_class_without_rewording` (all eight, in
+    /// crate) and, for the classes the endpoint can genuinely reach, by the
+    /// `/har/config/model` tests in `tests/api_surface.rs`.
+    pub(crate) fn from_writeback(file: &std::path::Path, error: WritebackError) -> Self {
+        match error {
+            WritebackError::WouldBreakFile { .. } | WritebackError::EmptyFile => {
+                ApiError::Conflict {
+                    reason: format!("{}: {error}", file.display()),
+                }
+            }
+            WritebackError::UnrepresentableValue { .. } | WritebackError::KeyNotInFile { .. } => {
+                ApiError::BadRequest {
+                    reason: error.to_string(),
+                }
+            }
+            WritebackError::Unreadable { .. }
+            | WritebackError::WriteFailed { .. }
+            | WritebackError::RenameFailed { .. }
+            | WritebackError::PostWriteValidation { .. } => ApiError::Internal {
+                reason: error.to_string(),
+            },
         }
     }
 }
@@ -1242,7 +1286,7 @@ async fn har_config_model(
     // the file half-edited (category moved, alias still there) if a write failed
     // between the two — 1g's non-atomic defect, not replicated here.
     crate::model::writeback::set_flags_on_file(&path, &refs)
-        .map_err(|reason| ApiError::Internal { reason })?;
+        .map_err(|error| ApiError::from_writeback(&path, error))?;
     // The catalog must reflect the file the moment the operator looks again.
     state.scheduler.reload().await.map_err(ApiError::from)?;
 
@@ -1761,7 +1805,116 @@ mod tests {
     use super::*;
     use crate::scheduler::SlotStatus;
     use axum::http::Request;
+    use std::path::PathBuf;
     use tower::ServiceExt;
+
+    /// FINDINGS-13 [10]: every writeback class has a decided HTTP class, and the
+    /// mapping re-words nothing. The two config-state classes additionally owe the
+    /// operator the *name of the file* that refused (the module's `Display`
+    /// deliberately carries none), so their reason is `"<file>: " + the module's
+    /// sentence` — a caller-side **prefix** with the sentence intact to the last
+    /// byte; every other class answers `reason == error.to_string()` exactly. The
+    /// split is asserted per row (`names_file`), so it cannot silently widen.
+    /// Falsifiers: send one variant back to `Internal` and its row fails; drop the
+    /// prefix and the two config rows fail; corrupt the sentence inside the
+    /// composition and the same two rows fail on the tail equality.
+    #[test]
+    fn writeback_errors_map_to_their_http_class_without_rewording() {
+        let file = PathBuf::from("ModelConf/qwen3.yaml");
+        let cases: Vec<(WritebackError, StatusCode, &'static str, bool)> = vec![
+            (
+                WritebackError::UnrepresentableValue {
+                    key: "name".to_string(),
+                    value: "\"a # b\"".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                false,
+            ),
+            (
+                WritebackError::KeyNotInFile {
+                    key: "ghost".to_string(),
+                },
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                false,
+            ),
+            (
+                WritebackError::WouldBreakFile {
+                    problems: vec!["line 2: not a `key: value` line: `nope`".to_string()],
+                },
+                StatusCode::CONFLICT,
+                "conflict",
+                true,
+            ),
+            (
+                WritebackError::EmptyFile,
+                StatusCode::CONFLICT,
+                "conflict",
+                true,
+            ),
+            (
+                WritebackError::Unreadable {
+                    file: PathBuf::from("ModelConf/qwen3.yaml"),
+                    io: "os error 2".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                false,
+            ),
+            (
+                WritebackError::WriteFailed {
+                    file: PathBuf::from("ModelConf/qwen3.yaml.1.2.sh.tmp"),
+                    io: "os error 28".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                false,
+            ),
+            (
+                WritebackError::RenameFailed {
+                    file: PathBuf::from("ModelConf/qwen3.yaml"),
+                    io: "os error 5".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                false,
+            ),
+            (
+                WritebackError::PostWriteValidation {
+                    detail: "RESTORE FAILED: io; original bytes are in qwen3.yaml.bak".to_string(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                false,
+            ),
+        ];
+        for (error, status, code, names_file) in cases {
+            let text = error.to_string();
+            let mapped = ApiError::from_writeback(&file, error);
+            assert_eq!(mapped.status(), status, "{text}");
+            assert_eq!(mapped.code(), code, "{text}");
+            let reason = match &mapped {
+                ApiError::BadRequest { reason }
+                | ApiError::Conflict { reason }
+                | ApiError::Internal { reason } => reason,
+                other => panic!("writeback errors map to the three decided classes, got {other:?}"),
+            };
+            if names_file {
+                assert_eq!(
+                    reason,
+                    &format!("{}: {text}", file.display()),
+                    "a config-state refusal must name the file that refused"
+                );
+                assert!(
+                    reason.ends_with(&text),
+                    "the path must be a prefix, never a re-word: {reason}"
+                );
+            } else {
+                assert_eq!(reason, &text, "the mapping must not re-word the module");
+            }
+        }
+    }
 
     #[test]
     fn config_write_path_follows_boot_and_never_the_legacy_file() {
