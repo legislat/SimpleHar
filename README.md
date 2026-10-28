@@ -3,7 +3,8 @@
 A Windows tray harness for local LLM inference engines: one app, one GPU, many
 models. It owns llama.cpp `llama-server` processes (more engines planned), swaps
 models between four category listeners with a typed, single-writer scheduler,
-admits loads against a real memory ledger, and refuses — with reasons — rather
+admits loads on the card's own reading (the witness) minus reserve, with in-flight
+bookings, and refuses — with reasons — rather
 than overcommitting.
 
 Current release: **1.0** — `cargo build --release` produces
@@ -70,7 +71,7 @@ partial files are completed, an invalid file is fatal with every problem logged
 | `categories` | four defaults | Per-category `id`, `public_port`, `max_models`, `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), `engine_ports` |
 | `vram_total_gb` | `72.0` | Admission ceiling |
 | `vram_reserve_gb` | `2.0` | Kept unreachable by admission |
-| `witness_tolerance_gb` | `2.0` | NVML/ledger disagreement band; also the settle allowance |
+| `witness_tolerance_gb` | `2.0` | Post-kill driver-lag band: a load may spawn up to this far under the gate (absorbs the lag between a confirmed release and the card's own reading catching up); also the settle allowance |
 | `greedy_launch_min_free_gb` | `4.0` | Launch floor applied to `cost: greedy` models without their own `launch_only_with_at_least_vram_free` |
 | `load_timeout_s` | `120` | Readiness deadline per load; per-model override via the `load_timeout:` yaml key |
 | `measured_sample_s` | `60` | Seconds between witness samples while a model serves; builds the `measured_gb`/`measured_gb_min` range |
@@ -154,8 +155,8 @@ After editing files, press **Rescan** (or `POST /har/rescan`).
 
 ## Control page
 
-`http://127.0.0.1:8708/` — slot cards + memory bars (VRAM ledger with the reserve
-marked as a hatched band, observed, host RAM), category tabs, per-model rows
+`http://127.0.0.1:8708/` — slot cards + memory bars (observed VRAM from the card's
+own reading, with the reserve marked as a hatched band and in-flight bookings noted, host RAM), category tabs, per-model rows
 (Load / Set default, state dot + name, category select, CPU checkbox, Engine,
 Ctx, Cost, Files), recent jobs, collapsible harness log.
 Updates push over SSE (`/har/events`) and degrade to polling; adaptive light/dark
@@ -230,7 +231,7 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
   the log panel) flags models whose GGUF is gone before the first load tries it.
 - **Refusals** — every rejection names the blockers and the numbers
   (`/har/status` jobs + `last_error`); nothing over-admits, so a refusal means
-  unload something or raise nothing — the ledger is the truth.
+  unload something or raise nothing — the card's own reading (the witness) is the truth.
 - **`launch floor not met`** (code `below_launch_floor`) — the card holds too
   little physically free VRAM for that model to launch sanely (foreign
   processes). The load was refused **before spawn**, so nothing thrashed; free
