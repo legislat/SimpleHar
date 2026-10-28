@@ -323,9 +323,13 @@ async fn unreadable_card_reading_refuses_rather_than_silently_fitting() {
 #[tokio::test]
 async fn serving_window_folds_total_diff_into_the_yaml_measured_range() {
     // §0.4 item c: while a model serves, the witness total-diff is sampled on
-    // `measured_sample_s` and persisted as `measured_gb` (the high end `fixed` books),
-    // `measured_gb_min` (the low end the page shows) and the `cpu_offload` setting the
-    // pair was taken under, so a later flip voids it at scan.
+    // `measured_sample_s` and persisted as `measured_gb` (the high end `fixed`
+    // books) and `measured_gb_min` (the low end the page shows). The pair is
+    // engine-agnostic witness truth, so it mints here on `engine: mock`; the
+    // `cpu_offload` stamp does NOT — mock sits outside `OFFLOAD_ENGINES`
+    // (engine/llama.rs), so its yaml must never gain a `measured_offload` line.
+    // The stamp-mint path is pinned on llama by
+    // `only_offload_engines_stamp_measured_offload` (src/scheduler/mod.rs).
     // A foreign process already holds 30 GiB. The baseline is the free memory this load
     // was admitted at, so the tenant must never be folded into the range — the
     // guarantee the old pid-attributed sample gave, kept on the new basis.
@@ -353,8 +357,8 @@ async fn serving_window_folds_total_diff_into_the_yaml_measured_range() {
     assert!(yaml.contains("measured_gb: 20.0"), "was: {yaml}");
     assert!(yaml.contains("measured_gb_min: 10.0"), "was: {yaml}");
     assert!(
-        yaml.contains("measured_offload: false"),
-        "the pair must carry the setting it was measured under: {yaml}"
+        !yaml.contains("measured_offload"),
+        "mock never reads cpu_offload: no stamp on its yaml: {yaml}"
     );
     assert!(
         yaml.contains("engine: mock") && yaml.contains("vram_gb: 8"),

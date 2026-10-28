@@ -1163,7 +1163,10 @@ async fn har_config_default(
 
 /// `POST /har/config/model {"model": name, "category"?: WORK|RP|AUX|EMB, "cpu"?: bool}`
 /// — write per-model flags into the model's yaml (Step 9: the file stays the
-/// source of truth). A category change on a *loaded* model frees the slot so the
+/// source of truth). A `cpu` edit on a model whose engine is outside
+/// [`crate::engine::llama::OFFLOAD_ENGINES`] is refused 400 naming the engine:
+/// that key changes no launch there, and the harness never writes inert keys.
+/// A category change on a *loaded* model frees the slot so the
 /// next use reloads it into the right listener (v3.3 §-behavior, kept).
 async fn har_config_model(
     State(state): State<Arc<ApiState>>,
@@ -1209,6 +1212,21 @@ async fn har_config_model(
         }
     }
     if let Some(cpu) = body.get("cpu").and_then(Value::as_bool) {
+        // The key is a knob the row's engine must actually read (same const as the
+        // scan hint, the stamp and the webui gate): the page stopped offering the
+        // control for non-offload rows, so the API must not let a script mint the
+        // dead yaml line the scan would then report. Refused with the named
+        // sentence, not silently accepted or dropped.
+        if !crate::engine::llama::offload_live(&entry.engine) {
+            return Err(ApiError::BadRequest {
+                reason: format!(
+                    "`cpu_offload` is read only by the {} engine(s) \u{2014} engine `{}` never \
+                     reads it; this key does nothing here",
+                    crate::engine::llama::OFFLOAD_ENGINES.join("/"),
+                    entry.engine
+                ),
+            });
+        }
         edits.push(("cpu_offload", Some(cpu.to_string())));
     }
     if edits.is_empty() {

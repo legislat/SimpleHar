@@ -279,6 +279,38 @@ mod tests {
         );
     }
 
+    /// Pin of the `cpu_offload` engine scoping: the ninfer adapter reads only
+    /// `ninfer_autostart`/`ninfer_container`/`ninfer_profile`/`ninfer_key` — the
+    /// key is inert for this engine, so absent, `true` and `false` must produce a
+    /// byte-identical [`LaunchSpec`] (argv, env, readiness, cwd, container alike).
+    /// Falsifier: if this adapter starts reading the key, the equality fails here.
+    #[test]
+    fn cpu_offload_changes_nothing_for_a_ninfer_launch() {
+        let base = NinferAdapter::new("Ubuntu", "ops")
+            .spec(
+                &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", "c")]),
+                18109,
+            )
+            .expect("absent key");
+        for value in ["true", "false"] {
+            let spec = NinferAdapter::new("Ubuntu", "ops")
+                .spec(
+                    &entry(&[
+                        ("ninfer_autostart", "/s.sh"),
+                        ("ninfer_container", "c"),
+                        ("cpu_offload", value),
+                    ]),
+                    18109,
+                )
+                .expect("an inert key never refuses a launch");
+            assert_eq!(
+                spec, base,
+                "cpu_offload: {value} must change nothing — if the ninfer adapter \
+                 starts reading the key, this fails"
+            );
+        }
+    }
+
     #[test]
     fn missing_required_keys_are_refusals_not_panic() {
         let err = NinferAdapter::new("Ubuntu", "ops")

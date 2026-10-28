@@ -5,6 +5,11 @@
 const CATEGORY_ORDER = ["WORK", "RP", "AUX", "EMB"];
 const POLL_MS = 2000;
 
+// Engines whose adapter reads `cpu_offload`: the row's checkbox renders only here.
+// Mirrors the Rust `OFFLOAD_ENGINES` const (engine/llama.rs, §20-9 Fork C knob
+// table row 1); the webui lib test compares these two lists, so they cannot drift.
+const OFFLOAD_ENGINES = ["llama"];
+
 // Anything a re-render would lose must live here: render() rebuilds the whole
 // DOM on every SSE push, so UI state (open tabs, log panel) is state, not DOM.
 let state = {
@@ -404,17 +409,24 @@ function modelRow(status, model, category) {
   row.append(el("td", {}, select));
 
   // CPU checkbox: forces -ngl 0 for llama engines; write-back is the yaml.
-  const cpu = el("input", { type: "checkbox", "aria-label": "cpu offload" });
-  cpu.checked = model.cpu_offload === true;
-  cpu.addEventListener("change", () =>
-    postJson("/har/config/model", { model: model.id, cpu: cpu.checked })
-      .then(refresh)
-      .catch((error) => {
-        flashError(error);
-        refresh();
-      }),
-  );
-  row.append(el("td", {}, cpu));
+  // Only the engines whose adapter reads the key get the control: a click on a
+  // strata/ninfer row would mint a dead yaml line and change no argv word, so
+  // those rows show a dash (scan reports `inert_key` if the file carries it).
+  if (OFFLOAD_ENGINES.includes(model.engine)) {
+    const cpu = el("input", { type: "checkbox", "aria-label": "cpu offload" });
+    cpu.checked = model.cpu_offload === true;
+    cpu.addEventListener("change", () =>
+      postJson("/har/config/model", { model: model.id, cpu: cpu.checked })
+        .then(refresh)
+        .catch((error) => {
+          flashError(error);
+          refresh();
+        }),
+    );
+    row.append(el("td", {}, cpu));
+  } else {
+    row.append(el("td", {}, text("—")));
+  }
 
   row.append(el("td", {}, text(model.engine)));
   row.append(el("td", {}, text(model.context ?? "—")));

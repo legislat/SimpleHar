@@ -86,6 +86,26 @@ pub(crate) const FLAG_TABLE: &[(&str, &str)] = &[
     ("fit_ctx", "--fit-ctx"),
 ];
 
+/// Engine ids for which `cpu_offload` is a live concept: this table is
+/// **the first row of the §20-9 Fork C `EnginePolicy` knob table** — scoping
+/// data, not scattered `if entry.engine == "llama"` tests, so chunk 10 replaces
+/// one lookup rather than a scatter. An absent `engine:` key resolves to
+/// `"llama"` ([`crate::model::ModelEntry::from_flat`]), the scan default, so it
+/// is in scope through that default. `mock` is deliberately absent: it
+/// impersonates other engines in tests and its adapter reads no offload knob,
+/// so claiming it live would be the engine-neutrality lie this scoping exists
+/// to remove; tests that need llama offload semantics name `engine: llama`.
+/// Sibling llama knobs (`ngl`, `fit`, `context`, ...) are knowingly unscoped
+/// here for now — the full knob table is chunk 10's object.
+pub(crate) const OFFLOAD_ENGINES: &[&str] = &["llama"];
+
+/// Whether `engine` reads `cpu_offload` anywhere (spawn, stamp, void). The
+/// engine string must already carry the absent-key default (`"llama"`).
+#[must_use]
+pub(crate) fn offload_live(engine: &str) -> bool {
+    OFFLOAD_ENGINES.contains(&engine)
+}
+
 /// `jinja` truthiness per `start.ps1`: only `true`, `1`, `on` (case-sensitive
 /// membership in the script's `-in 'true','1','on'`; note `yes` is *not* included).
 /// Also the canonical read of `cpu_offload` — the engine's behavior, so the

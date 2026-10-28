@@ -901,9 +901,18 @@ async fn events_stream_serves_sse_with_an_immediate_state() {
 
 #[tokio::test]
 async fn config_model_writes_back_to_the_yaml_file() {
-    let (control, _, _, _, _, modelconf) = app(
+    // The CPU leg rides a `llama` row since the FINDINGS-BATCH-2026-10-28F [3]
+    // gate: a `cpu` edit is refused for engines outside OFFLOAD_ENGINES (the
+    // refusal legs are pinned by
+    // `cpu_edit_is_refused_on_models_whose_engine_never_reads_the_key`); the
+    // category leg keeps the mock row, proving category writes stay engine-blind.
+    let (control, _, _, _, _, modelconf) = build_app(
         AppConfig::default(),
-        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+        &[
+            ("qwen3", "mock", CategoryId::Work, Some(4.0)),
+            ("gguf3", "llama", CategoryId::Work, Some(4.0)),
+        ],
+        &[("llama", Arc::new(MockAdapter))],
     );
     let file = modelconf.join("qwen3.yaml");
     let original = std::fs::read_to_string(&file).expect("model file");
@@ -930,18 +939,85 @@ async fn config_model_writes_back_to_the_yaml_file() {
         .expect("entry");
     assert_eq!(entry["category"], "AUX");
 
-    // CPU edit: boolean -> yaml key, and back.
-    let (status, _) = post_json(
+    // CPU edit on the offload engine: boolean -> yaml key, and back.
+    let (status, body) = post_json(
         &control,
         "/har/config/model",
-        r#"{"model":"qwen3","cpu":true}"#,
+        r#"{"model":"gguf3","cpu":true}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(std::fs::read_to_string(&file)
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(std::fs::read_to_string(modelconf.join("gguf3.yaml"))
         .expect("read")
         .contains("cpu_offload: true"));
     let _ = original;
+}
+
+#[tokio::test]
+async fn cpu_edit_is_refused_on_models_whose_engine_never_reads_the_key() {
+    // FINDINGS-BATCH-2026-10-28F [3]: with B shipped, a scripted `cpu` write to a
+    // strata (or mock) row would make the harness itself the #1 producer of the
+    // InertKey noise it just invented. The page offers no control there (C) and
+    // the API now agrees: 400 naming the key, the row engine and the owning set —
+    // while the engine-blind category write and the llama cpu write keep working.
+    // Falsifier: removing the OFFLOAD_ENGINES gate in `har_config_model` returns
+    // 200 here and lands a dead `cpu_offload` line in the yaml.
+    let (control, _, _, _, _, modelconf) = build_app(
+        AppConfig::default(),
+        &[
+            ("strataline", "strata", CategoryId::Work, Some(8.0)),
+            ("mockline", "mock", CategoryId::Work, Some(4.0)),
+            ("llamaline", "llama", CategoryId::Work, Some(4.0)),
+        ],
+        &[
+            ("strata", Arc::new(MockAdapter)),
+            ("llama", Arc::new(MockAdapter)),
+        ],
+    );
+    for (model, engine) in [("strataline", "strata"), ("mockline", "mock")] {
+        let (status, body) = post_json(
+            &control,
+            "/har/config/model",
+            &format!(r#"{{"model":"{model}","cpu":true}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["code"], "bad_request");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("cpu_offload")
+                && message.contains(engine)
+                && message.contains("llama"),
+            "the refusal must name key, row engine and the owning set: {message}"
+        );
+        let text = std::fs::read_to_string(modelconf.join(format!("{model}.yaml"))).expect("read");
+        assert!(
+            !text.contains("cpu_offload"),
+            "a refused edit must leave the yaml free of the dead key: {text}"
+        );
+    }
+    // The refusal is surgical: the category write still works on the same strata row.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"strataline","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(std::fs::read_to_string(modelconf.join("strataline.yaml"))
+        .expect("read")
+        .contains("category: AUX"));
+    // And the offload engine still accepts the cpu key.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"llamaline","cpu":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(std::fs::read_to_string(modelconf.join("llamaline.yaml"))
+        .expect("read")
+        .contains("cpu_offload: true"));
 }
 
 #[tokio::test]

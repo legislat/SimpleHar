@@ -547,12 +547,14 @@ enum ActorMsg {
     /// (Fork C, FINDINGS-13 [4] follow-through): the actor must stop booking in
     /// memory what disk rejected. Carries the exact triple the failed write
     /// attempted, so a reading that has since been superseded never drains the
-    /// newer (possibly persisted) values.
+    /// newer (possibly persisted) values. `offload` is `None` for engines outside
+    /// `OFFLOAD_ENGINES` — their persist carried only the pair, and their memory
+    /// never held a stamp to drain.
     MeasuredPersistFailed {
         model: String,
         high: f64,
         low: f64,
-        offload: bool,
+        offload: Option<bool>,
     },
     /// Periodic sweep from the tick task: idles out occupants per category policy.
     Tick,
@@ -1417,8 +1419,10 @@ impl ActorState {
 
     /// Folds one serving-window reading into the model's measured range and writes it
     /// back to the yaml (§0.4): `measured_gb` keeps the high end — what `fixed`
-    /// admission consults — and `measured_gb_min` the low end the page shows, with the
-    /// `cpu_offload` setting they were taken under so a later flip voids them at scan.
+    /// admission consults — and `measured_gb_min` the low end the page shows, plus —
+    /// for `OFFLOAD_ENGINES` owners only — the `cpu_offload` setting they were taken
+    /// under, so a later flip voids them at scan (the pair is engine-agnostic
+    /// witness truth; the stamp is a knob the engine must actually read).
     /// Four guards keep the number honest: the sampled engine must still be the one in
     /// the slot; no other job may be in flight; a tenant that appeared after admit is
     /// subtracted, or the driver's own per-process attribution is used when the card
@@ -1473,15 +1477,25 @@ impl ActorState {
             // would write the exact token the scanner's reader rule rejects.
             return;
         }
-        let mut persist: Option<(std::path::PathBuf, f64, f64, bool)> = None;
+        let mut persist: Option<(std::path::PathBuf, f64, f64, Option<bool>)> = None;
         let mut changed = false;
         if let Some(entry) = self.catalog.iter_mut().find(|m| m.name == model) {
             // Stamped with the engine's own truth set, the reading the page and the
             // adapter use, so the invalidation cannot disagree with them (HANDOFF §6).
-            let offload = entry
-                .raw
-                .get("cpu_offload")
-                .is_some_and(|v| crate::engine::llama::jinja_on(v));
+            // The stamp is minted only where `cpu_offload` is a live concept
+            // (OFFLOAD_ENGINES, §20-9 Fork C knob-table row 1): the pair is witness
+            // truth for every engine, but a stamp on an engine that never reads the
+            // key means nothing and could only ever be voided spuriously.
+            let offload = if crate::engine::llama::offload_live(&entry.engine) {
+                Some(
+                    entry
+                        .raw
+                        .get("cpu_offload")
+                        .is_some_and(|v| crate::engine::llama::jinja_on(v)),
+                )
+            } else {
+                None
+            };
             let high = entry.measured_gb.unwrap_or(rounded).max(rounded);
             let low = entry
                 .measured_min_gb
@@ -1490,7 +1504,7 @@ impl ActorState {
                 .min(high);
             if entry.measured_gb != Some(high)
                 || entry.measured_min_gb != Some(low)
-                || entry.measured_offload != Some(offload)
+                || entry.measured_offload != offload
             {
                 if let Some(declared) = entry.vram_gb {
                     let drift = (high - declared).abs();
@@ -1505,7 +1519,7 @@ impl ActorState {
                 }
                 entry.measured_gb = Some(high);
                 entry.measured_min_gb = Some(low);
-                entry.measured_offload = Some(offload);
+                entry.measured_offload = offload;
                 if let Some(path) = entry.file.clone() {
                     persist = Some((path, high, low, offload));
                 }
@@ -1516,20 +1530,22 @@ impl ActorState {
             let name = model.to_string();
             let tx = self.tx.clone();
             tokio::task::spawn_blocking(move || {
-                // All three keys in ONE rewrite: written separately, a failure between
-                // them could leave an orphan or inverted pair, and the scanner rejects
-                // that pair outright — dropping the whole model (review, 2026-10-27).
+                // Every measured key in ONE rewrite: written separately, a failure
+                // between them could leave an orphan or inverted pair, and the
+                // scanner rejects that pair outright — dropping the whole model
+                // (review, 2026-10-27). The stamp rides only when the engine reads
+                // `cpu_offload`: a non-offload yaml never gains a meaningless key.
                 let high_text = format!("{high:.1}");
                 let low_text = format!("{low:.1}");
-                let stamp = offload.to_string();
-                if let Err(error) = crate::model::writeback::set_flags_on_file(
-                    &path,
-                    &[
-                        ("measured_gb", Some(high_text.as_str())),
-                        ("measured_gb_min", Some(low_text.as_str())),
-                        ("measured_offload", Some(stamp.as_str())),
-                    ],
-                ) {
+                let stamp_text = offload.map(|on| on.to_string());
+                let mut edits: Vec<(&str, Option<&str>)> = vec![
+                    ("measured_gb", Some(high_text.as_str())),
+                    ("measured_gb_min", Some(low_text.as_str())),
+                ];
+                if let Some(stamp) = stamp_text.as_deref() {
+                    edits.push(("measured_offload", Some(stamp)));
+                }
+                if let Err(error) = crate::model::writeback::set_flags_on_file(&path, &edits) {
                     tracing::warn!(
                         error = %error,
                         model = %name,
@@ -1552,18 +1568,25 @@ impl ActorState {
         }
     }
 
-    /// Reconciles a refused measured persist (Fork C): the in-memory triple is
-    /// drained to its none state so the page and `fixed` admission never charge a
-    /// footprint the disk refused. The drain only lands when the entry still holds
-    /// the exact triple that failed — a superseding reading (whose own persist will
-    /// carry its own reconcile if it too fails) is left untouched.
-    fn on_measured_persist_failed(&mut self, model: &str, high: f64, low: f64, offload: bool) {
+    /// Reconciles a refused measured persist (Fork C): the in-memory measured pair
+    /// (and, for offload engines, the stamp) is drained to its none state so the
+    /// page and `fixed` admission never charge a footprint the disk refused. The
+    /// drain only lands when the entry still holds the exact values that failed —
+    /// a superseding reading (whose own persist will carry its own reconcile if it
+    /// too fails) is left untouched.
+    fn on_measured_persist_failed(
+        &mut self,
+        model: &str,
+        high: f64,
+        low: f64,
+        offload: Option<bool>,
+    ) {
         let Some(entry) = self.catalog.iter_mut().find(|m| m.name == model) else {
             return;
         };
         if entry.measured_gb == Some(high)
             && entry.measured_min_gb == Some(low)
-            && entry.measured_offload == Some(offload)
+            && entry.measured_offload == offload
         {
             entry.measured_gb = None;
             entry.measured_min_gb = None;
@@ -3471,9 +3494,11 @@ mod tests {
 
     /// A persist the disk refuses must not leave memory booking what disk denied
     /// (Fork C, closing FINDINGS-13 [4]'s warn-only tail): the warn fires AND the
-    /// catalog entry's measured triple drains to its none state. The wedged-drive
-    /// handle is Windows-only, so the test is gated like its writeback sibling
-    /// (FINDINGS-BATCH-2026-10-28 [7]).
+    /// catalog entry's measured triple drains to its none state. The entry is a
+    /// `llama` row so the persist really carries the stamped triple — non-offload
+    /// engines never mint the stamp (`only_offload_engines_stamp_measured_offload`).
+    /// The wedged-drive handle is Windows-only, so the test is gated like its
+    /// writeback sibling (FINDINGS-BATCH-2026-10-28 [7]).
     #[cfg(windows)]
     #[tokio::test]
     async fn a_refused_measured_persist_drains_the_triple_from_memory() {
@@ -3482,7 +3507,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let yaml = dir.join("drift.yaml");
-        std::fs::write(&yaml, "engine: mock\ncategory: work\nvram_gb: 2\n").expect("write");
+        std::fs::write(&yaml, "engine: llama\ncategory: work\nvram_gb: 2\n").expect("write");
 
         // Refuse the validated rename the way a wedged drive does: hold the target
         // open with delete-sharing off. Reads still succeed (the batch must be
@@ -3512,7 +3537,7 @@ mod tests {
             tx,
         );
         let (map, problems) =
-            crate::model::scan::parse_flat_yaml("engine: mock\ncategory: work\nvram_gb: 2\n");
+            crate::model::scan::parse_flat_yaml("engine: llama\ncategory: work\nvram_gb: 2\n");
         assert!(problems.is_empty(), "{problems:?}");
         let mut entry = ModelEntry::from_flat(&map, "drift").expect("entry");
         entry.file = Some(yaml.clone());
@@ -3560,7 +3585,7 @@ mod tests {
             panic!("expected the persist-failed reconcile message");
         };
         assert_eq!(model, "drift");
-        assert_eq!((high, low, offload), (3.7, 3.7, false));
+        assert_eq!((high, low, offload), (3.7, 3.7, Some(false)));
 
         state.on_measured_persist_failed(&model, high, low, offload);
         let entry = &state.catalog[0];
@@ -3588,7 +3613,11 @@ mod tests {
     }
 
     /// The reconcile must not drain a triple that a newer reading already replaced
-    /// (the stale-failure race: two persist tasks land out of order).
+    /// (the stale-failure race: two persist tasks land out of order), and the
+    /// exact-match guard covers the `Option<bool>` shape dimension itself
+    /// (FINDINGS-BATCH-2026-10-28F [2]): equal `(high, low)` with a mismatched
+    /// stamp shape drains nothing, in either direction. Falsifier: neutering the
+    /// `entry.measured_offload == offload` comparison fails the shape legs below.
     #[test]
     fn a_stale_persist_failure_never_drains_a_superseding_triple() {
         let dir = crate::testutil::temp_dir("measured-stale");
@@ -3608,23 +3637,201 @@ mod tests {
             Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
             tx,
         );
-        let (map, _) = crate::model::scan::parse_flat_yaml("engine: mock\nvram_gb: 2\n");
+        let (map, _) = crate::model::scan::parse_flat_yaml("engine: llama\nvram_gb: 2\n");
         let mut entry = ModelEntry::from_flat(&map, "fresh").expect("entry");
         entry.measured_gb = Some(6.0);
         entry.measured_min_gb = Some(4.0);
         entry.measured_offload = Some(false);
         state.catalog = vec![entry];
 
-        state.on_measured_persist_failed("fresh", 5.0, 5.0, false);
+        state.on_measured_persist_failed("fresh", 5.0, 5.0, Some(false));
         assert_eq!(
             state.catalog[0].measured_gb,
             Some(6.0),
             "the newer (possibly persisted) triple survives a stale failure"
         );
-        state.on_measured_persist_failed("fresh", 6.0, 4.0, false);
+        state.on_measured_persist_failed("fresh", 6.0, 4.0, None);
+        assert_eq!(
+            state.catalog[0].measured_gb,
+            Some(6.0),
+            "a None-shaped (strata-style) failure must not drain a stamped \
+             (llama-style) triple: equal pair values with the wrong stamp shape are \
+             not the triple that failed"
+        );
+        state.on_measured_persist_failed("fresh", 6.0, 4.0, Some(false));
         assert_eq!(
             state.catalog[0].measured_gb, None,
             "the matching triple drains"
+        );
+
+        let (map2, _) = crate::model::scan::parse_flat_yaml("engine: strata\nvram_gb: 2\n");
+        let mut paironly = ModelEntry::from_flat(&map2, "paironly").expect("entry");
+        paironly.measured_gb = Some(6.0);
+        paironly.measured_min_gb = Some(4.0);
+        // measured_offload stays None: the shape a non-offload engine's persist carries.
+        state.catalog.push(paironly);
+        state.on_measured_persist_failed("paironly", 6.0, 4.0, Some(false));
+        assert_eq!(
+            state.catalog[1].measured_gb,
+            Some(6.0),
+            "the reverse leg: a Some-shaped (llama-style) failure must not drain a \
+             pair-only (strata-style) triple"
+        );
+        state.on_measured_persist_failed("paironly", 6.0, 4.0, None);
+        assert_eq!(
+            state.catalog[1].measured_gb, None,
+            "the shape-matching failure drains the pair"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Poll a persisted yaml until every needle appears. The measured persist
+    /// runs on the blocking pool and lands through one atomic temp+rename, so a
+    /// successful write publishes the whole batch in one step.
+    async fn await_yaml_keys(path: &std::path::Path, keys: &[&str]) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(path).expect("persisted yaml readable");
+            if keys.iter().all(|k| text.contains(k)) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "keys {keys:?} never reached the disk: {text}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// D of the `cpu_offload` scoping ruling: the measured PAIR mints for every
+    /// engine (witness truth is engine-agnostic), but the `measured_offload` stamp
+    /// is minted only for `OFFLOAD_ENGINES` owners — in memory AND on disk: both
+    /// entries carry a real backing yaml, so the persist runs to completion and
+    /// the bytes are read back. Falsifier (disk leg): deleting the stamp push in
+    /// the persist edits makes this the only failing test — a llama yaml that
+    /// silently stops carrying `measured_offload` (killing the flip-void rule's
+    /// stamp source) cannot ship unnoticed; the mock leg then stays green (its
+    /// contract is pair-only). Also catches: dropping the `offload_live` gate in
+    /// `on_measured` (stamps the mock row) or tightening it past llama (unmints).
+    #[tokio::test]
+    async fn only_offload_engines_stamp_measured_offload() {
+        let dir = crate::testutil::temp_dir("measured-stamp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+        let ticket = SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 4242,
+            port: 18_992,
+        };
+        let seated = |state: &mut ActorState, model: &str| {
+            state.slots = vec![Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_992,
+                occupant: Some(Occupant {
+                    model: model.to_string(),
+                    need: Gibibytes(2.0),
+                    port: 18_992,
+                    ticket: ticket.clone(),
+                    loaded_at: Instant::now(),
+                    serve_id: None,
+                    measure: None,
+                }),
+                job: None,
+            }];
+        };
+        let entry = |name: &str, engine: &str| -> ModelEntry {
+            let (map, _) = crate::model::scan::parse_flat_yaml(&format!(
+                "engine: {engine}\ncpu_offload: true\nvram_gb: 2\n"
+            ));
+            ModelEntry::from_flat(&map, name).expect("entry")
+        };
+        let mut stampy = entry("stampy", "llama");
+        // `on` is in the engine truth set: the stamp must follow it, not a
+        // third reading of the token (HANDOFF §6).
+        stampy
+            .raw
+            .insert("cpu_offload".to_string(), "on".to_string());
+        let mut nostamp = entry("nostamp", "mock");
+        // Real backing files: the persist runs to completion (NOT the wedged-drive
+        // sibling) so the stamped triple is pinned as written bytes, not just as
+        // in-memory fields.
+        let stampy_path = dir.join("stampy.yaml");
+        std::fs::write(&stampy_path, "engine: llama\nvram_gb: 2\ncpu_offload: on\n").expect("seed");
+        let nostamp_path = dir.join("nostamp.yaml");
+        std::fs::write(
+            &nostamp_path,
+            "engine: mock\nvram_gb: 2\ncpu_offload: true\n",
+        )
+        .expect("seed");
+        stampy.file = Some(stampy_path.clone());
+        nostamp.file = Some(nostamp_path.clone());
+        state.catalog = vec![stampy.clone(), nostamp.clone()];
+
+        seated(&mut state, "stampy");
+        state.on_measured("stampy", &ticket, 4.2, Some(4.2), 24.0);
+        assert_eq!(
+            (
+                state.catalog[0].measured_gb,
+                state.catalog[0].measured_min_gb
+            ),
+            (Some(4.2), Some(4.2)),
+            "the pair mints on the offload engine"
+        );
+        assert_eq!(
+            state.catalog[0].measured_offload,
+            Some(true),
+            "the stamp mints on the engine that reads the key"
+        );
+        let written = await_yaml_keys(
+            &stampy_path,
+            &[
+                "measured_gb: 4.2",
+                "measured_gb_min: 4.2",
+                "measured_offload: true",
+            ],
+        )
+        .await;
+        assert!(
+            written.contains("measured_offload: true"),
+            "a genuine llama yaml must gain all three stamped keys on disk — if the \
+             persist stops pushing the stamp, this is the only failing test: {written}"
+        );
+
+        seated(&mut state, "nostamp");
+        state.on_measured("nostamp", &ticket, 4.3, Some(4.3), 24.0);
+        assert_eq!(
+            (
+                state.catalog[1].measured_gb,
+                state.catalog[1].measured_min_gb
+            ),
+            (Some(4.3), Some(4.3)),
+            "witness truth is engine-agnostic: the pair still mints on mock"
+        );
+        assert_eq!(
+            state.catalog[1].measured_offload, None,
+            "no stamp for an engine whose adapter never reads cpu_offload"
+        );
+        let written =
+            await_yaml_keys(&nostamp_path, &["measured_gb: 4.3", "measured_gb_min: 4.3"]).await;
+        assert!(
+            !written.contains("measured_offload"),
+            "a non-offload yaml must not gain the meaningless stamp on disk: {written}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

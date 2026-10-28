@@ -235,6 +235,34 @@ mod tests {
         let _ = std::fs::remove_file(config);
     }
 
+    /// Pin of the `cpu_offload` engine scoping: the strata adapter reads exactly
+    /// `strata_config`/`strata_python`/`strata_cwd` — the key is inert for this
+    /// engine, so absent, `true` and `false` must produce a byte-identical
+    /// [`LaunchSpec`] (argv, env, readiness, cwd, container alike). Falsifier: if
+    /// this adapter starts reading the key, the equality fails here.
+    #[test]
+    fn cpu_offload_changes_nothing_for_a_strata_launch() {
+        let config = real_file("inert-offload");
+        let path = config.to_str().expect("utf-8 path");
+        let base = StrataAdapter::default()
+            .spec(&entry(&[("strata_config", path)]), 18109)
+            .expect("absent key");
+        for value in ["true", "false"] {
+            let spec = StrataAdapter::default()
+                .spec(
+                    &entry(&[("strata_config", path), ("cpu_offload", value)]),
+                    18109,
+                )
+                .expect("an inert key never refuses a launch");
+            assert_eq!(
+                spec, base,
+                "cpu_offload: {value} must change nothing — if the strata adapter \
+                 starts reading the key, this fails"
+            );
+        }
+        let _ = std::fs::remove_file(config);
+    }
+
     #[test]
     fn missing_profile_is_a_missing_field_refusal() {
         let err = StrataAdapter::default()

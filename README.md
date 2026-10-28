@@ -100,11 +100,11 @@ If an atomic write ever fails its own post-write validation, the harness first w
 | `vram_gb` | Declared admission cost in GiB; `fixed` falls back to `file size × 1.15 + 2`, `exact` refuses without it |
 | `cost` | `fixed` (default): size binds admission · `greedy`: offloads to RAM/SSD, size never refuses but a launch floor is mandatory · `exact`: engine-computed number, required and binding |
 | `launch_only_with_at_least_vram_free` | GiB. Refuse the load **before spawn** unless the physically free card reaches this floor (reserve deducted; foreign processes counted whenever per-process attribution is available) — the thrash guard for big/greedy quants. Greedy models without it inherit `greedy_launch_min_free_gb`; set `0` per-model to opt out explicitly |
-| `cpu_offload` | `true`/`1`/`on` → forces `-ngl 0` |
+| `cpu_offload` | `true`/`1`/`on` → forces `-ngl 0` (**llama only**: the `strata`, `ninfer` and `mock` adapters never read it — such a row reports an `inert_key` hint in `catalog_errors`, still publishes, and the page offers no CPU control for it) |
 | `serve_model` | Expected engine-reported id; mismatch = recorded warning, never trusted |
 | `measured_gb` | High end of the footprint the harness measured from the witness while this model served (`total - used` diff against the free memory its load was admitted at, sampled every `measured_sample_s`). Written back after a load; `fixed` admission books it when `vram_gb` is absent, and a large divergence from `vram_gb` logs a verification warning |
 | `measured_gb_min` | Low end of that range: the smallest total-diff seen while serving. The spread is the KV cache growing during a session, which is why one number would be false precision. Must not exceed `measured_gb` |
-| `measured_offload` | The `cpu_offload` setting the pair was measured under, written with it. An offloaded launch has no comparable footprint, so flipping `cpu_offload` voids both values at scan while leaving the stamp visible on the page |
+| `measured_offload` | The `cpu_offload` setting the pair was measured under, written with it on `cpu_offload`-capable (llama) rows only — the witness pair itself mints for every engine. An offloaded launch has no comparable footprint, so flipping `cpu_offload` on such a row voids both values at scan; the stamp itself survives in the file and in the `/har/models` payload (the page renders the range, not the stamp) |
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `context`, `batch`, `flash_attn`, … | Mapped to the corresponding `llama-server` flags |
 | `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata/ninfer cold starts use 600–1200) |

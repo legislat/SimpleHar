@@ -242,6 +242,12 @@ const driver = `
       { id: "rangeone", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
         launch_floor_gb: null, measured_gb: 41.7, measured_min_gb: 24.3, est_vram_gb: null,
         context: null, model_ref: "F:/y.gguf", serve_model: null, cpu_offload: false },
+      { id: "ninferone", engine: "ninfer", category: "WORK", vram_gb: 26, cost: "fixed",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "ninfer://box:8004/served", serve_model: null, cpu_offload: false },
+      { id: "mockone", engine: "mock", category: "WORK", vram_gb: 4, cost: "fixed",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "mock://m", serve_model: null, cpu_offload: false },
     ],
   });
   const costs = {};
@@ -256,6 +262,29 @@ const driver = `
     costs["measuredone"] === "measured 29.9 GiB", JSON.stringify(costs));
   check("measured row shows the range when a low end exists",
     costs["rangeone"] === "measured 24.3-41.7 GiB", JSON.stringify(costs));
+  // cpu_offload engine scoping: the CPU column (td 3) offers its control only
+  // for OFFLOAD_ENGINES rows; a strata row gets a dash and NO checkbox.
+  const cpuBoxes = {};
+  const cpuCellText = {};
+  for (const tr of findAll(document.getElementById("sh-main"), "tr")) {
+    const tds = findAll(tr, "td");
+    const strong = tds.map((td) => findAll(td, "strong")[0]).find(Boolean);
+    if (strong && tds[3]) {
+      cpuBoxes[textOf(strong)] = findAll(tds[3], "input")
+        .filter((i) => i.attrs["aria-label"] === "cpu offload").length;
+      cpuCellText[textOf(strong)] = textOf(tds[3]);
+    }
+  }
+  check("strata row offers no CPU checkbox (engine-scoped)",
+    cpuBoxes["greedyone"] === 0 && cpuCellText["greedyone"] === "\u{2014}",
+    JSON.stringify(cpuBoxes));
+  check("non-llama rows offer no CPU checkbox (engine-scoped)",
+    cpuBoxes["greedyone"] === 0 && cpuBoxes["ninferone"] === 0 && cpuBoxes["mockone"] === 0 &&
+      cpuBoxes["measuredone"] === 1 && cpuBoxes["rangeone"] === 1,
+    JSON.stringify(cpuBoxes));
+  check("llama rows keep their CPU checkbox",
+    cpuBoxes["measuredone"] === 1 && cpuBoxes["rangeone"] === 1,
+    JSON.stringify(cpuBoxes));
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
 
   for (const [name, ok, extra] of results)

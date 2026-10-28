@@ -48,6 +48,16 @@ pub enum ScanKind {
     /// reserved forensic class that stays silent by operator ruling); warn-only,
     /// the entry still publishes.
     UnknownKey,
+    /// A real harness key — a member of [`CONSUMED_KEYS`] — that only engines
+    /// listed in [`crate::engine::llama::OFFLOAD_ENGINES`] read, appearing on a
+    /// model whose engine is not one of them. The opposite of
+    /// [`ScanKind::UnknownKey`] (a key the harness owns nowhere, i.e. a typo):
+    /// here the key is live config for a *different* engine, so it is not a typo
+    /// and cannot be silenced by [`CONSUMED_KEYS`] membership alone. Warn-only,
+    /// exactly the retired `host:`/`port:` policy-hint posture: the entry still
+    /// publishes. The only key scoped this way today: `cpu_offload` on a
+    /// non-offload row (§20-9 Fork C knob-table row 1).
+    InertKey,
     /// A yaml file carried at least one problem line (Fork C doctrine): the entry
     /// was **never** published and the `reason` names every offending line.
     InvalidYaml,
@@ -150,6 +160,17 @@ const HOST_POLICY_HINT: &str =
 /// Same for `port:` — allocated from the category config, never self-chosen.
 const PORT_POLICY_HINT: &str =
     "engine port is harness-assigned from category config \u{2014} this key does nothing";
+
+/// Builds the [`ScanKind::InertKey`] sentence for one engine-scoped key: the
+/// same named-policy-hint posture as [`HOST_POLICY_HINT`]/[`PORT_POLICY_HINT`]
+/// (§20-9 Fork C knob-table row 1, `cpu_offload` off its engines).
+fn inert_key_reason(key: &str, engine: &str) -> String {
+    format!(
+        "`{key}` is read only by the {} engine(s) \u{2014} engine `{engine}` never reads it; \
+         this key does nothing here",
+        crate::engine::llama::OFFLOAD_ENGINES.join("/")
+    )
+}
 
 /// Parses one flat yaml document into a key map plus per-line problems.
 ///
@@ -563,6 +584,19 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                             continue;
                         }
                     }
+                }
+                // Engine-scoped knobs on a row whose engine never reads them
+                // (§20-9 Fork C row 1): a real harness key, so `UnknownKey` would
+                // lie, and consumed, so silence would hide a dead click. Report it
+                // as a policy hint and publish — the `host:`/`port:` posture.
+                if map.contains_key("cpu_offload")
+                    && !crate::engine::llama::offload_live(&entry.engine)
+                {
+                    catalog.errors.push(ScanError {
+                        kind: ScanKind::InertKey,
+                        file: file_name.clone(),
+                        reason: inert_key_reason("cpu_offload", &entry.engine),
+                    });
                 }
                 // Unknown keys are reported, never fatal (README doctrine), but
                 // never silent: an operator's typo'd `contex:` is a config that
@@ -1760,6 +1794,102 @@ mod tests {
         );
     }
 
+    /// B of the `cpu_offload` scoping ruling: a non-offload engine carrying the
+    /// key gets the NEW warn kind (never `UnknownKey` — the key is real harness
+    /// config, owned by a different engine), and the entry still publishes exactly
+    /// like the retired `host:`/`port:` hints. Falsifier: any change that swallows
+    /// the report (removing the engine filter from the check), reports it under
+    /// `UnknownKey`, or drops the entry would fail here.
+    #[test]
+    fn cpu_offload_on_a_non_offload_engine_is_reported_inert_key_and_publishes() {
+        let dir = crate::testutil::temp_dir("scan-inert-key");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("strata-off.yaml"),
+            "engine: strata\nvram_gb: 8\ncpu_offload: true\n",
+        )
+        .expect("write strata");
+        std::fs::write(
+            dir.join("ninfer-off.yaml"),
+            "engine: ninfer\nvram_gb: 26\ncpu_offload: false\n",
+        )
+        .expect("write ninfer");
+        let catalog = scan_dir(&dir);
+        assert_eq!(
+            catalog.models.len(),
+            2,
+            "warn-only: both entries still publish: {:?}",
+            catalog.errors
+        );
+        let inert: Vec<&ScanError> = catalog
+            .errors
+            .iter()
+            .filter(|e| e.kind == ScanKind::InertKey)
+            .collect();
+        assert_eq!(
+            inert.len(),
+            2,
+            "one per non-llama row: {:?}",
+            catalog.errors
+        );
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .all(|e| e.kind != ScanKind::UnknownKey),
+            "a consumed key owned by another engine is not a typo: {:?}",
+            catalog.errors
+        );
+        for (file, engine) in [("strata-off.yaml", "strata"), ("ninfer-off.yaml", "ninfer")] {
+            let hit = inert
+                .iter()
+                .find(|e| e.file.contains(file))
+                .unwrap_or_else(|| panic!("{file} must be reported: {catalog:?}"));
+            assert!(
+                hit.reason.contains("cpu_offload")
+                    && hit.reason.contains(engine)
+                    && hit.reason.contains("llama"),
+                "the reason must name key, engine and the owning set: {}",
+                hit.reason
+            );
+        }
+        // Value does not matter: `false` reports exactly like `true`.
+        assert!(catalog
+            .errors
+            .iter()
+            .any(|e| e.kind == ScanKind::InertKey && e.file.contains("ninfer-off")));
+    }
+
+    /// The same key on llama rows — explicit `engine: llama` and the absent-key
+    /// default both — stays fully silent, preserving today's posture for the two
+    /// live catalog rows (`Qwen3-0.6B-GGUF`, `embeddinggemma-2-GGUF`). Falsifier:
+    /// scoping the const away from llama, or an absent engine key resolving to a
+    /// non-offload id, produces a spurious report here.
+    #[test]
+    fn cpu_offload_on_llama_rows_produces_no_report() {
+        let dir = crate::testutil::temp_dir("scan-llama-silent");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("explicit.yaml"),
+            "engine: llama\nmodel: mock://m\ncpu_offload: true\n",
+        )
+        .expect("write explicit");
+        std::fs::write(
+            dir.join("default.yaml"),
+            "model: mock://m\ncpu_offload: true\n",
+        )
+        .expect("write default");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 2, "{:?}", catalog.errors);
+        assert!(
+            catalog.errors.is_empty(),
+            "llama (incl. the absent-key default) must stay silent: {:?}",
+            catalog.errors
+        );
+        assert_eq!(catalog.models[0].engine, "llama");
+        assert_eq!(catalog.models[1].engine, "llama");
+    }
+
     #[test]
     fn a_one_edit_typo_gets_a_unique_suggestion() {
         assert_eq!(did_you_mean("contex"), " (did you mean 'context'?)");
@@ -1773,6 +1903,10 @@ mod tests {
 
     /// The golden fixture pins the const from the front: every consumed key appears
     /// in a real file, and the whole file scans with ZERO unknown-key errors.
+    /// `cpu_offload` rides the `engine: mock` file deliberately: mock is outside
+    /// `OFFLOAD_ENGINES` (it impersonates engines and reads no offload knob), so
+    /// the fixture's one legal report is exactly the `InertKey` hint below — the
+    /// const-coverage claim stays honest without pretending the key is live on mock.
     #[test]
     fn the_golden_yaml_covers_every_consumed_key_and_scans_unknown_key_free() {
         let dir = crate::testutil::temp_dir("scan-golden");
@@ -1826,6 +1960,23 @@ mod tests {
                 .all(|e| e.kind != ScanKind::UnknownKey),
             "every const member must be a real, read key: {:?}",
             catalog.errors
+        );
+        let inert: Vec<&ScanError> = catalog
+            .errors
+            .iter()
+            .filter(|e| e.kind == ScanKind::InertKey)
+            .collect();
+        assert_eq!(
+            inert.len(),
+            1,
+            "mock is outside OFFLOAD_ENGINES: the golden file's only report is the \
+             cpu_offload inert-key hint: {:?}",
+            catalog.errors
+        );
+        assert!(
+            inert[0].reason.contains("cpu_offload") && inert[0].reason.contains("mock"),
+            "{}",
+            inert[0].reason
         );
         for key in CONSUMED_KEYS {
             if *key == "external" {
@@ -1975,6 +2126,7 @@ mod tests {
             (ScanKind::EngineBinaryMissing, "engine_binary_missing"),
             (ScanKind::EngineUnavailable, "engine_unavailable"),
             (ScanKind::UnknownKey, "unknown_key"),
+            (ScanKind::InertKey, "inert_key"),
             (ScanKind::InvalidYaml, "invalid_yaml"),
             (ScanKind::Other, "other"),
         ] {

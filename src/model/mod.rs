@@ -116,9 +116,11 @@ pub struct ModelEntry {
     /// point would be a guess with false precision.
     pub measured_min_gb: Option<f64>,
     /// The `cpu_offload` setting the range was measured under (`measured_offload:`),
-    /// written with it. An offloaded launch has no comparable footprint, so a flip
-    /// between then and now voids the pair at scan time (measured values verify, they
-    /// never mislead).
+    /// written with it on [`crate::engine::llama::OFFLOAD_ENGINES`] rows only. An
+    /// offloaded launch has no comparable footprint, so a flip between then and now
+    /// voids the pair at scan time (measured values verify, they never mislead); on
+    /// engines that never read the key the flip cannot describe the launch, so it
+    /// voids nothing.
     pub measured_offload: Option<bool>,
     /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
     /// Informational for managed models; used for stem/path aliases (Step 10).
@@ -172,15 +174,22 @@ type MeasuredPair = (Option<f64>, Option<f64>, Option<bool>);
 
 /// Reads the measured footprint pair and its `cpu_offload` stamp together, because
 /// they are only meaningful as a unit: if the model is now launched differently than
-/// when it was measured, the range describes a different run and is dropped (the stamp
-/// itself survives so the page can say what it was measured under).
+/// when it was measured, the range describes a different run and is dropped. The
+/// stamp itself survives in the entry and the `/har/*` payload (the page renders the
+/// range only). A flip voids the pair solely for engines
+/// [`crate::engine::llama::offload_live`] says read `cpu_offload`: on the others the
+/// key cannot describe the launch, so voiding on it would be an inert key deciding
+/// an admission outcome.
 ///
 /// # Errors
 ///
 /// [`ModelError::BadNumber`] for a non-numeric or sub-quantum size, [`ModelError::BadBool`]
 /// for an unreadable stamp, and a `measured_gb_min` that exceeds its `measured_gb` or
 /// appears without one.
-fn read_measured(keys: &BTreeMap<String, String>) -> Result<MeasuredPair, ModelError> {
+fn read_measured(
+    engine: &str,
+    keys: &BTreeMap<String, String>,
+) -> Result<MeasuredPair, ModelError> {
     let stamp = keys
         .get("measured_offload")
         .map(|raw| parse_bool_stamp("measured_offload", raw))
@@ -190,7 +199,9 @@ fn read_measured(keys: &BTreeMap<String, String>) -> Result<MeasuredPair, ModelE
     let offload_now = keys
         .get("cpu_offload")
         .is_some_and(|v| crate::engine::llama::jinja_on(v));
-    if stamp.is_some_and(|stamped| stamped != offload_now) {
+    if crate::engine::llama::offload_live(engine)
+        && stamp.is_some_and(|stamped| stamped != offload_now)
+    {
         return Ok((None, None, stamp));
     }
     let size = |field: &str, raw: &str| -> Result<f64, ModelError> {
@@ -371,13 +382,17 @@ impl ModelEntry {
             }
             None => None,
         };
-        let (measured_gb, measured_min_gb, measured_offload) = read_measured(keys)?;
+        // Resolved before the measured pair: the `cpu_offload` flip only voids a
+        // range on engines whose adapters read the key, and an absent `engine:`
+        // means llama (the scan default), so the policy comparison needs this.
+        let engine = keys
+            .get("engine")
+            .cloned()
+            .unwrap_or_else(|| "llama".to_string());
+        let (measured_gb, measured_min_gb, measured_offload) = read_measured(&engine, keys)?;
         Ok(ModelEntry {
             name: name.trim().to_string(),
-            engine: keys
-                .get("engine")
-                .cloned()
-                .unwrap_or_else(|| "llama".to_string()),
+            engine,
             category,
             vram_gb,
             gguf_size_gb: None,
@@ -489,7 +504,8 @@ mod tests {
         assert_eq!(
             entry.measured_offload,
             Some(true),
-            "the page can still say what it was measured under"
+            "the stamp survives in the entry and the /har payload (the page renders \
+             the range, not the stamp)"
         );
         assert_eq!(entry.cost_source(), CostSource::Estimate);
         // A flip is judged with the engine's truth set, so `on` is `true` here too —
@@ -505,6 +521,45 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(agreed.measured_gb, Some(41.7));
+    }
+
+    /// D of the `cpu_offload` scoping ruling: the flip-void rule belongs to the
+    /// engines that read the key. A strata (and ninfer, and the engine-less-off
+    /// `mock`) row's measured pair describes a launch the key cannot influence, so
+    /// an added or flipped `cpu_offload` must neither drop the numbers nor refuse
+    /// the file. Falsifier: un-gating the void in `read_measured` (any engine
+    /// comparing stamp against the inert key) drops the pair here — the one real
+    /// damage the key did off llama.
+    #[test]
+    fn a_cpu_offload_flip_voids_nothing_for_engines_that_never_read_it() {
+        for engine in ["strata", "ninfer", "mock"] {
+            assert!(
+                !crate::engine::llama::offload_live(engine),
+                "{engine} must be outside OFFLOAD_ENGINES for this pin to mean anything"
+            );
+            let entry = ModelEntry::from_flat(
+                &flat(&[
+                    ("name", "m"),
+                    ("engine", engine),
+                    ("measured_gb", "41.7"),
+                    ("measured_gb_min", "24.3"),
+                    ("measured_offload", "false"),
+                    ("cpu_offload", "true"),
+                ]),
+                "m",
+            )
+            .unwrap_or_else(|e| panic!("{engine}: flip must not refuse the file: {e}"));
+            assert_eq!(
+                (entry.measured_gb, entry.measured_min_gb),
+                (Some(41.7), Some(24.3)),
+                "{engine}: an inert key must not void the range"
+            );
+            assert_eq!(
+                entry.cost_source(),
+                CostSource::Measured,
+                "{engine}: and must not change what admission books"
+            );
+        }
     }
 
     #[test]
