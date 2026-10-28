@@ -543,6 +543,17 @@ enum ActorMsg {
         own: Option<f64>,
         total_gib: f64,
     },
+    /// The blocking write-back of a measured triple was refused by the disk
+    /// (Fork C, FINDINGS-13 [4] follow-through): the actor must stop booking in
+    /// memory what disk rejected. Carries the exact triple the failed write
+    /// attempted, so a reading that has since been superseded never drains the
+    /// newer (possibly persisted) values.
+    MeasuredPersistFailed {
+        model: String,
+        high: f64,
+        low: f64,
+        offload: bool,
+    },
     /// Periodic sweep from the tick task: idles out occupants per category policy.
     Tick,
     Event {
@@ -789,6 +800,12 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 own,
                 total_gib,
             } => state.on_measured(&model, &ticket, total_diff, own, total_gib),
+            ActorMsg::MeasuredPersistFailed {
+                model,
+                high,
+                low,
+                offload,
+            } => state.on_measured_persist_failed(&model, high, low, offload),
             ActorMsg::Tick => {
                 state.on_tick();
                 state.publish();
@@ -1406,7 +1423,9 @@ impl ActorState {
     /// the slot; no other job may be in flight; a tenant that appeared after admit is
     /// subtracted, or the driver's own per-process attribution is used when the card
     /// reports it; and a figure outside the card is refused, not persisted
-    /// (measurement verifies, it never guesses).
+    /// (measurement verifies, it never guesses). A persist the disk refuses
+    /// reconciles: the triple drains from memory (Fork C — see
+    /// [`ActorState::on_measured_persist_failed`]).
     fn on_measured(
         &mut self,
         model: &str,
@@ -1495,6 +1514,7 @@ impl ActorState {
         }
         if let Some((path, high, low, offload)) = persist {
             let name = model.to_string();
+            let tx = self.tx.clone();
             tokio::task::spawn_blocking(move || {
                 // All three keys in ONE rewrite: written separately, a failure between
                 // them could leave an orphan or inverted pair, and the scanner rejects
@@ -1515,10 +1535,39 @@ impl ActorState {
                         model = %name,
                         "cannot persist the measured range"
                     );
+                    // Warn alone left memory booking a range the file never got
+                    // (FINDINGS-13 [4]'s degraded tail): hand the exact refused
+                    // triple back to the actor, which drains it from the catalog.
+                    let _ = tx.send(ActorMsg::MeasuredPersistFailed {
+                        model: name,
+                        high,
+                        low,
+                        offload,
+                    });
                 }
             });
         }
         if changed {
+            self.publish();
+        }
+    }
+
+    /// Reconciles a refused measured persist (Fork C): the in-memory triple is
+    /// drained to its none state so the page and `fixed` admission never charge a
+    /// footprint the disk refused. The drain only lands when the entry still holds
+    /// the exact triple that failed — a superseding reading (whose own persist will
+    /// carry its own reconcile if it too fails) is left untouched.
+    fn on_measured_persist_failed(&mut self, model: &str, high: f64, low: f64, offload: bool) {
+        let Some(entry) = self.catalog.iter_mut().find(|m| m.name == model) else {
+            return;
+        };
+        if entry.measured_gb == Some(high)
+            && entry.measured_min_gb == Some(low)
+            && entry.measured_offload == Some(offload)
+        {
+            entry.measured_gb = None;
+            entry.measured_min_gb = None;
+            entry.measured_offload = None;
             self.publish();
         }
     }
@@ -3051,15 +3100,73 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::{
-        headline_fault, ActorState, JobId, JobKind, JobStatus, Reply, Scheduler, SwapState,
+        headline_fault, ActorMsg, ActorState, Gibibytes, JobId, JobKind, JobStatus, Occupant,
+        Reply, ResourceKind, Scheduler, Slot, SpawnTicket, SwapState,
     };
     use crate::budget::LedgerOnlyWitness;
     use crate::config::CategoryId;
     use crate::engine::mock::MockAdapter;
     use crate::engine::EngineAdapter;
+    use crate::model::ModelEntry;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    /// Process-global warn capture for the persist-drift test: `tracing`'s default
+    /// dispatcher is thread-local, and the persist warn fires on a blocking-pool
+    /// thread, so the capturing layer goes in as the global default exactly once
+    /// (no lib test installs one; `observability::init` runs only in `main`).
+    type CapturedWarn = (String, BTreeMap<String, String>);
+    static WARN_CAPTURE: OnceLock<Arc<Mutex<Vec<CapturedWarn>>>> = OnceLock::new();
+
+    struct CaptureVisitor<'a> {
+        message: &'a mut String,
+        fields: &'a mut BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}");
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+    }
+
+    struct CaptureLayer(Arc<Mutex<Vec<CapturedWarn>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            let mut fields = BTreeMap::new();
+            event.record(&mut CaptureVisitor {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.0.lock().expect("capture lock").push((message, fields));
+        }
+    }
+
+    fn install_warn_capture() -> Arc<Mutex<Vec<CapturedWarn>>> {
+        WARN_CAPTURE
+            .get_or_init(|| {
+                let store = Arc::new(Mutex::new(Vec::new()));
+                let _ = tracing_subscriber::registry()
+                    .with(CaptureLayer(store.clone()))
+                    .try_init();
+                store
+            })
+            .clone()
+    }
 
     /// Constructor-only stand-in for the never-called runtime half of an
     /// [`ActorState`]: the boot-thread pin builds state and reads its catalog field,
@@ -3358,6 +3465,166 @@ mod tests {
             error.reason == "engine \"phantom\" is not available to this harness (known: mock)",
             "{}",
             error.reason
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A persist the disk refuses must not leave memory booking what disk denied
+    /// (Fork C, closing FINDINGS-13 [4]'s warn-only tail): the warn fires AND the
+    /// catalog entry's measured triple drains to its none state. The wedged-drive
+    /// handle is Windows-only, so the test is gated like its writeback sibling
+    /// (FINDINGS-BATCH-2026-10-28 [7]).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_refused_measured_persist_drains_the_triple_from_memory() {
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("measured-persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("drift.yaml");
+        std::fs::write(&yaml, "engine: mock\ncategory: work\nvram_gb: 2\n").expect("write");
+
+        // Refuse the validated rename the way a wedged drive does: hold the target
+        // open with delete-sharing off. Reads still succeed (the batch must be
+        // able to read the file), the replace cannot.
+        let _lock = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0x3) // FILE_SHARE_READ | FILE_SHARE_WRITE (no DELETE)
+                .open(&yaml)
+                .expect("exclusive handle")
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+        let (map, problems) =
+            crate::model::scan::parse_flat_yaml("engine: mock\ncategory: work\nvram_gb: 2\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut entry = ModelEntry::from_flat(&map, "drift").expect("entry");
+        entry.file = Some(yaml.clone());
+        state.catalog = vec![entry];
+        let ticket = SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 4242,
+            port: 18_991,
+        };
+        state.slots = vec![Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_991,
+            occupant: Some(Occupant {
+                model: "drift".to_string(),
+                need: Gibibytes(2.0),
+                port: 18_991,
+                ticket: ticket.clone(),
+                loaded_at: Instant::now(),
+                serve_id: None,
+                measure: None,
+            }),
+            job: None,
+        }];
+
+        state.on_measured("drift", &ticket, 3.7, Some(3.7), 24.0);
+        assert_eq!(
+            state.catalog[0].measured_gb,
+            Some(3.7),
+            "the reading books in memory first"
+        );
+
+        let msg = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("the persist failure reaches the actor")
+            .expect("channel open");
+        let ActorMsg::MeasuredPersistFailed {
+            model,
+            high,
+            low,
+            offload,
+        } = msg
+        else {
+            panic!("expected the persist-failed reconcile message");
+        };
+        assert_eq!(model, "drift");
+        assert_eq!((high, low, offload), (3.7, 3.7, false));
+
+        state.on_measured_persist_failed(&model, high, low, offload);
+        let entry = &state.catalog[0];
+        assert_eq!(entry.measured_gb, None);
+        assert_eq!(entry.measured_min_gb, None);
+        assert_eq!(entry.measured_offload, None);
+
+        let warns = capture.lock().expect("capture lock");
+        assert!(
+            warns.iter().any(|(message, fields)| {
+                message.contains("cannot persist the measured range")
+                    && fields.get("model").is_some_and(|m| m.contains("drift"))
+            }),
+            "the warn must have fired: {warns:?}"
+        );
+        // And the file really never gained the keys the memory had booked.
+        let text = std::fs::read_to_string(&yaml).expect("read back");
+        assert!(
+            !text.contains("measured_gb"),
+            "disk refused the triple: {text}"
+        );
+
+        drop(_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reconcile must not drain a triple that a newer reading already replaced
+    /// (the stale-failure race: two persist tasks land out of order).
+    #[test]
+    fn a_stale_persist_failure_never_drains_a_superseding_triple() {
+        let dir = crate::testutil::temp_dir("measured-stale");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+        let (map, _) = crate::model::scan::parse_flat_yaml("engine: mock\nvram_gb: 2\n");
+        let mut entry = ModelEntry::from_flat(&map, "fresh").expect("entry");
+        entry.measured_gb = Some(6.0);
+        entry.measured_min_gb = Some(4.0);
+        entry.measured_offload = Some(false);
+        state.catalog = vec![entry];
+
+        state.on_measured_persist_failed("fresh", 5.0, 5.0, false);
+        assert_eq!(
+            state.catalog[0].measured_gb,
+            Some(6.0),
+            "the newer (possibly persisted) triple survives a stale failure"
+        );
+        state.on_measured_persist_failed("fresh", 6.0, 4.0, false);
+        assert_eq!(
+            state.catalog[0].measured_gb, None,
+            "the matching triple drains"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

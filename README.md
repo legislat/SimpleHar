@@ -82,9 +82,13 @@ partial files are completed, an invalid file is fatal with every problem logged
 | `modelconf_dir` | `<exe dir>\ModelConf` | Catalog directory |
 | `tray_enabled` | `true` | Tray icon at boot |
 
-## Model files: `ModelConf/*.yaml` (or `.yml`)
+## Model files: `ModelConf/*.yaml`
 
 One flat `key: value` file per model (comments via `#` preserved on write-back):
+
+**Acceptance (strict — 13[5] Fork B):** a config is exactly a **regular file** whose final extension is `.yaml`, case-insensitively. `.yml` is **not** a config extension (repo convention) — `foo.yml` is silently inert, not broken: rename it to `.yaml` when you want it live. Everything else in `ModelConf` is silently inert with **zero `catalog_errors`**: `README.md`, `Thumbs.db`, a directory named `x.yaml`, incident copies `x.yaml.bak`. Symlinks are skipped as themselves — never followed, never opened — so a linked tree or a pipe can neither publish nor hang a scan. Parse reports (`invalid_yaml`) are reserved for actual `*.yaml` files: stray files do not talk.
+
+If an atomic write ever fails its own post-write validation, the harness first writes a single-slot **incident copy** `<stem>.yaml.bak` beside the target (overwritten per incident; if the source carries a `bak:` node, that node is rewritten in the copy to a one-line incident stamp — never appended when absent), then restores the original bytes through the same temp+rename machinery, and the returned error names where every byte ended up. These copies are inert to the scan by the acceptance rule above; the harness never reads or manages them.
 
 | Key | Notes |
 |---|---|
@@ -113,6 +117,8 @@ One flat `key: value` file per model (comments via `#` preserved on write-back):
 | `ninfer_key` | `true` sends `key` as `$2`; anything else sends `nokey` |
 
 Unknown keys are preserved for reference and reported as `unknown_key` warnings in `catalog_errors` — the model still loads. `host` and `port` are harness-owned and inert: the engine bind is forced to loopback (§5) and the port is assigned from the category config, so those keys do nothing.
+
+The `bak:` key is a reserved forensic note — **forensic manual only** (operator ruling, 2026-10-28). It is a single-line, hand-written one-shot snapshot record (with its relevant comments on the same line); **in your model files** the harness never reads it, never warns about it, never logs it, and strips it from the parsed catalog, so its value can never surface on the page or be re-emitted by write-back. **In your model files** the harness itself never writes `bak:` — it inspects the node's presence only when producing the incident copy described above (that paragraph is authoritative), and rewrites the node there, never in the model file. Keep exactly one `bak:` line: a second is a duplicate-key problem line and the file will not publish.
 
 ### Ninfer engines
 

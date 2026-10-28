@@ -2,9 +2,9 @@
 //! with per-file error reports.
 //!
 //! v3.3 lessons encoded here: quotes and inline comments are handled (D2 — `name:
-//! "foo"` and `context: 4096 # 32k` parse correctly), invalid keys are *reported*
-//! instead of silently dropped (D3), duplicate keys are reported, and a bad file is
-//! skipped and named, never fatal (§0.2 step 6).
+//! "foo"` and `context: 4096 # 32k` parse correctly), and a file with problem lines
+//! is never published; its lines are named (D3, operator doctrine: "better not
+//! publish anything blindly"), while the scan itself stays non-fatal (§0.2 step 6).
 //!
 //! Catalog-trust rules (FINDINGS-13 [2]/[3]/[7]/[8]): identity is the yaml FILE
 //! STEM — a `name:` key is legacy-optional and only legal when it equals the stem,
@@ -44,10 +44,15 @@ pub enum ScanKind {
     /// The entry names an engine this harness has no adapter for; dropped by the
     /// actor (the scan cannot see the adapter map).
     EngineUnavailable,
-    /// A yaml key outside [`CONSUMED_KEYS`]; warn-only, the entry still publishes.
+    /// A yaml key outside [`CONSUMED_KEYS`] (and outside [`SILENT_KEYS`], the one
+    /// reserved forensic class that stays silent by operator ruling); warn-only,
+    /// the entry still publishes.
     UnknownKey,
-    /// Every pre-existing report shape: line problems, unreadable files or dirs,
-    /// typed field rejects, duplicate containers, unresolved `default_model`s.
+    /// A yaml file carried at least one problem line (Fork C doctrine): the entry
+    /// was **never** published and the `reason` names every offending line.
+    InvalidYaml,
+    /// Every pre-existing report shape: unreadable files or dirs, typed field
+    /// rejects, duplicate containers, unresolved `default_model`s.
     Other,
 }
 
@@ -126,6 +131,17 @@ const CONSUMED_KEYS: &[&str] = &[
     "external",
 ];
 
+/// Reserved forensic keys the operator hand-writes into a yaml: one-shot snapshot
+/// notes and relevant comments, for the forensic manual only (operator ruling,
+/// 2026-10-28, on the `bak:` node). The harness never reads them, never warns
+/// about them, never logs them, and never surfaces them: they are stripped from
+/// the parsed raw map in [`crate::model::ModelEntry::from_flat`] exactly like the
+/// retired `external`, so the value can neither reach the page nor be re-emitted
+/// by write-back — the operator's file bytes are never altered. Deliberately NOT
+/// members of [`CONSUMED_KEYS`]: membership there claims a real read, and the
+/// golden-yaml test enforces that every member is actually read.
+pub(crate) const SILENT_KEYS: &[&str] = &["bak"];
+
 /// The `host:` key is inert by policy, not by accident (FINDINGS-13 [8]): the
 /// harness forces the loopback bind itself (FINDINGS-09 [1], §5).
 const HOST_POLICY_HINT: &str =
@@ -161,7 +177,9 @@ pub fn parse_flat_yaml(text: &str) -> (BTreeMap<String, String>, Vec<String>) {
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
             problems.push(format!("line {}: invalid key `{key}`", index + 1));
             continue;
@@ -211,8 +229,29 @@ fn strip_comment(value: &str) -> String {
     trimmed.to_string()
 }
 
-/// Scans a ModelConf directory: every `*.yaml`/`*.yml` becomes an entry or an error;
-/// a missing directory is one error, not a panic.
+/// The 13[5] Fork B acceptance gate: a config is exactly a **regular file** whose
+/// final extension is `.yaml`, case-insensitively. Never a symlink — the caller
+/// passes `DirEntry::file_type()`, which does not follow the link, so a symlink
+/// (to a file, a directory, a pipe or a linked tree) is judged as itself: inert,
+/// never opened, never stat'd. `.yml` is **deliberately not a config extension**
+/// (repo convention): `foo.yml` is inert-not-broken — it earns no error, and
+/// renaming it to `.yaml` is the operator's call, not the harness's. Everything
+/// else in ModelConf (`README.md`, the single-slot `.yaml.bak` incident copies,
+/// `x.yaml.bak`, `Thumbs.db`, even a directory named `x.yaml`) is silently inert:
+/// non-candidates are not configs, so they produce **no catalog_error** — the
+/// Fork C InvalidYaml voice stays reserved for actual `*.yaml` files.
+fn is_accepted_config(file_type: &std::fs::FileType, path: &Path) -> bool {
+    file_type.is_file()
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("yaml"))
+}
+
+/// Scans a ModelConf directory: every regular (non-symlink) `*.yaml` file becomes
+/// an entry or an error; `.yml` and every other name is **silently inert** (the
+/// 13[5] Fork B acceptance gate, [`is_accepted_config`]); a missing directory is
+/// one error, not a panic.
 pub fn scan_dir(dir: &Path) -> Catalog {
     let mut catalog = Catalog::empty();
     // Test-only hang seam: parks this scan (and only a scan of the armed directory)
@@ -246,12 +285,16 @@ pub fn scan_dir(dir: &Path) -> Catalog {
     };
     let mut files: Vec<std::path::PathBuf> = entries
         .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"))
+        .filter(|entry| {
+            // The acceptance gate reads `DirEntry::file_type()` — never
+            // `metadata()`, so a symlink is judged as itself and never followed
+            // (or opened): links, pipes and linked trees are inert, not hung.
+            entry
+                .file_type()
+                .ok()
+                .is_some_and(|file_type| is_accepted_config(&file_type, &entry.path()))
         })
+        .map(|entry| entry.path())
         .collect();
     files.sort();
     let mut seen_containers: std::collections::HashMap<String, String> =
@@ -289,15 +332,20 @@ pub fn scan_dir(dir: &Path) -> Catalog {
             }
         };
         let (map, problems) = parse_flat_yaml(&text);
-        for problem in &problems {
+        if !problems.is_empty() {
+            // Fork C doctrine (operator ruling): a file with ANY problem line is
+            // never published — "better not publish anything blindly". One report
+            // names the file and every offending line; the empty-map case (every
+            // line bad) folds into the same shape, so the file is still named.
             catalog.errors.push(ScanError {
-                kind: ScanKind::Other,
+                kind: ScanKind::InvalidYaml,
                 file: file_name.clone(),
-                reason: problem.clone(),
+                reason: format!(
+                    "yaml not loaded \u{2014} problem lines: {}",
+                    problems.join("; ")
+                ),
             });
-        }
-        if map.is_empty() && !problems.is_empty() {
-            continue; // the line problems already name the file; no redundant report
+            continue;
         }
         if let Some(claimed) = map.get("name") {
             if claimed != &stem {
@@ -408,8 +456,14 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 }
                 // Unknown keys are reported, never fatal (README doctrine), but
                 // never silent: an operator's typo'd `contex:` is a config that
-                // does nothing, and the page must be able to say so.
+                // does nothing, and the page must be able to say so. The one
+                // silent class is [`SILENT_KEYS`] — reserved forensic keys
+                // ("forensic manual only", operator ruling), which are neither
+                // warned nor logged nor surfaced.
                 for key in map.keys() {
+                    if SILENT_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
                     if !CONSUMED_KEYS.contains(&key.as_str()) {
                         let reason = match key.as_str() {
                             "host" => HOST_POLICY_HINT.to_string(),
@@ -496,7 +550,10 @@ fn is_absolute_shape(text: &str) -> bool {
 }
 
 /// The did-you-mean tail of an unknown-key report: only when exactly one consumed
-/// key sits one edit away, so the advice is a fact, never a coin flip.
+/// key sits one edit away, so the advice is a fact, never a coin flip. The
+/// candidate list is [`CONSUMED_KEYS`] alone, so a [`SILENT_KEYS`] member can
+/// never surface as a suggestion — reserved-forensic silence means no breadcrumb
+/// either.
 fn did_you_mean(key: &str) -> String {
     let mut candidate = String::new();
     let mut count = 0usize;
@@ -605,10 +662,171 @@ mod tests {
 
     #[test]
     fn invalid_keys_and_duplicates_are_reported_not_dropped() {
-        let (_, problems) = parse_flat_yaml("bad-key: 1\ngood: 1\ngood: 2\n");
+        // FINDINGS-13 [9]: `-` is a *valid* key character (the documented charset
+        // wins), so the invalid-key half needs a genuinely illegal shape — a space.
+        let (map, problems) = parse_flat_yaml("bad key: 1\ngood: 1\ngood: 2\ngpu-layers: 99\n");
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(problems[0].contains("invalid key"));
         assert!(problems[1].contains("duplicate"));
+        assert!(map.contains_key("gpu-layers"), "a hyphenated key parses");
+    }
+
+    /// FINDINGS-13 [9], both directions pinned: the parser accepts exactly the
+    /// charset its doc comment promises — `[A-Za-z_][A-Za-z0-9_-]*` — and rejects
+    /// everything else, so neither side of the contract can drift again.
+    #[test]
+    fn the_parser_accepts_exactly_the_documented_key_charset() {
+        // The doc claim, literally: every member of the documented classes parses
+        // without a problem line.
+        let (map, problems) =
+            parse_flat_yaml("a: 1\nZ: 1\n_: 1\nA0: 1\na0-Z_9-x-y: 1\nwith-hyphen: 1\nx-a-b-c: 1\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        for key in ["a", "Z", "_", "A0", "a0-Z_9-x-y", "with-hyphen", "x-a-b-c"] {
+            assert!(map.contains_key(key), "`{key}` must parse");
+        }
+        // And the classes the doc excludes are still reported, never accepted.
+        let (_, problems) =
+            parse_flat_yaml("9lead: 1\nwith.dot: 1\nwith space: 1\n-hyphenfirst: 1\n");
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(
+            problems.iter().all(|p| p.contains("invalid key")),
+            "{problems:?}"
+        );
+    }
+
+    /// FINDINGS-13 [9] + Fork C boundary: a hyphenated key is a *key*, not a
+    /// problem line — an unconsumed one publishes with the UnknownKey warn.
+    /// (`cache_type_k` uses an underscore, so `gpu-layers` is a genuinely unknown
+    /// hyphenated key.)
+    #[test]
+    fn a_hyphenated_key_is_a_key_not_a_problem_line() {
+        let dir = crate::testutil::temp_dir("scan-hyphen-key");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("hp.yaml"),
+            "engine: mock\nvram_gb: 2\ngpu-layers: 99\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert_eq!(
+            catalog.models.len(),
+            1,
+            "a hyphenated key never blocks publication: {:?}",
+            catalog.errors
+        );
+        assert!(
+            !catalog
+                .errors
+                .iter()
+                .any(|e| e.kind == ScanKind::InvalidYaml),
+            "the hyphenated key must not be a problem line: {:?}",
+            catalog.errors
+        );
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::UnknownKey)
+            .expect("an unconsumed hyphenated key is warn-only, like any unknown key");
+        assert!(error.reason.contains("gpu-layers"), "{}", error.reason);
+        assert!(
+            catalog.models[0].raw.contains_key("gpu-layers"),
+            "README: unknown keys stay preserved for reference"
+        );
+    }
+
+    /// Operator ruling 2026-10-28 (`bak:`): the reserved forensic key publishes
+    /// with ZERO reports — no UnknownKey, no Other, nothing naming `bak` — while
+    /// a genuinely unknown key in the same file still reaches `raw` and still
+    /// earns its warn (silence is surgical, not a blanket mute). The value
+    /// exercises both `strip_comment` paths: a `#` inside quotes survives, an
+    /// inline ` # comment` after the quotes is cut.
+    #[test]
+    fn the_reserved_bak_key_publishes_silently_and_never_reaches_raw() {
+        let dir = crate::testutil::temp_dir("scan-bak-silent");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("bak.yaml"),
+            "engine: mock\nvram_gb: 2\n\
+             bak: \"pre-quant snapshot # keep: F:/bak/x.gguf\" # forensic manual only\n\
+             frobnicate: yes\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        assert_eq!(
+            catalog.errors.len(),
+            1,
+            "only the genuinely unknown key may be reported: {:?}",
+            catalog.errors
+        );
+        let warn = &catalog.errors[0];
+        assert_eq!(warn.kind, ScanKind::UnknownKey);
+        assert!(warn.reason.contains("frobnicate"), "{}", warn.reason);
+        assert!(
+            catalog.errors.iter().all(|e| !e.reason.contains("bak")),
+            "no report may mention the bak node: {:?}",
+            catalog.errors
+        );
+        let entry = &catalog.models[0];
+        assert!(
+            !entry.raw.contains_key("bak"),
+            "the forensic value never reaches the raw passthrough: {:?}",
+            entry.raw
+        );
+        assert_eq!(
+            entry.raw.get("frobnicate").map(String::as_str),
+            Some("yes"),
+            "silence must not mute real unknown keys"
+        );
+    }
+
+    /// Fork C consistency: the reserved word does not exempt a file from the
+    /// structural rules. A second `bak:` line is a duplicate-key problem line —
+    /// one InvalidYaml report naming it, entry never published.
+    #[test]
+    fn a_duplicate_bak_line_is_a_problem_line_and_drops_the_file() {
+        let dir = crate::testutil::temp_dir("scan-bak-dup");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("twice.yaml"),
+            "engine: mock\nvram_gb: 2\nbak: first\nbak: second\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(
+            catalog.models.is_empty(),
+            "a duplicate bak line must not publish: {:?}",
+            catalog.models
+        );
+        let reports: Vec<&ScanError> = catalog
+            .errors
+            .iter()
+            .filter(|e| e.kind == ScanKind::InvalidYaml)
+            .collect();
+        assert_eq!(reports.len(), 1, "{:?}", catalog.errors);
+        assert!(reports[0].file.contains("twice.yaml"));
+        assert!(
+            reports[0].reason.contains("duplicate key `bak`"),
+            "{}",
+            reports[0].reason
+        );
+    }
+
+    /// A key cannot be both read and silent: the two lists must not intersect,
+    /// and the silent word must stay out of `did_you_mean`'s candidate source
+    /// (CONSUMED_KEYS only), so forensic silence carries no breadcrumb either.
+    #[test]
+    fn the_silent_and_consumed_key_lists_are_disjoint() {
+        for silent in SILENT_KEYS {
+            assert!(
+                !CONSUMED_KEYS.contains(silent),
+                "`{silent}` cannot be both consumed and silent"
+            );
+            // The one-edit misspelling of a silent key owes no suggestion: the
+            // candidate list is CONSUMED_KEYS alone.
+            assert_eq!(did_you_mean(&format!("{silent}x")), "");
+        }
+        assert!(SILENT_KEYS.contains(&"bak"));
     }
 
     #[test]
@@ -638,9 +856,121 @@ mod tests {
             Some("a.yaml")
         );
         assert_eq!(catalog.errors.len(), 1);
+        assert_eq!(catalog.errors[0].kind, ScanKind::InvalidYaml);
         assert!(catalog.errors[0].file.contains("bad.yaml"));
+        assert!(
+            catalog.errors[0]
+                .reason
+                .starts_with("yaml not loaded \u{2014} problem lines: "),
+            "{}",
+            catalog.errors[0].reason
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fork C doctrine, pinned to its exact shape: a file with problem lines is
+    /// NEVER published, and one report names the file and every offending line.
+    #[test]
+    fn a_file_with_problem_lines_is_never_published_and_every_line_is_named() {
+        let dir = crate::testutil::temp_dir("scan-invalid-yaml");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("broken.yaml"),
+            "engine: mock\nvram_gb: 2\njust text\nbad key: 1\ncontext: 1\ncontext: 2\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(
+            catalog.models.is_empty(),
+            "nothing is published blindly: a problem line drops the whole file"
+        );
+        let errors: Vec<&ScanError> = catalog
+            .errors
+            .iter()
+            .filter(|e| e.kind == ScanKind::InvalidYaml)
+            .collect();
+        assert_eq!(errors.len(), 1, "exactly ONE report: {:?}", catalog.errors);
+        assert!(errors[0].file.contains("broken.yaml"), "{:?}", errors[0]);
+        assert_eq!(
+            errors[0].reason,
+            "yaml not loaded \u{2014} problem lines: line 3: not a `key: value` line: `just \
+             text`; line 4: invalid key `bad key`; line 6: duplicate key `context` (first \
+             value kept)"
+        );
+    }
+
+    /// The UnknownKey/InvalidYaml boundary (Fork C's first-class test): dead keys
+    /// are not broken files. Valid syntax with a dead key publishes with a warn;
+    /// one junk line never publishes; both never publishes; a lone duplicate never
+    /// publishes.
+    #[test]
+    fn a_dead_key_publishes_but_a_problem_line_never_does() {
+        let dir = crate::testutil::temp_dir("scan-dead-key-boundary");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("deadkey.yaml"),
+            "engine: mock\nvram_gb: 2\nfrobnicate: yes\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join("junk.yaml"),
+            "engine: mock\nvram_gb: 2\njust text\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join("both.yaml"),
+            "engine: mock\nvram_gb: 2\nfrobnicate: yes\njust text\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.join("dup.yaml"),
+            "engine: mock\nvram_gb: 2\nvram_gb: 3\n",
+        )
+        .expect("write");
+
+        let catalog = scan_dir(&dir);
+        let names: Vec<&str> = catalog.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["deadkey"],
+            "only the dead-key file publishes: {names:?}"
+        );
+
+        let dead = catalog
+            .errors
+            .iter()
+            .filter(|e| e.file.contains("deadkey.yaml"))
+            .collect::<Vec<_>>();
+        assert!(
+            dead.iter().all(|e| e.kind == ScanKind::UnknownKey)
+                && dead.iter().any(|e| e.reason.contains("frobnicate")),
+            "the dead key is warn-only: {dead:?}"
+        );
+        for (file, needle) in [
+            ("junk.yaml", "not a `key: value` line"),
+            ("both.yaml", "not a `key: value` line"),
+            ("dup.yaml", "duplicate key"),
+        ] {
+            let report = catalog
+                .errors
+                .iter()
+                .find(|e| e.kind == ScanKind::InvalidYaml && e.file.contains(file))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{file} must be refused as invalid yaml: {:?}",
+                        catalog.errors
+                    )
+                });
+            assert!(report.reason.contains(needle), "{}", report.reason);
+        }
+        assert!(
+            !catalog
+                .errors
+                .iter()
+                .any(|e| e.kind == ScanKind::Other && e.file.contains("junk.yaml")),
+            "problem lines travel as InvalidYaml, never scattered Other reports"
+        );
     }
 
     #[test]
@@ -717,6 +1047,121 @@ mod tests {
         assert!(catalog.models.is_empty());
         assert!(catalog.errors.len() == 1);
         assert!(catalog.errors[0].reason.contains("cannot read"));
+    }
+
+    /// 13[5] Fork B acceptance matrix: `.yaml` (any case) is the only config
+    /// shape; `.yml`, `README.md`, `.yaml.bak`, `.YAML.bak` and even a directory
+    /// named `dir.yaml` are INERT with ZERO catalog errors (the anti-noise pin —
+    /// a stray junk file must not start talking).
+    #[test]
+    fn only_regular_dot_yaml_files_are_configs_and_everything_else_is_silent() {
+        let dir = crate::testutil::temp_dir("scan-gate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("good.yaml"), "engine: mock\nvram_gb: 2\n").expect("write");
+        std::fs::write(dir.join("CAPS.YAML"), "engine: mock\nvram_gb: 2\n").expect("write");
+        // A perfectly valid model document that is NOT accepted: inert, not broken.
+        std::fs::write(dir.join("nope.yml"), "engine: mock\nvram_gb: 2\n").expect("write");
+        std::fs::write(dir.join("README.md"), "# ModelConf notes\n").expect("write");
+        // Junk inside a non-candidate: if the filter ever parsed it, an
+        // InvalidYaml report would appear and the errors-empty assert would bite.
+        std::fs::write(dir.join("x.yaml.bak"), "oops no colon\n").expect("write");
+        std::fs::write(dir.join("UPPER.YAML.bak"), "oops no colon\n").expect("write");
+        std::fs::create_dir_all(dir.join("dir.yaml")).expect("dir named yaml");
+
+        let catalog = scan_dir(&dir);
+        let names: Vec<&str> = catalog.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["CAPS", "good"],
+            "exactly the *.yaml regular files: {names:?}"
+        );
+        assert!(
+            catalog.errors.is_empty(),
+            "non-candidates are silent-inert, never noise: {:?}",
+            catalog.errors
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The predicate pinned as a unit, both directions, using real `FileType`s
+    /// (a regular file's and a directory's) so the `is_file` half is not
+    /// decorative either.
+    #[test]
+    fn the_extension_gate_accepts_only_dot_yaml_case_insensitively() {
+        let dir = crate::testutil::temp_dir("scan-gate-predicate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("probe.txt"), "x").expect("write probe");
+        std::fs::create_dir_all(dir.join("probe.d")).expect("make dir");
+        let (mut file_type, mut dir_type) = (None, None);
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let entry = entry.expect("entry");
+            if entry.file_name() == "probe.txt" {
+                file_type = Some(entry.file_type().expect("file type"));
+            } else if entry.file_name() == "probe.d" {
+                dir_type = Some(entry.file_type().expect("dir type"));
+            }
+        }
+        let file_type = file_type.expect("probe file");
+        let dir_type = dir_type.expect("probe dir");
+        for name in ["m.yaml", "m.YAML", "m.YaMl", "model.yaml"] {
+            assert!(is_accepted_config(&file_type, Path::new(name)), "{name}");
+        }
+        for name in [
+            "m.yml",
+            "m.YML",
+            "x.yaml.bak",
+            "UPPER.YAML.bak",
+            "README.md",
+            "noext",
+            ".yaml",
+            "m.yamlx",
+            // The write-back temp shape (FINDINGS-BATCH-2026-10-28 [5]): a killed
+            // write can never leave a scannable file behind.
+            "qwen3.yaml.4242.7.sh.tmp",
+        ] {
+            assert!(!is_accepted_config(&file_type, Path::new(name)), "{name}");
+        }
+        // Right name, wrong shape: a directory named like a config is inert.
+        assert!(!is_accepted_config(&dir_type, Path::new("d.yaml")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pipe/linked-tree hang shape the reviewer feared dies here: a symlink
+    /// is judged by `file_type()` (never followed), so a `*.yaml` link is inert.
+    /// Creating symlinks on Windows needs privilege (SeCreateSymbolicLinkPrivilege
+    /// or Developer Mode) — when the OS refuses, the non-`is_file` rejection is
+    /// still pinned by the directory case above and the std contract that
+    /// `DirEntry::file_type` reports the link itself.
+    #[test]
+    #[cfg(windows)]
+    fn a_symlink_is_inert_even_when_it_targets_a_valid_yaml() {
+        let dir = crate::testutil::temp_dir("scan-symlink");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let real = dir.join("real.yaml");
+        std::fs::write(&real, "engine: mock\nvram_gb: 2\n").expect("write");
+        let link = dir.join("linked.yaml");
+        match std::os::windows::fs::symlink_file(&real, &link) {
+            Ok(()) => {
+                let catalog = scan_dir(&dir);
+                let names: Vec<&str> = catalog.models.iter().map(|m| m.name.as_str()).collect();
+                assert_eq!(names, ["real"], "the symlink must not publish: {names:?}");
+                assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
+            }
+            Err(error) => {
+                // Falsifier role is unchanged either way; the privilege fact is
+                // stated, not papered over.
+                eprintln!(
+                    "symlink_file refused on this host ({error}) — unprivileged Windows \
+                     without Developer Mode; the non-regular-file rejection stays pinned \
+                     by the dir.yaml directory case and the `is_accepted_config` unit test."
+                );
+                assert!(!link.exists() || link.is_symlink());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1280,6 +1725,56 @@ mod tests {
         );
     }
 
+    /// Fork C gate: the strict acceptance must not blind-side the live catalog —
+    /// every accepted file the operator keeps publishes, and the dir talks to
+    /// nobody: zero problem lines, zero reports of any kind. The expected count
+    /// is the dir's own accepted enumeration (FINDINGS-BATCH-2026-10-28 [6]):
+    /// adding or removing a live yaml is catalog state, not a test edit. Skipped
+    /// when the dir is absent.
+    #[test]
+    fn the_live_modelconf_directory_scans_fully_clean() {
+        let dir = Path::new("ModelConf");
+        if !dir.is_dir() {
+            eprintln!(
+                "no ModelConf directory beside the test cwd (looked for {}); skipping",
+                dir.display()
+            );
+            return;
+        }
+        let accepted = std::fs::read_dir(dir)
+            .expect("read live ModelConf dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .is_some_and(|file_type| is_accepted_config(&file_type, &entry.path()))
+            })
+            .count();
+        assert!(accepted > 0, "an accepted-file count of zero pins nothing");
+        let catalog = scan_dir(dir);
+        assert_eq!(
+            catalog.models.len(),
+            accepted,
+            "every accepted live file is problem-line-free and must publish: {:?}",
+            catalog.errors
+        );
+        let offenders: Vec<&ScanError> = catalog
+            .errors
+            .iter()
+            .filter(|e| e.kind == ScanKind::InvalidYaml)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the live ModelConf must scan with zero invalid-yaml files: {offenders:?}"
+        );
+        assert!(
+            catalog.errors.is_empty(),
+            "the live ModelConf must scan fully clean, not just publishable: {:?}",
+            catalog.errors
+        );
+    }
+
     /// `kind` is part of the wire contract (`/har/status` and `/har/rescan` both
     /// serialize `catalog_errors`): the JSON field names are pinned here.
     #[test]
@@ -1299,6 +1794,7 @@ mod tests {
             (ScanKind::EngineBinaryMissing, "engine_binary_missing"),
             (ScanKind::EngineUnavailable, "engine_unavailable"),
             (ScanKind::UnknownKey, "unknown_key"),
+            (ScanKind::InvalidYaml, "invalid_yaml"),
             (ScanKind::Other, "other"),
         ] {
             let value = serde_json::to_value(ScanError {

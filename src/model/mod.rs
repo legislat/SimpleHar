@@ -393,10 +393,16 @@ impl ModelEntry {
             // v3.3's `external: true` is scrapped (operator 2026-10-26): skipped here
             // so a copied-back v3.3 yaml cannot keep advertising a meaning nothing has,
             // and cannot resurrect it through the raw passthrough on write-back. The
+            // forensic `bak:` key joins `external` in never reaching the raw map
+            // (operator ruling 2026-10-28, "forensic manual only"): its value can
+            // neither surface on the page nor be re-emitted by write-back. The
             // operator's file bytes are left alone — only the parsed entry drops it.
             raw: keys
                 .iter()
-                .filter(|(key, _)| key.as_str() != "external")
+                .filter(|(key, _)| {
+                    key.as_str() != "external"
+                        && !crate::model::scan::SILENT_KEYS.contains(&key.as_str())
+                })
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         })
@@ -543,6 +549,23 @@ mod tests {
         let entry = ModelEntry::from_flat(&flat(&[("name", "m"), ("external", "true")]), "m")
             .expect("valid entry");
         assert!(!entry.raw.contains_key("external"));
+        let kept = ModelEntry::from_flat(&flat(&[("name", "m"), ("custom", "x")]), "m")
+            .expect("valid entry");
+        assert_eq!(kept.raw.get("custom").map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn reserved_silent_bak_key_is_skipped_from_the_raw_map() {
+        // `bak:` is forensic-manual-only (operator ruling 2026-10-28): stripped
+        // from the parsed raw map like the retired `external`, so its value can
+        // never reach the page or be re-emitted by write-back. Every other key
+        // still passes through.
+        let entry = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("bak", "snapshot 2026-10-28 pre-quant")]),
+            "m",
+        )
+        .expect("valid entry");
+        assert!(!entry.raw.contains_key("bak"));
         let kept = ModelEntry::from_flat(&flat(&[("name", "m"), ("custom", "x")]), "m")
             .expect("valid entry");
         assert_eq!(kept.raw.get("custom").map(String::as_str), Some("x"));
