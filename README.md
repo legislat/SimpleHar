@@ -1,25 +1,48 @@
 # SimpleHar SE
 
 A Windows tray harness for local LLM inference engines: one app, one GPU, many
-models. It owns llama.cpp `llama-server` processes (more engines planned), swaps
-models between four category listeners with a typed, single-writer scheduler,
-admits loads on the card's own reading (the witness) minus reserve, with in-flight
-bookings, and refuses — with reasons — rather
-than overcommitting.
+models. It owns your engine processes (llama.cpp `llama-server`, strata Python
+servers, ninfer GPU containers), swaps models between four category listeners
+with a typed, single-writer scheduler, admits loads on the card's own reading
+(the *witness*) minus a reserve, with in-flight bookings — and **refuses, with
+reasons**, rather than overcommitting.
 
-Current release: **1.0** — `cargo build --release` produces
-`target\release\simplehar-se.exe`.
+Current release: **v1.0.0** — `cargo build --release` produces
+`target\release\simplehar-se.exe`, or use the shipped exe directly.
 
-## Requirements
+## Who this is for
 
-- Windows 10/11 with an NVIDIA GPU (NVML witness; `nvidia-smi` fallback).
-- Rust toolchain (`cargo build --release`) for building.
-- `llama-server.exe` from [llama.cpp](https://github.com/ggml-org/llama.cpp)
-  (default expected at `C:\Inference\llama.cpp\llama-server.exe`, configurable).
+You run local LLMs on one NVIDIA GPU and want:
+
+- several models ready to swap instantly — a coding/agent model, a roleplay
+  model, utility and embedding models — each pinned to its own OpenAI-compatible
+  endpoint, without juggling console windows;
+- one safe budget manager: loads are admitted against what the card actually
+  reports, nothing is ever force-loaded onto a full GPU, and every refusal
+  names the blockers and the numbers;
+- declarative config: a JSON file for the harness, one flat YAML per model —
+  hot-reloadable, and every page edit writes back to those exact files.
+
+## Engines and the stack you need
+
+| Engine | What runs | Stack required on the machine |
+|---|---|---|
+| `llama` (default) | a native `llama-server.exe` process per model, serving a GGUF file | [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server.exe` (default expected at `C:\Inference\llama.cpp\llama-server.exe`, configurable) |
+| `strata` | `python -m serve.server --engine strata` in a Python venv | a strata install with its virtualenv (default `C:\Strata\.venv\Scripts\python.exe`, cwd `C:\Strata`) and a per-model profile JSON |
+| `ninfer` | a GPU container inside WSL2, started by your autostart script and reaped by container name | WSL2 distro + Docker, the ninfer container image, and an operator-written `autostart.sh` per model; set `wsl_distro` / `wsl_user` in the config |
+
+Common requirements:
+
+- Windows 10/11 with an NVIDIA GPU (memory is read via NVML, `nvidia-smi` fallback).
+- The Rust toolchain only if you build from source.
+
+No engine ever starts when the harness boots — engines spawn only when a model
+is loaded (by you, or by a request naming it).
 
 ## Quick start
 
 ```powershell
+# from source:
 cargo build --release
 # place simplehar-se.exe anywhere; create a ModelConf\ folder next to it
 # and drop one flat .yaml per model (see "Model files" below)
@@ -28,8 +51,12 @@ target\release\simplehar-se.exe
 start http://127.0.0.1:8708/
 ```
 
-No config file is required — defaults are usable. Boot spawns **zero engines**:
-models load on demand (first request, or from the page).
+No config file is required. On the **first start** the harness probes the real
+system (GPU total from NVML, `llama-server.exe` on PATH) and creates
+`simplehar-se.json` beside the exe with the detected values — from then on the
+file is the truth, so edit it there (delete it to have it re-created). Every
+boot also cross-checks the pinned `vram_total_gb` against the card and warns —
+never repairs — when they disagree beyond `witness_tolerance_gb`.
 
 ## Categories & ports
 
@@ -40,152 +67,236 @@ models load on demand (first request, or from the page).
 | AUX | 8710 | 1–6 | utility models | WORK, RP |
 | EMB | 8711 | 1 | embeddings | WORK, RP |
 
-llama engines are **forced** to `--host 127.0.0.1` by the harness; strata and ninfer
-take their bind address from their own external config (strata profile `host`,
-ninfer autostart script) — keep those loopback unless you mean to publish. One
-port per slot allocated sequentially from
-18109 (`18109`–`18112` with the default four single-slot categories, up to `18117`
-with six AUX slots). All ports are declarative — see `categories` in
-the config.
+AUX may hold up to six models at once (`max_models` in the config); the others
+hold exactly one. Engine ports are allocated per slot sequentially from 18109
+(`18109`–`18112` with the default four single-slot categories, up to `18117`
+with six AUX slots). Everything here is declarative — see `categories` in the
+config.
+
+llama engines are **forced** to `--host 127.0.0.1` by the harness; strata and
+ninfer take their bind address from their own external config (strata profile
+`host`, ninfer autostart script) — keep those loopback unless you mean to
+publish.
 
 Each public listener answers OpenAI-style `/v1/models` (category-filtered),
-`/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. A request naming no
-model is served by the category's loaded occupant (the MRU one at AUX ×N); only with
-nothing loaded does it load that category's `default_model` instead of erroring.
+`/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. A request
+naming no model is served by the category's loaded occupant (the most-recently
+used one at AUX); when nothing is loaded it loads that category's
+`default_model` instead of erroring.
 
 ## Configuration: `simplehar-se.json`
 
 Lives beside the executable; override the path with the `SIMPLEHAR_CONFIG`
-environment variable. It is SE's own file: the older app's `simplehar.json` is read
-once, to migrate, and never written. **The config file is the truth**:
-`default_model` changes
+environment variable. **The config file is the truth**: `default_model` changes
 made on the page persist back to the exact file boot read (atomic rewrite),
-partial files are completed, an invalid file is fatal with every problem logged
-— never silently defaulted.
+partial files are completed, and an invalid file is fatal with every problem
+logged — never silently defaulted.
 
 | Field | Default | Meaning |
 |---|---|---|
 | `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN — set `control_token` first, see Security |
 | `control_token` | *unset* | When set, every route but the page assets demands it (`X-Har-Token` or `Authorization: Bearer`); `SIMPLEHAR_TOKEN` overrides it and keeps the secret out of the file |
-| `allow_mock_engine` | `false` | Registers the test-facing `mock` engine at boot. Its argv is the bare name `mock-engine`, resolved through the harness's own directories — turning this on where others can write beside the harness exe or its cwd is a code-execution grant; tests never need it |
-| `categories` | four defaults | Per-category `id`, `public_port`, `max_models`, `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), `engine_ports` |
+| `categories` | four defaults | Per-category `id`, `public_port`, `max_models` (1–6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), `engine_ports` |
 | `vram_total_gb` | `72.0` | Admission ceiling |
 | `vram_reserve_gb` | `2.0` | Kept unreachable by admission |
-| `witness_tolerance_gb` | `2.0` | Post-kill driver-lag band: a load may spawn up to this far under the gate (absorbs the lag between a confirmed release and the card's own reading catching up); also the settle allowance |
-| `greedy_launch_min_free_gb` | `4.0` | Launch floor applied to `cost: greedy` models without their own `launch_only_with_at_least_vram_free` |
+| `witness_tolerance_gb` | `2.0` | Post-kill driver-lag band: a load may spawn up to this far under the gate (absorbs the lag between a confirmed release and the card's reading catching up); also the settle allowance |
+| `greedy_launch_min_free_gb` | `4.0` | Launch floor for `cost: greedy` models without their own `launch_only_with_at_least_vram_free` |
 | `load_timeout_s` | `120` | Readiness deadline per load; per-model override via the `load_timeout:` yaml key |
-| `measured_sample_s` | `60` | Seconds between witness samples while a model serves; builds the `measured_gb`/`measured_gb_min` range |
-| `release_timeout_s` | `60` | Kill-confirmation deadline (G12) |
+| `measured_sample_s` | `60` | Seconds between witness samples while a model serves |
+| `release_timeout_s` | `60` | Kill-confirmation deadline |
 | `settle_timeout_s` | `30` | Memory-settle deadline after release |
-| `protected_ports` | `8003-8005`, `8009`, `8016-8017`, `8030`, `18203-18209` | Ports the harness must never bind or touch |
-| `wsl_distro` / `wsl_user` | `Ubuntu` / *(set this)* | WSL coordinates for ninfer containers |
+| `protected_ports` | small reserved set | Ports the harness must never bind or touch — extend it to cover any servers you run manually outside this app |
+| `wsl_distro` / `wsl_user` | `Ubuntu` / *(set for ninfer)* | WSL coordinates for ninfer containers |
 | `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary |
 | `modelconf_dir` | `<exe dir>\ModelConf` | Catalog directory |
 | `tray_enabled` | `true` | Tray icon at boot |
 
 ## Model files: `ModelConf/*.yaml`
 
-One flat `key: value` file per model (comments via `#` are preserved on write-back: an untouched line always keeps its comments; an **identical-value** write — identical *as the scanner reads the value*, which is the one rule both sides share — passes the edited line through byte-verbatim, BOM, indentation, raw quoting, comment and `\r` all intact, and the file is not rewritten at all; a real change rewrites the line in harness form and drops its inline comment, because a stale note beside a new value is a lie; a `#` opens a comment only when an ASCII **space** precedes it outside quotes, so a tab never opens one and a `#` at the very start of the value text is part of the value — write `"# tail"` if you mean it literally; operator ruling 2026-10-28, FINDINGS-13 [8]):
+One flat `key: value` file per model. `#` comments are preserved when the
+harness rewrites a file, and an unchanged value passes through byte-for-byte.
 
-**Acceptance (strict — 13[5] Fork B):** a config is exactly a **regular file** whose final extension is `.yaml`, case-insensitively. `.yml` is **not** a config extension (repo convention) — `foo.yml` is silently inert, not broken: rename it to `.yaml` when you want it live. Everything else in `ModelConf` is silently inert with **zero `catalog_errors`**: `README.md`, `Thumbs.db`, a directory named `x.yaml`, incident copies `x.yaml.bak`. Symlinks are skipped as themselves — never followed, never opened — so a linked tree or a pipe can neither publish nor hang a scan. Parse reports (`invalid_yaml`) are reserved for actual `*.yaml` files: stray files do not talk.
+**What counts as a model file:** a regular file whose extension is `.yaml`
+(case-insensitive). `.yml` is not recognized — such a file is silently inert,
+not an error. Everything else in `ModelConf` is ignored with zero errors
+(readme files, thumbnails, backup copies); symlinks are skipped, never
+followed. Only real `*.yaml` files are parsed and can report parse errors.
 
-If an atomic write ever fails its own post-write validation, the harness first writes a single-slot **incident copy** `<stem>.yaml.bak` beside the target (overwritten per incident; if the source carries a `bak:` node, that node is rewritten in the copy to a one-line incident stamp — never appended when absent), then restores the original bytes through the same temp+rename machinery, and the returned error names where every byte ended up. These copies are inert to the scan by the acceptance rule above; the harness never reads or manages them.
+If an atomic write ever fails its own validation, the harness restores the
+original bytes and the error names exactly where every byte ended up — a failed
+edit never leaves a half-written model file live.
 
 | Key | Notes |
 |---|---|
-| `name` | Legacy/optional; identity is the file stem and a mismatching `name` is refused (the file is renamed or the key deleted) |
-| `model` | GGUF path (or `scheme://` engine sentinel). **Required for llama** |
-| `engine` | `llama` (default), `strata`, `ninfer`, or `mock` |
+| `name` | Optional; identity is the file stem, and a mismatching `name` is refused (rename the file or drop the key) |
+| `model` | GGUF path (or the engine's model URI). **Required for llama** |
+| `engine` | `llama` (default), `strata`, or `ninfer` |
 | `category` | `WORK`/`RP`/`AUX`/`EMB` |
 | `vram_gb` | Declared admission cost in GiB; `fixed` falls back to `file size × 1.15 + 2`, `exact` refuses without it |
-| `cost` | `fixed` (default): size binds admission · `greedy`: offloads to RAM/SSD, size never refuses but a launch floor is mandatory · `exact`: engine-computed number, required and binding |
-| `launch_only_with_at_least_vram_free` | GiB. Refuse the load **before spawn** unless the physically free card reaches this floor (reserve deducted; foreign processes counted whenever per-process attribution is available) — the thrash guard for big/greedy quants. Greedy models without it inherit `greedy_launch_min_free_gb`; set `0` per-model to opt out explicitly |
-| `cpu_offload` | `true`/`1`/`on` → forces `-ngl 0` (**llama only**: the `strata`, `ninfer` and `mock` adapters never read it — such a row reports an `inert_key` hint in `catalog_errors`, still publishes, and the page offers no CPU control for it) |
+| `cost` | `fixed` (default): size binds admission · `greedy`: offloads to RAM/SSD, size never refuses but a launch floor is mandatory · `exact`: an engine-computed number, required and binding |
+| `launch_only_with_at_least_vram_free` | GiB. Refuse the load **before spawn** unless the physically free card reaches this floor (reserve deducted; foreign processes counted whenever per-process attribution is available) — the thrash guard for big/greedy quants. Greedy models without it inherit `greedy_launch_min_free_gb`; set `0` per-model to opt out |
+| `cpu_offload` | `true`/`1`/`on` → forces `-ngl 0` (**llama only** — other engines report an `inert_key` hint and the page offers no CPU control for them) |
 | `serve_model` | Expected engine-reported id; mismatch = recorded warning, never trusted |
-| `measured_gb` | High end of the footprint the harness measured from the witness while this model served (`total - used` diff against the free memory its load was admitted at, sampled every `measured_sample_s`). Written back after a load; `fixed` admission books it when `vram_gb` is absent, and a large divergence from `vram_gb` logs a verification warning |
-| `measured_gb_min` | Low end of that range: the smallest total-diff seen while serving. The spread is the KV cache growing during a session, which is why one number would be false precision. Must not exceed `measured_gb` |
-| `measured_offload` | The `cpu_offload` setting the pair was measured under, written with it on `cpu_offload`-capable (llama) rows only — the witness pair itself mints for every engine. Captured **when the engine spawns**, so flipping the knob while that engine serves cannot restamp the range to agree with the new yaml — and the mismatch is then what the scan's void rule is for. An offloaded launch has no comparable footprint, so flipping `cpu_offload` on such a row voids both values at scan; the stamp itself survives in the file and in the `/har/models` payload (the page renders the range, not the stamp) |
+| `measured_gb` / `measured_gb_min` | The footprint range the harness measured from the witness while this model served (high/low end — the spread is the KV cache growing). Written back after a load; the admission books `measured_gb` when `vram_gb` is absent |
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `context`, `batch`, `flash_attn`, … | Mapped to the corresponding `llama-server` flags |
-| `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata/ninfer cold starts use 600–1200) |
-| `strata_config` | **Required for strata.** Profile JSON path; must be an existing **file** (refused at spec time, before any eviction or spawn). Weights/quant/context all live in this file, never in argv; its *contents* are not policy-checked (owed to chunk 10) |
+| `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata/ninfer cold starts commonly need 600–1200) |
+| `strata_config` | **Required for strata.** Profile JSON path; must be an existing **file** (refused up front, before any eviction or spawn). Weights/quant/context live in this file, never in argv |
 | `strata_python` | Interpreter: must be an existing `.exe` **file** — it is the program the harness launches (default `C:\Strata\.venv\Scripts\python.exe`) |
 | `strata_cwd` | Working directory; must be an existing directory (default `C:\Strata`) |
-| `extra_args` | **Closed allow-list, not a denial list** (FINDINGS2-0910 [1]). Whitespace-split words are appended to the argv only if each is one of the reviewed options — `--embedding`, `--embeddings`, `--pooling <mode>`, `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`, `--warmup`, `--no-warmup` — plus the value words its arity consumes (a value may not be option-shaped, so it cannot smuggle another flag; `--seed -1` is fine). **Anything else is refused with the launch**, naming the word: there is no list of forbidden flags to dodge — `-m`/`--model`, `--host`, `--port`, `-ngl` and every alias spelling (`--n-gpu-layers`, `--gpu-layers`), `--jinja`/`--no-jinja`, `--mmproj`, `--api-key*`, `--ssl-*`, `--rpc`, `--path`, `--models-dir`, `--model-url`, `--hf-*`, `--reuse-port`, `--lora*`, `--override-kv` and all ~190 other options are admitted by absence. Adding a word is a code review (it must state which harness-owned decision it cannot move). The forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` are appended after it, so they win under any parser that honors last occurrence. Unknown keys elsewhere in the file are preserved for reference but never launched |
-| `ninfer_autostart` | **Required for ninfer.** Path (inside WSL) of the operator's autostart script; invoked as `bash <script> <profile> <key\|nokey> <port>` via `wsl.exe`. Must be a plain word — no spaces, no shell metacharacters, no leading `~` (the login shell would expand it) — so an absolute path inside the distro is the only shape that loads |
-| `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload — strictly scoped to the name this harness has a claim on: the claim is minted only once the autostart client actually started, and retracted if the spawn is nevertheless reported failed (`ninfer-claims.json` beside the harness exe). Must be docker-legal and must not look like a container ID (4+ hex chars): docker would resolve such an argument as an id prefix and delete someone else's container |
+| `extra_args` | **Closed allow-list, not a denial list.** Whitespace-split words are appended to the argv only if each is a reviewed option — `--embedding`, `--embeddings`, `--pooling <mode>`, `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`, `--warmup`, `--no-warmup` — plus the value words it consumes (a value may not be option-shaped, so it cannot smuggle another flag). **Anything else is refused with the launch**, naming the word: model, host, port, gpu-layers, jinja, api-key, lora, rpc and every other option are admitted by absence, so there is nothing to dodge. The harness's forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` are appended after it and win |
+| `ninfer_autostart` | **Required for ninfer.** Path (inside WSL) of your autostart script; invoked as `bash <script> <profile> <key\|nokey> <port>` via `wsl.exe`. Must be a plain absolute path — no spaces, no shell metacharacters, no leading `~` |
+| `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload, scoped strictly to the name this harness started (claim ledger: `ninfer-claims.json` beside the harness exe). Must be docker-legal and must not look like a container ID (4+ hex chars) |
 | `ninfer_profile` | Profile passed as the script's `$1` (default `b`) |
-| `ninfer_key` | Truthy — `true`/`1`/`yes`/`on`, case-insensitive, the shared truthy table — sends `key` as `$2`; anything else sends `nokey` |
+| `ninfer_key` | Truthy (`true`/`1`/`yes`/`on`) sends `key` as `$2`; anything else sends `nokey` |
 
-Unknown keys are preserved for reference and reported as `unknown_key` warnings in `catalog_errors` — the model still loads. `host` and `port` are harness-owned and inert: the engine bind is forced to loopback (§5) and the port is assigned from the category config, so those keys do nothing.
-
-The `bak:` key is a reserved forensic note — **forensic manual only** (operator ruling, 2026-10-28). It is a single-line, hand-written one-shot snapshot record (with its relevant comments on the same line); **in your model files** the harness never reads it, never warns about it, never logs it, and strips it from the parsed catalog, so its value can never surface on the page or be re-emitted by write-back. **In your model files** the harness itself never writes `bak:` — it inspects the node's presence only when producing the incident copy described above (that paragraph is authoritative), and rewrites the node there, never in the model file. Keep exactly one `bak:` line: a second is a duplicate-key problem line and the file will not publish.
-
-### Ninfer engines
-
-Ninfer models (`engine: ninfer`) are GPU containers in WSL: the harness spawns a
-short-lived `wsl.exe -d <wsl_distro> -u <wsl_user> -- bash <ninfer_autostart>
-<profile> <key|nokey> <assigned-port>` client, then waits for `/health` 200
-**then** `/v1/models` 200. Because the container outlives the client, unload
-reaps it by name (`docker rm -f <ninfer_container>`); the release evidence is
-the port closing after the reaping, not the client's exit. Every ninfer model the
-catalog carries is managed; manual
-servers the harness did not spawn are never registered or monitored, only
-subtracted from VRAM via the witness. A harness crash can orphan a container (the job object only reaps
-the client); the next load of that name reconciles by removing the stale
-container before autostart runs. At boot an orphan is reclaimed only when all
-three ownership gates hold — a `ninfer` model declares the name, the name is
-legal, and the claim ledger proves this harness started it — otherwise the
-harness warns and leaves the container alone: boot reclaim never destroys on
-suspicion, never by prefix, never by container-ID prefix. Duplicate
-`ninfer_container` names across models are refused at scan — reaping is by
-name. As with strata: no preload, booting spawns nothing.
+Unknown keys are preserved for reference and reported as `unknown_key`
+warnings — the model still loads. `host` and `port` keys are harness-owned and
+inert: the bind is forced to loopback and the port is assigned from the
+category config.
 
 ### Strata engines
 
-Strata models (`engine: strata`) launch `python -m serve.server --engine strata
---config <strata_config> --port <assigned>` in `strata_cwd`; the harness passes the
-assigned `--port` last, after the profile — whether the pinned strata server lets that
-beat a port in the profile is an owed live check (HANDOFF §4), not a harness guarantee.
-Readiness requires `/health`
-200 **and** the JSON `loaded` flag not being `false` (strata answers 200 while
-weights stream in). There is no preload anywhere in this harness: a strata engine
-starts only when an operator loads it (or a client request names it through the
-proxy); booting the harness spawns nothing.
+Strata models (`engine: strata`) launch
+`python -m serve.server --engine strata --config <strata_config> --port <assigned>`
+in `strata_cwd`; the harness passes the assigned `--port` last, after the
+profile — pin the port outside the strata profile rather than relying on the
+engine to arbitrate. Readiness requires `/health` 200 **and** the JSON `loaded`
+flag not being `false` (strata answers 200 while weights stream in). A strata
+engine starts only when you load it (or a client request names it); booting the
+harness spawns nothing.
 
-After editing files, press **Rescan** (or `POST /har/rescan`). A rescan re-reads the
-catalog and nothing else: a model that is serving keeps the launch it was spawned with
-(its argv, its booked size, its measured range and `measured_offload` stamp), so an edit
-to a live model's yaml takes effect on its next load, not under its running engine; a
-**queued** load whose yaml moved (or whose file vanished) is retired by the rescan with a
-`superseded by rescan` job note — re-queue it to apply the new bytes — while a rescan
-that changed nothing never drops a queue. Two
-files whose names collapse to one identity are both reported in `catalog_errors` as
-`duplicate_name` — both publish, and every load of that name stays refused as ambiguous
-until one is renamed.
+### Ninfer engines
+
+Ninfer models (`engine: ninfer`) are GPU containers in WSL2: the harness runs
+`wsl.exe -d <wsl_distro> -u <wsl_user> -- bash <ninfer_autostart> <profile>
+<key|nokey> <assigned-port>` as a short-lived client, then waits for `/health`
+200 **then** `/v1/models` 200. The container outlives the client, so unload
+reaps it by name (`docker rm -f <ninfer_container>`) and the release evidence is
+the port closing, not the client's exit. Every ninfer model the catalog carries
+is managed; servers you started manually are never registered or monitored —
+they are only subtracted from VRAM via the witness.
+
+If a harness crash orphans a container, the next load of that name reconciles
+by removing the stale container before autostart runs. At boot, an orphan is
+reclaimed only when ownership is provable (the name is declared by a `ninfer`
+model, the name is legal, and the claim ledger proves this harness started it) —
+otherwise the harness warns and leaves it alone. Duplicate `ninfer_container`
+names across models are refused at scan, because reaping is by name.
+
+#### autostart.sh template
+
+A ready-to-edit copy ships as **`ninfer-autostart-template.sh`** next to this
+README (and beside the exe in the release package); copy it into your distro,
+rename, `chmod +x`, and fill in the four variables at the top. The contract: the
+harness invokes your script as `bash <script> <profile> <key|nokey> <port>`
+inside WSL — `$1` selects a resource profile, `$2` toggles the service's API
+key, `$3` is the **host** port the harness assigned (map it to the container's
+internal port), and the script exits once the container is starting; the
+harness then polls `/health` and `/v1/models` itself. Keep the container name
+equal to the model's `ninfer_container`.
+
+```bash
+#!/usr/bin/env bash
+# autostart.sh — start one NInfer service with a VRAM profile: a|b|c|d (default b)
+set -euo pipefail
+
+NAME="SE-nin-mymodel"                 # == ninfer_container in the model yaml
+IMAGE="ninfer-mymodel:local"          # the image your artifact requires
+MODEL_NAME="My-Model-NInfer"          # directory name holding the artifact
+ARTIFACT="my-model.ninfer"            # file name inside the model directory
+MODEL_ID="my-model"                   # OpenAI-style served id (== serve_model in yaml)
+INTERNAL_PORT=8005                    # port the server listens on inside the container
+
+# Model directories to search for ARTIFACT (first hit wins).
+MODEL_ROOTS=(
+  "/mnt/d/Models"
+  "/home/you/ai/models"
+)
+MODEL_DIR=""
+for root in "${MODEL_ROOTS[@]}"; do
+  if [[ -f "$root/$MODEL_NAME/$ARTIFACT" ]]; then MODEL_DIR="$root/$MODEL_NAME"; break; fi
+done
+[[ -n "$MODEL_DIR" ]] || { echo "autostart: no '$ARTIFACT' under ${MODEL_ROOTS[*]}" >&2; exit 1; }
+
+CFG="${1:-b}"
+WITH_KEY="${2:-}"
+case "$CFG" in
+  a) MAX_CTX=262144; KV_CAP=524288; CONC=2 ;;  # big context, 2 concurrent
+  b) MAX_CTX=262144; KV_CAP=262144; CONC=1 ;;  # default: large single agent context
+  c) MAX_CTX=131072; KV_CAP=131072; CONC=1 ;;  # most VRAM-conserving
+  d) MAX_CTX=16384;  KV_CAP=32768;  CONC=2 ;;  # short context, 2 concurrent
+  *) echo "usage: $0 <a|b|c|d> [key]" >&2; exit 1 ;;
+esac
+
+if [[ "$WITH_KEY" == "key" ]]; then
+  API_KEY="$(cat "$(dirname "$0")/.api_key")"  # keep the secret in a file, never here
+  API_KEY_ARGS=(--api-key "$API_KEY")
+else
+  API_KEY_ARGS=()
+fi
+
+PUBLISH="${3:-$INTERNAL_PORT}"        # host port assigned by the harness
+
+# Idempotent: reclaim a stale container of OUR name before starting.
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+docker run -d --name "$NAME" \
+  --gpus '"device=0"' \
+  --restart unless-stopped \
+  --publish "127.0.0.1:${PUBLISH}:${INTERNAL_PORT}" \
+  --volume "$MODEL_DIR:/models:ro" \
+  "$IMAGE" \
+  serve "/models/$ARTIFACT" \
+  --host 0.0.0.0 \
+  --port "$INTERNAL_PORT" \
+  --model-id "$MODEL_ID" \
+  "${API_KEY_ARGS[@]}" \
+  --max-context "$MAX_CTX" \
+  --kv-capacity "$KV_CAP" \
+  --max-concurrency "$CONC"
+
+echo "autostart: '$NAME' profile '$CFG' (ctx=$MAX_CTX kv=$KV_CAP conc=$CONC key=$([[ "$WITH_KEY" == "key" ]] && echo on || echo off)) on port $PUBLISH->$INTERNAL_PORT"
+```
+
+Notes:
+
+- `--publish 127.0.0.1:...` keeps the container loopback-only. Publishing on all
+  interfaces exposes an unauthenticated engine to your LAN — do it only with the
+  `key` profile (and a real `.api_key` file), or not at all.
+- The name-scoped `docker rm -f` before `docker run` makes the launch idempotent
+  and complements the harness's orphan reconciliation.
+- `serve_model` in the model yaml must match `--model-id`, or the harness records
+  a served-id warning.
+- `chmod +x` the script; the harness runs it with `bash`, so the shebang is
+  documentation, but the executable bit avoids surprises when testing by hand.
+
+## Rescan
+
+After editing files, press **Rescan** (or `POST /har/rescan`). A rescan
+re-reads the catalog only: a model that is serving keeps the launch it was
+spawned with, so an edit to a live model's yaml takes effect on its next load
+(the page marks it **amber** while the file differs from the running bytes;
+unload + reload to apply). A queued load whose yaml moved is retired with a
+`superseded by rescan` note — re-queue it. Two files whose names collapse to
+one identity are both reported as `duplicate_name` and loads of that name stay
+refused as ambiguous until one is renamed.
 
 ## Control page
 
-`http://127.0.0.1:8708/` — slot cards + memory bars (observed VRAM from the card's
-own reading, with the reserve marked as a hatched band and in-flight bookings noted, host RAM), category tabs, per-model rows
-(Load / Set default, state dot + name, category select, CPU checkbox, Engine,
-Ctx, Cost, Files), recent jobs, collapsible harness log. A loaded row also shows
-`launched_at` — the wall-clock moment its engine became serving, formatted by the
-server (ISO-8601 UTC, printed verbatim) — and its dot turns **amber** while
-`stale_config` says the model's yaml differs from the bytes that launch used: the
-verdict is recomputed only at install and on Rescan (the status path never touches
-the file), the tooltip reads "config file changed since launch — unload + reload to
-apply", and the amber is info only: the resident keeps serving, keeps its measured
-range, and is evicted like any other. Updates push over SSE (`/har/events`) and
-degrade to polling; adaptive light/dark
-theme with a toggle.
+`http://127.0.0.1:8708/` — slot cards + memory bars (observed VRAM from the
+card's own reading, the reserve marked as a hatched band, in-flight bookings
+noted, host RAM), category tabs, per-model rows (Load / Set default, state dot
++ name, category select, CPU checkbox, Engine, Ctx, Cost, Files), recent jobs,
+collapsible harness log. A loaded row shows `launched_at` and turns amber while
+the model's file differs from the bytes its launch used. Updates push over SSE
+and degrade to polling; adaptive light/dark theme with a toggle.
 
 ## Tray
 
-Four states: green = loaded, yellow = swap in flight, gray = idle, **red =
-listener down** — the listener palette only; the page's config amber never drives
-the icon. Left-click does nothing; the menu offers Open Web UI, Unload
-All / per-category, Exit.
+Four states: green = loaded, yellow = swap in flight, gray = idle,
+**red = listener down**. The menu offers Open Web UI, Unload All /
+per-category, Exit.
 
 ## HTTP control API (control listener, 8708)
 
@@ -201,27 +312,26 @@ All / per-category, Exit.
 | `POST /har/unload` | `{model}` \| `{category}` \| `{}` (all). Unloading a *loading* slot cancels that swap (cleanup still completes) |
 | `POST /har/rescan` | `{}` catalog rescan |
 | `POST /har/config/default` | `{category, model \| null}` — persists to the config file |
-| `POST /har/config/logging` | `{enabled: bool}` — toggles the verbose harness log (answers `extended_logging`) |
-| `POST /har/config/model` | `{model, category?, cpu?}` — writes back to the model yaml (400 on an unwritable value or absent key, 409 when the edited file would not be publishable, 500 only for a real io/validation failure) |
+| `POST /har/config/logging` | `{enabled: bool}` — toggles the verbose harness log |
+| `POST /har/config/model` | `{model, category?, cpu?}` — writes back to the model yaml |
 
 Errors carry both a flat `{code, message}` and the OpenAI-style
-`{error:{message,type,code}}` envelope, with the same values in both. The `code` is
-one of: `not_found` (404), `bad_request` (400), `unauthorized` (401, control token),
-`forbidden` (403, cross-site `Origin` on a POST), `conflict` (409, cancelled /
-superseded / port still held / a model-yaml edit whose result the scanner would
-refuse to publish), `unsupported_media_type` (415), `unavailable` (503,
-admission refused with the numbers and blockers), `below_launch_floor` (503, refused
-before spawn), `witness_unavailable` (503, card unreadable), `upstream` (502),
+`{error:{message,type,code}}` envelope, with the same values in both. The `code`
+is one of: `not_found` (404), `bad_request` (400), `unauthorized` (401, control
+token), `forbidden` (403, cross-site `Origin` on a POST), `conflict` (409,
+cancelled / superseded / port still held / an edit the scanner would refuse to
+publish), `unsupported_media_type` (415), `unavailable` (503, admission refused
+with the numbers and blockers), `below_launch_floor` (503, refused before
+spawn), `witness_unavailable` (503, card unreadable), `upstream` (502),
 `not_implemented` (501), `internal` (500). Refusals that carry numbers do so in
 `message` and in the job ledger, never in a bare status.
 
 ## Autostart
 
-No `autostart.vbs` ships with the harness — create it at the path the `Run` key below
-names, with this content (adapt paths):
+Create `autostart.vbs` at the path the `Run` key below names (adapt paths), to
+run the harness hidden at logon, once:
 
 ```vb
-' runs the harness hidden at logon, once (WMI guards double-launch)
 Option Explicit
 Dim dir, exe, sh, wmi, procs
 dir = "C:\Inference\SimpleHar-SE\target\release"
@@ -248,38 +358,39 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
   `port N lies in the reserved range` (`netsh interface ipv4 show
   excludedportrange protocol=tcp` shows them all; reserve yours permanently with
   `netsh int ipv4 add excludedportrange protocol=tcp startport=N numberofports=1`).
-- **Missing model file at boot** — the banner (`simplehar_se::boot` lines in
-  the log panel) names it two ways: a `llama` row whose GGUF is gone is **dropped by the
-  scan** and reported as `! <file>.yaml: model file not found: <path>`, while a row that
-  does publish but cannot load (`llama` with no `model:` at all, or a non-llama row whose
-  `model:` path is gone) leads its `marker/category/engine/path` line with `!`. Either way
+- **Missing model file at boot** — a `llama` row whose GGUF is gone is dropped
+  by the scan and reported as `! <file>.yaml: model file not found: <path>`;
+  a row that publishes but cannot load leads its log line with `!`. Either way
   you see it before the first load tries it.
 - **Refusals** — every rejection names the blockers and the numbers
   (`/har/status` jobs + `last_error`); nothing over-admits, so a refusal means
-  unload something or raise nothing — the card's own reading (the witness) is the truth.
+  unload something — the card's own reading (the witness) is the truth.
 - **`launch floor not met`** (code `below_launch_floor`) — the card holds too
   little physically free VRAM for that model to launch sanely (foreign
-  processes). The load was refused **before spawn**, so nothing thrashed; free
-  VRAM or lower the model's `launch_only_with_at_least_vram_free` (the printed
-  `free` is the number the gate compared — reserve deducted, same-slot
-  replacement credited).
+  processes included). The load was refused **before spawn**, so nothing
+  thrashed; free VRAM or lower the model's
+  `launch_only_with_at_least_vram_free` (the printed `free` is the number the
+  gate compared — reserve deducted, same-slot replacement credited).
 - **Second instance** — a single-instance guard exits duplicates immediately.
 - Logs: `logs/` next to the exe (harness + captured engine logs, pruned).
 
 ## Security note
 
-Set `control_token` (or `SIMPLEHAR_TOKEN`, which wins so the secret can stay out of
-the file) and **every route requires it** on `X-Har-Token` or `Authorization: Bearer` —
-`/har/*`, each listener's `/v1/*`, and `GET /health` too, so a liveness probe must carry
-the token or it will read 401 and look like a dead listener. Only the page and the assets
-it links — `/`, `/index.html`, `/app.js`, `/style.css` and `/pico.min.css` — answer
-unauthenticated, so the page can load and ask. The structural guards run **before** the
-token check: a cross-site `Origin` on a POST is `403` whether or not a token is presented,
-and a missing `application/json` content-type is `415` even with a valid one — so the
-token decides *who*, never *whether* the request shape is acceptable. The token is
-never logged and never accepted from a URL. With no token set the harness has **no authentication**:
-`internal_host: 0.0.0.0` (Publish to LAN) then trusts every machine on the segment to
-load/unload models and drive the GPUs; it exists for LAN boxes and warns loudly at
-boot. Default is loopback only. The token guards only the harness's own listeners —
-engine ports have no harness auth, so a published strata profile (`host` non-loopback)
-needs its own `api_key`, and llama is forced loopback regardless of `internal_host`.
+Set `control_token` (or `SIMPLEHAR_TOKEN`, which wins so the secret can stay
+out of the file) and **every route requires it** on `X-Har-Token` or
+`Authorization: Bearer` — `/har/*`, each listener's `/v1/*`, and `GET /health`
+too, so a liveness probe must carry the token or it will read 401 and look like
+a dead listener. Only the page and the assets it links answer unauthenticated,
+so the page can load and ask. The structural guards run **before** the token
+check: a cross-site `Origin` on a POST is `403` whether or not a token is
+presented, and a missing `application/json` content-type is `415` even with a
+valid one — the token decides *who*, never *whether* the request shape is
+acceptable. The token is never logged and never accepted from a URL.
+
+With no token set the harness has **no authentication**: `internal_host:
+0.0.0.0` (Publish to LAN) then trusts every machine on the segment to
+load/unload models and drive the GPUs; it exists for LAN boxes and warns loudly
+at boot. Default is loopback only. The token guards only the harness's own
+listeners — engine ports have no harness auth, so a published strata profile
+(`host` non-loopback) needs its own `api_key`, and llama is forced loopback
+regardless of `internal_host`.
