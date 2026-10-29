@@ -204,15 +204,47 @@ async fn run_control_command(program: &str, args: &[String]) -> ControlOutcome {
     }
 }
 
-/// Deletes the oldest `*.log` files beyond `keep` in `dir`.
-fn prune_log_files(dir: &std::path::Path, keep: usize) {
+/// The directory every harness log file lands in: `logs/` beside the current
+/// executable, falling back to the working directory. Shared by the captured engine
+/// children and [`crate::observability`]'s boot log, so the two can never disagree
+/// about where the operator's `logs/` lives.
+#[must_use]
+pub fn harness_logs_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("logs")))
+        .unwrap_or_else(|| PathBuf::from("logs"))
+}
+
+/// Whether a path is the harness's own boot log rather than a captured engine child.
+/// Matched on the file stem, so the rolled `harness-<epoch>.log.1`, `.log.2`, … (whose
+/// extension is a generation number) still count as harness logs and cannot leak out of
+/// the harness budget into the engine one.
+fn is_harness_log(path: &std::path::Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.starts_with(crate::observability::HARNESS_LOG_PREFIX))
+}
+
+fn is_engine_log(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("log") && !is_harness_log(path)
+}
+
+/// Deletes the oldest files beyond `keep` in `dir` that `wants` claims. `kind` names
+/// them in the one warning this can emit, so a failure says which budget broke.
+fn prune_matching(
+    dir: &std::path::Path,
+    keep: usize,
+    kind: &str,
+    wants: impl Fn(&std::path::Path) -> bool,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("log"))
+        .filter(|path| wants(path))
         .filter_map(|path| {
             let modified = std::fs::metadata(&path)
                 .and_then(|meta| meta.modified())
@@ -227,9 +259,26 @@ fn prune_log_files(dir: &std::path::Path, keep: usize) {
     let excess = files.len() - keep;
     for (_, path) in files.into_iter().take(excess) {
         if let Err(error) = std::fs::remove_file(&path) {
-            tracing::warn!(error = %error, path = %path.display(), "cannot prune old engine log");
+            tracing::warn!(error = %error, path = %path.display(), "cannot prune old {kind} log");
         }
     }
+}
+
+/// Deletes the oldest `*.log` engine captures beyond `keep` in `dir`.
+///
+/// Harness boot logs are deliberately excluded: a swap-heavy session burns the engine
+/// budget, and the log that explains a refusal must never be evicted by the next 50
+/// spawns — least of all by the first spawn of the boot that follows the crash the
+/// operator is about to investigate. Its own budget is
+/// [`prune_harness_log_files`].
+fn prune_log_files(dir: &std::path::Path, keep: usize) {
+    prune_matching(dir, keep, "engine", is_engine_log);
+}
+
+/// Keeps the newest `keep` harness boot logs (rotations included). Called by
+/// [`crate::observability::attach_file_sink`] at boot.
+pub fn prune_harness_log_files(dir: &std::path::Path, keep: usize) {
+    prune_matching(dir, keep, "harness", is_harness_log);
 }
 
 /// What the engine table says about a kill/release request for a port.
@@ -533,10 +582,6 @@ impl ProcessRuntime {
     /// Creates the runtime; log files land under `logs/` next to the current exe
     /// (falling back to the working directory).
     pub fn new() -> Self {
-        let logs_dir = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("logs")))
-            .unwrap_or_else(|| PathBuf::from("logs"));
         ProcessRuntime {
             engines: Arc::new(Mutex::new(HashMap::new())),
             // One ledger for the whole process lifetime, shared by every clone:
@@ -546,7 +591,7 @@ impl ProcessRuntime {
                 .timeout(Duration::from_secs(2))
                 .build()
                 .expect("invariant: plain-HTTP client with a timeout needs no configuration"),
-            logs_dir,
+            logs_dir: harness_logs_dir(),
             // No WSL coordinates before boot: they name a machine-specific distro and a
             // personal account, so nothing is assumed. Boot wires both through `with_wsl`,
             // and the reaping guards refuse loudly rather than invoke `wsl.exe` without
@@ -1302,6 +1347,105 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(remaining.len(), 3, "cap enforced: {remaining:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The classification the two budgets depend on. A rolled generation is named
+    /// `harness-<epoch>.log.2` — extension `2`, so an extension-only test would let it
+    /// escape the harness budget, and an extension-`log` test would hand it to the
+    /// engine budget. Falsifier: match on `extension()` in either predicate.
+    #[test]
+    fn harness_logs_are_never_engine_logs() {
+        assert!(is_harness_log(std::path::Path::new(
+            "logs/harness-1793.log"
+        )));
+        assert!(
+            is_harness_log(std::path::Path::new("logs/harness-1793.log.2")),
+            "a rolled generation is still the harness's own log"
+        );
+        assert!(!is_engine_log(std::path::Path::new(
+            "logs/harness-1793.log"
+        )));
+        assert!(
+            !is_engine_log(std::path::Path::new("logs/harness-1793.log.2")),
+            "and is never budgeted twice, once per budget"
+        );
+        assert!(is_engine_log(std::path::Path::new("logs/llama-1793.log")));
+        assert!(!is_harness_log(std::path::Path::new("logs/notes.txt")));
+    }
+
+    /// The trap this split exists to close: the boot log that explains a refusal must
+    /// not be deleted by the engine spawns that follow it — least of all by the first
+    /// spawn of the boot after the crash the operator is about to investigate.
+    /// Falsifier: drop the `!is_harness_log` guard from `is_engine_log` and the boot
+    /// log disappears with `keep = 3`.
+    #[test]
+    fn the_engine_budget_never_prunes_the_harness_boot_log() {
+        let dir = crate::testutil::temp_dir("logprune-h");
+        std::fs::create_dir_all(&dir).expect("temp logs dir");
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("engine-{i}.log")), b"x").expect("seed engine log");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(dir.join("harness-1793.log"), b"the refusal").expect("seed boot log");
+        prune_log_files(&dir, 3);
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            remaining.contains(&"harness-1793.log".to_string()),
+            "the boot log was evicted by the engine budget: {remaining:?}"
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|name| name.starts_with("engine-"))
+                .count(),
+            3,
+            "the engine cap is still enforced: {remaining:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mirror leg: the harness budget prunes its own logs (rolled generations
+    /// included) and must not touch a single engine capture.
+    #[test]
+    fn the_harness_budget_prunes_only_harness_logs() {
+        let dir = crate::testutil::temp_dir("logprune-e");
+        std::fs::create_dir_all(&dir).expect("temp logs dir");
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("harness-{i}.log")), b"x").expect("seed boot log");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(dir.join("harness-9.log.2"), b"x").expect("seed rolled generation");
+        for i in 0..2 {
+            std::fs::write(dir.join(format!("engine-{i}.log")), b"x").expect("seed engine log");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        prune_harness_log_files(&dir, 2);
+        let remaining: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|name| name.starts_with("harness-"))
+                .count(),
+            2,
+            "harness cap enforced across rolled generations: {remaining:?}"
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|name| name.starts_with("engine-"))
+                .count(),
+            2,
+            "not one engine capture may be lost to the harness budget: {remaining:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

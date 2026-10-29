@@ -398,7 +398,15 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
   `launch_only_with_at_least_vram_free` (the printed `free` is the number the
   gate compared — reserve deducted, same-slot replacement credited).
 - **Second instance** — a single-instance guard exits duplicates immediately.
-- Logs: `logs/` next to the exe (harness + captured engine logs, pruned).
+- Logs: `logs/` next to the exe. The harness keeps **its own** streaming log,
+  `logs/harness-<boot-epoch>.log` — one JSON line per event, written unbuffered so a
+  killed process still keeps what it logged, never quieter than `INFO` whatever
+  `SIMPLEHAR_LOG` asks for, and rolling to a new generation at 8 MiB (the last 10
+  harness log files survive, rolled generations included). Engine children keep
+  `logs/<model>-<epoch>.log`, pruned to 50 on a separate budget the harness log can
+  neither consume nor be consumed by. `GET /har/log` reads the in-memory ring; a
+  non-zero `log_write_failures` at `/har/status` means the file sink died and this boot
+  leaves an incomplete artifact.
 
 ## Security note
 

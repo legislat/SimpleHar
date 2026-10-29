@@ -98,6 +98,19 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
 async fn main() -> ExitCode {
     let boot_started = std::time::Instant::now();
     observability::init();
+    // The boot identity, emitted before anything can fail: a harness that dies at the
+    // single-instance guard or on an invalid config still leaves an artifact that says
+    // which build and which process died. Non-secret facts only — the token is
+    // reported as presence alone, never its value (the 15[9] posture).
+    tracing::info!(
+        target: "simplehar_se::boot",
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        exe = %std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "unknown".to_string()),
+        "harness booting"
+    );
     // A10 single-instance guard (§0.2 step 3): a second harness refuses to boot.
     let _guard = match SingleInstanceGuard::acquire() {
         Ok(guard) => guard,
@@ -116,6 +129,30 @@ async fn main() -> ExitCode {
         }
     };
     let config_ms = boot_started.elapsed().as_millis() as u64;
+    // The configuration this boot is acting on, so a refusal in the file can be read
+    // against the numbers that produced it without opening the JSON — the coordinates
+    // I had to reverse-engineer from a silent release package today.
+    tracing::info!(
+        target: "simplehar_se::boot",
+        config = %config
+            .source_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string()),
+        internal_host = %config.internal_host,
+        vram_total_gb = config.vram_total_gb,
+        vram_reserve_gb = config.vram_reserve_gb,
+        wsl_distro = %config.wsl_distro,
+        wsl_user = %config.wsl_user.as_deref().unwrap_or("(unset)"),
+        token_configured = config
+            .control_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty()),
+        token_from_env = std::env::var("SIMPLEHAR_TOKEN")
+            .ok()
+            .is_some_and(|token| !token.trim().is_empty()),
+        "boot configuration"
+    );
     let witness = simplehar_se::witness::NvmlWitness::new();
     let witness = Arc::new(witness);
     // First-start materialization (operator ruling 2026-10-29): with no config file,
@@ -879,7 +916,14 @@ async fn run(
         _ = tokio::signal::ctrl_c() => {},
         _ = shutdown_rx.changed() => {},
     }
-    tracing::info!("shutdown requested; stopping listeners");
+    // Carries the `simplehar_se::shutdown` target so "clean exit or killed?" is
+    // answerable from the file alone — the question today's incident could not answer.
+    tracing::info!(
+        target: "simplehar_se::shutdown",
+        uptime_s = boot_started.elapsed().as_secs(),
+        log_write_failures = observability::log_write_failures(),
+        "shutdown requested; stopping listeners"
+    );
     for supervisor in supervisors {
         supervisor.abort();
     }

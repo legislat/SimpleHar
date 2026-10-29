@@ -1035,6 +1035,10 @@ async fn render_status_document(state: &ApiState, scheduler: &SchedulerStatus) -
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
         "extended_logging": crate::observability::extended_logging(),
+        // Non-zero means the on-disk post-mortem artifact is incomplete. The sink
+        // cannot report itself — the failed write is what would have carried the
+        // report — so this counter is the only durable signal that it died.
+        "log_write_failures": crate::observability::log_write_failures(),
         "boot": boot,
         "categories": categories,
         "listeners": verdicts,
