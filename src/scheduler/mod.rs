@@ -780,6 +780,12 @@ struct Job {
     /// Non-fatal observations recorded during the job (serve_model mismatch...).
     warnings: Vec<String>,
     slot: Option<usize>,
+    /// The model's yaml as it was when this row **queued** (reload-drift Axis 1,
+    /// operator ruling 2026-10-29): the bytes the parked intent was taken on, for
+    /// [`ActorState::invalidate_queued_loads`] to compare when a rescan lands.
+    /// `None` = a synthetic entry, or the stat was unreadable at registration:
+    /// nothing to compare, nothing to retire on.
+    queue_fingerprint: Option<crate::model::FileFingerprint>,
 }
 
 struct ActorState {
@@ -1126,6 +1132,101 @@ impl ActorState {
         );
         self.catalog = models;
         self.catalog_errors = errors;
+        self.invalidate_queued_loads();
+    }
+
+    /// The queued-intent half of reload (Axis 1 = **1b**, operator ruling
+    /// 2026-10-29, `research/reload-slot-drift-2026-10-28.md` rows 12-13): a
+    /// rescan retires parked/queued load rows whose model bytes moved or whose
+    /// model left the catalog — with the blessed `superseded` vocabulary (19[5]),
+    /// named reason, and the same release path every other queued retirement
+    /// takes. A **no-change rescan never drops a queue**.
+    ///
+    /// Candidate states (the registration vocabulary): [`ActorState::register_queued_load`]
+    /// is called from two sites — [`ActorState::begin_load`], which arms the row in
+    /// the same actor turn (a row never observable as queued), and the park path in
+    /// [`ActorState::on_swap`]. What makes a row a candidate is **pending
+    /// membership plus its removal discipline**: `pending.insert` lives only on
+    /// the park path, [`ActorState::start_pending`] removes before arming, and
+    /// [`ActorState::finish_queued_load`] removes before terminalizing — so an
+    /// armed row (`Admit` and beyond, a **committed launch**: its witness sample
+    /// is dispatched and the gate is pricing the very process it will spawn; the
+    /// ruling keeps in-flight/spawning out of scope) is unreachable from here by
+    /// construction. The `JobKind::Load`, `!terminal` and `SwapState::Idle`
+    /// tests (the same one [`ActorState::cancel_job`] uses for "queued") are
+    /// belt-and-braces guards: no exclusion has teeth today under that
+    /// invariant, kept deliberately as defense-in-depth for future callers of
+    /// registration. This never touches a live
+    /// slot, an occupant, a ticket, `last_used`/MRU, or any other job — residents
+    /// are the `stale_config` companion round's ground.
+    ///
+    /// The predicate is the yaml fingerprint captured at registration and nothing
+    /// else: every fact a parked row freezes (`cost`, `launch_floor`, `engine`,
+    /// `category`, `load_timeout_s`) is derived from that one file, and the only
+    /// catalog re-read an armed row still consults ([`ActorState::start_pending`] →
+    /// a fresh entry) derives its numbers from the same bytes — so bytes unchanged
+    /// means the row is consistent *by construction*, and a per-field diff would
+    /// only re-implement the fingerprint with more ways to lie. Bytes moved means a
+    /// frozen fact can now contradict the re-read fact: the intent is stale, so it
+    /// retires and the operator re-queues on the new file. A missing fingerprint on
+    /// either side (`fingerprint` = `None`: unreadable stat) is the absence of
+    /// **evidence**, never evidence of change — the queue is kept (pinned by
+    /// `a_rescan_keeps_a_queue_whose_fingerprint_cannot_show_a_change`).
+    ///
+    /// Budget no-leak: a never-armed row books nothing (`reserves_vram` excludes
+    /// `Idle`), so retirement cannot strand a reservation; what it must not strand
+    /// is the queue place — `finish_queued_load` clears it, so a later finish of
+    /// the predecessor can never arm a retired row (verified by the integration
+    /// pins' spawn arithmetic).
+    fn invalidate_queued_loads(&mut self) {
+        let candidates: Vec<JobId> = self
+            .pending
+            .values()
+            .copied()
+            .filter(|job_id| {
+                self.jobs.get(job_id).is_some_and(|job| {
+                    job.kind == JobKind::Load && !job.terminal && job.state == SwapState::Idle
+                })
+            })
+            .collect();
+        for job_id in candidates {
+            let Some(job) = self.jobs.get(&job_id) else {
+                continue;
+            };
+            let (model, category, queued) =
+                (job.model.clone(), job.category, job.queue_fingerprint);
+            let reason = match self.catalog.iter().find(|m| m.name == model) {
+                None => Some("superseded by rescan (removed from the catalog)".to_string()),
+                Some(entry) => {
+                    let now = entry.file.as_deref().and_then(crate::model::fingerprint);
+                    match (queued, now) {
+                        (Some(then), Some(now)) if then != now => Some(format!(
+                            "superseded by rescan ({} changed since queued \u{2014} re-queue to apply)",
+                            entry
+                                .file
+                                .as_ref()
+                                .and_then(|p| p.file_name())
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "<model file>".to_string())
+                        )),
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(reason) = reason {
+                tracing::warn!(
+                    model = %model,
+                    category = ?category,
+                    reason = %reason,
+                    "queued load superseded by rescan"
+                );
+                self.finish_queued_load(
+                    job_id,
+                    Err(SchedulerError::Cancelled(reason)),
+                    "cancelled",
+                );
+            }
+        }
     }
 
     /// Resolves every reload waiter dispatched at or before `seq`: whichever
@@ -1473,6 +1574,8 @@ impl ActorState {
             note: Some(note.to_string()),
             warnings: Vec::new(),
             slot: Some(slot),
+            // Unload rows queue against an occupant, not a file: nothing to compare.
+            queue_fingerprint: None,
         };
         self.jobs.insert(job_id, job);
         self.slots[slot].job = Some(job_id);
@@ -1894,6 +1997,11 @@ impl ActorState {
             launch_floor: entry.launch_floor_gb,
             load_timeout_s: entry.load_timeout_s,
             gate_target: None,
+            // The yaml as the catalog saw it, statted once per registration: the
+            // same one-stat-per-event discipline `apply_catalog` keeps (the stat
+            // rides a file the just-applied scan already read; adapters already
+            // stat config files synchronously on the actor at preflight).
+            queue_fingerprint: entry.file.as_deref().and_then(crate::model::fingerprint),
         };
         self.jobs.insert(job_id, job);
         self.set_timing(job_id, |t| &mut t.queue_ms);
@@ -3777,6 +3885,7 @@ mod tests {
                 note: Some("loaded".to_string()),
                 warnings: Vec::new(),
                 slot: Some(0),
+                queue_fingerprint: None,
             },
         );
         state.slots = vec![Slot {
@@ -4723,6 +4832,150 @@ mod tests {
             "an unanchored spawn has no stamp to mint and no file to write"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Axis 1 predicate table (ruling 2026-10-29), including the
+    /// unreadable-stat windows the actor path cannot race into existence
+    /// deterministically (the scan that publishes the bytes rides the same read
+    /// the stat does), so the `None` legs are manufactured here directly: a
+    /// missing fingerprint — at registration or at rescan — is the absence of
+    /// evidence, never evidence of change. Falsifiers: treating `None` as change
+    /// fails every KEEP leg; disabling the invalidation fails both RETIRE legs;
+    /// an always-retire predicate fails KEEP 1 (whose actor-path twin is
+    /// `an_unchanged_rescan_keeps_the_queue_and_the_parked_load_still_loads`).
+    #[test]
+    fn a_rescan_keeps_a_queue_whose_fingerprint_cannot_show_a_change() {
+        let dir = crate::testutil::temp_dir("rescan-fp");
+        let yaml = dir.join("m.yaml");
+        let entry_on_disk = |bytes: &str| -> ModelEntry {
+            std::fs::write(&yaml, bytes).expect("seed");
+            let (map, _) = crate::model::scan::parse_flat_yaml("engine: mock\nvram_gb: 4\n");
+            let mut entry = ModelEntry::from_flat(&map, "m").expect("entry");
+            entry.file = Some(yaml.clone());
+            entry
+        };
+        let fresh_state = || -> ActorState {
+            let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+            let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+            adapters.insert(
+                "mock".to_string(),
+                Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+            );
+            ActorState::empty(
+                crate::config::AppConfig::default(),
+                dir.clone(),
+                adapters,
+                Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+                Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+                tx,
+            )
+        };
+        let queue_on = |state: &mut ActorState, entry: &ModelEntry| -> JobId {
+            state.slots = vec![Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_100,
+                occupant: None,
+                // The parked row does not own the slot: some other job is in
+                // flight on it, exactly as parking requires.
+                job: Some(JobId(9_999)),
+            }];
+            let id = state.register_queued_load(0, entry, Vec::new());
+            state.pending.insert(0, id);
+            id
+        };
+        let apply = |state: &mut ActorState, models: Vec<ModelEntry>| {
+            state.apply_catalog(
+                crate::model::scan::Catalog {
+                    models,
+                    errors: Vec::new(),
+                },
+                None,
+            );
+        };
+        let queued_alive = |state: &ActorState, id: JobId| {
+            state.jobs.get(&id).is_some_and(|j| !j.terminal)
+                && state.pending.values().any(|p| *p == id)
+        };
+
+        // KEEP 1: same bytes, same clock — the no-change rescan must not drop
+        // the queue (budget kept intact, place kept, row non-terminal).
+        let entry = entry_on_disk("vram_gb: 4\n");
+        let mut state = fresh_state();
+        let id = queue_on(&mut state, &entry);
+        apply(&mut state, vec![entry.clone()]);
+        assert!(
+            queued_alive(&state, id),
+            "a no-change rescan must never drop a queue"
+        );
+
+        // KEEP 2: the file became unstat'able by apply time (bytes published
+        // from the earlier read, the stat window lost the file) — a missing
+        // rescan-side fingerprint is not evidence.
+        let entry = entry_on_disk("vram_gb: 4\n");
+        let mut state = fresh_state();
+        let id = queue_on(&mut state, &entry);
+        std::fs::remove_file(&yaml).expect("delete after the scan read");
+        apply(&mut state, vec![entry.clone()]);
+        assert!(
+            queued_alive(&state, id),
+            "an unreadable rescan-time stat must not retire"
+        );
+
+        // KEEP 3: the row queued on an unreadable file (no registration
+        // baseline at all) — even readable-and-changed bytes now prove nothing.
+        let entry = entry_on_disk("vram_gb: 4\n");
+        let mut state = fresh_state();
+        let id = queue_on(&mut state, &entry);
+        state.jobs.get_mut(&id).expect("row").queue_fingerprint = None;
+        std::fs::write(&yaml, "vram_gb: 400\n").expect("edit");
+        apply(&mut state, vec![entry.clone()]);
+        assert!(
+            queued_alive(&state, id),
+            "a row without a registration baseline survives the rescan"
+        );
+
+        // RETIRE: bytes moved against a real baseline — the named reason is on
+        // the row and the queue place is released.
+        let entry = entry_on_disk("vram_gb: 4\n");
+        let mut state = fresh_state();
+        let id = queue_on(&mut state, &entry);
+        std::fs::write(&yaml, "vram_gb: 400\n").expect("edit");
+        apply(&mut state, vec![entry]);
+        assert!(
+            state.jobs[&id].terminal,
+            "moved bytes must retire the intent"
+        );
+        assert!(state.pending.is_empty(), "and release the queue place");
+        let error = state.jobs[&id]
+            .error
+            .clone()
+            .expect("the reason rides the ledger row")
+            .to_string();
+        assert!(
+            error.contains("superseded by rescan")
+                && error.contains("m.yaml")
+                && error.contains("changed since queued")
+                && error.contains("re-queue to apply"),
+            "{error}"
+        );
+
+        // RETIRE: the model left the catalog.
+        let entry = entry_on_disk("vram_gb: 4\n");
+        let mut state = fresh_state();
+        let id = queue_on(&mut state, &entry);
+        apply(&mut state, Vec::new());
+        assert!(
+            state.jobs[&id].terminal,
+            "a vanished model retires its intent"
+        );
+        assert!(
+            state.jobs[&id].error.as_ref().is_some_and(|e| e
+                .to_string()
+                .contains("superseded by rescan (removed from the catalog)")),
+            "{:?}",
+            state.jobs[&id].error
+        );
     }
 
     #[test]

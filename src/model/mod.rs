@@ -8,7 +8,7 @@ pub mod scan;
 pub mod writeback;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::CategoryId;
 use thiserror::Error;
@@ -143,6 +143,31 @@ pub(crate) fn truthy(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "true" | "1" | "yes" | "on"
     )
+}
+
+/// The moved-or-not answer for one file: the pair a reload compares against what a
+/// load queued on. Reload-drift Axis 1 (operator ruling 2026-10-29) captures it at
+/// row registration and re-stats when a rescan lands; Axis 2 (the `stale_config`
+/// companion round) reuses the same primitive at spawn. Typed on purpose: one
+/// helper, no stringly timestamps on the job rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileFingerprint {
+    /// Last-modified time as the filesystem reports it.
+    pub mtime: std::time::SystemTime,
+    /// Length in bytes.
+    pub size: u64,
+}
+
+/// The fingerprint of one file; `None` when it cannot be stat'ed (absent, locked,
+/// volume down). Absence of a fingerprint is the absence of **evidence**, never
+/// evidence of change — callers must keep their queue on `None`, never retire on it.
+#[must_use]
+pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileFingerprint {
+        mtime: meta.modified().ok()?,
+        size: meta.len(),
+    })
 }
 
 /// The one GiB parser for every size-valued yaml key. Rust's `f64` parse accepts
@@ -443,6 +468,37 @@ mod tests {
         assert_eq!(entry.category, CategoryId::Work);
         assert_eq!(entry.engine, "llama");
         assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
+    }
+
+    /// The Axis 1 primitive of the 2026-10-29 reload-drift ruling: still with the
+    /// file, moved with its bytes, and `None` when unreadable — the absence of
+    /// evidence every caller must read as "change not proven". Falsifier: a
+    /// fingerprint that survives an edit (stale KEEP) or flakes while the file
+    /// stands (false RETIRE) fails here first.
+    #[test]
+    fn a_file_fingerprint_stands_with_the_file_and_moves_with_the_bytes() {
+        let dir = crate::testutil::temp_dir("fingerprint");
+        let path = dir.join("m.yaml");
+        std::fs::write(&path, "vram_gb: 4\n").expect("seed");
+        let first = crate::model::fingerprint(&path).expect("a readable file fingerprints");
+        assert_eq!(
+            first,
+            crate::model::fingerprint(&path)
+                .expect("the pair is stable while the file stands still")
+        );
+        std::fs::write(&path, "vram_gb: 400\n").expect("edit");
+        let moved = crate::model::fingerprint(&path).expect("an edited file fingerprints");
+        assert_ne!(
+            first, moved,
+            "moved bytes must move the pair (the SIZE moved here; the clock leg is \
+             isolated end-to-end by `rescan_supersedes_a_queued_load_when_only_the_clock_moves`, \
+             which keeps the size identical and forces the mtime)"
+        );
+        assert_eq!(
+            crate::model::fingerprint(&dir.join("gone.yaml")),
+            None,
+            "unreadable is None: no evidence either way"
+        );
     }
 
     #[test]

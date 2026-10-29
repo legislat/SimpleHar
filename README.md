@@ -156,7 +156,10 @@ proxy); booting the harness spawns nothing.
 After editing files, press **Rescan** (or `POST /har/rescan`). A rescan re-reads the
 catalog and nothing else: a model that is serving keeps the launch it was spawned with
 (its argv, its booked size, its measured range and `measured_offload` stamp), so an edit
-to a live model's yaml takes effect on its next load, not under its running engine. Two
+to a live model's yaml takes effect on its next load, not under its running engine; a
+**queued** load whose yaml moved (or whose file vanished) is retired by the rescan with a
+`superseded by rescan` job note — re-queue it to apply the new bytes — while a rescan
+that changed nothing never drops a queue. Two
 files whose names collapse to one identity are both reported in `catalog_errors` as
 `duplicate_name` — both publish, and every load of that name stays refused as ambiguous
 until one is renamed.
