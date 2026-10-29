@@ -6,6 +6,8 @@
 //! safety policy over one typo). A *missing* file yields the documented defaults, so
 //! "no config file" still produces a usable harness (§0.1 "simple").
 
+pub mod firstrun;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;

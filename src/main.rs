@@ -2,7 +2,8 @@
 //! engine work (there is none: preload is scrapped), zero engine spawns at boot.
 
 use simplehar_se::api::{category_router, control_router, ApiState, BootMsStamp};
-use simplehar_se::config::{self, AppConfig, ConfigError};
+use simplehar_se::budget::VramWitness;
+use simplehar_se::config::{self, firstrun, AppConfig, ConfigError};
 use simplehar_se::engine::EngineRuntime;
 use simplehar_se::observability;
 use simplehar_se::process::{ContainerCandidate, ProcessRuntime, SingleInstanceGuard};
@@ -105,7 +106,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let config = match boot_config(std::env::var("SIMPLEHAR_CONFIG").ok()) {
+    let mut config = match boot_config(std::env::var("SIMPLEHAR_CONFIG").ok()) {
         Ok(config) => config,
         Err(errors) => {
             for error in &errors {
@@ -115,6 +116,87 @@ async fn main() -> ExitCode {
         }
     };
     let config_ms = boot_started.elapsed().as_millis() as u64;
+    let witness = simplehar_se::witness::NvmlWitness::new();
+    let witness = Arc::new(witness);
+    // First-start materialization (operator ruling 2026-10-29): with no config file,
+    // derive values from the real system and create the file beside the exe — the
+    // documented defaults (notably `vram_total_gb` = 72.0, THIS box's card) must not
+    // silently ship as everyone's ceiling. Fires only for the beside-the-exe path;
+    // a missing SIMPLEHAR_CONFIG file already failed boot as an instruction (14 [3]).
+    let first_run = first_run_target(&config);
+    let mut observed_total: Option<f64> = None;
+    if let Some(path) = first_run {
+        // Rare one-time boot; probe_system caps each leg itself and never touches
+        // the driver on this thread (the sample runs on the blocking pool behind
+        // FIRST_RUN_PROBE_BUDGET). Steady boots pay nothing inline: witness init
+        // stays on the blocking pool (prime below) and the cross-check runs
+        // detached (FINDINGS-14 [1] holds).
+        let results = probe_system(&witness).await;
+        observed_total = results.vram_total_gb;
+        for (field, value) in firstrun::fill(&mut config, &results) {
+            tracing::info!(field = %field, value = %value, "first start: detected from the system");
+        }
+        if results.vram_total_gb.is_none() {
+            tracing::warn!(
+                default = config.vram_total_gb,
+                "first start: card probe failed; vram_total_gb stays at the documented default — \
+                 edit the created file if this machine's card differs"
+            );
+        }
+        match firstrun::ensure_created(&config, &path) {
+            Ok(true) => tracing::info!(
+                path = %path.display(),
+                "first start: config created beside the exe — the file is now the truth"
+            ),
+            Ok(false) => tracing::info!(
+                path = %path.display(),
+                "first start: a config file appeared during boot; the operator's file is kept"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "first start: config creation failed or could not be verified; this boot \
+                 continues on in-memory defaults — check the path before the next boot"
+            ),
+        }
+    }
+    // Cross-check every boot: a pinned ceiling that disagrees with the card's own
+    // reading beyond the tolerance is reported, never auto-repaired (config is king).
+    // Detached: no boot path waits on this sample.
+    {
+        let witness = Arc::clone(&witness);
+        let configured = config.vram_total_gb;
+        let tolerance = config.witness_tolerance_gb;
+        let probed = observed_total;
+        tokio::spawn(async move {
+            let card = match probed {
+                Some(total) => Some(total),
+                None => match tokio::time::timeout(Duration::from_secs(12), witness.sample()).await
+                {
+                    Ok(Ok(sample)) => Some(firstrun::floor_gib(sample.total_gib)),
+                    Ok(Err(reason)) => {
+                        tracing::debug!(reason = %reason, "cross-check skipped: the card did not answer");
+                        None
+                    }
+                    Err(_elapsed) => {
+                        tracing::debug!("cross-check skipped: card sample budget (12 s) expired");
+                        None
+                    }
+                },
+            };
+            if let Some((configured, observed)) =
+                card.and_then(|card| firstrun::total_mismatch(configured, card, tolerance))
+            {
+                tracing::warn!(
+                    configured,
+                    observed,
+                    tolerance,
+                    "config vram_total_gb disagrees with the card's own reading (never auto-repaired): \
+                     edit simplehar-se.json if the card is right"
+                );
+            }
+        });
+    }
     let adapters = simplehar_se::engine::default_adapters(&config);
     // Witness/runtime/scheduler are bind-cheap (FINDINGS-14 [1]): the NVML witness
     // defers Nvml::init to its first sample (or the priming task below) and the
@@ -130,8 +212,6 @@ async fn main() -> ExitCode {
     // shared container-claim ledger (chunk 10 [1]).
     let boot_runtime = runtime.clone();
     let runtime: Arc<dyn EngineRuntime> = Arc::new(runtime);
-    let witness = simplehar_se::witness::NvmlWitness::new();
-    let witness = Arc::new(witness);
     // FINDINGS-FIXROUND2 [3]: pay the lazy `Nvml::init()` on the blocking pool,
     // where it can hold neither an async worker, the witness `refill` guard, nor a
     // OnceLock caller on the first `/har/status`. Concurrent samples share the
@@ -216,6 +296,88 @@ async fn main() -> ExitCode {
 
 /// Pause between listener rebind attempts while a port is unavailable.
 const LISTENER_RETRY: Duration = Duration::from_secs(5);
+
+/// Per-leg cap on the rare first-start system probes: each leg (card, engine)
+/// waits no longer than this before its `None` degrade. A fully stalled driver
+/// therefore delays first boot by ~2x this, not one shared deadline; steady boots
+/// (config file present) never run the probes at all.
+const FIRST_RUN_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// First-start gate: materialization fires only for the beside-the-exe
+/// `simplehar-se.json` that is absent — never for a legacy name, and never for a
+/// `SIMPLEHAR_CONFIG` path (an explicit env file is an instruction: boot already
+/// failed when it was missing, FINDINGS-14 [3]; if it exists it is not a target).
+fn first_run_target(config: &AppConfig) -> Option<PathBuf> {
+    config.source_path.clone().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name == config::CONFIG_FILE)
+            && !path.exists()
+    })
+}
+
+/// One first-start sweep, every leg on the blocking pool behind its own budget:
+/// card total via the synchronous NVML-only witness leg (a wedged driver can park
+/// one blocking thread, never the boot), engine binary via PATH + the known dir.
+/// Each leg answers `None` on failure and logs why; callers degrade to defaults.
+async fn probe_system(witness: &Arc<simplehar_se::witness::NvmlWitness>) -> firstrun::ProbeResults {
+    let probing = Arc::clone(witness);
+    let total = match tokio::time::timeout(
+        FIRST_RUN_PROBE_BUDGET,
+        tokio::task::spawn_blocking(move || probing.sample_boot()),
+    )
+    .await
+    {
+        Ok(Ok(Ok(sample))) => {
+            let gib = firstrun::floor_gib(sample.total_gib);
+            if firstrun::trustworthy(gib) {
+                Some(gib)
+            } else {
+                tracing::warn!(
+                    reading = gib,
+                    "first start: card answered garbage; keeping the default ceiling"
+                );
+                None
+            }
+        }
+        Ok(Ok(Err(reason))) => {
+            tracing::warn!(reason = %reason, "first start: NVML probe failed; keeping the default ceiling");
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "first start: NVML probe task failed; keeping the default ceiling");
+            None
+        }
+        Err(_elapsed) => {
+            tracing::warn!(budget = ?FIRST_RUN_PROBE_BUDGET, "first start: NVML probe timed out; keeping the default ceiling");
+            None
+        }
+    };
+    let llama = match tokio::time::timeout(
+        FIRST_RUN_PROBE_BUDGET,
+        tokio::task::spawn_blocking(firstrun::detect_llama_server),
+    )
+    .await
+    {
+        Ok(Ok(found)) => {
+            if found.is_none() {
+                tracing::info!("first start: no llama-server.exe on PATH or the default dir; the config keeps the documented path");
+            }
+            found
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "first start: llama-server probe task failed");
+            None
+        }
+        Err(_elapsed) => {
+            tracing::warn!("first start: llama-server probe timed out");
+            None
+        }
+    };
+    firstrun::ProbeResults {
+        vram_total_gb: total,
+        llama_server_exe: llama,
+    }
+}
 
 /// Test-only ordering seam (the shape of `model::scan`'s scan pause): `run()` raises
 /// `READY_LOGGED` the instant the `boot ready` line is printed, and the boot-reclaim
@@ -735,8 +897,8 @@ mod tests {
     //! (FINDINGS-14 [4]/[5]) with every listener on an ephemeral port.
 
     use super::{
-        boot_config, boot_order, decode_console_output, gate_verdict, log_boot_banner,
-        parse_excluded_ranges, probe_outcome, run, supervise_listener,
+        boot_config, boot_order, decode_console_output, first_run_target, gate_verdict,
+        log_boot_banner, parse_excluded_ranges, probe_outcome, run, supervise_listener,
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -754,6 +916,52 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn first_run_target_fires_only_for_a_missing_beside_exe_config() {
+        let root = simplehar_se::testutil::temp_dir("first-run-target");
+        let mut cfg = AppConfig {
+            source_path: None,
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            first_run_target(&cfg),
+            None,
+            "nowhere to create is not a target"
+        );
+
+        let target = root.join(config::CONFIG_FILE);
+        cfg.source_path = Some(target.clone());
+        assert_eq!(
+            first_run_target(&cfg),
+            Some(target.clone()),
+            "absent beside the exe: materialize"
+        );
+
+        std::fs::write(&target, "{}").expect("write config");
+        assert_eq!(
+            first_run_target(&cfg),
+            None,
+            "an existing file is never a target (never overwrite)"
+        );
+
+        // An explicit SIMPLEHAR_CONFIG path — existing or not — is an instruction,
+        // never a materialization target (FINDINGS-14 [3]).
+        let named = root.join("operator-spelled.json");
+        std::fs::write(&named, "{}").expect("write env config");
+        cfg.source_path = Some(named);
+        assert_eq!(
+            first_run_target(&cfg),
+            None,
+            "a differently-named env file is inert"
+        );
+        cfg.source_path = Some(root.join("missing-env-file.json"));
+        assert_eq!(
+            first_run_target(&cfg),
+            None,
+            "a path not named CONFIG_FILE is never a target, existing or not"
+        );
     }
 
     #[test]

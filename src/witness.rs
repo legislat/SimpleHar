@@ -171,6 +171,20 @@ impl NvmlWitness {
         let (at, reason) = self.failure.lock().expect("witness failure lock").clone()?;
         (at.elapsed() < FAILURE_TTL).then_some(reason)
     }
+
+    /// Synchronous single sample for the first-start probe: cache check plus the
+    /// NVML leg only — it never spawns `nvidia-smi`, so a wedged driver can block
+    /// only the one blocking-pool thread the caller parked it on, and that caller
+    /// caps its own wait (main's first-run budget). The async [`VramWitness::sample`]
+    /// keeps the fallback; the probe degrades to documented defaults on `Err`.
+    pub fn sample_boot(&self) -> Result<MemorySample, String> {
+        if let Some(sample) = self.fresh_sample() {
+            return Ok(sample);
+        }
+        let sample = self.sample_nvml()?;
+        *self.cache.lock().expect("witness cache lock") = Some((Instant::now(), sample.clone()));
+        Ok(sample)
+    }
 }
 
 impl Default for NvmlWitness {

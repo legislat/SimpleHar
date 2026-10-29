@@ -593,6 +593,8 @@ fn temp_beside(path: &Path) -> PathBuf {
 /// together are every byte this module ever puts on disk; none of them calls
 /// `std::fs::write` directly, and the source-tripwire pin
 /// (`the_publish_writes_all_go_through_write_synced_tripwire`) holds that shape.
+/// Since the first-start ruling (2026-10-29) it is also `pub(crate)` and serves as
+/// the flushed temp write for `config::firstrun::ensure_created`.
 ///
 /// `File` is unbuffered, so `write_all` has already reached the kernel by the time
 /// `sync_all` is asked; what the flush buys is that a rename can no longer expose a
@@ -601,7 +603,7 @@ fn temp_beside(path: &Path) -> PathBuf {
 /// drive's volatile write cache remains below the software line, so nothing here is
 /// a durability guarantee against power loss. The read-back verifiers
 /// ([`compare_read_back`]) are what prove content.
-fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
