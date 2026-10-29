@@ -5,7 +5,9 @@
 //! Operator-gated like the T-suite: every test is `#[ignore]`d and driven by
 //! `handoff/gate-honesty/` (PROMPT.md + RUN.md + preflight/run-group/tier scripts),
 //! which an external agent runs on a machine with a free card. Run nothing from
-//! this file directly unless RUN.md says so.
+//! this file directly unless RUN.md says so. Sole exception:
+//! [`closed_verdicts_are_observations`] is cardless by design and runs in normal
+//! `cargo test` — it pins the port-observation honesty itself.
 //!
 //! Verdict vocabulary (each test prints one anchored line; `tier.ps1` classifies
 //! it case-sensitively, exactly like the T-suite's `T<n>` markers):
@@ -16,6 +18,9 @@
 //!   tree; it rides an assertion failure, so cargo reports FAIL and the marker
 //!   text is the evidence line.
 //! - `G<n> BLOCKED: ...`  a model/card prerequisite is missing (never a PASS).
+//! - `INCONCLUSIVE: ...`  a port yielded neither refusal nor accept in the window
+//!   (machine TCP anomaly, e.g. the measured ~2 s loopback refused delay) — the
+//!   gate neither passes nor confirms; the run is invalid until classified.
 //! - `G<n> SKIP: ...`     the item is not injectable from outside the product in
 //!   this condition; the line names what would be needed.
 //! - assertion failure    `FAIL` via cargo.
@@ -507,30 +512,100 @@ impl Drop for Decoy {
     }
 }
 
-/// Polls until a TCP connect to `port` fails (refused): the engine that answered
+/// What [`port_closed`] actually OBSERVED. A timeout is evidence for neither side,
+/// so it never becomes a verdict — this machine delivers loopback
+/// `ConnectionRefused` ~2 s after the SYN (measured 2026-10-29, WSA 10061 after
+/// ~2050 ms on v4 and v6 alike), and a gate must not mistake that delay for an
+/// answerer (the exact false CONFIRMED that g01/g02 suffered).
+#[derive(Debug, PartialEq, Eq)]
+enum Closed {
+    /// A real TCP refusal was observed — the only form of PASS.
+    Refused,
+    /// A real TCP accept was observed — the port truly answers.
+    Answered,
+    /// Deadline passed with neither refusal nor accept: environment anomaly,
+    /// never gate evidence for either side.
+    Inconclusive,
+}
+
+/// Polls until a TCP connect to `port` is OBSERVED refused: the engine that answered
 /// there is gone. The T-suite's own proven release evidence (T2), replacing every
-/// fixed sleep in this suite.
-async fn port_closed(port: u16, secs: u64) -> bool {
+/// fixed sleep in this suite. The per-attempt bound must exceed the ~2 s refused
+/// delay above or "closed" becomes unobservable.
+async fn port_closed(port: u16, secs: u64) -> Closed {
     let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut answered = false;
     loop {
         let attempt = tokio::time::timeout(
-            Duration::from_millis(400),
+            Duration::from_millis(3000),
             tokio::net::TcpStream::connect(("127.0.0.1", port)),
         )
         .await;
-        let refused = match attempt {
-            Err(_elapsed) => false,
-            Ok(Err(_)) => true,
-            Ok(Ok(_stream)) => false,
-        };
-        if refused {
-            return true;
+        match attempt {
+            Err(_elapsed) => {}
+            // Only a genuine refusal proves closed; any other terminal connect
+            // error (e.g. EDR-injected) must not hand a PASS to the gate.
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return Closed::Refused
+            }
+            Ok(Err(_)) => {}
+            Ok(Ok(_stream)) => answered = true,
         }
         if Instant::now() > deadline {
-            return false;
+            return if answered {
+                Closed::Answered
+            } else {
+                Closed::Inconclusive
+            };
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+}
+
+/// Asserts a port was OBSERVED closed. Only a real refusal passes; a real accept
+/// rides the site's CONFIRMED line; silence rides an `INCONCLUSIVE` line so a slow
+/// machine can never produce a false CONFIRMED — nor a false PASS.
+async fn expect_closed(port: u16, secs: u64, confirmed_claim: &str) {
+    match port_closed(port, secs).await {
+        Closed::Refused => {}
+        Closed::Answered => panic!("{confirmed_claim} (port {port})"),
+        Closed::Inconclusive => panic!(
+            "INCONCLUSIVE: port {port} yielded neither refused nor accept in {secs}s — \
+             environment anomaly, not gate evidence (never PASSes, never CONFIRMEDs)"
+        ),
+    }
+}
+
+/// Cardless regression for the g01/g02 false CONFIRMED (forensics/findings.md):
+/// verdicts must rest on OBSERVATIONS, and refused must stay observable despite
+/// the machine's ~2 s loopback refused delay. Runs without a card or the exe.
+#[tokio::test]
+async fn closed_verdicts_are_observations() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    assert_eq!(
+        port_closed(port, 10).await,
+        Closed::Refused,
+        "a truly dead port must be observably refused within the window, \
+         even when refused arrives ~2 s late"
+    );
+    let live = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+    let live_port = live.local_addr().expect("local addr").port();
+    assert_eq!(
+        port_closed(live_port, 2).await,
+        Closed::Answered,
+        "a live listener (kernel backlog answers without accept()) must read Answered"
+    );
+    assert!(
+        port_open(live_port, 5).await,
+        "port_open must observe the live listener"
+    );
+    drop(live);
+    assert!(
+        !port_open(port, 2).await,
+        "port_open must not claim a dead port"
+    );
 }
 
 /// The mirror of [`port_closed`]: polls until a TCP connect to `port` SUCCEEDS, so
@@ -540,7 +615,7 @@ async fn port_open(port: u16, secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         let accepted = tokio::time::timeout(
-            Duration::from_millis(400),
+            Duration::from_millis(3000),
             tokio::net::TcpStream::connect(("127.0.0.1", port)),
         )
         .await
@@ -680,14 +755,8 @@ async fn g01_unload_all_frees_every_occupant() {
         harness.wait_empty(60).await,
         "CONFIRMED-g1: unload-all left an occupant installed"
     );
-    assert!(
-        port_closed(port_a, 30).await,
-        "auxA port {port_a} still answering"
-    );
-    assert!(
-        port_closed(port_b, 30).await,
-        "auxB port {port_b} still answering"
-    );
+    expect_closed(port_a, 30, "auxA port still answering").await;
+    expect_closed(port_b, 30, "auxB port still answering").await;
     println!("G1 REFUTED: unload-all verified against TWO residents (slots null, ports closed)");
 }
 
@@ -734,14 +803,18 @@ async fn g02_evidence_before_and_after_the_unload() {
         harness.wait_empty(60).await,
         "CONFIRMED-g2: unload-all left residents installed"
     );
-    assert!(
-        port_closed(port_a, 30).await,
-        "CONFIRMED-g2: null slot but {port_a} answers — the snapshot lied"
-    );
-    assert!(
-        port_closed(port_b, 30).await,
-        "CONFIRMED-g2: null slot but {port_b} answers — the snapshot lied"
-    );
+    expect_closed(
+        port_a,
+        30,
+        "CONFIRMED-g2: null slot but the port answers — the snapshot lied",
+    )
+    .await;
+    expect_closed(
+        port_b,
+        30,
+        "CONFIRMED-g2: null slot but the port answers — the snapshot lied",
+    )
+    .await;
     println!("G2 REFUTED: accepted receipts, live chats before, and port-closed after — not a discarded reply plus null slots");
 }
 
@@ -970,11 +1043,13 @@ async fn g07_release_is_proven_by_the_port_not_a_sleep() {
         status, 200,
         "CONFIRMED-g7: the unload reply was never asserted before: {body}"
     );
-    assert!(
-        port_closed(port, 30).await,
-        "CONFIRMED-g7: port {port} still answering after unload — a fixed sleep would \
-         have passed this while the card was held"
-    );
+    expect_closed(
+        port,
+        30,
+        "CONFIRMED-g7: port still answering after unload — a fixed sleep would \
+         have passed this while the card was held",
+    )
+    .await;
     let (status, body) = harness.load("auxA").await;
     assert!(
         status == 200 || status == 202,
@@ -1061,10 +1136,7 @@ async fn g09_orphan_count_is_parent_scoped() {
         .post(&format!("{CONTROL}/har/unload"), json!({ "model": "auxA" }))
         .await;
     assert_eq!(status, 200);
-    assert!(
-        port_closed(port, 30).await,
-        "CONFIRMED-g9: engine port {port} outlived its unload"
-    );
+    expect_closed(port, 30, "CONFIRMED-g9: engine port outlived its unload").await;
     let deadline = Instant::now() + Duration::from_secs(30);
     while child_llama_count(harness_pid) != 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
