@@ -2,7 +2,9 @@
   "boot": {
     "bind_ms": 53,
     "config_ms": 0,
-    "scan_ms": 44
+    "first_bind_at": 41,
+    "reap_ms": 812,
+    "scheduler_spawn_ms": 7
   },
   "catalog_errors": [],
   "categories": [
@@ -711,5 +713,5 @@
       "serve_id": null
     }
   ],
-  "version": "0.1.0"
+  "version": "1.0.0"
 }

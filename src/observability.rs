@@ -103,6 +103,12 @@ pub fn ring_push(entry: LogEntry) {
 /// into 11 (measured: 18/20 co-scheduled runs failed before this lock existed).
 /// Ring-touching tests take this guard; the lock is poison-tolerant because a
 /// failing test must not cascade into every later ring test.
+///
+/// Keep it as declared: it is timing-window **insurance**, not a live failure on every
+/// host. After the cap pin's set-difference rewrite its single `ring_push` can land
+/// outside `ring_caps`' drain..fill window, and one host measured 60/60 passes with the
+/// pin-side lock removed (the locked pair still 10/10) — on a machine where the pin's
+/// setup is faster than that window, `dropped == 10` becomes 11 (FINDINGS2-15 [5]).
 #[cfg(test)]
 static RING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -167,20 +173,64 @@ where
 /// Initializes the global tracing subscriber.
 ///
 /// Filter level comes from the `SIMPLEHAR_LOG` environment variable; when unset it
-/// defaults to `info`. Installs the ring layer alongside the console formatter.
+/// defaults to [`DEFAULT_LOG_LEVEL`]. A value that does not parse is **not** silently
+/// accepted: `EnvFilter::new` is `parse_lossy`, which drops unparseable directives and
+/// defaults to `ERROR` (tracing-subscriber-0.3.23 src/filter/env/mod.rs:350-354) — so
+/// `SIMPLEHAR_LOG=verbose`, or a mistyped directive typed while debugging a boot
+/// failure, produced an errors-only ring with no diagnostic, and `parse_lossy`'s own
+/// warning fired before a subscriber existed, going to the no-op dispatcher
+/// (FINDINGS-15 [8]). An invalid value now falls back to `info` and says so, into the
+/// console and the ring. Installs the ring layer alongside the console formatter.
 /// Called once from `main`; tests never call it (the default subscriber would
 /// reject a second registration).
 pub fn init() {
-    let env = std::env::var("SIMPLEHAR_LOG").unwrap_or_else(|_| "info".to_string());
-    let filter = EnvFilter::new(env.clone());
-    let console_filter = EnvFilter::new(env);
+    let env = std::env::var("SIMPLEHAR_LOG").unwrap_or_else(|_| DEFAULT_LOG_LEVEL.to_string());
+    let (filter, invalid) = log_filter(&env);
+    let console_filter = filter.clone();
     let ring_layer = RingLayer.with_filter(filter);
     let console = tracing_subscriber::fmt::layer().with_target(true);
     tracing_subscriber::registry()
         .with(console.with_filter(console_filter))
         .with(ring_layer)
         .init();
+    if let Some(error) = invalid {
+        // Emitted AFTER `init`: before it there is no subscriber to hear the warning,
+        // which is exactly how the lossy parse managed to be silent.
+        tracing::warn!(
+            simplehar_log = %env,
+            error = %error,
+            "SIMPLEHAR_LOG is not a valid filter; using `{DEFAULT_LOG_LEVEL}` \
+             (a mistyped level used to mean errors-only)"
+        );
+    }
     // `init` sets the global default; the ring is installed for /har/log.
+}
+
+/// The level the harness logs at when `SIMPLEHAR_LOG` is unset or unusable.
+const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Builds the `SIMPLEHAR_LOG` filter strictly, so a bad value is visible instead of
+/// quietly downgrading the operator to errors-only.
+///
+/// # Arguments
+///
+/// * `env` - the raw `SIMPLEHAR_LOG` value.
+///
+/// # Returns
+///
+/// The filter to install, plus the parse error when the value was unusable (the caller
+/// reports it once the subscriber exists).
+fn log_filter(env: &str) -> (EnvFilter, Option<String>) {
+    // `FromStr` is the strict path; `EnvFilter::new` is the lossy one this replaces.
+    match env.parse::<EnvFilter>() {
+        Ok(filter) => (filter, None),
+        Err(error) => (
+            DEFAULT_LOG_LEVEL
+                .parse::<EnvFilter>()
+                .expect("invariant: the default directive parses"),
+            Some(error.to_string()),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -209,5 +259,53 @@ mod tests {
         let (tail, _) = ring_tail(5);
         assert_eq!(tail.len(), 5);
         assert_eq!(tail.last().expect("non-empty").message, "event 509");
+    }
+
+    /// FINDINGS-15 [8]: `EnvFilter::new` is `parse_lossy` and defaults to `ERROR`, so a
+    /// mistyped `SIMPLEHAR_LOG` — `verbose`, a slipped key — silently produced an
+    /// errors-only ring, the opposite of what the operator asked for, with no
+    /// diagnostic (the lossy parse's own warning fires before a subscriber exists).
+    /// Falsifier: build the filter with `EnvFilter::new(env)` and the mistyped legs
+    /// report `ERROR` with no warning.
+    #[test]
+    fn a_mistyped_log_directive_falls_back_to_info_and_says_so() {
+        let (filter, warning) = log_filter("info");
+        assert!(warning.is_none(), "the documented default is not an error");
+        assert_eq!(filter.max_level_hint(), Some(tracing::Level::INFO.into()));
+
+        let (filter, warning) = log_filter("debug");
+        assert!(warning.is_none(), "a valid directive is accepted");
+        assert_eq!(filter.max_level_hint(), Some(tracing::Level::DEBUG.into()));
+
+        for mistyped in [
+            "!!!not-a-directive!!!",
+            "simplehar_se=nonsense",
+            "level=banana",
+        ] {
+            let (filter, warning) = log_filter(mistyped);
+            assert!(
+                warning.is_some(),
+                "`SIMPLEHAR_LOG={mistyped}` must be reported, not swallowed"
+            );
+            assert_eq!(
+                filter.max_level_hint(),
+                Some(tracing::Level::INFO.into()),
+                "`SIMPLEHAR_LOG={mistyped}` must fall back to the documented default — \
+                 never to errors-only, which is what the lossy parse handed back"
+            );
+        }
+
+        // The finding's other example is not the same case, and the pin says so:
+        // `verbose` is a *valid* EnvFilter directive (a target named "verbose" at
+        // TRACE), so `parse_lossy` never dropped it and it was never the errors-only
+        // path. A value that names a target no callsite matches leaves an empty ring;
+        // that hazard is EnvFilter's own grammar, not the lossy parse, and is left as
+        // documented operator trust rather than second-guessed here.
+        let (filter, warning) = log_filter("verbose");
+        assert!(
+            warning.is_none(),
+            "a grammatically valid directive is not a mistype"
+        );
+        assert_eq!(filter.max_level_hint(), Some(tracing::Level::TRACE.into()));
     }
 }

@@ -9,7 +9,9 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use mock_runtime::MockRuntime;
 use serde_json::Value;
-use simplehar_se::api::{category_router, classify_send_failure, control_router, ApiState};
+use simplehar_se::api::{
+    category_router, classify_send_failure, control_router, ApiState, BootMsStamp, BootTimings,
+};
 use simplehar_se::config::{AppConfig, CategoryConfig, CategoryId};
 use simplehar_se::engine::mock::MockAdapter;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
@@ -951,6 +953,169 @@ async fn config_model_writes_back_to_the_yaml_file() {
         .expect("read")
         .contains("cpu_offload: true"));
     let _ = original;
+}
+
+#[tokio::test]
+async fn a_wrong_typed_cpu_is_refused_rather_than_silently_dropped() {
+    // FINDINGS2-0507 [5]: `body.get("cpu").and_then(Value::as_bool)` treated `"true"`
+    // and `1` as "absent", so a client that asked for two changes got one and a
+    // `{"status":"edited"}` saying both landed. The in-file sibling
+    // `/har/config/logging` 400s a non-bool `enabled`, and 07[10] made that the parity
+    // rule for this file — the same mistake may not live two routes apart.
+    let (control, _, _, _, _, modelconf) = build_app(
+        AppConfig::default(),
+        &[("gguf3", "llama", CategoryId::Work, Some(4.0))],
+        &[("llama", Arc::new(MockAdapter))],
+    );
+    let file = modelconf.join("gguf3.yaml");
+    let before = std::fs::read_to_string(&file).expect("model file");
+
+    for presented in [r#""true""#, "1", "null", r#"[true]"#, r#"{"on":true}"#] {
+        let (status, body) = post_json(
+            &control,
+            "/har/config/model",
+            &format!(r#"{{"model":"gguf3","cpu":{presented}}}"#),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`cpu:{presented}` is a caller mistake, not an absent field: {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("cpu") && message.contains("boolean"),
+            "the refusal must name the key and what it wanted: {message}"
+        );
+    }
+
+    // The leg with teeth: the type error precedes the rewrite, so the sibling edit in
+    // the same request is refused too — no half-applied write behind a 400.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"gguf3","category":"AUX","cpu":"yes"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    let untouched = std::fs::read_to_string(&file).expect("read back");
+    assert_eq!(
+        untouched, before,
+        "a refused request may not edit the file at all"
+    );
+    assert!(!untouched.contains("category: AUX"), "was: {untouched}");
+
+    // And a real boolean is still accepted, in both polarities.
+    for offered in ["true", "false"] {
+        let (status, body) = post_json(
+            &control,
+            "/har/config/model",
+            &format!(r#"{{"model":"gguf3","cpu":{offered}}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            std::fs::read_to_string(&file)
+                .expect("read")
+                .contains(&format!("cpu_offload: {offered}")),
+            "`cpu:{offered}` must land"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_webui_fixture_is_a_document_the_endpoint_can_actually_emit() {
+    // FINDINGS2-0507 [8]: the DOM suite drives the page from a hand-maintained
+    // `tests/webui/fixtures/status.json`, and nothing compared that file with what
+    // `/har/status` really sends. It had drifted into a document the server cannot
+    // produce — `"version": "0.1.0"` behind the crate, and a `boot.scan_ms` no
+    // `BootTimings` field has ever had (the initial scan is deliberately unmeasured,
+    // 4389a0a) while two measures that do exist were absent. A page tested against a
+    // fictional server passes while the real one breaks it.
+    let (control, _, _, _, _, _) = build_app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+        &[],
+    );
+    post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    let (_, live) = get_json(&control, "/har/status").await;
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string("tests/webui/fixtures/status.json")
+            .expect("the DOM suite's fixture is committed"),
+    )
+    .expect("the fixture is JSON");
+
+    fn keys(value: &Value, what: &str) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{what} must be an object"))
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    assert_eq!(
+        keys(&fixture, "fixture"),
+        keys(&live, "/har/status"),
+        "the fixture carries a different top-level shape than the endpoint emits"
+    );
+    assert_eq!(
+        fixture["version"],
+        env!("CARGO_PKG_VERSION"),
+        "the fixture quotes a version the harness has never run"
+    );
+
+    // `boot` is the one section whose live shape depends on which measures have
+    // completed, so it is compared against the fully-stamped variant.
+    let first_bind_at = BootMsStamp::default();
+    assert!(first_bind_at.stamp(41), "the first writer wins");
+    let reap_ms = BootMsStamp::default();
+    assert!(reap_ms.stamp(812), "the first writer wins");
+    let stamped = BootTimings {
+        config_ms: 0,
+        scheduler_spawn_ms: 7,
+        bind_ms: Some(53),
+        first_bind_at,
+        reap_ms,
+    };
+    assert_eq!(
+        keys(&fixture["boot"], "fixture.boot"),
+        keys(
+            &serde_json::to_value(stamped).expect("boot timings serialize"),
+            "BootTimings"
+        ),
+        "`boot` must name the measures the harness has, no more and no fewer"
+    );
+
+    for section in ["categories", "mem", "slots", "listeners"] {
+        let row = |doc: &Value| match doc[section].as_array() {
+            Some(rows) => rows.first().cloned().unwrap_or(Value::Null),
+            None => doc[section].clone(),
+        };
+        assert_eq!(
+            keys(&row(&fixture), &format!("fixture.{section}")),
+            keys(&row(&live), &format!("/har/status.{section}")),
+            "the {section} rows in the fixture are not the rows the endpoint sends"
+        );
+    }
+
+    let live_job = live["jobs"]
+        .as_array()
+        .and_then(|jobs| jobs.first())
+        .cloned()
+        .expect("the mock load leaves a job row to compare against");
+    let fixture_job = fixture["jobs"]
+        .as_array()
+        .and_then(|jobs| jobs.first())
+        .cloned()
+        .expect("the fixture carries job rows");
+    assert_eq!(
+        keys(&fixture_job, "fixture.jobs[0]"),
+        keys(&live_job, "/har/status.jobs[0]"),
+        "the fixture's job ledger is not the ledger shape `JobStatus` serializes"
+    );
 }
 
 #[tokio::test]

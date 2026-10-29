@@ -326,6 +326,96 @@ impl BootTimings {
     }
 }
 
+/// The guard's evidence classes (FINDINGS2-0507 [3]): the four refusals that used to
+/// leave no ring entry at all, each deduplicated per path since the last successful
+/// command re-armed it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum GuardRefusal {
+    /// DNS-rebinding-shaped `Host`.
+    Host,
+    /// Cross-site `Origin`.
+    Origin,
+    /// POST without `application/json`.
+    ContentType,
+    /// Missing or wrong control token.
+    Token,
+}
+
+impl GuardRefusal {
+    /// The class a refusal status belongs to; `None` for anything the guard does not
+    /// raise (a handler's own 400/409 is not guard evidence).
+    fn from_status(status: StatusCode) -> Option<Self> {
+        match status {
+            StatusCode::BAD_REQUEST => Some(Self::Host),
+            StatusCode::FORBIDDEN => Some(Self::Origin),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => Some(Self::ContentType),
+            StatusCode::UNAUTHORIZED => Some(Self::Token),
+            _ => None,
+        }
+    }
+
+    /// The wire label, so a reader of `/har/log` sees which wall answered.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Origin => "origin",
+            Self::ContentType => "content-type",
+            Self::Token => "token",
+        }
+    }
+}
+
+/// Per-`(class, path)` guard-refusal evidence, one per [`ApiState`] (so per process,
+/// and fresh at boot: the first refusal after a restart is always reported).
+///
+/// The two maps are bounded by construction (FINDINGS-BATCH-2026-10-28M [2]): at most
+/// [`GUARD_TRACKED_PATHS_PER_CLASS`] keys per class in `reported` and at most one entry
+/// per class in `overflow`, so neither a repeat flood nor a distinct-path flood can grow
+/// this state or the ring past a constant per re-arm window.
+#[derive(Default)]
+struct GuardTrace {
+    /// `(class, path)` already reported, with how many repeats were swallowed since.
+    /// Absent means armed: the next refusal of that pair reports.
+    reported: BTreeMap<(GuardRefusal, String), u64>,
+    /// Per class: distinct paths refused past the tracking cap, and whether that class
+    /// has already spent its one fold line this window. One entry per class, ever.
+    overflow: BTreeMap<GuardRefusal, GuardOverflow>,
+}
+
+/// The beyond-the-cap tally for one class (FINDINGS-BATCH-2026-10-28M [2]).
+#[derive(Default, Clone, Copy)]
+struct GuardOverflow {
+    /// Distinct refused paths that were collapsed instead of tracked.
+    paths: u64,
+    /// The fold line is spent once per window, not once per collapsed path.
+    folded: bool,
+}
+
+/// How many distinct paths one class may name per re-arm window.
+///
+/// The bound has to be on cardinality, not just repeats: `reject_reason` runs ahead of
+/// `auth_reason` and consults neither the token nor route membership, so the three
+/// structural classes are reachable **pre-auth on arbitrary paths** — dedup by
+/// `(class, path)` alone turned 1000 bogus paths into 1000 ring lines and 1000 map
+/// entries (FINDINGS-BATCH-2026-10-28M [2], Attack 1). Past this cap a class emits one
+/// fold line and counts the rest.
+const GUARD_TRACKED_PATHS_PER_CLASS: usize = 8;
+
+/// How much of an attacker-chosen path the evidence keeps, in chars. The path is
+/// attacker-chosen, so the stored key and the logged field are capped together: a flood
+/// of kilobyte-long paths must not become an allocation channel, and a key must agree
+/// with the line printed for it.
+const GUARD_TRACKED_PATH_CHARS: usize = 96;
+
+/// The path as the guard evidence stores and prints it.
+fn tracked_path(path: &str) -> String {
+    if path.chars().count() <= GUARD_TRACKED_PATH_CHARS {
+        return path.to_string();
+    }
+    let kept: String = path.chars().take(GUARD_TRACKED_PATH_CHARS - 3).collect();
+    format!("{kept}...")
+}
+
 /// Shared application state (AGENTS.md: layered extractors, no globals).
 #[derive(Clone)]
 pub struct ApiState {
@@ -350,6 +440,21 @@ pub struct ApiState {
     /// Shared secret for API/proxy routes when configured (`control_token` or
     /// `SIMPLEHAR_TOKEN`). Private: only the guard reads it, and it is never logged.
     control_token: Option<String>,
+    /// Guard-refusal evidence state, shared by every clone of this state (one per
+    /// process).
+    ///
+    /// The TRUE bound, stated exactly (FINDINGS-BATCH-2026-10-28M [2] killed the earlier
+    /// "a refusal flood costs the ring a bounded number of lines", which was false — the
+    /// structural classes fire pre-auth on arbitrary paths, so path cardinality has to be
+    /// bounded too): with Extended Logging **off** (the shipped default) one re-arm
+    /// window costs the ring at most
+    /// `4 classes × (GUARD_TRACKED_PATHS_PER_CLASS + 1 fold) + 1 recovery line`
+    /// = 37 lines, whatever the number of refused requests, and holds at most
+    /// `4 × GUARD_TRACKED_PATHS_PER_CLASS` keys plus 4 fold counters in memory.
+    /// Extended Logging is the operator's explicit record-everything switch and lifts
+    /// the line bound (and the state writes with it), as it does for `request complete`.
+    /// Pinned by `a_distinct_path_flood_costs_a_constant_number_of_lines`.
+    guard_trace: Arc<Mutex<GuardTrace>>,
     proxy: reqwest::Client,
 }
 
@@ -381,6 +486,7 @@ impl ApiState {
             default_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
             control_token,
+            guard_trace: Arc::new(Mutex::new(GuardTrace::default())),
             proxy: reqwest::Client::builder()
                 .timeout(Duration::from_secs(600))
                 .build()
@@ -394,6 +500,182 @@ impl ApiState {
     #[must_use]
     pub fn requires_token(&self) -> bool {
         self.control_token.is_some()
+    }
+
+    /// Reports a guard refusal to the ring (FINDINGS2-0507 [3]) — the refusals that
+    /// used to answer and vanish, while benign 200s filled the same ring.
+    ///
+    /// Threat model, stated plainly, because the ring is the operator's only
+    /// post-mortem and it holds 500 lines: these four refusals are exactly what an
+    /// attacker produces **in a flood** (token guessing → 401, cross-site POST probe →
+    /// 403, DNS rebinding → 400, content-type probe → 415), and three of them are
+    /// reachable pre-auth on any path. So the flood is bounded on both axes:
+    ///
+    /// * **repeats** of one `(class, path)` cost no further line — the counter rides the
+    ///   recovery line;
+    /// * **distinct paths** past [`GUARD_TRACKED_PATHS_PER_CLASS`] cost no further line
+    ///   either, only the class's single fold line (FINDINGS-BATCH-2026-10-28M [2]).
+    ///
+    /// The window re-arms on the next successful *command* — a 2xx that is not one of
+    /// [`ROUTINE_POLL_PATHS`], because the page's 2 s polls would otherwise re-arm a
+    /// flood into a line every tick — and Extended Logging (the switch whose doc promises
+    /// "the full request ring") reports every refusal outright and keeps no state at all.
+    /// Never logged: the token, in any form (15[9] posture).
+    fn note_guard_refusal(
+        &self,
+        reason: &ApiError,
+        method: &axum::http::Method,
+        path: &str,
+        request_id: &str,
+    ) {
+        let Some(class) = GuardRefusal::from_status(reason.status()) else {
+            return;
+        };
+        let status = reason.status();
+        if crate::observability::extended_logging() {
+            // The record-everything mode is defined by its name: one line per refusal,
+            // and no evidence map to grow.
+            tracing::warn!(
+                %request_id,
+                method = %method,
+                path = %path,
+                status = status.as_u16(),
+                refusal = class.label(),
+                reason = %reason,
+                "guard refused"
+            );
+            return;
+        }
+        let tracked = tracked_path(path);
+        let key = (class, tracked.clone());
+
+        enum Action {
+            Report,
+            Fold(u64),
+            Silent,
+        }
+        let action = {
+            let mut trace = self
+                .guard_trace
+                .lock()
+                .expect("guard trace lock poisoned by a panic");
+            if let Some(count) = trace.reported.get_mut(&key) {
+                *count = count.saturating_add(1);
+                Action::Silent
+            } else if trace
+                .reported
+                .keys()
+                .filter(|(tracked, _)| *tracked == class)
+                .count()
+                < GUARD_TRACKED_PATHS_PER_CLASS
+            {
+                trace.reported.insert(key, 0);
+                Action::Report
+            } else {
+                let entry = trace.overflow.entry(class).or_default();
+                entry.paths = entry.paths.saturating_add(1);
+                if entry.folded {
+                    Action::Silent
+                } else {
+                    entry.folded = true;
+                    Action::Fold(entry.paths)
+                }
+            }
+        };
+        match action {
+            Action::Report => tracing::warn!(
+                %request_id,
+                method = %method,
+                path = %tracked,
+                status = status.as_u16(),
+                refusal = class.label(),
+                reason = %reason,
+                "guard refused"
+            ),
+            Action::Fold(paths) => tracing::warn!(
+                %request_id,
+                method = %method,
+                status = status.as_u16(),
+                refusal = class.label(),
+                tracked = GUARD_TRACKED_PATHS_PER_CLASS,
+                folded = paths,
+                "guard refusal window full: further new-path refusals are counted, not logged"
+            ),
+            Action::Silent => {}
+        }
+    }
+
+    /// One line naming what the guard refused since the last successful command, then
+    /// re-arms every class. Cheap by construction: it fires only when something was
+    /// actually refused, so a quiet harness never sees it.
+    fn note_guard_recovery(&self, request_id: &str) {
+        let mut trace = self
+            .guard_trace
+            .lock()
+            .expect("guard trace lock poisoned by a panic");
+        if trace.reported.is_empty() && trace.overflow.is_empty() {
+            return;
+        }
+        let drained = std::mem::take(&mut trace.reported);
+        let folded = std::mem::take(&mut trace.overflow);
+        drop(trace);
+        let mut parts: Vec<String> = drained
+            .iter()
+            .map(|((class, path), suppressed)| {
+                if *suppressed == 0 {
+                    format!("{} on {path}", class.label())
+                } else {
+                    format!("{} on {path} (+{suppressed} suppressed)", class.label())
+                }
+            })
+            .collect();
+        // The collapsed paths are reported here rather than one line each, which is the
+        // whole point of the cap (FINDINGS-BATCH-2026-10-28M [2]).
+        for (class, entry) in &folded {
+            if entry.paths > 0 {
+                parts.push(format!(
+                    "{}: +{} further paths folded",
+                    class.label(),
+                    entry.paths
+                ));
+            }
+        }
+        let summary = parts.join(", ");
+        tracing::info!(
+            %request_id,
+            refusals = %summary,
+            "guard refusals cleared by a successful command"
+        );
+    }
+
+    /// The refusals this state has reported since the last successful command, as
+    /// `(class, path, suppressed)`. Test-only: this bookkeeping is what the ring line is
+    /// rendered from, and reading it directly keeps those assertions independent of
+    /// which subscriber happens to be installed on which thread.
+    #[cfg(test)]
+    pub(crate) fn guard_report(&self) -> Vec<(String, String, u64)> {
+        self.guard_trace
+            .lock()
+            .expect("guard trace lock poisoned by a panic")
+            .reported
+            .iter()
+            .map(|((class, path), suppressed)| {
+                (class.label().to_string(), path.clone(), *suppressed)
+            })
+            .collect()
+    }
+
+    /// The per-class collapsed-path tallies since the last re-arm: `(class, paths)`.
+    /// Test-only companion of [`ApiState::guard_report`] for the cardinality bound.
+    #[cfg(test)]
+    pub(crate) fn guard_folds(&self) -> Vec<(String, u64)> {
+        self.guard_trace
+            .lock()
+            .expect("guard trace lock poisoned by a panic")
+            .overflow
+            .iter()
+            .map(|(class, entry)| (class.label().to_string(), entry.paths))
+            .collect()
     }
 
     /// Handle to the §0.2 `first_bind_at` cell, for the supervisor that first binds.
@@ -605,8 +887,89 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
         tracing::error!(error = %error, "cannot persist default_model: rename failed");
         return false;
     }
+    // The symmetric leg the yaml writer has had since D4 and this one lacked
+    // (FINDINGS2-0507 [7]): `rename()` returning `Ok` is the OS accepting the move, not
+    // proof the bytes landed. This is the one file the harness re-reads at boot under
+    // `deny_unknown_fields`, so a silent-short write is a harness that will not start —
+    // `persisted: true` may not be cheaper than the truth. Re-read, re-parse, and
+    // require it to parse back to exactly the tree that was published.
+    // The test arm corrupts the bytes this verification is about to read (valid JSON,
+    // different tree), so the `persisted:false` leg of the pin is produced by the real
+    // `read_back == root` comparison rather than a hard-set verdict — a rubber-stamped
+    // compare has to be caught by the pin (FINDINGS-BATCH-2026-10-28M, item 6 note).
+    #[cfg(test)]
+    config_corrupt_if_armed(&path);
+    let verified = match std::fs::read_to_string(&path)
+        .map_err(|error| format!("read-back failed: {error}"))
+        .and_then(|text| {
+            serde_json::from_str::<Value>(&text)
+                .map_err(|error| format!("re-parse failed: {error}"))
+        }) {
+        Ok(read_back) if read_back == root => Ok(()),
+        Ok(_) => Err("the file parses to a different tree than the one published".to_string()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = verified {
+        tracing::error!(
+            error = %error,
+            path = %path.display(),
+            "cannot verify the persisted config file; answering persisted:false"
+        );
+        return false;
+    }
     tracing::info!(category = %id, model = ?model, path = %path.display(), "default_model persisted to the config file");
     true
+}
+
+/// Paths whose post-rename verification read is preceded by a byte corruption
+/// (FINDINGS2-0507 [7]); see [`config_corrupt_if_armed`], which is shaped after the
+/// write-back module's `corrupt_if_armed`.
+#[cfg(test)]
+fn config_read_back_faults() -> &'static Mutex<Vec<std::path::PathBuf>> {
+    static ARMED: std::sync::OnceLock<Mutex<Vec<std::path::PathBuf>>> = std::sync::OnceLock::new();
+    ARMED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn arm_config_read_back_fault(path: &std::path::Path) {
+    config_read_back_faults()
+        .lock()
+        .expect("config read-back arm lock")
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+pub(crate) fn release_config_read_back_fault(path: &std::path::Path) {
+    config_read_back_faults()
+        .lock()
+        .expect("config read-back arm lock")
+        .retain(|armed| armed != path);
+}
+
+/// The arm's bite (FINDINGS-BATCH-2026-10-28M, item 6 coverage note): between the
+/// rename and the verification read, rewrite the file with **different but valid**
+/// bytes, so production's own `read_back == root` comparison is what refuses the
+/// `persisted: true`. Hard-setting a verdict here instead would have left the
+/// always-`true` regression unpinned: the arm proves the compare runs, only a corrupted
+/// file proves the compare decides.
+#[cfg(test)]
+fn config_corrupt_if_armed(path: &std::path::Path) {
+    let armed = config_read_back_faults()
+        .lock()
+        .expect("config read-back arm lock")
+        .iter()
+        .any(|tracked| tracked == path);
+    if !armed {
+        return;
+    }
+    let text = std::fs::read_to_string(path).expect("the file exists in the verify window");
+    let mut value: Value = serde_json::from_str(&text).expect("the published file is valid JSON");
+    value
+        .as_object_mut()
+        .expect("a JSON object was published")
+        .insert("tampered".to_string(), Value::Bool(true));
+    let bytes = serde_json::to_string(&value).expect("invariant: JSON serializes");
+    std::fs::write(path, bytes.as_bytes()).expect("the fixture corruption lands");
 }
 
 /// `GET /har/status`: boot info + slot table + jobs, one call (G13).
@@ -646,13 +1009,21 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
             .as_ref()
             .map(|reason| format!("{}@{}: {reason}", job.model, job.category))
     });
+    // One registry acquisition for the whole badge story (FINDINGS2-0507 [6]):
+    // `snapshot()`, `any_down()` and `pending()` each took the lock themselves, so a
+    // supervisor flipping `Pending → Down` mid-document could publish `listeners`
+    // saying `Serving` next to `listeners_down: true` — the red-over-green
+    // contradiction 9c73a39 exists to prevent, re-opened through read timing. The
+    // three fields are now three reads of ONE clone, through the registry's own
+    // predicates (`is_down`/`is_pending`), never a re-derived match.
+    let verdicts = state.listeners.snapshot();
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
         "extended_logging": crate::observability::extended_logging(),
         "boot": boot,
         "categories": categories,
-        "listeners": state.listeners.snapshot(),
+        "listeners": verdicts,
         // The header badge's two truths, computed here from the registry's own
         // predicates (FINDINGS-16 [4]). `listeners` above is the raw verdict map; a
         // page that decoded "is any listener down" out of its serde shape would be a
@@ -660,8 +1031,8 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
         // ever changed representation would hide behind a green badge. Total over the
         // four seeded categories: `down` is some supervisor that could not serve a
         // port, `pending` is a category nobody has spoken for (the tray's amber).
-        "listeners_down": state.listeners.any_down(),
-        "listeners_pending": !state.listeners.pending().is_empty(),
+        "listeners_down": verdicts.values().any(crate::listeners::ListenerState::is_down),
+        "listeners_pending": verdicts.values().any(crate::listeners::ListenerState::is_pending),
         "mem": mem_section(state, &scheduler).await,
         "slots": scheduler.slots,
         "jobs": scheduler.jobs,
@@ -971,6 +1342,18 @@ pub const PUBLIC_PATHS: [&str; 5] = [
     "/pico.min.css",
 ];
 
+/// The page's routine polls: GETs whose per-tick `request complete` line would evict
+/// real evidence from the ring while the operator merely leaves the control page open
+/// (FINDINGS-15 [10] for the log read, FINDINGS2-0507 [1] for the third poll).
+///
+/// `pub`, and the guard + its pin both read THIS list, with the pin's teeth coming
+/// from an independent third source — the page's own `getJson("…")` literals in
+/// `app.js`. The exemption used to be a private `matches!` literal inside the guard
+/// while the pin named paths of its own: `/har/models`, which `refresh()` polls every
+/// 2 s, sat in neither, so a token-protected harness turned its ring over in ~17
+/// minutes with the page open and both suites stayed green.
+pub const ROUTINE_POLL_PATHS: [&str; 3] = ["/har/status", "/har/log", "/har/models"];
+
 /// The control token, if any: the environment wins so the secret can stay out of the
 /// config file entirely (AGENTS.md — secrets live in the environment, not in
 /// code/config). Whitespace-only values mean "no token" at read time; `validate`
@@ -1037,25 +1420,42 @@ pub async fn guard(
         .map(str::to_string)
         .unwrap_or_else(next_request_id);
 
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+
+    // Structural refusals stay strictly BEFORE the token check (DECISIONS LOCKED,
+    // README:265-268): a cross-site page that knows nothing about the token must be
+    // refused for the security reason, not told the route wants a secret. The order is
+    // pinned by `structural_refusals_are_answered_before_the_token_is_consulted`, which
+    // is what makes swapping the two blocks below a red suite instead of a green one
+    // (FINDINGS2-0507 [2]; the two refusals are also individually pinned in
+    // `tests/api_surface.rs`, but only on a token-less app, which cannot see the order).
     if let Some(reason) = reject_reason(&request) {
+        state.note_guard_refusal(&reason, &method, &path, &request_id);
         let response = (reason.status(), Json(error_body(&reason))).into_response();
         return with_request_id(response, &request_id);
     }
     if let Some(reason) = auth_reason(&state, &request) {
+        state.note_guard_refusal(&reason, &method, &path, &request_id);
         let response = (reason.status(), Json(error_body(&reason))).into_response();
         return with_request_id(response, &request_id);
     }
 
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
     response = with_request_id(response, &request_id);
-    // The page polls /har/status continuously and opens the log panel repeatedly;
-    // those lines would evict real evidence from the ring during long boots — and
-    // reading the log must not be an event that pushes the log's own evidence out
-    // (FINDINGS-15 [10]). Extended logging restores them (operator, 2026-10-26).
+    // The page polls /har/status and /har/models every 2 s and opens the log panel
+    // repeatedly; those lines would evict real evidence from the ring during long boots
+    // — and reading the log must not be an event that pushes the log's own evidence out
+    // (FINDINGS-15 [10], FINDINGS2-0507 [1]; the list is one const, shared with its
+    // pin, whose teeth are the page's own fetch literals). Extended logging restores
+    // them (operator, 2026-10-26).
     let routine_poll =
-        method == axum::http::Method::GET && matches!(path.as_str(), "/har/status" | "/har/log");
+        method == axum::http::Method::GET && ROUTINE_POLL_PATHS.contains(&path.as_str());
+    if response.status().is_success() && !routine_poll {
+        // A real command succeeded: whatever the guard refused since the last one gets
+        // one line now, and the refusals become reportable again.
+        state.note_guard_recovery(&request_id);
+    }
     if !routine_poll || crate::observability::extended_logging() {
         tracing::info!(
             %request_id,
@@ -1265,7 +1665,23 @@ async fn har_config_model(
             edits.push(("is_embedding_model", None));
         }
     }
-    if let Some(cpu) = body.get("cpu").and_then(Value::as_bool) {
+    // A wrong-typed `cpu` is a caller mistake, not an absent one: `and_then(as_bool)`
+    // dropped `"true"`/`1`/`"yes"` silently and the request still answered
+    // `{"status":"edited"}` — a client that asked for two changes got one, reported as
+    // success. The in-file sibling `har_config_logging` 400s a non-bool `enabled` for
+    // exactly this, and 07[10] established the in-file parity rule
+    // (FINDINGS2-0507 [5]). The type is checked before the engine gate, so a malformed
+    // body gets the same answer regardless of the row it named.
+    let cpu = match body.get("cpu") {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => {
+            return Err(ApiError::BadRequest {
+                reason: "`cpu` must be a boolean".to_string(),
+            })
+        }
+        None => None,
+    };
+    if let Some(cpu) = cpu {
         // The key is a knob the row's engine must actually read (same const as the
         // scan hint, the stamp and the webui gate): the page stopped offering the
         // control for non-offload rows, so the API must not let a script mint the
@@ -1643,7 +2059,20 @@ async fn swap_for_port(
     let (port, serve_id) = match reply {
         Reply::Loaded(receipt) => (receipt.port, receipt.serve_id),
         Reply::Already { port, serve_id, .. } => (port, serve_id),
-        Reply::Done => (0, None),
+        // `on_swap` only ever answers a swap with `Already` or by attaching the waiter
+        // to a load that finishes `Loaded(receipt)`; `Done` is the unload/cancel reply.
+        // Fabricating `0` here handed the proxy `127.0.0.1:0` — a connect failure three
+        // layers from the cause, and a port number that belongs to no listener
+        // (FINDINGS2-0507 [10]). An answer that names no port is an invariant
+        // violation, and it is reported as one.
+        Reply::Done => {
+            return Err(ApiError::Internal {
+                reason: format!(
+                    "the scheduler acknowledged the swap of `{model}` into {category} without \
+                     naming a port; refusing to proxy to an unbound address"
+                ),
+            })
+        }
     };
     api.touch(model);
     api.scheduler.touch(model);
@@ -2398,26 +2827,34 @@ mod tests {
     }
 
     /// FINDINGS-15 [10]: reading the ring must not append to the ring, or the act of
-    /// asking "why did the last load fail" evicts the answer. Falsifier: drop
-    /// `/har/log` from the routine-poll exemption and the two-reads assertion fails
-    /// with two `request complete` lines.
+    /// asking "why did the last load fail" evicts the answer. Extended to every member
+    /// of the routine list (FINDINGS2-0507 [1]) — `/har/models` is polled on the same
+    /// 2 s timer and was silently missing from the exemption, so the models panel was
+    /// the one poll still evicting evidence. Falsifier: drop `/har/log` (or any member)
+    /// from `ROUTINE_POLL_PATHS` and the zero-count assertion fails with that path's
+    /// `request complete` lines present.
     #[tokio::test]
     async fn reading_the_log_never_appends_to_the_log() {
         // The switch is process-global and off at boot; state it explicitly so this
         // pin means "exempted", not "someone turned the logging off".
         crate::observability::set_extended_logging(false);
-        let api = Arc::new(unit_state());
+        // A live actor, not `unit_state`: a routine poll that 500s would make the
+        // exemption pass for the wrong reason (the guard only mutes 2xx polls).
+        let api = Arc::new(live_state(BootTimings::default()));
         let session = crate::tray::testlog::Session::start();
-        for _ in 0..2 {
-            let response = control_router(Arc::clone(&api))
-                .oneshot(
-                    Request::get("/har/log")
-                        .body(Body::empty())
-                        .expect("log request"),
-                )
-                .await
-                .expect("in-process log read");
-            assert_eq!(response.status(), StatusCode::OK, "/har/log must answer");
+        let polled = pages_own_polls();
+        for path in &polled {
+            for _ in 0..2 {
+                let response = control_router(Arc::clone(&api))
+                    .oneshot(
+                        Request::get(path)
+                            .body(Body::empty())
+                            .expect("routine poll request"),
+                    )
+                    .await
+                    .expect("in-process routine poll");
+                assert_eq!(response.status(), StatusCode::OK, "{path} must answer");
+            }
         }
         // And a GET that is not a routine poll still reports, so the exemption is
         // scoped rather than an accidental mute of the whole request line.
@@ -2431,14 +2868,17 @@ mod tests {
             .expect("in-process health read");
         assert_eq!(other.status(), StatusCode::OK, "/health must answer");
         let lines = session.stop();
-        let log_lines = lines
-            .iter()
-            .filter(|line| line.contains("request complete") && line.contains("/har/log"))
-            .count();
-        assert_eq!(
-            log_lines, 0,
-            "the log's own reads may not evict its own evidence: {lines:?}"
-        );
+        for path in &polled {
+            let poll_lines = lines
+                .iter()
+                .filter(|line| line.contains("request complete") && line.contains(path))
+                .count();
+            assert_eq!(
+                poll_lines, 0,
+                "a poll the page runs every 2 s may not evict the ring it is read from: \
+                 {path} logged {poll_lines} lines: {lines:?}"
+            );
+        }
         assert_eq!(
             lines
                 .iter()
@@ -2446,6 +2886,812 @@ mod tests {
                 .count(),
             1,
             "non-routine GETs stay in the ring (the exemption is scoped): {lines:?}"
+        );
+    }
+
+    /// The routes `webui/app.js` actually fetches with `getJson(...)`, query stripped.
+    /// The behavior pin polls THIS list and the parity pin compares it to the const, so
+    /// shrinking `ROUTINE_POLL_PATHS` fails both: the const cannot quietly stop covering
+    /// a poll the page still runs (FINDINGS2-0507 [1]).
+    fn pages_own_polls() -> Vec<String> {
+        let page = include_str!("../webui/app.js");
+        let mut polled: Vec<String> = Vec::new();
+        for rest in page
+            .match_indices("getJson(\"")
+            .map(|(index, _)| &page[index + 9..])
+        {
+            if let Some(end) = rest.find('"') {
+                let literal = &rest[..end];
+                // The page's log panel asks for a window, not the bare route; the guard
+                // matches on `uri().path()`, so the query is not part of the identity.
+                let route = literal.split('?').next().unwrap_or(literal).to_string();
+                if route.starts_with("/har/") && !polled.contains(&route) {
+                    polled.push(route);
+                }
+            }
+        }
+        polled.sort();
+        polled
+    }
+
+    /// FINDINGS2-0507 [1]: the exemption list and the page's own polling code were two
+    /// files that nothing linked, so the list could shrink to "everything except
+    /// /har/log" and stay green. The third source of truth is `webui/app.js` itself:
+    /// every `getJson(...)` literal the page fetches on its timer must be in
+    /// `ROUTINE_POLL_PATHS`, and nothing extra may be (an exempt path is a path whose
+    /// requests leave no trace — a mute button needs proving absent, not assumed).
+    /// Falsifier: remove `"/har/models"` from the const and the set equality fails.
+    #[test]
+    fn the_routine_poll_list_is_the_pages_own_poll_list() {
+        let polled = pages_own_polls();
+        let mut declared: Vec<String> = ROUTINE_POLL_PATHS
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect();
+        declared.sort();
+        assert_eq!(
+            declared, polled,
+            "`ROUTINE_POLL_PATHS` drifted from the page's own `getJson(...)` literals \
+             (a poll that is not exempted evicts the ring; an exempted route nobody \
+             polls hides its traffic)"
+        );
+    }
+
+    /// FINDINGS2-0507 [3]: the four guard refusals used to answer and vanish while
+    /// benign 200s filled the same ring the operator reads after a bad boot. A refusal
+    /// must leave a line, but a flood must not turn that line into an eviction engine —
+    /// these are precisely the responses an attacker produces in bulk. One line per
+    /// `(class, path)`, the repeats counted, and the count published by the next
+    /// successful command. Falsifier: report unconditionally (drop the dedup branch in
+    /// `note_guard_refusal`) and the first count assertion fails with 24 lines; never
+    /// re-arm and the last assertion fails with 0.
+    #[tokio::test]
+    async fn guard_refusals_leave_one_line_per_class_and_path_not_one_per_packet() {
+        crate::observability::set_extended_logging(false);
+        // Live actor: the recovery leg needs a poll that actually answers 2xx, and a
+        // 5xx would let the window stay shut while looking like it re-armed.
+        let api = Arc::new(live_state(BootTimings::default()));
+        // Warm the reporting callsite outside the capture window. `tracing` caches
+        // per-callsite interest process-wide, and this binary installs no subscriber at
+        // all (`observability::init` is `main`-only), so the first event a callsite
+        // ever emits can be swallowed by that cached decision — which reads as "the
+        // flood's one line is missing" and only on the run where this test is first to
+        // touch it. One refused Host request up front registers the callsite; it is not
+        // captured because it happens before `Session::start`.
+        let warm = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::post("/har/rescan")
+                    .header("host", "warmup.example")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .expect("warm-up request"),
+            )
+            .await
+            .expect("in-process warm-up");
+        assert_eq!(warm.status(), StatusCode::BAD_REQUEST);
+        let session = crate::tray::testlog::Session::start();
+
+        async fn probe(
+            api: Arc<ApiState>,
+            path: &'static str,
+            origin: Option<&'static str>,
+            json: bool,
+        ) -> StatusCode {
+            let mut builder = Request::post(path);
+            if let Some(origin) = origin {
+                builder = builder.header("origin", origin);
+            }
+            if json {
+                builder = builder.header("content-type", "application/json");
+            }
+            control_router(api)
+                .oneshot(builder.body(Body::empty()).expect("probe request"))
+                .await
+                .expect("in-process probe")
+                .status()
+        }
+
+        for _ in 0..20 {
+            assert_eq!(
+                probe(
+                    Arc::clone(&api),
+                    "/har/rescan",
+                    Some("http://evil.example"),
+                    true
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "the cross-site POST is refused before anything else can see it"
+            );
+        }
+        assert_eq!(
+            probe(Arc::clone(&api), "/har/rescan", None, false).await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "same path, different class: the dedup unit is (class, path), not path"
+        );
+        assert_eq!(
+            probe(
+                Arc::clone(&api),
+                "/har/unload",
+                Some("http://evil.example"),
+                true
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "same class, different path: a second path is its own line"
+        );
+        // The fourth class, from a state that demands the token: 401 is what a guess
+        // produces, so it must be visible — and the secret must not be.
+        const OFFERED: &str = "sekrit-never-in-the-ring";
+        let guarded = Arc::new(ApiState::new(
+            AppConfig {
+                control_token: Some(OFFERED.to_string()),
+                ..AppConfig::default()
+            },
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        ));
+        for _ in 0..2 {
+            let response = control_router(Arc::clone(&guarded))
+                .oneshot(
+                    Request::post("/har/rescan")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer nope")
+                        .body(Body::empty())
+                        .expect("probe request"),
+                )
+                .await
+                .expect("in-process probe");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let lines = session.stop();
+        assert_eq!(
+            refused_lines(&lines),
+            4,
+            "20 identical refusals are one line, the two distinct (class, path) pairs \
+             are one line each, and the token guesses are one more: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("guard refused")
+                && line.contains("refusal=\"token\"")
+                && line.contains("status=401")),
+            "the token class renders its own line: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains(OFFERED)),
+            "the ring is readable by the page: the control token may not be in it: \
+             {lines:?}"
+        );
+
+        // A routine poll answers 200 but is not a command: the page's 2 s timer must
+        // never re-arm a flood into a line every tick.
+        let poll = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::get("/har/status")
+                    .body(Body::empty())
+                    .expect("poll request"),
+            )
+            .await
+            .expect("in-process poll");
+        assert_eq!(poll.status(), StatusCode::OK);
+        let quiet = crate::tray::testlog::Session::start();
+        assert_eq!(
+            control_router(Arc::clone(&api))
+                .oneshot(
+                    Request::get("/health")
+                        .body(Body::empty())
+                        .expect("health request"),
+                )
+                .await
+                .expect("in-process health read")
+                .status(),
+            StatusCode::OK,
+            "a successful command closes the window"
+        );
+        let closed = quiet.stop();
+        let cleared = closed
+            .iter()
+            .filter(|line| line.contains("guard refusals cleared"))
+            .collect::<Vec<_>>();
+        assert_eq!(cleared.len(), 1, "exactly one summary line: {closed:?}");
+        let summary = &cleared[0];
+        for expected in [
+            "origin on /har/rescan (+19 suppressed)",
+            "content-type on /har/rescan",
+            "origin on /har/unload",
+        ] {
+            assert!(
+                summary.contains(expected),
+                "the summary must name what the flood hid, with its count — missing \
+                 {expected:?} in {summary}"
+            );
+        }
+
+        let rearmed = crate::tray::testlog::Session::start();
+        for _ in 0..3 {
+            assert_eq!(
+                probe(
+                    Arc::clone(&api),
+                    "/har/rescan",
+                    Some("http://evil.example"),
+                    true
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            refused_lines(&rearmed.stop()),
+            1,
+            "the window re-armed after the command, so a fresh flood is still visible"
+        );
+    }
+
+    fn refused_lines(lines: &[String]) -> usize {
+        lines
+            .iter()
+            .filter(|line| line.contains("guard refused"))
+            .count()
+    }
+
+    /// FINDINGS2-0507 [3] + the 15[9] token posture: reporting a refusal must never
+    /// mean publishing the secret, and the flood must still count as one report. The
+    /// assertions read the report bookkeeping and the wire bodies directly rather than
+    /// a captured subscriber, because which thread's thread-local default is active
+    /// under the parallel harness is not this pin's business (the rendering of the line
+    /// itself is asserted by `guard_refusals_leave_one_line_per_class_and_path_not_one_per_packet`,
+    /// which owns the single capture session). Falsifier: build the reported sentence
+    /// from the presented credential and the absence assertions fail.
+    #[tokio::test]
+    async fn a_refused_token_is_counted_once_and_never_carries_the_token() {
+        crate::observability::set_extended_logging(false);
+        const OFFERED: &str = "sekrit-token-value-never-logged";
+        let config = AppConfig {
+            control_token: Some(OFFERED.to_string()),
+            ..AppConfig::default()
+        };
+        let api = Arc::new(ApiState::new(
+            config,
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        ));
+        let mut bodies: Vec<String> = Vec::new();
+        for _ in 0..5 {
+            let response = control_router(Arc::clone(&api))
+                .oneshot(
+                    Request::post("/har/rescan")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer wrong-token")
+                        .body(Body::empty())
+                        .expect("probe request"),
+                )
+                .await
+                .expect("in-process probe");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("refusal body");
+            bodies.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        assert_eq!(
+            api.guard_report(),
+            vec![("token".to_string(), "/har/rescan".to_string(), 4)],
+            "five guesses at the token are one report and a count of four"
+        );
+        for body in &bodies {
+            assert!(
+                !body.contains(OFFERED),
+                "the 401 body may not echo what the ring would have carried: {body}"
+            );
+        }
+        assert!(
+            !format!("{:?}", api.guard_report()).contains(OFFERED),
+            "the evidence trail names the class and the route, never the credential"
+        );
+
+        let health = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::get("/health")
+                    .header("x-har-token", OFFERED)
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("in-process health read");
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(
+            api.guard_report().is_empty(),
+            "a successful command publishes and re-arms the window: {:?}",
+            api.guard_report()
+        );
+    }
+
+    /// FINDINGS-BATCH-2026-10-28M [2]: bounding *repeats* per `(class, path)` did not
+    /// bound the flood, because three of the four classes are refused **pre-auth on any
+    /// path** — `reject_reason` runs ahead of `auth_reason` and consults neither the
+    /// token nor route membership. So N bogus paths were N ring lines (ring turnover,
+    /// operator's post-mortem gone) and N map entries (unbounded state). The window is
+    /// now bounded on cardinality too: `GUARD_TRACKED_PATHS_PER_CLASS` named paths per
+    /// class, then one fold line, then silence, and the collapsed count rides the
+    /// recovery line.
+    ///
+    /// Proves the stated bound, not a smaller one: 3× the threshold distinct paths from
+    /// an unauthenticated client cost the ring exactly `cap + 1` origin lines, the state
+    /// holds exactly `cap` keys, and the token class keeps its own budget (a flood on one
+    /// wall cannot mute the evidence for another).
+    ///
+    /// Falsifier: revert `note_guard_refusal` to the unbounded map (drop the cap branch
+    /// and fold, report whenever the key is new) and the origin-count assertion fails with
+    /// 24 lines, the `guard_report().len()` assertion fails with 24 keys, and the fold
+    /// line disappears.
+    #[tokio::test]
+    async fn a_distinct_path_flood_costs_a_constant_number_of_lines() {
+        crate::observability::set_extended_logging(false);
+        const OFFERED: &str = "sekrit-never-in-the-ring";
+        let api = Arc::new(ApiState::new(
+            AppConfig {
+                control_token: Some(OFFERED.to_string()),
+                ..AppConfig::default()
+            },
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        ));
+
+        async fn probe(api: &Arc<ApiState>, path: &str, origin: Option<&str>) -> StatusCode {
+            let mut builder = Request::post(path).header("content-type", "application/json");
+            if let Some(origin) = origin {
+                builder = builder.header("origin", origin);
+            }
+            control_router(Arc::clone(api))
+                .oneshot(builder.body(Body::empty()).expect("probe request"))
+                .await
+                .expect("in-process probe")
+                .status()
+        }
+
+        // Register BOTH reporting callsites outside the capture window (see the warm-up
+        // note in `guard_refusals_leave_one_line_per_class_and_path_not_one_per_packet`):
+        // the fold line is a second `warn!` callsite, so a flood on a class this test
+        // never asserts about (`Host`) has to spend both the per-path line and the fold
+        // line before the Session opens, or the capture can lose their first emission to
+        // the process-wide interest cache.
+        for index in 0..=GUARD_TRACKED_PATHS_PER_CLASS {
+            let warm = control_router(Arc::clone(&api))
+                .oneshot(
+                    Request::post(format!("/warm/{index}"))
+                        .header("host", "warmup.example")
+                        .header("content-type", "application/json")
+                        .body(Body::empty())
+                        .expect("warm-up request"),
+                )
+                .await
+                .expect("in-process warm-up");
+            assert_eq!(warm.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let session = crate::tray::testlog::Session::start();
+        let flood = 3 * GUARD_TRACKED_PATHS_PER_CLASS;
+        for index in 0..flood {
+            assert_eq!(
+                probe(
+                    &api,
+                    &format!("/flood/{index}"),
+                    Some("http://evil.example")
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "a foreign Origin is refused before the token, on any path"
+            );
+        }
+        // A different class keeps its own budget: a path flood on one wall may not mute
+        // the evidence for token guessing on another.
+        for _ in 0..2 {
+            assert_eq!(
+                probe(&api, "/har/rescan", None).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let lines = session.stop();
+
+        let origin_lines = lines
+            .iter()
+            .filter(|line| line.contains("guard refused") && line.contains("refusal=\"origin\""))
+            .count();
+        assert_eq!(
+            origin_lines, GUARD_TRACKED_PATHS_PER_CLASS,
+            "an attacker chose {flood} distinct paths; the ring may only pay for the \
+             tracked cap: {lines:?}"
+        );
+        let fold_lines = lines
+            .iter()
+            .filter(|line| line.contains("guard refusal window full"))
+            .count();
+        assert_eq!(
+            fold_lines, 1,
+            "the overflow collapses to exactly one fold line for the class: {lines:?}"
+        );
+        let fold = lines
+            .iter()
+            .find(|line| line.contains("guard refusal window full"))
+            .expect("the fold line exists");
+        assert!(
+            fold.contains("refusal=\"origin\"")
+                && fold.contains(&format!("tracked={GUARD_TRACKED_PATHS_PER_CLASS}"))
+                && fold.contains("folded=1"),
+            "the fold line is spent on the first collapsed path and names the cap it \
+             applied; the running total is the recovery line's job (asserted below): {fold}"
+        );
+        assert_eq!(
+            refused_lines(&lines),
+            GUARD_TRACKED_PATHS_PER_CLASS + 1,
+            "cap + one token line, not one line per packet: {lines:?}"
+        );
+        assert!(
+            refused_lines(&lines) <= 4 * (GUARD_TRACKED_PATHS_PER_CLASS + 1),
+            "the documented worst-case window cost is 4 classes x (cap + fold): {:?}",
+            refused_lines(&lines)
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("guard refused") && line.contains("status=401"))
+                .count(),
+            1,
+            "the token leg is untouched by the Origin flood: {lines:?}"
+        );
+        // The untracked paths really are absent, not merely uncounted.
+        let last = format!("/flood/{}", flood - 1);
+        assert!(
+            lines.iter().all(|line| !line.contains(&last)),
+            "{last} was past the cap and must not appear: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("guard refused") && line.contains("path=/flood/0 ")),
+            "the first {GUARD_TRACKED_PATHS_PER_CLASS} paths keep their detail: {lines:?}"
+        );
+
+        // Bounded state, not merely bounded lines: this is what makes the bound provable
+        // rather than lucky, and no attacker-chosen path can push it further.
+        let tracked_origin: Vec<_> = api
+            .guard_report()
+            .into_iter()
+            .filter(|(class, _, _)| class == "origin")
+            .collect();
+        assert_eq!(
+            tracked_origin.len(),
+            GUARD_TRACKED_PATHS_PER_CLASS,
+            "the map is capped per class: {:?}",
+            api.guard_report()
+        );
+        assert!(
+            api.guard_report().len() <= 4 * GUARD_TRACKED_PATHS_PER_CLASS,
+            "state is bounded by classes x cap, whatever the flood: {:?}",
+            api.guard_report()
+        );
+        assert_eq!(
+            api.guard_folds()
+                .into_iter()
+                .filter(|(class, _)| class == "origin")
+                .collect::<Vec<_>>(),
+            vec![(
+                "origin".to_string(),
+                (flood - GUARD_TRACKED_PATHS_PER_CLASS) as u64
+            )],
+            "the collapsed paths are counted, once each (the warm-up owns the host \
+             class's own tally): {:?}",
+            api.guard_folds()
+        );
+
+        // Recovery semantics survive the cap: one line, and it says what was hidden.
+        let recovery = crate::tray::testlog::Session::start();
+        let health = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::get("/health")
+                    .header("x-har-token", OFFERED)
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("in-process health read");
+        assert_eq!(health.status(), StatusCode::OK);
+        let closed = recovery.stop();
+        let cleared = closed
+            .iter()
+            .filter(|line| line.contains("guard refusals cleared"))
+            .collect::<Vec<_>>();
+        assert_eq!(cleared.len(), 1, "exactly one summary line: {closed:?}");
+        assert!(
+            cleared[0].contains("origin: +16 further paths folded"),
+            "the fold is published where the operator will read it: {}",
+            cleared[0]
+        );
+        assert!(api.guard_report().is_empty() && api.guard_folds().is_empty());
+
+        // Re-armed: a fresh distinct path reports again, and an attacker-chosen path of
+        // any length costs only the tracked budget (the key and the line agree).
+        let long = format!("/long/{}", "x".repeat(4 * GUARD_TRACKED_PATH_CHARS));
+        let rearmed = crate::tray::testlog::Session::start();
+        assert_eq!(
+            probe(&api, &long, Some("http://evil.example")).await,
+            StatusCode::FORBIDDEN
+        );
+        let rearmed_lines = rearmed.stop();
+        assert_eq!(
+            refused_lines(&rearmed_lines),
+            1,
+            "the window re-armed after the command: {rearmed_lines:?}"
+        );
+        let stored = api
+            .guard_report()
+            .first()
+            .expect("the re-armed window holds the refusal")
+            .1
+            .clone();
+        assert_eq!(
+            stored.chars().count(),
+            GUARD_TRACKED_PATH_CHARS,
+            "an attacker-chosen path cannot become an allocation channel: {stored}"
+        );
+        let reported = rearmed_lines
+            .iter()
+            .find(|line| line.contains("guard refused"))
+            .expect("the re-armed window prints its line");
+        assert!(
+            stored.ends_with("...") && reported.contains(&stored),
+            "the line names the same elided path the map keys on: {reported}"
+        );
+    }
+
+    /// FINDINGS2-0507 [2]: structural refusals must be answered strictly before the
+    /// token check (README:265-268, DECISIONS LOCKED). A page that knows nothing about
+    /// the token must be told the security reason it triggered, not that a route wants
+    /// a secret — the 401 is an oracle for "this route exists and is protected".
+    /// Falsifier: move the `auth_reason` block above `reject_reason` in `guard` and all
+    /// three structural arms below fail with 401.
+    #[tokio::test]
+    async fn structural_refusals_are_answered_before_the_token_is_consulted() {
+        let config = AppConfig {
+            control_token: Some("a-token-never-presented".to_string()),
+            ..AppConfig::default()
+        };
+        let api = Arc::new(ApiState::new(
+            config,
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        ));
+
+        let structural = |builder: axum::http::request::Builder| async {
+            control_router(Arc::clone(&api))
+                .oneshot(builder.body(Body::empty()).expect("probe request"))
+                .await
+                .expect("in-process probe")
+                .status()
+        };
+        assert_eq!(
+            structural(Request::post("/har/rescan")).await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a content-type probe with no token is a 415, never a 401"
+        );
+        assert_eq!(
+            structural(
+                Request::post("/har/rescan")
+                    .header("content-type", "application/json")
+                    .header("origin", "http://evil.example")
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "a cross-site POST with no token is a 403, never a 401"
+        );
+        assert_eq!(
+            structural(
+                Request::post("/har/rescan")
+                    .header("content-type", "application/json")
+                    .header("host", "rebind.example")
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "a DNS-rebinding Host with no token is a 400, never a 401"
+        );
+        // And the token check is still there behind them: structurally clean + no
+        // credential is the one case that may answer 401.
+        assert_eq!(
+            structural(Request::post("/har/rescan").header("content-type", "application/json"))
+                .await,
+            StatusCode::UNAUTHORIZED,
+            "with nothing structural to refuse, the token is what gates the route"
+        );
+    }
+
+    /// FINDINGS2-0507 [7]: `rename()` returning `Ok` is the OS accepting the move, not
+    /// proof the bytes landed, and this is the one file the harness re-reads at boot
+    /// under `deny_unknown_fields` — a silent-short config write is a harness that will
+    /// not start. `persisted: true` is therefore earned by reading the file back and
+    /// requiring it to parse to the tree that was published.
+    ///
+    /// The false leg goes through the **real** comparison: the test arm corrupts the
+    /// on-disk bytes inside the verify window (valid JSON, one extra key), so it is
+    /// production's `read_back == root` that refuses the answer
+    /// (FINDINGS-BATCH-2026-10-28M, item 6 note). Falsifiers, both caught: delete the
+    /// verification block and the armed leg answers `persisted: true` for bytes nobody
+    /// checked; or replace the comparison with an always-true `Ok(_) => Ok(())` and the
+    /// same leg fails while every other pin stays green — which is exactly the
+    /// rubber-stamp the seam used to be unable to detect.
+    #[test]
+    fn config_persistence_is_answered_only_after_the_bytes_read_back() {
+        let dir = crate::testutil::temp_dir("api-config-readback");
+        let path = dir.join("simplehar-se.json");
+        let config = AppConfig {
+            source_path: Some(path.clone()),
+            ..AppConfig::default()
+        };
+
+        assert!(
+            persist_default_model(&config, CategoryId::Work, Some("honest.gguf")),
+            "a write that reads back as published is a persistence the API may claim"
+        );
+        let on_disk: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("the config file exists after a true answer"),
+        )
+        .expect("temp + rename never expose a partial file");
+        assert_eq!(
+            on_disk["categories"]
+                .as_array()
+                .expect("categories array")
+                .iter()
+                .find(|entry| entry["id"].as_str() == Some(CategoryId::Work.to_string().as_str()))
+                .and_then(|entry| entry["default_model"].as_str()),
+            Some("honest.gguf"),
+            "and the answer means the field is on disk, not merely in memory: {on_disk}"
+        );
+
+        // The volume accepted the rename and the bytes are there — they are simply not
+        // the tree that was published, and only the real compare can tell.
+        arm_config_read_back_fault(&path);
+        assert!(
+            !persist_default_model(&config, CategoryId::Work, Some("phantom.gguf")),
+            "an unverifiable write may only ever be answered `persisted: false`"
+        );
+        release_config_read_back_fault(&path);
+        let tampered: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("the file is present, merely unverified"),
+        )
+        .expect("the corruption is different-but-valid, not garbage");
+        assert_eq!(
+            tampered["tampered"],
+            Value::Bool(true),
+            "the leg has to be reached by genuinely-diverging bytes, or an always-true \
+             compare would sail through it: {tampered}"
+        );
+        assert_eq!(
+            tampered["categories"]
+                .as_array()
+                .expect("categories array")
+                .iter()
+                .find(|entry| entry["id"].as_str() == Some(CategoryId::Work.to_string().as_str()))
+                .and_then(|entry| entry["default_model"].as_str()),
+            Some("phantom.gguf"),
+            "the refused write did land — `persisted: false` is a verdict about \
+             verification, not about whether the rename worked: {tampered}"
+        );
+        let backup: Value = serde_json::from_str(
+            &std::fs::read_to_string(path.with_extension("json.bak"))
+                .expect("the pre-write copy is kept for exactly this case"),
+        )
+        .expect("the backup is a config file");
+        assert_eq!(
+            backup["categories"]
+                .as_array()
+                .expect("categories array")
+                .iter()
+                .filter(|entry| entry["default_model"].as_str() == Some("honest.gguf"))
+                .count(),
+            1,
+            "the last value the harness can vouch for is still recoverable: {backup}"
+        );
+    }
+
+    /// FINDINGS2-0507 [6]: `snapshot()`, `any_down()` and `pending()` each took the
+    /// registry lock for themselves, so a supervisor flipping a verdict mid-document
+    /// could publish `"listeners": {"aux": "Serving"}` beside `"listeners_down": true` —
+    /// the red-over-green contradiction the badge work exists to prevent, re-opened
+    /// through read timing. The three fields are now three reads of ONE clone, so the
+    /// pair is checked against the map in the SAME document (never against the registry,
+    /// which would re-read the instant the pin is meant to audit) while a writer churns
+    /// the verdicts underneath. Falsifier: neuter `ListenerState::is_down` to
+    /// `matches!(self, Self::Serving)` and the agreement assertion fails on the map.
+    #[tokio::test]
+    async fn the_badge_booleans_are_always_the_published_maps_own_verdicts() {
+        fn derived_from_the_published_map(doc: &Value) -> (bool, bool) {
+            // The registry's serde shape, read exactly as the page reads it:
+            // `"Serving"` / `"Pending"` as strings, `{"Down":{"reason":…}}` as the
+            // externally-tagged struct variant.
+            let listeners = doc["listeners"].as_object().expect("listeners map");
+            (
+                listeners.values().any(|state| state.get("Down").is_some()),
+                listeners
+                    .values()
+                    .any(|state| state.as_str() == Some("Pending")),
+            )
+        }
+
+        let api = live_state(BootTimings::default());
+        let doc = status_document(&api).await.expect("status document");
+        let (down, pending) = derived_from_the_published_map(&doc);
+        assert!(
+            pending && !down,
+            "a freshly seeded registry is all-amber, never all-clear: {doc}"
+        );
+        assert_eq!(doc["listeners_down"], down, "unmixed boot: {doc}");
+
+        api.listeners
+            .mark_down(CategoryId::Aux, "port taken".to_string());
+        api.listeners.mark_serving(CategoryId::Work);
+        let doc = status_document(&api).await.expect("status document");
+        let (down, pending) = derived_from_the_published_map(&doc);
+        assert!(
+            down && pending,
+            "one Down and one still-unspoken category is red AND amber: {doc}"
+        );
+        assert_eq!(doc["listeners_down"], down, "mixed shape: {doc}");
+        assert_eq!(doc["listeners_pending"], pending, "mixed shape: {doc}");
+
+        // The timing leg: no document may ever contradict its own map, however the
+        // verdicts move while it is being assembled.
+        let churn_registry = api.listeners.clone();
+        let churn = tokio::spawn(async move {
+            for _ in 0..400 {
+                churn_registry.mark_down(CategoryId::Aux, "flapping".to_string());
+                tokio::task::yield_now().await;
+                churn_registry.mark_serving(CategoryId::Aux);
+                tokio::task::yield_now().await;
+            }
+        });
+        for round in 0..120 {
+            let doc = status_document(&api).await.expect("status document");
+            let (down, pending) = derived_from_the_published_map(&doc);
+            assert_eq!(
+                doc["listeners_down"], down,
+                "round {round} published a badge its own map denies: {doc}"
+            );
+            assert_eq!(
+                doc["listeners_pending"], pending,
+                "round {round} published a badge its own map denies: {doc}"
+            );
+        }
+        churn.await.expect("the churner never panics");
+    }
+
+    /// FINDINGS2-0507 [10]: `Reply::Done => (0, None)` handed the proxy
+    /// `127.0.0.1:0`, a port that belongs to no listener, and the failure surfaced as a
+    /// connect error three layers from its cause. The arm now refuses, and this
+    /// inspection tripwire keeps it that way: the fabricated zero may not come back into
+    /// `swap_for_port`, and the arm must still name an error class. Falsifier: restore
+    /// `(0, None)` and the body assertion fails.
+    #[test]
+    fn a_swap_that_names_no_port_is_refused_rather_than_forwarded_to_zero() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("async fn swap_for_port(")
+            .expect("swap_for_port is still in this file");
+        let body =
+            &source[start..source[start..].find("\n}\n").expect("the function closes") + start];
+        assert!(
+            !body.contains("(0, None)"),
+            "`swap_for_port` may not answer a swap with a fabricated port 0: {body}"
+        );
+        assert!(
+            body.contains("Reply::Done") && body.contains("ApiError::Internal"),
+            "the no-port reply must still be refused as an invariant violation: {body}"
         );
     }
 

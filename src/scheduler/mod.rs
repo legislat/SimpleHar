@@ -518,6 +518,9 @@ enum ActorMsg {
     CatalogLoaded {
         catalog: Catalog,
         seq: u64,
+        /// The `llama-server.exe` verdict gathered on the same blocking leg as the
+        /// scan (FINDINGS2-04 [2]); `None` means nothing to report.
+        binary: Option<ScanError>,
     },
     /// The blocking scan task itself failed (panic or cancel): the previous
     /// catalog stays in place, the failure is reported, and the reload waiters
@@ -628,6 +631,12 @@ struct MeasuredAnchor {
     /// in-memory pair the moment a stamp no longer matches — from silently re-seeding
     /// an accumulated range from the one process still on the card.
     range: Option<(f64, f64)>,
+    /// The `serve_model` the row declared when this engine was launched
+    /// (FINDINGS-BATCH-2026-10-28L [L-2]). The install-time mismatch verdict is about
+    /// the process on the card, so it is judged against these bytes: a reload landing
+    /// inside the cold-start window must not manufacture or erase the warning, and a
+    /// same-name twin must not lend this one its id.
+    serve_model: Option<String>,
 }
 
 impl MeasuredAnchor {
@@ -652,8 +661,41 @@ impl MeasuredAnchor {
                 (Some(high), None) => Some((high, high)),
                 (None, _) => None,
             },
+            serve_model: entry.serve_model.clone(),
         }
     }
+}
+
+/// The serve_model mismatch verdict, decided against the SPAWN-era row
+/// (FINDINGS-BATCH-2026-10-28L [L-2]).
+///
+/// Taking the anchor instead of the catalog is the whole point: the pre-fix site read
+/// `self.catalog.iter().find(|m| m.name == job.model)` minutes after `begin_spawn`, so
+/// under a mid-serve reload the warning compared the engine's real id against yaml that
+/// arrived after the launch (a false warning, or a missed one), and under same-name
+/// twins it could read the wrong twin's `serve_model`.
+///
+/// # Arguments
+///
+/// * `anchor` - the job's spawn-era anchor, `None` for a job that never spawned.
+/// * `discovered` - the id the engine actually reported, `None` when discovery saw
+///   nothing.
+///
+/// # Returns
+///
+/// The warning sentence, or `None` when there is nothing to report.
+#[must_use]
+fn serve_model_warning(
+    anchor: Option<&MeasuredAnchor>,
+    discovered: Option<&str>,
+) -> Option<String> {
+    let declared = anchor?.serve_model.as_deref()?;
+    let actual = discovered?;
+    (declared != actual).then(|| {
+        format!(
+            "serve_model `{declared}` is not reported by the engine; using its real id `{actual}`"
+        )
+    })
 }
 
 /// A release target during Quiesce/Dispose (Step 6 calls these victims).
@@ -804,6 +846,53 @@ async fn scan_models_dir(dir: PathBuf) -> Result<Catalog, String> {
         .map_err(|error| format!("{error} scanning {}", reported.display()))
 }
 
+/// The filesystem half of a catalog refresh: the modelconf walk **and** the configured
+/// `llama-server.exe` stat, on blocking threads, concurrent with each other.
+///
+/// The stat lives here rather than in [`ActorState::apply_catalog`] because that runs
+/// during the single writer's turn: `llama_server_exe` is operator config, so a
+/// `Path::exists()` there parks the actor behind a sleeping USB or a disconnected NAS
+/// volume while the listener is already bound — every command, `/har/status` poll and
+/// tray tick queues behind it, the A1-class stall FINDINGS-14 [1] and FINDINGS-13 [6]
+/// moved the scans off-thread for. This was the last `std::fs` touch on the actor
+/// (FINDINGS2-04 [2]).
+///
+/// # Arguments
+///
+/// * `dir` - the `ModelConf` directory to walk.
+/// * `llama_server_exe` - the configured binary to check.
+///
+/// # Returns
+///
+/// The scan result, plus the page-visible error for a missing binary (`None` when there
+/// is nothing to report: the binary is present, or the blocking task itself died, where
+/// silence beats a false alarm).
+async fn scan_with_binary_check(
+    dir: PathBuf,
+    llama_server_exe: PathBuf,
+) -> (Result<Catalog, String>, Option<ScanError>) {
+    let (scan, binary) = tokio::join!(
+        scan_models_dir(dir),
+        tokio::task::spawn_blocking(move || missing_binary_error(&llama_server_exe))
+    );
+    (scan, binary.unwrap_or(None))
+}
+
+/// The `EngineBinaryMissing` report for a binary the config points at but the volume
+/// does not have. Pure apart from the one stat, which is why it runs inside
+/// [`scan_with_binary_check`]'s blocking task and not on the actor.
+#[must_use]
+fn missing_binary_error(llama_server_exe: &std::path::Path) -> Option<ScanError> {
+    (!llama_server_exe.exists()).then(|| ScanError {
+        kind: ScanKind::EngineBinaryMissing,
+        file: "config".to_string(),
+        reason: format!(
+            "llama-server.exe not found at {}; llama loads will fail",
+            llama_server_exe.display()
+        ),
+    })
+}
+
 /// The actor's message loop. The initial catalog scan is the **first thing this task
 /// does**, before it takes any message: commands, ticks and reads queue behind it on
 /// the unbounded channel, exactly as when the scan ran synchronously in
@@ -820,24 +909,26 @@ async fn scan_models_dir(dir: PathBuf) -> Result<Catalog, String> {
 /// replace.
 async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<ActorMsg>) {
     let boot_dir = state.models_dir.clone();
-    let catalog = state
-        .scan_blocking()
-        .await
-        .unwrap_or_else(|reason| Catalog {
-            models: Vec::new(),
-            errors: vec![ScanError {
-                kind: ScanKind::Other,
-                file: boot_dir.display().to_string(),
-                reason: format!("cannot scan ModelConf: {reason}"),
-            }],
-        });
-    state.apply_catalog(catalog);
+    let (scan, binary) = state.scan_blocking().await;
+    let catalog = scan.unwrap_or_else(|reason| Catalog {
+        models: Vec::new(),
+        errors: vec![ScanError {
+            kind: ScanKind::Other,
+            file: boot_dir.display().to_string(),
+            reason: format!("cannot scan ModelConf: {reason}"),
+        }],
+    });
+    state.apply_catalog(catalog, binary);
     while let Some(msg) = rx.recv().await {
         match msg {
             ActorMsg::Command { cmd, reply } => state.on_command(cmd, reply),
-            ActorMsg::CatalogLoaded { catalog, seq } => {
+            ActorMsg::CatalogLoaded {
+                catalog,
+                seq,
+                binary,
+            } => {
                 if seq > state.last_reload_applied {
-                    state.apply_catalog(catalog);
+                    state.apply_catalog(catalog, binary);
                     state.last_reload_applied = seq;
                     state.publish();
                 }
@@ -958,8 +1049,8 @@ impl ActorState {
     /// caller applies the result with [`ActorState::apply_catalog`] — at boot
     /// before the first message, on reload when the result returns as
     /// [`ActorMsg::CatalogLoaded`].
-    async fn scan_blocking(&self) -> Result<Catalog, String> {
-        scan_models_dir(self.models_dir.clone()).await
+    async fn scan_blocking(&self) -> (Result<Catalog, String>, Option<ScanError>) {
+        scan_with_binary_check(self.models_dir.clone(), self.cfg.llama_server_exe.clone()).await
     }
 
     /// Applies a scanned catalog with the single-writer wholesale replace, adding
@@ -969,9 +1060,11 @@ impl ActorState {
     /// audit for that verdict shipped with this batch: no fixture publishes an
     /// engine its adapter map lacks, and a load for one could only ever die later
     /// as `no adapter registered`, so early refusal is strictly better), the
-    /// configured `llama-server.exe` is existence-checked once per scan, and every
-    /// `default_model` must resolve.
-    fn apply_catalog(&mut self, catalog: Catalog) {
+    /// configured `llama-server.exe` verdict (gathered off-thread by
+    /// [`ActorState::scan_blocking`], never by a stat in this function —
+    /// FINDINGS2-04 [2]) is carried into the report, and every `default_model` must
+    /// resolve.
+    fn apply_catalog(&mut self, catalog: Catalog, binary: Option<ScanError>) {
         let mut errors = catalog.errors;
         let known: Vec<&str> = self.adapters.keys().map(String::as_str).collect();
         let models: Vec<ModelEntry> = catalog
@@ -1015,15 +1108,8 @@ impl ActorState {
         // Page-visible twin of the boot banner's warn (`main.rs`): the banner says
         // it once, this says it on every scan, so a binary configured away mid-day
         // is visible on `/har/status` rather than only in the boot log.
-        if !self.cfg.llama_server_exe.exists() {
-            errors.push(ScanError {
-                kind: ScanKind::EngineBinaryMissing,
-                file: "config".to_string(),
-                reason: format!(
-                    "llama-server.exe not found at {}; llama loads will fail",
-                    self.cfg.llama_server_exe.display()
-                ),
-            });
+        if let Some(missing) = binary {
+            errors.push(missing);
         }
         for error in &errors {
             tracing::warn!(
@@ -1091,12 +1177,18 @@ impl ActorState {
                 // waiter — so `/har/rescan` still means "new catalog applied".
                 let tx = self.tx.clone();
                 let dir = self.models_dir.clone();
+                let exe = self.cfg.llama_server_exe.clone();
                 let seq = self.next_reload;
                 self.next_reload += 1;
                 tokio::spawn(async move {
-                    match scan_models_dir(dir).await {
+                    let (scan, binary) = scan_with_binary_check(dir, exe).await;
+                    match scan {
                         Ok(catalog) => {
-                            let _ = tx.send(ActorMsg::CatalogLoaded { catalog, seq });
+                            let _ = tx.send(ActorMsg::CatalogLoaded {
+                                catalog,
+                                seq,
+                                binary,
+                            });
                         }
                         Err(reason) => {
                             let _ = tx.send(ActorMsg::ReloadFailed { seq, reason });
@@ -1499,6 +1591,26 @@ impl ActorState {
     /// named once and the sampler is retired. A persist the disk refuses
     /// reconciles: the triple drains from memory (Fork C — see
     /// [`ActorState::on_measured_persist_failed`]).
+    /// Takes and aborts the sampler of the serving occupant identified by
+    /// `model`+`ticket`, so a reading with nowhere to go stops being produced rather
+    /// than being discarded for 24 h. Both anchor classes that cannot persist call this
+    /// (FINDINGS2-04 [3]); it is idempotent, and the ticket keeps a re-minted twin's
+    /// sampler untouched.
+    fn retire_sampler(&mut self, model: &str, ticket: &SpawnTicket) {
+        let Some(slot) = self.slots.iter_mut().find(|slot| {
+            slot.occupant
+                .as_ref()
+                .is_some_and(|o| o.model == model && &o.ticket == ticket)
+        }) else {
+            return;
+        };
+        if let Some(occupant) = slot.occupant.as_mut() {
+            if let Some(sampler) = occupant.measure.take() {
+                sampler.abort();
+            }
+        }
+    }
+
     fn on_measured(
         &mut self,
         model: &str,
@@ -1563,7 +1675,18 @@ impl ActorState {
         // was launched from may receive the write (FINDINGS-13 [3]).
         let Some(path) = anchor.file.clone() else {
             // Synthetic row at spawn: no operator file exists, so nothing may be
-            // written and nothing may be booked against a name nobody owns.
+            // written and nothing may be booked against a name nobody owns. The sampler
+            // still has to be retired here (FINDINGS2-04 [3]): without this line the
+            // task keeps walking the witness every `measured_sample_s` until its 24 h
+            // deadline while the actor discards every reading it returns — the same
+            // orphan class the row-gone branch below closes, reached from the other
+            // unreadable anchor shape.
+            tracing::warn!(
+                model,
+                "measured reading has no operator file: the spawn-era row was synthetic, \
+                 so the sampler is retired instead of sampling into a discard"
+            );
+            self.retire_sampler(model, ticket);
             return;
         };
         let Some(entry) = self
@@ -1580,17 +1703,7 @@ impl ActorState {
                 file = %path.display(),
                 "measured reading has no catalog row: its yaml went away mid-serve, so the range is neither booked nor persisted"
             );
-            if let Some(slot) = self.slots.iter_mut().find(|slot| {
-                slot.occupant
-                    .as_ref()
-                    .is_some_and(|o| o.model == model && &o.ticket == ticket)
-            }) {
-                if let Some(occupant) = slot.occupant.as_mut() {
-                    if let Some(sampler) = occupant.measure.take() {
-                        sampler.abort();
-                    }
-                }
-            }
+            self.retire_sampler(model, ticket);
             return;
         };
         // Folded against the SPAWN's range, not the entry's live pair: `read_measured`
@@ -1686,9 +1799,17 @@ impl ActorState {
     /// page and `fixed` admission never charge a footprint the disk refused. The
     /// drain only lands when the entry still holds the exact values that failed —
     /// a superseding reading (whose own persist will carry its own reconcile if it
-    /// too fails) is left untouched — and, since the fold writes by spawn-era file,
-    /// only on the entry that file identifies: with a duplicate name in the catalog
-    /// the name alone would drain a row whose bytes the refused never wrote.
+    /// too fails) is left untouched.
+    ///
+    /// The row is found by the same key the fold used, the spawn-era FILE
+    /// (FINDINGS2-04 [1]): keying this leg `name && file` while the fold is keyed
+    /// file-only made the name clause the single divergence point — a reload that
+    /// renames the yaml leaves the fold booking the file's row and this drain missing
+    /// it, so memory keeps a triple the disk refused for the whole serve window
+    /// (subsequent samples reproduce the same high/low against the updated anchor
+    /// range, `changed` stays false, and no retry persist ever fires). `model` is the
+    /// fallback only for the hand-built no-file messages; production persist failures
+    /// always carry the file (the fold's own `anchor_file`).
     fn on_measured_persist_failed(
         &mut self,
         model: &str,
@@ -1698,10 +1819,8 @@ impl ActorState {
         file: Option<PathBuf>,
     ) {
         let Some(entry) = self.catalog.iter_mut().find(|m| {
-            m.name == model
-                && file
-                    .as_deref()
-                    .is_none_or(|path| m.file.as_deref() == Some(path))
+            file.as_deref()
+                .map_or(m.name == model, |path| m.file.as_deref() == Some(path))
         }) else {
             return;
         };
@@ -2792,22 +2911,15 @@ impl ActorState {
             )
         };
         // F-4: a yaml that claims an id the engine never reports becomes a visible
-        // warning at load time, and the engine's real id wins for rewriting.
+        // warning at load time, and the engine's real id wins for rewriting. Judged
+        // against the spawn-era anchor, never the live catalog: this install runs
+        // minutes after `begin_spawn`, and the process being judged was launched from
+        // the bytes that anchor captured (FINDINGS-BATCH-2026-10-28L [L-2]).
         let serve_id = discovered_id;
         if let Some(job) = self.jobs.get_mut(&job_id) {
-            let declared = self
-                .catalog
-                .iter()
-                .find(|m| m.name == job.model)
-                .and_then(|m| m.serve_model.clone());
-            if let (Some(declared), Some(actual)) = (&declared, &serve_id) {
-                if declared != actual {
-                    let warning = format!(
-                        "serve_model `{declared}` is not reported by the engine; using its real id `{actual}`"
-                    );
-                    tracing::warn!(%job_id, model = %job.model, "{warning}");
-                    job.warnings.push(warning);
-                }
+            if let Some(warning) = serve_model_warning(job.measured.as_ref(), serve_id.as_deref()) {
+                tracing::warn!(%job_id, model = %job.model, "{warning}");
+                job.warnings.push(warning);
             }
         }
         if let Some(slot) = slot {
@@ -3252,9 +3364,9 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::{
-        headline_fault, ActorMsg, ActorState, Gibibytes, Job, JobId, JobKind, JobStatus,
-        JobTimings, MeasuredAnchor, Occupant, Reply, ResourceKind, Scheduler, Slot, SpawnTicket,
-        SwapState,
+        headline_fault, missing_binary_error, serve_model_warning, ActorMsg, ActorState, Gibibytes,
+        Job, JobId, JobKind, JobStatus, JobTimings, MeasuredAnchor, Occupant, Reply, ResourceKind,
+        ScanKind, Scheduler, Slot, SpawnTicket, SwapState,
     };
     use crate::budget::LedgerOnlyWitness;
     use crate::config::CategoryId;
@@ -3793,6 +3905,312 @@ mod tests {
         );
 
         drop(_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS2-04 [1]: the fold books the row that owns the spawn-era FILE, while the
+    /// drain keyed `name && file`. Wherever the file's row answers to a different name
+    /// than the spawn-era string, the drain missed the very row it exists to clear:
+    /// memory kept booking a footprint the disk refused for the whole serve window
+    /// (later samples reproduce the same high/low against the updated anchor range, so
+    /// `changed` stays false and no retry persist ever fires — it healed only on
+    /// rescan). Scan derives identity from the file stem today, so the state is built by
+    /// hand: it is the vocabulary the DEFERRED `name:`-key hard-reject opens up, and the
+    /// drain must not be the line that turns it into a leak. Falsifier: restore the
+    /// `name && file` key and the renamed row keeps `Some(3.7)` after the drain.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_refused_persist_drain_follows_the_file_the_fold_booked() {
+        let _capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("measured-drain-file");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("renamed.yaml");
+        std::fs::write(&yaml, "engine: llama\ncategory: work\nvram_gb: 2\n").expect("write");
+        let _lock = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0x3)
+                .open(&yaml)
+                .expect("exclusive handle")
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+        let (map, problems) =
+            crate::model::scan::parse_flat_yaml("engine: llama\ncategory: work\nvram_gb: 2\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut spawn_era = ModelEntry::from_flat(&map, "renamed").expect("entry");
+        spawn_era.file = Some(yaml.clone());
+        let ticket = SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 4243,
+            port: 18_997,
+        };
+        state.catalog = vec![spawn_era.clone()];
+        seat_spawn(&mut state, &spawn_era, &ticket, 18_997);
+
+        // The reload the finding names: the same bytes on disk, a row that answers to a
+        // different name. The engine is still serving the spawn-era string.
+        state.catalog = vec![ModelEntry {
+            name: "moved".to_string(),
+            ..spawn_era.clone()
+        }];
+
+        state.on_measured("renamed", &ticket, 3.7, Some(3.7), 24.0);
+        assert_eq!(
+            state.catalog[0].measured_gb,
+            Some(3.7),
+            "the fold reaches the row by file, whatever it is called now"
+        );
+
+        let msg = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .expect("the persist failure reaches the actor")
+            .expect("channel open");
+        let ActorMsg::MeasuredPersistFailed {
+            model,
+            high,
+            low,
+            offload,
+            file,
+        } = msg
+        else {
+            panic!("expected the persist-failed reconcile message");
+        };
+        assert_eq!(
+            model, "renamed",
+            "the message carries the spawn-era name, which is what used to defeat the drain"
+        );
+        assert_eq!(file.as_deref(), Some(yaml.as_path()));
+
+        state.on_measured_persist_failed(&model, high, low, offload, file);
+        let entry = &state.catalog[0];
+        assert_eq!(
+            entry.measured_gb, None,
+            "memory may not book what the disk refused, whichever name the row answers to"
+        );
+        assert_eq!(entry.measured_min_gb, None);
+        assert_eq!(entry.measured_offload, None);
+
+        drop(_lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS2-04 [3]: a spawn whose anchor carries `file: None` passed the serving
+    /// and anchor checks and returned early WITHOUT retiring the sampler — the one
+    /// reading class that left the task walking the witness every `measured_sample_s`
+    /// until its 24 h deadline while the actor discarded every reading it produced.
+    /// `apply_catalog` keeps file-None rows whose engine has an adapter, so the door is
+    /// config-inert, not type-inert. Falsifier: delete the `retire_sampler` call from
+    /// the file-None arm and the sampler is still attached.
+    #[tokio::test]
+    async fn a_synthetic_anchor_retires_the_sampler_that_has_nowhere_to_write() {
+        let capture = install_warn_capture();
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            crate::testutil::temp_dir("synthetic-anchor"),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+        let (map, problems) = crate::model::scan::parse_flat_yaml("engine: mock\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        // `from_flat` is the only producer of a `file: None` row: the synthetic shape.
+        let entry = ModelEntry::from_flat(&map, "synthetic").expect("entry");
+        assert_eq!(entry.file, None, "the shape under test");
+        let ticket = SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 4343,
+            port: 18_998,
+        };
+        state.catalog = vec![entry.clone()];
+        seat_spawn(&mut state, &entry, &ticket, 18_998);
+        let sampler = tokio::spawn(tokio::time::sleep(Duration::from_secs(3600)));
+        state
+            .slots
+            .first_mut()
+            .and_then(|slot| slot.occupant.as_mut())
+            .expect("a seated occupant")
+            .measure = Some(sampler);
+
+        state.on_measured("synthetic", &ticket, 3.7, Some(3.7), 24.0);
+
+        let measure = &state
+            .slots
+            .first()
+            .and_then(|slot| slot.occupant.as_ref())
+            .expect("a seated occupant")
+            .measure;
+        assert!(
+            measure.is_none(),
+            "a reading with no operator file may not leave a sampler polling for a day"
+        );
+        let warns = capture.lock().expect("capture lock");
+        assert!(
+            warns
+                .iter()
+                .any(|(message, _)| message.contains("no operator file")),
+            "the retirement has to be visible: {warns:?}"
+        );
+    }
+
+    /// FINDINGS-BATCH-2026-10-28L [L-2]: the install-time `serve_model` verdict read the
+    /// LIVE catalog by name, minutes after `begin_spawn`. Under a mid-serve reload that
+    /// rewrites the row's `serve_model`, the warning was computed against yaml the
+    /// running process was never launched from — a false warning, or a missed one — and
+    /// under same-name twins it could quote the other twin's id. The verdict now rides
+    /// the spawn-era anchor. Falsifier: judge from the live row instead of the anchor
+    /// and the `declared-A`/`declared-B` legs fail.
+    #[test]
+    fn the_serve_model_verdict_is_judged_against_the_spawn_era_row() {
+        let (map, problems) =
+            crate::model::scan::parse_flat_yaml("engine: mock\nserve_model: declared-A\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        let spawn_era = ModelEntry::from_flat(&map, "served").expect("entry");
+        let anchor = MeasuredAnchor::at_spawn(&spawn_era);
+
+        let warning = serve_model_warning(Some(&anchor), Some("actual"))
+            .expect("the yaml claims an id the engine does not report");
+        assert!(warning.contains("declared-A"), "{warning}");
+
+        // The reload the finding names: the same model, a different id on disk now.
+        let (reloaded_map, _) =
+            crate::model::scan::parse_flat_yaml("engine: mock\nserve_model: declared-B\n");
+        let reloaded = ModelEntry::from_flat(&reloaded_map, "served").expect("entry");
+        assert_eq!(reloaded.serve_model.as_deref(), Some("declared-B"));
+        assert!(
+            !warning.contains("declared-B"),
+            "yaml that arrived after the launch may not rewrite what counted as a \
+             mismatch: {warning}"
+        );
+
+        assert!(
+            serve_model_warning(Some(&anchor), Some("declared-A")).is_none(),
+            "an id the engine really reports is not a mismatch"
+        );
+        assert!(
+            serve_model_warning(Some(&anchor), None).is_none(),
+            "no discovered id is nothing to compare against"
+        );
+        assert!(
+            serve_model_warning(None, Some("actual")).is_none(),
+            "a job that never spawned holds no spawn-era claim"
+        );
+
+        // And the site may not quietly go back to describing the process from live
+        // catalog bytes.
+        let source = include_str!("mod.rs");
+        let site = source
+            .split("let serve_id = discovered_id;")
+            .nth(1)
+            .expect("the install verdict site is still here")
+            .split("if let Some(slot) = slot")
+            .next()
+            .expect("the site ends where the slot work begins");
+        assert!(
+            !site.contains("self.catalog"),
+            "the install verdict must come from the anchor, not the live catalog: {site}"
+        );
+    }
+
+    /// FINDINGS2-04 [2]: `apply_catalog` ran `self.cfg.llama_server_exe.exists()` inside
+    /// the single writer's turn — the last synchronous `std::fs` touch on the actor.
+    /// The exe path is operator config, so that stat can park the actor behind a
+    /// sleeping USB or a disconnected NAS volume with the listener already bound, and
+    /// every command, `/har/status` poll and tray tick queues behind it (the A1-class
+    /// stall FINDINGS-14 [1]/13 [6] moved the scans off-thread for). The verdict now
+    /// travels in from the blocking leg. Falsifier: restore the stat inside
+    /// `apply_catalog` and the first leg fails (an absent binary reports itself even
+    /// when the scan leg said nothing), and the file-wide count leg fails.
+    #[test]
+    fn the_actor_applies_the_binary_verdict_it_is_handed_and_never_stats_for_one() {
+        let source = include_str!("mod.rs");
+        // Counted over the production half only, and with a needle built at compile
+        // time so this assertion's own text cannot feed on itself.
+        let production = source.split("mod tests").next().unwrap_or(source);
+        let needle = concat!(".exists", "()");
+        assert_eq!(
+            production.match_indices(needle).count(),
+            1,
+            "the actor half must hold exactly one synchronous stat — the one inside \
+             `missing_binary_error`, which runs on a blocking thread"
+        );
+
+        let dir = crate::testutil::temp_dir("binary-verdict");
+        let absent = dir.join("llama-server.exe");
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let config = crate::config::AppConfig {
+            llama_server_exe: absent.clone(),
+            ..crate::config::AppConfig::default()
+        };
+        let mut state = ActorState::empty(
+            config,
+            dir.clone(),
+            BTreeMap::new(),
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+
+        assert!(
+            missing_binary_error(&absent).is_some(),
+            "the fixture binary really is absent"
+        );
+        state.apply_catalog(crate::model::scan::Catalog::empty(), None);
+        assert!(
+            !state
+                .catalog_errors
+                .iter()
+                .any(|error| error.kind == ScanKind::EngineBinaryMissing),
+            "the actor may not answer from a stat of its own: {:?}",
+            state.catalog_errors
+        );
+
+        state.apply_catalog(
+            crate::model::scan::Catalog::empty(),
+            missing_binary_error(&absent),
+        );
+        let report = state
+            .catalog_errors
+            .iter()
+            .find(|error| error.kind == ScanKind::EngineBinaryMissing)
+            .expect("the carried verdict is published");
+        assert!(
+            report.file == "config"
+                && report.reason.contains(&absent.display().to_string())
+                && report.reason.contains("llama loads will fail"),
+            "the page-visible sentence keeps naming the path and the consequence: {:?}",
+            report.reason
+        );
+
+        // The other polarity: a binary that is there is nothing to report.
+        let present = dir.join("present.exe");
+        std::fs::write(&present, b"").expect("fixture binary");
+        assert!(missing_binary_error(&present).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

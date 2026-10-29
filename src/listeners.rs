@@ -41,6 +41,15 @@ impl ListenerState {
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
     }
+
+    /// THE down predicate — the single home of the `Down` test, shared by
+    /// [`ListenerRegistry::any_down`] and the one-snapshot `/har/status` document
+    /// (FINDINGS2-0507 [6]), so no consumer re-implements the match and the red badge
+    /// cannot be derived twice from two different instants.
+    #[must_use]
+    pub fn is_down(&self) -> bool {
+        matches!(self, Self::Down { .. })
+    }
 }
 
 /// Shared registry written by the listener supervisors and read by the API and tray.
@@ -103,9 +112,7 @@ impl ListenerRegistry {
     /// belongs to amber. With the registry seeded at construction this boolean says
     /// exactly one thing — some supervisor looked at a port and could not serve it.
     pub fn any_down(&self) -> bool {
-        self.snapshot()
-            .values()
-            .any(|state| matches!(state, ListenerState::Down { .. }))
+        self.snapshot().values().any(ListenerState::is_down)
     }
 
     /// Every category still without a verdict, in canonical (slot-priority) order.

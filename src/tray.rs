@@ -236,6 +236,13 @@ fn run(ctx: TrayCtx) -> Result<(), String> {
     let icon = solid_icon(TrayState::Gray)?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        // The header's "Left click does nothing" is a contract, not an observation
+        // (FINDINGS2-15 [1]): tray-icon defaults `menu_on_left_click: true`
+        // (tray-icon-0.21.3 src/lib.rs:209) and pops the modal menu on `WM_LBUTTONDOWN`
+        // whenever a menu is attached (platform_impl/windows/mod.rs:462-467) — which
+        // ours is, so a misclick opened the menu whose items act on the fleet. The
+        // right-click menu is the only entry point the operator was told about.
+        .with_menu_on_left_click(false)
         .with_tooltip("SimpleHar")
         .with_icon(icon)
         .build()
@@ -280,18 +287,37 @@ fn handle_menu(id: MenuId) {
 /// Opens the control page without a console window (defect E5). A spawn that never
 /// happened used to be invisible (FINDINGS-15 [7]): a missing `cmd.exe` now lands in
 /// the ring, where `/har/log` can answer "why did nothing open?".
+///
+/// The `CreateProcessW` behind `spawn()` runs on the **caller's** thread, and this
+/// caller is the pump thread that owns the hidden window: a hung process-creation path
+/// (AV minifilter, broken shell association, reparse driver) would freeze the icon, the
+/// menu and the Exit item together — the same wedge FINDINGS-15 [3] put a budget on the
+/// actor waits for, but no budget can interrupt a wedged syscall. So the spawn is handed
+/// to a short-lived thread and the pump returns to pumping (FINDINGS2-15 [3]).
 fn open_web_ui(ctx: &TrayCtx) {
-    let mut opener = std::process::Command::new("cmd");
-    #[cfg(windows)]
+    let url = ctx.control_url.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("se-open-web-ui".to_string())
+        .spawn(move || {
+            let mut opener = std::process::Command::new("cmd");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                opener.args(["/C", "start", "", &url]);
+                opener.creation_flags(CREATE_NO_WINDOW);
+            }
+            #[cfg(not(windows))]
+            opener.arg(&url);
+            if let Err(error) = opener.spawn() {
+                tracing::error!(error = %error, url = %url, "tray: cannot open the Web UI");
+            }
+        })
     {
-        use std::os::windows::process::CommandExt;
-        opener.args(["/C", "start", "", &ctx.control_url]);
-        opener.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    opener.arg(&ctx.control_url);
-    if let Err(error) = opener.spawn() {
-        tracing::error!(error = %error, url = %ctx.control_url, "tray: cannot open the Web UI");
+        tracing::error!(
+            error = %error,
+            url = %ctx.control_url,
+            "tray: cannot start the opener thread; the Web UI was not opened"
+        );
     }
 }
 
@@ -456,9 +482,10 @@ fn tick(
     now: Instant,
 ) -> Tick {
     let signal = tray_signal(listeners, status.is_none(), now);
+    let reason = down_reason(listeners);
     let tooltip = match status {
-        Some(snapshot) => tooltip(snapshot),
-        None => NO_VERDICT_TIP.to_string(),
+        Some(snapshot) => tooltip(snapshot, reason.as_deref()),
+        None => dead_tooltip(reason.as_deref()),
     };
     Tick {
         state: tray_state(status, &signal),
@@ -524,9 +551,94 @@ pub fn tray_state(status: Option<&SchedulerStatus>, signal: &TraySignal) -> Tray
     }
 }
 
-/// Hover text: one line with every category's occupants; the error line when red.
-pub fn tooltip(status: &SchedulerStatus) -> String {
-    let mut line = String::from("SimpleHar — ");
+/// The red state's reason, in the one sentence the operator needs (FINDINGS2-15 [2]).
+///
+/// `ListenerState::Down { reason }` carries the port and the bind error — the whole
+/// story of the colour the icon is showing — and until now it lived only in the
+/// registry and `/har/status`, while the header promised it in the tooltip. Categories
+/// are walked in canonical slot-priority order so a harness with two dead listeners
+/// names the one the operator would act on first.
+fn down_reason(listeners: &crate::listeners::ListenerRegistry) -> Option<String> {
+    let verdicts = listeners.snapshot();
+    CategoryId::all()
+        .iter()
+        .filter_map(|category| {
+            verdicts
+                .get(category)
+                .map(|state| (*category, state.clone()))
+        })
+        .find_map(|(category, state)| match state {
+            crate::listeners::ListenerState::Down { reason } => {
+                Some(format!("{category} listener is down: {reason}"))
+            }
+            _ => None,
+        })
+}
+
+/// `NOTIFYICONDATAW.szTip` is a fixed `[u16; 128]` and tray-icon copies at most 128
+/// UTF-16 units (tray-icon-0.21.3 src/platform_impl/windows/mod.rs:209-212). Anything
+/// past that is cut silently, with no error from `set_tooltip` (FINDINGS-15 [4]).
+const SOLTIP_CAPACITY: usize = 128;
+
+/// Assembles hover text so the part that matters survives the truncation the shell
+/// performs: `head` (prefix + the reason/fault lines) leads and `tail` (the category
+/// list) is what gives way. The pre-fix layout appended the error last, which made it
+/// the first casualty of the cap — exactly when the icon was red.
+fn fit_soltip(head: &str, tail: &str) -> String {
+    let head_units = head.encode_utf16().count();
+    if head_units >= SOLTIP_CAPACITY {
+        // A reason long enough to fill the tip on its own: the inventory is decoration,
+        // the diagnosis is not.
+        return elide_middle(head, SOLTIP_CAPACITY);
+    }
+    let budget = SOLTIP_CAPACITY - head_units;
+    if tail.encode_utf16().count() <= budget {
+        return format!("{head}{tail}");
+    }
+    format!("{}{}", head, elide_middle(tail, budget))
+}
+
+/// Truncates on a UTF-16 budget (the unit the shell counts in), on `char` boundaries,
+/// keeping both ENDS: the front of a bind failure names the port and the tail names the
+/// OS error, so a cut that keeps only one of them loses the diagnosis.
+fn elide_middle(text: &str, max: usize) -> String {
+    if text.encode_utf16().count() <= max {
+        return text.to_string();
+    }
+    const MARK: &str = "...";
+    let budget = max.saturating_sub(MARK.encode_utf16().count());
+    let front_target = budget / 2;
+
+    let mut front = String::new();
+    let mut front_units = 0;
+    let mut rest = text.chars();
+    while let Some(ch) = rest.clone().next() {
+        let need = ch.len_utf16();
+        if front_units + need > front_target {
+            break;
+        }
+        front.push(ch);
+        front_units += need;
+        rest.next();
+    }
+
+    let limit = budget - front_units;
+    let mut back = String::new();
+    let mut back_units = 0;
+    for ch in rest.rev() {
+        let need = ch.len_utf16();
+        if back_units + need > limit {
+            break;
+        }
+        back.insert(0, ch);
+        back_units += need;
+    }
+    format!("{front}{MARK}{back}")
+}
+
+/// One line with every category's occupants, in canonical order.
+fn category_line(status: &SchedulerStatus) -> String {
+    let mut line = String::new();
     for (index, category) in CategoryId::all().iter().enumerate() {
         if index > 0 {
             line.push_str(" | ");
@@ -543,12 +655,42 @@ pub fn tooltip(status: &SchedulerStatus) -> String {
             line.push_str(&format!("{category}: {}", models.join(", ")));
         }
     }
+    line
+}
+
+/// Hover text: the listener reason and the headline job fault first, then every
+/// category's occupants, all inside what the shell will actually display.
+///
+/// # Arguments
+///
+/// * `status` - this tick's scheduler snapshot.
+/// * `down_reason` - [`down_reason`]'s sentence when a listener is `Down`, `None`
+///   otherwise. It leads the text because red is the colour that needs explaining.
+#[must_use]
+pub fn tooltip(status: &SchedulerStatus, down_reason: Option<&str>) -> String {
+    let mut head = String::from("SimpleHar — ");
+    if let Some(reason) = down_reason {
+        head.push_str(&format!("{reason}\n"));
+    }
     if let Some(fault) = crate::scheduler::headline_fault(&status.jobs) {
         if let Some(error) = &fault.error {
-            line.push_str(&format!("\n{error}"));
+            head.push_str(&format!("{error}\n"));
         }
     }
-    line
+    if head.ends_with('\n') {
+        head.push_str("  ");
+    }
+    fit_soltip(&head, &category_line(status))
+}
+
+/// Hover text for a tick whose status fetch produced nothing (FINDINGS-15 [1]). The
+/// colour is still decided by the registry, so the reason must be too: a red icon with
+/// an actor gone still has to say which listener died.
+fn dead_tooltip(down_reason: Option<&str>) -> String {
+    match down_reason {
+        Some(reason) => fit_soltip(&format!("{NO_VERDICT_TIP}\n"), reason),
+        None => NO_VERDICT_TIP.to_string(),
+    }
 }
 
 /// Renders a filled-circle icon of `state`'s color; no asset files (Step 15).
@@ -1042,7 +1184,21 @@ mod tests {
             TrayState::Red,
             "a `Down` must surface even when /har/status is unreachable"
         );
-        assert_eq!(dead.tooltip, NO_VERDICT_TIP);
+        // Pre-fix this asserted exact equality with `NO_VERDICT_TIP`, which pinned the
+        // FINDINGS2-15 [2] defect: a red icon whose hover said nothing about why. The
+        // pin's point (the no-verdict sentence survives an actor that is gone) is kept
+        // as a prefix leg, and the reason the colour is red must now be in the text.
+        assert!(
+            dead.tooltip.starts_with(NO_VERDICT_TIP),
+            "the honest no-verdict sentence is still there: {}",
+            dead.tooltip
+        );
+        assert!(
+            dead.tooltip
+                .contains("AUX listener is down: cannot bind AUX"),
+            "the reason that painted the icon red has to reach the hover: {}",
+            dead.tooltip
+        );
 
         let unreachable_all_up = tick(&registry_with(None, None), None, after_grace);
         assert_eq!(
@@ -1071,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_lists_every_category_and_appends_errors() {
+    fn tooltip_lists_every_category_and_leads_with_the_errors() {
         let loaded_status = SchedulerStatus {
             slots: vec![
                 slot(CategoryId::Work, Some("qwen3")),
@@ -1081,19 +1237,156 @@ mod tests {
             jobs: vec![],
             catalog_errors: Vec::new(),
         };
-        let text = tooltip(&loaded_status);
+        let text = tooltip(&loaded_status, None);
         assert!(text.contains("WORK: qwen3"), "was: {text}");
         assert!(text.contains("AUX: a, b"), "was: {text}");
         assert!(text.contains("RP: —"), "was: {text}");
+        assert!(
+            text.starts_with("SimpleHar — WORK:"),
+            "with nothing to explain the hover stays the one-line category list it \
+             always was: {text}"
+        );
 
         let errored = status(
             vec![slot(CategoryId::Work, None)],
             vec![job(true, Some("need 50 GiB"))],
         );
-        assert!(tooltip(&errored).contains("need 50 GiB"));
+        let text = tooltip(&errored, None);
+        assert!(text.contains("need 50 GiB"), "was: {text}");
+        // FINDINGS-15 [4]: the error used to be APPENDED after the four-category list,
+        // which made it the first casualty of the shell's 128-unit `szTip` cap.
+        assert!(
+            text.find("need 50 GiB") < text.find("WORK:"),
+            "the explanation comes before the inventory: {text}"
+        );
         assert!(
             NO_VERDICT_TIP.chars().count() < 128,
             "the tray-icon crate truncates szTip at 128 wchar: {NO_VERDICT_TIP}"
+        );
+    }
+
+    /// FINDINGS2-15 [2] + FINDINGS-15 [4]: the listener `Down` reason never reached the
+    /// hover at all, and even the job error that did was appended last — where the
+    /// vendored `szTip` copy (`tray-icon-0.21.3 src/platform_impl/windows/mod.rs:209-212`,
+    /// `for i in 0..tip.len().min(128)`) silently cuts it. Long model names are the
+    /// realistic case that eats the budget. Falsifier: move the reason back behind the
+    /// category list (append it instead of leading with it) and the tail assertion fails
+    /// while the icon is red — the exact state that needs the sentence.
+    #[test]
+    fn the_red_reason_survives_the_soltip_cap() {
+        let registry = ListenerRegistry::new();
+        for category in CategoryId::all() {
+            if category != CategoryId::Aux {
+                registry.mark_serving(category);
+            }
+        }
+        let reason = "cannot bind AUX listener on 127.0.0.1:8710: Only one usage of each \
+                      socket address (protocol/network address/port) is normally permitted \
+                      (os error 10048)";
+        registry.mark_down(CategoryId::Aux, reason.to_string());
+        let crowded = status(
+            vec![
+                slot(CategoryId::Work, Some("qwen2.5-coder-32b-instruct-q6_k")),
+                slot(CategoryId::Rp, Some("artemis-31b-v1.2-q4_k-xl-merged")),
+                slot(CategoryId::Aux, Some("ninfer-swift-nvfp4-uncensored")),
+                slot(CategoryId::Emb, Some("embeddinggemma-2-GGUF-f16")),
+            ],
+            vec![],
+        );
+
+        let ticked = tick(&registry, Some(&crowded), Instant::now());
+        assert_eq!(ticked.state, TrayState::Red);
+        let units = ticked.tooltip.encode_utf16().count();
+        assert!(
+            units <= SOLTIP_CAPACITY,
+            "the hover must be what the shell will actually display, not longer: \
+             {units} units: {}",
+            ticked.tooltip
+        );
+        assert!(
+            ticked.tooltip.contains("os error 10048"),
+            "the tail of the reason is the useful half (it names the port and the OS \
+             error); appended-last lost it: {}",
+            ticked.tooltip
+        );
+        assert!(
+            ticked.tooltip.contains("AUX listener is down"),
+            "{}",
+            ticked.tooltip
+        );
+
+        // Same rule with the actor gone: red still has to say which listener died.
+        let dead = tick(&registry, None, Instant::now());
+        assert_eq!(dead.state, TrayState::Red);
+        assert!(
+            dead.tooltip.contains("os error 10048"),
+            "a red icon with no status fetch still owes the reason: {}",
+            dead.tooltip
+        );
+        assert!(
+            dead.tooltip.encode_utf16().count() <= SOLTIP_CAPACITY,
+            "{}",
+            dead.tooltip
+        );
+    }
+
+    /// FINDINGS2-15 [1]: the header tells the operator "Left click does nothing", and
+    /// tray-icon's default is the opposite (`menu_on_left_click: true`, lib.rs:209) —
+    /// with a menu attached, `WM_LBUTTONDOWN` pops the modal menu whose items unload
+    /// models. The contract is enforced at the builder, so this is an inspection pin:
+    /// the call may not quietly disappear in a refactor. Falsifier: drop
+    /// `.with_menu_on_left_click(false)` and the assertion fails.
+    #[test]
+    fn left_click_stays_inert_because_the_builder_says_so() {
+        let source = include_str!("tray.rs");
+        let builder = source
+            .split("TrayIconBuilder::new()")
+            .nth(1)
+            .expect("the tray is built from TrayIconBuilder")
+            .split(".build()")
+            .next()
+            .expect("the builder chain terminates");
+        assert!(
+            builder.contains(".with_menu("),
+            "the right-click menu is the documented entry point"
+        );
+        assert!(
+            builder.contains(".with_menu_on_left_click(false)"),
+            "without this call tray-icon opens the acting menu on a left click, \
+             contradicting the module header"
+        );
+    }
+
+    /// FINDINGS2-15 [3]: `CreateProcessW` runs on the caller's thread, and the menu
+    /// dispatch IS the pump thread — so the open-the-page spawn has to leave it. A hung
+    /// shell path (AV minifilter, broken association) would freeze icon + menu + Exit
+    /// together, the same wedge FINDINGS-15 [3] budgets the actor waits against, except
+    /// no budget can interrupt a wedged syscall. Inspection pin: the process spawn may
+    /// not come back inline. Falsifier: run `opener.spawn()` directly in `open_web_ui`
+    /// and the last assertion fails.
+    #[test]
+    fn opening_the_web_ui_never_runs_the_process_spawn_on_the_pump_thread() {
+        let source = include_str!("tray.rs");
+        let body = source
+            .split("fn open_web_ui(ctx: &TrayCtx) {")
+            .nth(1)
+            .expect("open_web_ui is still here")
+            .split("\n}\n")
+            .next()
+            .expect("the function closes");
+        assert!(
+            body.contains(".spawn(move ||"),
+            "the work is handed to a thread: {body}"
+        );
+        let before_the_thread = body.split(".spawn(move ||").next().unwrap_or(body);
+        assert!(
+            !before_the_thread.contains("opener.spawn()"),
+            "the browser command may not be spawned inline on the thread that owns the \
+             hidden window: {body}"
+        );
+        assert!(
+            body.contains("tracing::error!"),
+            "and it still reports a spawn that never happened (FINDINGS-15 [7]): {body}"
         );
     }
 
