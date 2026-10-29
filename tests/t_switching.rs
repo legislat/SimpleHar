@@ -145,20 +145,43 @@ impl Harness {
         // the single-instance guard while the test drove the foreign server, where
         // `unload {}` takes down live models. Only OUR catalog carries this name.
         yaml(&format!("sentinel-{tag}"), "EMB", &emb_gguf(), "1", "");
+        // Readiness IS the load budget for llama - llama-server binds only after the
+        // weights load, so scheduler/mod.rs:2843 runs the readiness deadline
+        // `load_timeout_s.unwrap_or(cfg)`, whose default is 120 s (config/mod.rs:106) -
+        // and a 23.5 GiB Q6_K off a spun-down F: must not lose the release gate to a
+        // disk race. Truthful test-side budget (FINDINGS-BATCH-2026-10-28Q D-1b): the
+        // 31B legs POST /har/load INLINE, so their ceiling is the shared http client's
+        // 300 s timeout above, not the 900 s product deadline nor the 600 s polls that
+        // follow them (those polls are status slack after the blocking POST returns);
+        // a miss under 300 s lands as a transport panic, not a typed EngineFailed.
+        // The 900 s still defuses the product's 120 s deadline, which was firing first.
+        // rp8 (7.6 GiB) rides the same deadline.
         if big_work_gguf().exists() {
-            yaml("work31", "WORK", &big_work_gguf(), "29", "");
+            yaml(
+                "work31",
+                "WORK",
+                &big_work_gguf(),
+                "29",
+                "\nload_timeout: 900",
+            );
         }
         if big_rp_gguf().exists() {
-            yaml("rp31", "RP", &big_rp_gguf(), "29", "");
+            yaml("rp31", "RP", &big_rp_gguf(), "29", "\nload_timeout: 900");
         }
         if big_aux_gguf().exists() {
-            yaml("aux31", "AUX", &big_aux_gguf(), "29", "");
+            yaml("aux31", "AUX", &big_aux_gguf(), "29", "\nload_timeout: 900");
         }
         // T8's cancel target: a mid-size load is slow enough that the cancel arrives
         // while the job is genuinely still in flight, which is what the test claims to
         // prove and what a 0.6B model (ready in ~1 s) could never show.
         if use_mid_t08() {
-            yaml("rp8", "RP", &mid_gguf(), &booked_gib(&mid_gguf()), "");
+            yaml(
+                "rp8",
+                "RP",
+                &mid_gguf(),
+                &booked_gib(&mid_gguf()),
+                "\nload_timeout: 900",
+            );
         }
 
         // The temp catalog must be named in the config: `default_modelconf_dir()` is
@@ -230,34 +253,99 @@ impl Harness {
             );
         }
         let sentinel = format!("sentinel-{tag}");
+        // `/har/models` queues behind the actor's FIRST turn - the boot scan stats
+        // every `model:` file, and one spun-up cold F: volume holds that request for
+        // 5-10 s on its own (FINDINGS2-17 [2]). The probe therefore gets a 15 s
+        // per-attempt budget (one cold-volume spin-up plus slack) inside a 30 s wall
+        // clock, and a failed attempt RETRIES instead of panicking: the 2 s
+        // single-attempt `expect` used to convert an ordinary slow boot into the
+        // impersonation sentence, which is bait for mid-window misdiagnosis.
+        let identity_probe = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("identity probe client");
+        let identity_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut identified = false;
-        for _ in 0..25 {
-            let value: Value = probe
+        let mut last_attempt = String::from("(no attempt completed)");
+        while !identified && tokio::time::Instant::now() < identity_deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                break; // our own child died: the diagnosis below names that precisely
+            }
+            match identity_probe
                 .get(format!("{CONTROL}/har/models"))
                 .send()
                 .await
-                .expect("GET /har/models for identity")
-                .json()
-                .await
-                .expect("models json");
-            identified = value["data"]
-                .as_array()
-                .map(|rows| {
-                    rows.iter().any(|row| {
-                        row["id"] == sentinel.as_str() || row["name"] == sentinel.as_str()
-                    })
-                })
-                .unwrap_or(false);
-            if identified {
-                break;
+            {
+                Ok(response) => match response.json::<Value>().await {
+                    Ok(value) => {
+                        identified = value["data"].as_array().is_some_and(|rows| {
+                            rows.iter().any(|row| {
+                                row["id"] == sentinel.as_str() || row["name"] == sentinel.as_str()
+                            })
+                        });
+                        last_attempt = "last request answered, sentinel absent".to_string();
+                    }
+                    Err(error) => last_attempt = format!("models body unreadable: {error}"),
+                },
+                Err(error) => {
+                    last_attempt = format!("GET /har/models failed: {error}");
+                }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            if !identified {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
         }
-        assert!(
-            identified,
-            "T-harness: whatever is answering {CONTROL} has no `{sentinel}` in its catalog, \
-             so it is not the harness this test spawned"
-        );
+        if !identified {
+            // Diagnose before accusing: the catalog's own report distinguishes an
+            // innocent scan drop (the sentinel names itself in `catalog_errors`)
+            // from a stalled first turn (requests error, child alive). An accusation
+            // needs EVIDENCE: "foreign harness" is only sayable when something
+            // actually answered on this control port after our own child died.
+            let mut status_answered = false;
+            let diagnosis = match identity_probe
+                .get(format!("{CONTROL}/har/status"))
+                .send()
+                .await
+            {
+                Ok(response) => match response.json::<Value>().await {
+                    Ok(value) => {
+                        status_answered = true;
+                        format!(
+                            "catalog_errors={} boot={}",
+                            value["catalog_errors"], value["boot"]
+                        )
+                    }
+                    Err(error) => format!("/har/status answered but was unreadable: {error}"),
+                },
+                Err(error) => format!("/har/status unreachable: {error}"),
+            };
+            let exited = child.try_wait().ok().flatten();
+            let _ = child.kill();
+            let _ = child.wait();
+            match (exited, status_answered) {
+                (Some(status), true) => panic!(
+                    "T-harness: the exe we spawned exited ({status:?}) while {CONTROL} answered \
+                     a live /har/status without `{sentinel}` ({diagnosis}) - something else \
+                     holds 8708-8711; do not run the suite over it"
+                ),
+                (Some(status), false) => panic!(
+                    "T-harness: the exe we spawned died at boot (exit {status:?}) and the probe \
+                     found NO listener on {CONTROL} ({diagnosis}) - no foreign harness is \
+                     implicated, nothing answered at all; read the engine log beside the exe \
+                     (`logs\\<name>-<epoch>.log`) for why boot died \
+                     (last attempt: {last_attempt})"
+                ),
+                (None, _) => panic!(
+                    "T-harness: our spawned exe was still alive at the identity deadline, so \
+                     this is NOT a foreign harness: `{sentinel}` never appeared in \
+                     {CONTROL}/har/models within 30 s (last attempt: {last_attempt}; \
+                     {diagnosis}). Read the catalog_errors above - a scan-dropped sentinel \
+                     (missing/detached SE_T_EMB gguf, InvalidYaml) or a first-turn stall on \
+                     a cold volume names itself there. Report it as that, not as \
+                     impersonation."
+                ),
+            }
+        }
         Harness {
             child,
             http,
@@ -1102,6 +1190,8 @@ async fn t09_concurrency() {
         .post(&format!("{CONTROL}/har/rescan"), json!({}))
         .await;
     assert_eq!(status, 200);
+    // Queued-intents coverage lives at actor level (tests/scheduler_actor.rs);
+    // a card park leg needs a slow-first-load design - deferred, FINDINGS2-17 [3] reopened.
     println!("T9 PASS");
 }
 
@@ -1310,6 +1400,25 @@ async fn t12_unload_semantics() {
         )
         .await;
     assert_eq!(status, 400);
+    // The two spec bodies the leg never probed (TEST-SWITCHING.md:204 - `garbage` /
+    // `null` / `[1]`): both PARSE as JSON and must fall through the category/model/
+    // `{}` discrimination to 400, not a convenience read (the v3.3-CRITICAL class:
+    // a body the handler does not understand must never empty the card). These are
+    // the proof, not decoration: a red leg here is a REAL finding - stop, report,
+    // do not soften the leg.
+    for body in ["null", "[1]"] {
+        let status = harness
+            .post_raw(
+                &format!("{CONTROL}/har/unload"),
+                body,
+                Some("application/json"),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "`{body}` must be refused, never read as unload-all"
+        );
+    }
     println!("T12 PASS");
 }
 
