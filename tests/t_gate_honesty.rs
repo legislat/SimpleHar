@@ -10,7 +10,8 @@
 //! `cargo test` — it pins the port-observation honesty itself.
 //!
 //! Verdict vocabulary (each test prints one anchored line; `tier.ps1` classifies
-//! it case-sensitively, exactly like the T-suite's `T<n>` markers):
+//! it case-sensitively by its two-word form, mid-line-tolerant because libtest
+//! prefixes passing tests' stdout with "test NAME ... " on the same line):
 //! - `G<n> REFUTED: ...`  the falsifier ran and the strengthened guard caught the
 //!   defect class — the gate cannot lie about this item any more.
 //! - `G<n> CONFIRMED: ...` the falsifier ran and the gate did lie (or the guard
