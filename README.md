@@ -87,17 +87,20 @@ used one at AUX); when nothing is loaded it loads that category's
 ## Configuration: `simplehar-se.json`
 
 Lives beside the executable; override the path with the `SIMPLEHAR_CONFIG`
-environment variable. **The config file is the truth**: `default_model` changes
-made on the page persist back to the exact file boot read (atomic rewrite),
-partial files are completed, and an invalid file is fatal with every problem
-logged — never silently defaulted.
+environment variable — an env-named file is an instruction, not an absence: boot
+fails when it does not exist, and first-start creation never writes there. If a
+legacy `simplehar.json` sits beside the exe and no `simplehar-se.json` exists yet,
+it is copied over once, the old file left untouched for rollback. **The config
+file is the truth**: `default_model` changes made on the page persist back to the
+exact file boot read (atomic rewrite), partial files are completed, and an
+invalid file is fatal with every problem logged — never silently defaulted.
 
 | Field | Default | Meaning |
 |---|---|---|
 | `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN — set `control_token` first, see Security |
 | `control_token` | *unset* | When set, every route but the page assets demands it (`X-Har-Token` or `Authorization: Bearer`); `SIMPLEHAR_TOKEN` overrides it and keeps the secret out of the file |
 | `categories` | four defaults | Per-category `id`, `public_port`, `max_models` (1–6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), `engine_ports` |
-| `vram_total_gb` | `72.0` | Admission ceiling |
+| `vram_total_gb` | `72.0` | Admission ceiling. Normally **detected at first start** (NVML total, floored to 0.1 GiB); the default only survives a failed card probe, and every boot warns when the pinned value and the card disagree beyond `witness_tolerance_gb` |
 | `vram_reserve_gb` | `2.0` | Kept unreachable by admission |
 | `witness_tolerance_gb` | `2.0` | Post-kill driver-lag band: a load may spawn up to this far under the gate (absorbs the lag between a confirmed release and the card's reading catching up); also the settle allowance |
 | `greedy_launch_min_free_gb` | `4.0` | Launch floor for `cost: greedy` models without their own `launch_only_with_at_least_vram_free` |
@@ -107,7 +110,7 @@ logged — never silently defaulted.
 | `settle_timeout_s` | `30` | Memory-settle deadline after release |
 | `protected_ports` | small reserved set | Ports the harness must never bind or touch — extend it to cover any servers you run manually outside this app |
 | `wsl_distro` / `wsl_user` | `Ubuntu` / *(set for ninfer)* | WSL coordinates for ninfer containers |
-| `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary |
+| `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary. First start prefers a `llama-server.exe` found on PATH (absolute entries only) and records the winner in the created file |
 | `modelconf_dir` | `<exe dir>\ModelConf` | Catalog directory |
 | `tray_enabled` | `true` | Tray icon at boot |
 
