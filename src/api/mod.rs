@@ -2841,6 +2841,23 @@ mod tests {
         // A live actor, not `unit_state`: a routine poll that 500s would make the
         // exemption pass for the wrong reason (the guard only mutes 2xx polls).
         let api = Arc::new(live_state(BootTimings::default()));
+        // `request complete` is its own callsite (`:1465`, not the guard's) and the
+        // assertion below reads its FIRST emission, so the same process-wide interest
+        // hazard that made the guard pins flaky (D9) applies here: prove it delivers
+        // into a capture — on a throwaway state — before the measured window opens.
+        warm_capture_lines(&["request complete"], || async {
+            let warm = warm_state(None);
+            let response = control_router(Arc::clone(&warm))
+                .oneshot(
+                    Request::get("/health")
+                        .body(Body::empty())
+                        .expect("warm-up request"),
+                )
+                .await
+                .expect("in-process warm-up");
+            assert_eq!(response.status(), StatusCode::OK);
+        })
+        .await;
         let session = crate::tray::testlog::Session::start();
         let polled = pages_own_polls();
         for path in &polled {
@@ -2951,24 +2968,12 @@ mod tests {
         // Live actor: the recovery leg needs a poll that actually answers 2xx, and a
         // 5xx would let the window stay shut while looking like it re-armed.
         let api = Arc::new(live_state(BootTimings::default()));
-        // Warm the reporting callsite outside the capture window. `tracing` caches
-        // per-callsite interest process-wide, and this binary installs no subscriber at
-        // all (`observability::init` is `main`-only), so the first event a callsite
-        // ever emits can be swallowed by that cached decision — which reads as "the
-        // flood's one line is missing" and only on the run where this test is first to
-        // touch it. One refused Host request up front registers the callsite; it is not
-        // captured because it happens before `Session::start`.
-        let warm = control_router(Arc::clone(&api))
-            .oneshot(
-                Request::post("/har/rescan")
-                    .header("host", "warmup.example")
-                    .header("content-type", "application/json")
-                    .body(Body::empty())
-                    .expect("warm-up request"),
-            )
-            .await
-            .expect("in-process warm-up");
-        assert_eq!(warm.status(), StatusCode::BAD_REQUEST);
+        // The reporting callsites are warmed and *proven* to deliver before the
+        // measured window opens (see [`warm_capture_lines`]): their process-wide
+        // `Interest` used to be established by an un-asserted warm-up emission that
+        // a co-scheduled, capture-less sibling guard pin could win, which is the
+        // D9 flake — the flood's one line absent while its tower lines were present.
+        warm_guard_reporting_callsites().await;
         let session = crate::tray::testlog::Session::start();
 
         async fn probe(
@@ -3136,6 +3141,117 @@ mod tests {
             .count()
     }
 
+    /// How many times a warm-up emission is retried before the pin fails loudly.
+    const CAPTURE_WARM_UP_ATTEMPTS: usize = 8;
+
+    /// Emit inside a throwaway capture until every fragment in `wanted` has landed
+    /// (FINDINGS-BATCH-2026-10-28N D9, the flake that read as "the flood's one line
+    /// is missing", 1 run in 5).
+    ///
+    /// A `tracing` callsite's `Interest` is cached process-wide on its first touch,
+    /// and the guard's reporting lines come from callsites another test may touch
+    /// first with no subscriber installed. The sibling that does exactly that —
+    /// reading bookkeeping rather than a capture — is
+    /// `a_refused_token_is_counted_once_and_never_carries_the_token`, and
+    /// `set_default` (thread-local, which is what `Session::start` uses) never
+    /// re-registers an already-touched callsite. The symptom is what the D9 capture
+    /// showed: every `tower_http` line of the refused requests present and the
+    /// guard's own line absent, because `TraceLayer` is applied outside the guard
+    /// layers and reports independently of it.
+    ///
+    /// So the precondition is enforced rather than hoped for: with the throwaway
+    /// capture as this thread's default, `rebuild_interest_cache` re-evaluates every
+    /// callsite against it (the step `set_default` alone never performs), the emit
+    /// runs, and the lines are *asserted* to have arrived — retried until they do, and
+    /// failing with the capture in hand rather than letting the pin measure against a
+    /// line that can never appear. No test lock is needed: the captures are
+    /// thread-local and every warm-up traffic goes through its own `ApiState`, so a
+    /// sibling cannot spend the `(class, path)` budget the caller asserts about; the
+    /// interest cache is the only shared state, and this function repairs it.
+    async fn warm_capture_lines<F, Fut>(wanted: &[&'static str], mut emit: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        for attempt in 0..CAPTURE_WARM_UP_ATTEMPTS {
+            let session = crate::tray::testlog::Session::start();
+            tracing::callsite::rebuild_interest_cache();
+            emit().await;
+            let lines = session.stop();
+            if wanted
+                .iter()
+                .all(|want| lines.iter().any(|line| line.contains(want)))
+            {
+                return;
+            }
+            assert!(
+                attempt + 1 < CAPTURE_WARM_UP_ATTEMPTS,
+                "the reporting callsites never delivered a line to a capture session: \
+                 wanted {wanted:?} after {CAPTURE_WARM_UP_ATTEMPTS} attempts, last \
+                 capture {lines:?}"
+            );
+        }
+    }
+
+    /// A state for warm-up traffic only: never the state a pin measures. The interest
+    /// cache is keyed by callsite, so any state exercises it, and a throwaway keeps
+    /// the measured window's dedup budget and fold tallies untouched.
+    fn warm_state(token: Option<&str>) -> Arc<ApiState> {
+        Arc::new(ApiState::new(
+            AppConfig {
+                control_token: token.map(str::to_string),
+                ..AppConfig::default()
+            },
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        ))
+    }
+
+    /// The three guard reporting callsites: `note_guard_refusal`'s `Report` and
+    /// `Fold` arms and `note_guard_recovery`'s summary. Every pin that asserts on
+    /// their lines warms them through this first.
+    async fn warm_guard_reporting_callsites() {
+        warm_capture_lines(
+            &[
+                "guard refused",
+                "guard refusal window full",
+                "guard refusals cleared",
+            ],
+            || async {
+                let warm = warm_state(Some("warm-up-token"));
+                // Past the per-class cap in one class: the cap's worth of `Report`
+                // lines and the one `Fold` line, from a class no pin asserts about.
+                for index in 0..=GUARD_TRACKED_PATHS_PER_CLASS {
+                    let response = control_router(Arc::clone(&warm))
+                        .oneshot(
+                            Request::post(format!("/warm/{index}"))
+                                .header("origin", "http://warm.example")
+                                .header("content-type", "application/json")
+                                .body(Body::empty())
+                                .expect("warm-up request"),
+                        )
+                        .await
+                        .expect("in-process warm-up");
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                }
+                // A successful command after refusals: the recovery summary line.
+                let health = control_router(Arc::clone(&warm))
+                    .oneshot(
+                        Request::get("/health")
+                            .header("x-har-token", "warm-up-token")
+                            .body(Body::empty())
+                            .expect("warm-up health read"),
+                    )
+                    .await
+                    .expect("in-process warm-up");
+                assert_eq!(health.status(), StatusCode::OK);
+            },
+        )
+        .await;
+    }
+
     /// FINDINGS2-0507 [3] + the 15[9] token posture: reporting a refusal must never
     /// mean publishing the secret, and the flood must still count as one report. The
     /// assertions read the report bookkeeping and the wire bodies directly rather than
@@ -3255,25 +3371,11 @@ mod tests {
                 .status()
         }
 
-        // Register BOTH reporting callsites outside the capture window (see the warm-up
-        // note in `guard_refusals_leave_one_line_per_class_and_path_not_one_per_packet`):
-        // the fold line is a second `warn!` callsite, so a flood on a class this test
-        // never asserts about (`Host`) has to spend both the per-path line and the fold
-        // line before the Session opens, or the capture can lose their first emission to
-        // the process-wide interest cache.
-        for index in 0..=GUARD_TRACKED_PATHS_PER_CLASS {
-            let warm = control_router(Arc::clone(&api))
-                .oneshot(
-                    Request::post(format!("/warm/{index}"))
-                        .header("host", "warmup.example")
-                        .header("content-type", "application/json")
-                        .body(Body::empty())
-                        .expect("warm-up request"),
-                )
-                .await
-                .expect("in-process warm-up");
-            assert_eq!(warm.status(), StatusCode::BAD_REQUEST);
-        }
+        // Both reporting callsites this pin asserts on (`Report`, `Fold`) and the
+        // recovery summary are proven to deliver into a capture before the measured
+        // window opens — on a throwaway state, so none of this spends the budget or
+        // the fold tally the assertions below read (see [`warm_capture_lines`]).
+        warm_guard_reporting_callsites().await;
 
         let session = crate::tray::testlog::Session::start();
         let flood = 3 * GUARD_TRACKED_PATHS_PER_CLASS;
@@ -3385,8 +3487,8 @@ mod tests {
                 "origin".to_string(),
                 (flood - GUARD_TRACKED_PATHS_PER_CLASS) as u64
             )],
-            "the collapsed paths are counted, once each (the warm-up owns the host \
-             class's own tally): {:?}",
+            "the collapsed paths are counted, once each (the warm-up runs against its \
+             own state, so nothing here is shared with it): {:?}",
             api.guard_folds()
         );
 

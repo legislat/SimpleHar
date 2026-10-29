@@ -7,13 +7,18 @@
 //! harness-spawned; externals are display-only and can never enter a slot.
 //!
 //! Containers outlive the process that started them, so their provenance must too:
-//! [`ContainerClaims`] is the persisted claim ledger written at spawn and read at boot,
-//! and [`boot_reap_decision`] is the single rule the boot reclaim evaluates against it
-//! (chunk 10 [1], 2026-10-27). Both reaping paths — the spawn-time pre-reap and the boot
-//! reclaim — address a name only if the ledger accepts it: the spawn-time pre-reap is
-//! gated on [`ContainerClaims::claim`], the boot reclaim on [`boot_reap_decision`], and
-//! both — with the adapter spec — validate the name through the one function
-//! [`valid_container_name`], so the rules can never drift.
+//! [`ContainerClaims`] is the persisted claim ledger, and [`boot_reap_decision`] is
+//! the single rule the boot reclaim evaluates against it (chunk 10 [1], 2026-10-27).
+//! Both reaping paths — the spawn-time pre-reap and the boot reclaim — address a
+//! name only if the ledger rules accept it: the pre-reap is gated on the shared
+//! [`valid_container_name`] rule alone (it must stay able to destroy a stale
+//! container from an earlier run before this one has a claim), while the kill reap
+//! and the boot reclaim require the positive claim (FINDINGS2-0910 [3], 2026-10-29:
+//! a claim is minted only once `command.spawn()` really started a client, and is
+//! retracted if the spawn is nevertheless reported as failed, so a load that never
+//! reached the engine leaves no ownership evidence behind). Both — with the adapter
+//! spec — validate the name through the one function [`valid_container_name`], so
+//! the rules can never drift.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -113,11 +118,12 @@ pub fn boot_reap_decision(engine: &str, name: &str, claimed: bool) -> ReapDecisi
 
 /// The persisted record of container names this harness started: the ownership
 /// evidence behind [`boot_reap_decision`]. Written (atomically, temp + rename) when
-/// [`ProcessRuntime`](crate::process::ProcessRuntime) spawns a container, cleared when
-/// a release is confirmed, and read at boot — so a container can only be reclaimed if
-/// an earlier lifetime of *this* harness claimed it and died before releasing it. A
-/// missing or corrupt ledger reads as no claims: absence of evidence is absence of
-/// permission, never a guess.
+/// [`ProcessRuntime`](crate::process::ProcessRuntime) has a client *actually
+/// started* — never at spawn intent (FINDINGS2-0910 [3]) — cleared when a release is
+/// confirmed or the spawn is reported as failed, and read at boot, so a container can
+/// only be reclaimed if an earlier lifetime of *this* harness started it and died
+/// before releasing it. A missing or corrupt ledger reads as no claims: absence of
+/// evidence is absence of permission, never a guess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerClaims {
     claims: BTreeSet<String>,

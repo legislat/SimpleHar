@@ -11,10 +11,14 @@
 //! Spawns are hidden (`CREATE_NO_WINDOW`) with stdout/stderr captured to
 //! `logs/<name>-<epoch>.log`. Engine children receive exactly an OS baseline plus
 //! `LaunchSpec.env` (§5, E3): harness secrets (`SIMPLEHAR_TOKEN`) and Python
-//! import-hijack vars (`PYTHONPATH`, `VIRTUAL_ENV`) never leak into them.
-//! Harness-internal control commands (`wsl.exe`/docker, `netsh`, `nvidia-smi`,
-//! the Web UI opener) execute harness code, not operator config, and deliberately
-//! keep their inherited environment.
+//! import-hijack vars (`PYTHONPATH`, `VIRTUAL_ENV`) never leak into them. The
+//! harness-internal control commands spawned here (`wsl.exe` docker teardown and
+//! `docker ps`) are scrubbed the same way, because they execute *inside the
+//! operator's distro*: inheriting there would carry the plaintext token across that
+//! very boundary (FINDINGS2-0910 [4], closing the asymmetry E3 left). Control
+//! commands owned by other modules (`netsh` in `main.rs`, the `nvidia-smi` fallback
+//! in `witness.rs`, the Web UI opener in `tray.rs`) still inherit — none of them
+//! crosses into WSL — and are the smaller remaining half of that rule.
 //! G12 release evidence: the child handle is signaled *and* the port refuses TCP
 //! (for containers, the closed port after reaping is the evidence).
 //!
@@ -26,7 +30,8 @@ use crate::engine::{
     http_probe, wsl_prefix, EngineRuntime, LaunchSpec, Probe, SpawnError, Spawned,
 };
 use crate::ownership::{
-    boot_reap_decision, ContainerClaims, ReapDecision, ResourceKind, SpawnTicket,
+    boot_reap_decision, valid_container_name, ContainerClaims, ReapDecision, ResourceKind,
+    SpawnTicket,
 };
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -126,11 +131,11 @@ fn baseline_fallback(name_upper: &str) -> Option<String> {
 /// whose uppercased key equals its own, then appends under its own spelling —
 /// the assembly never carries two spellings of one name.
 ///
-/// Applies to `LaunchSpec`-driven engine spawns **only**: the harness-internal
-/// control commands ([`reap_container`], [`docker_ps`], `netsh`, `nvidia-smi`,
-/// the Web UI opener) run harness code rather than operator config and keep
-/// inheriting the harness env by design. Shared by the spawn site and the tests
-/// so the tests exercise the real production assembly.
+/// Applies to `LaunchSpec`-driven engine spawns and, with an empty `spec_env`, to
+/// the harness-internal WSL control commands built by [`run_control_command`] —
+/// nothing spawned by this module inherits the harness environment any more
+/// (FINDINGS2-0910 [4]). Shared by the spawn site and the tests so the tests
+/// exercise the real production assembly.
 fn engine_child_env<I>(source: I, spec_env: &BTreeMap<String, String>) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -142,6 +147,61 @@ where
         env.push((key.clone(), value.clone()));
     }
     env
+}
+
+/// What a harness-internal control command may carry: exactly the OS baseline
+/// ([`OS_ENV_BASELINE`]) and nothing else — no `SIMPLEHAR_TOKEN`, no `PYTHONPATH`,
+/// no stray harness name (FINDINGS2-0910 [4]).
+///
+/// The earlier ruling here was "control commands run harness code, not operator
+/// config, so they keep inheriting"; that justified the *inbound* direction only.
+/// The two WSL control commands execute *outbound* — their whole purpose is to run
+/// inside the operator's distro, the very boundary E3 called worse than a Windows
+/// child environment — so inheriting was an outbound secret leak. They need nothing
+/// but `SystemRoot`/`windir`/`Path`/`PATHEXT`/`COMSPEC`/`TEMP`/`TMP`, i.e. what
+/// `wsl.exe` itself requires, so no separate control-only list was invented: one
+/// baseline, one rule, nothing to drift.
+fn control_child_env() -> Vec<(String, String)> {
+    engine_child_env(std::env::vars(), &BTreeMap::new())
+}
+
+/// How one harness-internal control command finished.
+#[derive(Debug)]
+enum ControlOutcome {
+    /// The command ran and reported; the caller judges the exit status and stdout.
+    Ran(std::process::Output),
+    /// The command could not be started at all (no `wsl.exe`, spawn refused).
+    Failed(String),
+    /// The command outlived [`CONTROL_TIMEOUT`].
+    TimedOut,
+}
+
+/// The deadline every control command gets: a wedged `wsl.exe`/docker call must not
+/// park a boot reconcile or an unload indefinitely.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The ONE site through which a harness-internal control command is built and run:
+/// hidden (`CREATE_NO_WINDOW`), `kill_on_drop` so a timed-out client cannot
+/// accumulate as an orphan, and with the scrubbed [`control_child_env`] rather than
+/// the inherited environment (FINDINGS2-0910 [4]). Both WSL control commands go
+/// through here; neither may build its own [`Command`], which is what made the
+/// asymmetry between engine children and control commands possible in the first
+/// place.
+async fn run_control_command(program: &str, args: &[String]) -> ControlOutcome {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .kill_on_drop(true)
+        .env_clear();
+    for (key, value) in control_child_env() {
+        command.env(key, value);
+    }
+    match tokio::time::timeout(CONTROL_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => ControlOutcome::Ran(output),
+        Ok(Err(error)) => ControlOutcome::Failed(error.to_string()),
+        Err(_) => ControlOutcome::TimedOut,
+    }
 }
 
 /// Deletes the oldest `*.log` files beyond `keep` in `dir`.
@@ -252,6 +312,11 @@ pub struct ProcessRuntime {
     logs_dir: PathBuf,
     wsl_distro: String,
     wsl_user: String,
+    /// Test seam: fails the job-object step *after* `command.spawn()` succeeded, so
+    /// the post-spawn failure path — the one that must retract a claim this call
+    /// minted (FINDINGS2-0910 [3]) — is reachable without a wedged Win32 API.
+    #[cfg(test)]
+    fail_job_after_spawn: bool,
 }
 
 /// `wsl.exe -d <distro> -u <user> -- docker rm -f <name>` (v3.3 kill_container
@@ -281,6 +346,31 @@ fn should_reap(terminated: bool, container: Option<&String>) -> Option<String> {
     container.cloned()
 }
 
+/// What the kill path may do about a detached container (FINDINGS2-0910 [3]).
+///
+/// Two independent facts decide it: the ticket says this kill carries the *duty*,
+/// and the ledger says this harness *owns* the name. The kill used to reap straight
+/// from the ticket's name without consulting the ledger, so any future adapter that
+/// invented a container name (chunk 10's templates) would have had a reap authority
+/// the boot reclaim rightly refuses. Pure, so the rule is testable without WSL.
+#[derive(Debug, PartialEq, Eq)]
+enum ReapAction {
+    /// The duty fell to this kill and the ledger holds the claim.
+    Reap(String),
+    /// The duty fell to this kill but no claim backs the name: leave the container.
+    SkipUnclaimed(String),
+    /// Nothing to do (no container, or a re-kill that already carried the duty).
+    None,
+}
+
+fn reap_action(duty: Option<String>, claimed: bool) -> ReapAction {
+    match duty {
+        Some(name) if claimed => ReapAction::Reap(name),
+        Some(name) => ReapAction::SkipUnclaimed(name),
+        None => ReapAction::None,
+    }
+}
+
 /// G12 release evidence: process engines must show exit + closed port; a
 /// detached container's client exit proves nothing — the closed port after
 /// reaping is the evidence (v3.3 `Proc::Container` parity).
@@ -304,11 +394,10 @@ fn excerpt(bytes: &[u8]) -> String {
 }
 
 /// Best-effort `docker rm -f` inside WSL; every failure path warns and lets the
-/// caller proceed (the release poll is the arbiter). `kill_on_drop` so a timed-out
-/// client cannot accumulate as an orphan (review, 2026-10-26). A harness-internal
-/// control command: it runs harness code, not operator config, so it keeps
-/// inheriting the harness env (the [`engine_child_env`] baseline is for
-/// `LaunchSpec`-driven engine spawns only).
+/// caller proceed (the release poll is the arbiter). Built and run by
+/// [`run_control_command`]: hidden, kill-on-drop, and scrubbed to the OS baseline so
+/// the harness's `SIMPLEHAR_TOKEN` never rides into the operator's distro
+/// (FINDINGS2-0910 [4]).
 ///
 /// # Returns
 ///
@@ -328,17 +417,12 @@ async fn reap_container(distro: &str, user: &str, name: &str) -> bool {
         return false;
     }
     let (program, args) = container_rm(distro, user, name);
-    let command = Command::new(&program)
-        .args(&args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(Duration::from_secs(10), command).await {
-        Ok(Ok(output)) if output.status.success() => {
+    match run_control_command(&program, &args).await {
+        ControlOutcome::Ran(output) if output.status.success() => {
             tracing::info!(container = name, "container removed");
             true
         }
-        Ok(Ok(output)) => {
+        ControlOutcome::Ran(output) => {
             tracing::warn!(
                 container = name,
                 stderr = %excerpt(&output.stderr),
@@ -346,11 +430,11 @@ async fn reap_container(distro: &str, user: &str, name: &str) -> bool {
             );
             false
         }
-        Ok(Err(error)) => {
+        ControlOutcome::Failed(error) => {
             tracing::warn!(container = name, error = %error, "docker rm -f cannot run");
             false
         }
-        Err(_) => {
+        ControlOutcome::TimedOut => {
             tracing::warn!(container = name, "docker rm -f timed out");
             false
         }
@@ -403,8 +487,9 @@ fn container_claims_path() -> PathBuf {
 }
 
 /// `wsl.exe … docker ps --format {{.Names}}`; `None` when the call cannot run or
-/// reports failure (the reconcile is advisory, never fatal). A harness-internal
-/// control command, inherited env by design (see [`reap_container`]).
+/// reports failure (the reconcile is advisory, never fatal). A control command like
+/// [`reap_container`], so it goes through [`run_control_command`] and carries only
+/// the OS baseline.
 async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
     let mut argv = wsl_prefix(distro, user);
     argv.extend([
@@ -416,25 +501,20 @@ async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
     let (program, args) = argv
         .split_first()
         .unwrap_or_else(|| unreachable!("invariant: wsl_prefix is never empty"));
-    let command = Command::new(program)
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(Duration::from_secs(10), command).await {
-        Ok(Ok(output)) if output.status.success() => output,
-        Ok(Ok(output)) => {
+    let output = match run_control_command(program, args).await {
+        ControlOutcome::Ran(output) if output.status.success() => output,
+        ControlOutcome::Ran(output) => {
             tracing::warn!(
                 stderr = %excerpt(&output.stderr),
                 "docker ps failed; skipping the boot container reconcile"
             );
             return None;
         }
-        Ok(Err(error)) => {
+        ControlOutcome::Failed(error) => {
             tracing::warn!(error = %error, "docker ps cannot run; skipping the boot reconcile");
             return None;
         }
-        Err(_) => {
+        ControlOutcome::TimedOut => {
             tracing::warn!("docker ps timed out; skipping the boot reconcile");
             return None;
         }
@@ -473,6 +553,8 @@ impl ProcessRuntime {
             // them (review, 2026-10-26).
             wsl_distro: String::new(),
             wsl_user: String::new(),
+            #[cfg(test)]
+            fail_job_after_spawn: false,
         }
     }
 
@@ -483,6 +565,57 @@ impl ProcessRuntime {
         self.wsl_distro = wsl_distro.into();
         self.wsl_user = wsl_user.into();
         self
+    }
+
+    /// Points this runtime's ownership ledger at `path`. Test-only: the pins for
+    /// [3] must neither touch the real `ninfer-claims.json` beside the test exe nor
+    /// hand `wsl.exe` the operator's coordinates.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_claims_ledger(mut self, path: impl Into<PathBuf>) -> Self {
+        self.claims = Arc::new(Mutex::new(ContainerClaims::load(path)));
+        self
+    }
+
+    /// Fails the job-object step after the client started. Test-only; see the
+    /// [`Self::fail_job_after_spawn`] field.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_injected_job_failure(mut self) -> Self {
+        self.fail_job_after_spawn = true;
+        self
+    }
+
+    /// Creates the kill-on-close job for a freshly spawned child. The `#[cfg(test)]`
+    /// seam exists so the post-spawn failure path (which must retract a claim) can be
+    /// reached without a wedged Win32 API.
+    ///
+    /// # Errors
+    ///
+    /// The Win32 reason the job could not be created.
+    fn create_kill_job(&self) -> Result<windows::Win32::Foundation::HANDLE, String> {
+        #[cfg(test)]
+        if self.fail_job_after_spawn {
+            return Err("injected job-object failure (test)".to_string());
+        }
+        // Safety: the handle is created here and handed to exactly one `JobHandle`,
+        // whose `Drop` closes it; job handles are usable from any thread.
+        unsafe { create_kill_on_close_job() }
+    }
+
+    /// Retracts the claim this spawn minted, when the spawn is nevertheless reported
+    /// as failed after the client started but before it was ever recorded (a job-object
+    /// failure): no later `kill`/`release_confirmed` can reach this resource, so the
+    /// claim would be permanent evidence for something the harness has disowned
+    /// (FINDINGS2-0910 [3]'s belt, on top of minting the claim only after a real
+    /// spawn).
+    fn retract_claim(&self, name: Option<&str>) {
+        if let Some(name) = name {
+            self.claims
+                .lock()
+                .expect("container claim ledger lock")
+                .unclaim(name);
+        }
     }
 
     /// Boot reconcile (deploy review, 2026-10-26; scoped by chunk 10 [1], 2026-10-27):
@@ -556,6 +689,15 @@ impl ProcessRuntime {
         }
     }
 
+    /// Test-only read of the ownership ledger behind [3]'s pins.
+    #[cfg(test)]
+    fn claimed(&self, name: &str) -> bool {
+        self.claims
+            .lock()
+            .expect("container claim ledger lock")
+            .contains(name)
+    }
+
     /// Number of tracked engines (test/leak assertion helper).
     pub fn engine_count(&self) -> usize {
         self.engines.lock().expect("engine table lock").len()
@@ -577,29 +719,27 @@ impl EngineRuntime for ProcessRuntime {
             });
         };
         // Container identity travels on the ticket (the provenance type); the
-        // runtime never invents one. Reaping is ownership-scoped: only names
-        // this harness claimed at spawn are ever addressed.
+        // runtime never invents one. Every reap stays ownership-scoped, in two
+        // parts: the shared name rule gates the pre-reap below, and the claim
+        // ledger — minted only on a spawn that really started — gates the kill
+        // reap and the boot reclaim (FINDINGS2-0910 [3]).
         let container = match &ticket.kind {
             ResourceKind::Container { name } => Some(name.clone()),
             ResourceKind::ChildProcess => None,
         };
-        // Reconcile a stale container from a crashed run before claiming the
-        // name: otherwise `docker run` fails on the name conflict (opaque
-        // minutes-long readiness failure) or the stale container answers
-        // readiness for a model the harness never started.
+        // Reconcile a stale container from a crashed run before this spawn: otherwise
+        // `docker run` fails on the name conflict (opaque minutes-long readiness
+        // failure) or the stale container answers readiness for a model the harness
+        // never started.
         if let Some(name) = container.as_deref() {
-            // One rule for both reaping paths (chunk 10 [1] and [4]): `claim` is the sole
-            // authority on whether this harness may address the name at all. It records
-            // the positive evidence the boot reclaim demands, and it refuses what the
-            // shared validator rejects — including docker container-ID shapes — so the
-            // pre-reap can never hand `docker rm -f` an argument docker would resolve as
-            // someone else's id prefix. A refused name reaps nothing.
-            let claimable = self
-                .claims
-                .lock()
-                .expect("container claim ledger lock")
-                .claim(name);
-            if claimable {
+            // The stale-container pre-reap is gated on the SHARED name rule — the one
+            // the adapter, the claim ledger and the boot reclaim all use — so a name
+            // docker could resolve as a container-ID prefix can never reach
+            // `docker rm -f` from here. It is deliberately NOT a ledger write: the
+            // claim that authorizes future reaping is minted only once a client
+            // actually started (FINDINGS2-0910 [3]), so a load that failed before the
+            // spawn leaves no ownership evidence behind. A refused name reaps nothing.
+            if valid_container_name(name) {
                 reap_container(&self.wsl_distro, &self.wsl_user, name).await;
             } else {
                 tracing::warn!(
@@ -633,8 +773,8 @@ impl EngineRuntime for ProcessRuntime {
             .stderr(log_file)
             .creation_flags(CREATE_NO_WINDOW)
             // §5 (E3): the child sees exactly the OS baseline plus `spec.env`,
-            // never the harness environment. Control commands elsewhere keep
-            // inheriting on purpose — they are not LaunchSpec-driven.
+            // never the harness environment. The control commands in this module
+            // get the same baseline with no spec entries ([`control_child_env`]).
             .env_clear();
         for (key, value) in engine_child_env(std::env::vars(), &spec.env) {
             command.env(key, value);
@@ -642,17 +782,37 @@ impl EngineRuntime for ProcessRuntime {
         let mut child = command.spawn().map_err(|e| SpawnError::SpawnFailed {
             reason: format!("cannot spawn {program}: {e}"),
         })?;
+        // The claim is the positive ownership evidence the boot reclaim demands, so it
+        // is minted HERE — only once a client really started (FINDINGS2-0910 [3]).
+        // Minting it before the spawn let a load that failed at `create_dir_all`,
+        // the log file or the spawn itself leave `ninfer-claims.json` holding a name
+        // this harness never started, which then passed all three boot gates and
+        // authorized `docker rm -f` against a container the operator had started by
+        // hand under that name. `claim` keeps its own validity rule, so an ID-shaped
+        // name is still never recorded.
+        if let Some(name) = container.as_deref() {
+            self.claims
+                .lock()
+                .expect("container claim ledger lock")
+                .claim(name);
+        }
+        // From here the client exists but is not yet recorded: these two paths report
+        // a failed spawn, so the claim just minted has to go back with the report.
         // Safety: the job handle is created and assigned here, on this task, before
-        // the child is stored; `raw_handle` is valid while the child is alive. The
+        // the child is stored; `raw_handle` is valid while the child is alive, and the
         // job is closed exactly once, by `JobHandle::drop`.
-        let job = JobHandle(
-            unsafe { create_kill_on_close_job() }
-                .map_err(|reason| SpawnError::SpawnFailed { reason })?,
-        );
+        let job = match self.create_kill_job() {
+            Ok(handle) => JobHandle(handle),
+            Err(reason) => {
+                self.retract_claim(container.as_deref());
+                return Err(SpawnError::SpawnFailed { reason });
+            }
+        };
         if let Some(handle) = child.raw_handle() {
             let assigned = unsafe { assign_to_job(job.0, handle) };
             if let Err(reason) = assigned {
                 let _ = child.kill().await;
+                self.retract_claim(container.as_deref());
                 return Err(SpawnError::SpawnFailed { reason });
             }
         }
@@ -692,7 +852,7 @@ impl EngineRuntime for ProcessRuntime {
     }
 
     async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError> {
-        let container = {
+        let duty = {
             let mut engines = self.engines.lock().expect("engine table lock");
             match table_verdict(
                 engines.get(&ticket.port).map(|entry| entry.generation),
@@ -716,14 +876,34 @@ impl EngineRuntime for ProcessRuntime {
             unsafe { terminate_job(engine.job.0) };
             // Only the first kill carries the reap duty; re-kills (cancel,
             // release-retry) must not re-run `docker rm` (review, 2026-10-26).
-            let reaped = should_reap(engine.terminated, engine.container.as_ref());
+            let duty = should_reap(engine.terminated, engine.container.as_ref());
             engine.terminated = true;
             let _ = engine.child.start_kill();
-            reaped
+            duty
         };
-        // A detached WSL container survives its client process: reap it by name.
-        if let Some(name) = container {
-            reap_container(&self.wsl_distro, &self.wsl_user, &name).await;
+        // A detached WSL container survives its client process: reap it by name —
+        // but the LEDGER, not the ticket, is the reap authority (FINDINGS2-0910 [3]).
+        let action = match duty {
+            Some(name) => {
+                let claimed = self
+                    .claims
+                    .lock()
+                    .expect("container claim ledger lock")
+                    .contains(&name);
+                reap_action(Some(name), claimed)
+            }
+            None => ReapAction::None,
+        };
+        match action {
+            ReapAction::Reap(name) => {
+                reap_container(&self.wsl_distro, &self.wsl_user, &name).await;
+            }
+            ReapAction::SkipUnclaimed(name) => tracing::warn!(
+                container = %name,
+                port = ticket.port,
+                "kill owed a container reap but the ledger holds no claim: leaving it running"
+            ),
+            ReapAction::None => {}
         }
         Ok(())
     }
@@ -1240,6 +1420,155 @@ mod tests {
         assert!(plan.is_empty());
     }
 
+    fn container_ticket(port: u16, name: &str) -> SpawnTicket {
+        SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::Container {
+                name: name.to_string(),
+            },
+            pid: 0,
+            port,
+        }
+    }
+
+    /// A spec whose `argv[0]` is `program`; the container identity lives on the
+    /// ticket, which is the only place the runtime reads it from.
+    fn client_spec(program: &str, args: &[&str], log_name: &str) -> LaunchSpec {
+        LaunchSpec {
+            argv: std::iter::once(program.to_string())
+                .chain(args.iter().map(|arg| arg.to_string()))
+                .collect(),
+            cwd: std::env::temp_dir(),
+            env: BTreeMap::new(),
+            log_name: log_name.to_string(),
+            readiness: ReadinessSpec::Http {
+                path: "/health".to_string(),
+                expect_status: 200,
+            },
+            container: None,
+        }
+    }
+
+    /// FINDINGS2-0910 [3] (the reviewer's F4): a claim minted at spawn *intent* is
+    /// ownership evidence for a client that never existed, and the boot reclaim
+    /// reads exactly that evidence as permission to `docker rm -f`. Blank WSL
+    /// coordinates keep every reap path from invoking `wsl.exe` (the reapers refuse
+    /// and warn), and the ledger is a temp file so the real one beside the test exe
+    /// stays untouched. Falsifier: mint the claim before the pre-reap again and this
+    /// pin fails on both the in-memory and the on-disk read.
+    #[tokio::test]
+    async fn a_failed_container_spawn_leaves_no_claim() {
+        let dir = crate::testutil::temp_dir("claims-failed-spawn");
+        let ledger = dir.join("ninfer-claims.json");
+        let runtime = ProcessRuntime::new().with_claims_ledger(&ledger);
+        let error = runtime
+            .spawn(
+                &client_spec("no-such-engine-program-se.exe", &[], "se-probe-1"),
+                container_ticket(18_281, "se-probe-1"),
+            )
+            .await
+            .expect_err("a program that does not exist cannot spawn");
+        assert!(
+            matches!(&error, SpawnError::SpawnFailed { reason }
+                if reason.contains("no-such-engine-program-se.exe")),
+            "{error}"
+        );
+        assert!(
+            !runtime.claimed("se-probe-1"),
+            "a spawn that never happened must leave no ownership evidence"
+        );
+        assert!(
+            !ContainerClaims::load(&ledger).contains("se-probe-1"),
+            "and nothing of it may reach the persisted ledger"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The belt on that suspenders: the client started, so the claim was minted —
+    /// then the spawn is nevertheless reported failed (here: the job object could not
+    /// be created). Nothing can ever `release_confirmed` a resource that was never
+    /// recorded, so the claim has to leave with the failure report.
+    #[tokio::test]
+    async fn a_post_spawn_failure_retracts_the_claim_it_minted() {
+        let dir = crate::testutil::temp_dir("claims-retract");
+        let ledger = dir.join("ninfer-claims.json");
+        let runtime = ProcessRuntime::new()
+            .with_claims_ledger(&ledger)
+            .with_injected_job_failure();
+        let error = runtime
+            .spawn(
+                &client_spec("cmd.exe", &["/c", "exit 0"], "se-probe-2"),
+                container_ticket(18_282, "se-probe-2"),
+            )
+            .await
+            .expect_err("the injected job failure must fail the spawn");
+        assert!(
+            matches!(&error, SpawnError::SpawnFailed { reason }
+                if reason.contains("injected job-object failure")),
+            "{error}"
+        );
+        assert!(
+            !runtime.claimed("se-probe-2"),
+            "the claim this call minted must go back with the failure report"
+        );
+        assert!(
+            !ContainerClaims::load(&ledger).contains("se-probe-2"),
+            "including on disk, where the boot reclaim reads it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control that keeps the two pins above from being satisfied by a claim
+    /// path that never works at all: a client that really started mints the claim
+    /// every reap depends on, in memory and on disk.
+    #[tokio::test]
+    async fn a_started_client_mints_the_claim_the_reaps_depend_on() {
+        let dir = crate::testutil::temp_dir("claims-mint");
+        let ledger = dir.join("ninfer-claims.json");
+        let runtime = ProcessRuntime::new().with_claims_ledger(&ledger);
+        let spawned = runtime
+            .spawn(
+                &client_spec("cmd.exe", &["/c", "exit 0"], "se-probe-3"),
+                container_ticket(18_283, "se-probe-3"),
+            )
+            .await
+            .expect("cmd.exe starts as a stand-in client");
+        assert_eq!(spawned.port, 18_283);
+        assert!(
+            runtime.claimed("se-probe-3"),
+            "a started client is exactly what the ledger records"
+        );
+        assert!(
+            ContainerClaims::load(&ledger).contains("se-probe-3"),
+            "and persists for the next boot to read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [3]'s other half: the ticket carries the reap *duty*, the ledger carries the
+    /// *authority*, and only their conjunction reaps. The kill path used to reap
+    /// straight from the ticket's name.
+    #[test]
+    fn the_kill_reap_requires_both_the_duty_and_the_claim() {
+        let duty = Some("ninfer-a".to_string());
+        assert_eq!(
+            reap_action(duty.clone(), true),
+            ReapAction::Reap("ninfer-a".to_string()),
+            "duty plus claim is the only combination that addresses a container"
+        );
+        assert_eq!(
+            reap_action(duty.clone(), false),
+            ReapAction::SkipUnclaimed("ninfer-a".to_string()),
+            "a duty with no claim behind it leaves the container running"
+        );
+        assert_eq!(reap_action(None, true), ReapAction::None);
+        assert_eq!(
+            reap_action(None, false),
+            ReapAction::None,
+            "a re-kill never reaps, claim or no claim"
+        );
+    }
+
     fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
         list.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1579,6 +1908,82 @@ mod tests {
             );
         }
         runtime.kill(&tk).await.expect("cleanup kill runs");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS2-0910 [4], the assembly rule: a control command gets exactly the OS
+    /// baseline. The test process genuinely carries `CARGO_*` (and a real harness run
+    /// carries `SIMPLEHAR_TOKEN`), so "exactly the baseline names" is a filter that
+    /// has to be working for this to hold.
+    #[test]
+    fn control_child_env_is_the_baseline_and_nothing_else() {
+        let env = control_child_env();
+        let keys = upper_keys(&env);
+        let expected: BTreeSet<String> = OS_ENV_BASELINE
+            .iter()
+            .map(|name| name.to_uppercase())
+            .collect();
+        let actual: BTreeSet<String> = keys.iter().cloned().collect();
+        assert_eq!(
+            actual, expected,
+            "one entry per baseline name, nothing else"
+        );
+        assert_eq!(keys.len(), env.len(), "no case-duplicates: {keys:?}");
+        for name in &keys {
+            assert!(
+                !name.starts_with("SIMPLEHAR_") && !name.starts_with("CARGO_"),
+                "secret/toolchain name {name} reached the control assembly"
+            );
+        }
+    }
+
+    /// FINDINGS2-0910 [4], the production site: `run_control_command` is the ONE
+    /// builder both WSL control commands go through, so this drives it directly with
+    /// a real child — exactly how the engine-child pin drives `ProcessRuntime::spawn`.
+    /// The load-bearing marker is `CARGO_*`: cargo always sets those in the test
+    /// process, they are not on the baseline, and reading them from the harness env
+    /// is something no other test does (unlike `SIMPLEHAR_TOKEN`, which the api layer
+    /// reads). Falsifier: drop the `env_clear()` here and the toolchain assertions
+    /// below fail.
+    #[tokio::test]
+    async fn a_control_command_child_carries_no_harness_environment() {
+        let dir = crate::testutil::temp_dir("controlenv");
+        let dump = dir.join("child-set.txt");
+        let args = vec!["/c".to_string(), format!("set > {}", dump.display())];
+        match run_control_command("cmd.exe", &args).await {
+            ControlOutcome::Ran(output) => {
+                assert!(output.status.success(), "cmd /c set exited with {output:?}")
+            }
+            other => panic!("the control command could not run: {other:?}"),
+        }
+        let text = wait_for_child_env_dump(&dump).await;
+        for forbidden in ["SIMPLEHAR_TOKEN", "PYTHONPATH", "VIRTUAL_ENV"] {
+            assert!(
+                !has_child_var(&text, forbidden),
+                "control child inherited harness {forbidden}: {text}"
+            );
+        }
+        let inherited_toolchain: Vec<String> = text
+            .lines()
+            .filter(|line| line.trim_start().to_uppercase().starts_with("CARGO_"))
+            .map(|line| line.trim().to_string())
+            .collect();
+        assert!(
+            inherited_toolchain.is_empty(),
+            "control child inherited the harness toolchain environment: \
+             {inherited_toolchain:?}"
+        );
+        assert_eq!(
+            count_child_var(&text, "Path"),
+            1,
+            "exactly one Path line for `wsl.exe` to resolve itself: {text}"
+        );
+        if std::env::var_os("SystemRoot").is_some() || std::env::var_os("windir").is_some() {
+            assert!(
+                has_child_var(&text, "SystemRoot") || has_child_var(&text, "windir"),
+                "OS locators must survive into the control child: {text}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

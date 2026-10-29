@@ -42,9 +42,12 @@ pub enum EngineError {
 
 /// Readiness as typed data: one HTTP expectation, or two in sequence (Step 7 sketch).
 ///
-/// Placeholders in `path` are confined to argv-style substitution — there is no string
-/// mini-language for liveness or kill here (typed `kill`/`liveness` arrive with the
-/// template schema, item 9).
+/// `path` carries **no placeholders**: `probe_one` interpolates it verbatim into
+/// `http://127.0.0.1:{port}{path}`, so an adapter that wrote `{port}` or `{model}`
+/// would dial a literal brace rather than substitute it. Substitution — argv-style,
+/// from the adapter — is what the typed template schema (item 9) will introduce;
+/// there is no string mini-language for liveness or kill here (typed
+/// `kill`/`liveness` arrive with that same schema).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadinessSpec {
     /// `GET path` must answer `expect_status`.
@@ -241,8 +244,12 @@ pub struct Spawned {
 /// Process-layer operations, driven by the scheduler actor but never executed inline
 /// in the actor loop (Step 2: no I/O in the actor; Step 8: one implementation).
 ///
-/// The production implementation (hidden spawn, Job Objects, log files, container
-/// labels) is the future `process.rs`; the mock implementation used by tests lives in
+/// The production implementation is [`crate::process::ProcessRuntime`] — hidden
+/// spawns under Job Objects, log files, and the name-plus-claim-ledger ownership
+/// rule for detached WSL containers (there are no docker *labels*: ownership is the
+/// exact `ninfer_container` name plus its entry in `ninfer-claims.json`, see
+/// [`crate::ownership`]). It is constructed at boot (`main.rs`) and held by the
+/// scheduler. The mock implementation used by tests lives in
 /// `tests/mock_runtime.rs` (Step 19).
 #[async_trait::async_trait]
 pub trait EngineRuntime: Send + Sync {
@@ -286,10 +293,11 @@ pub trait EngineRuntime: Send + Sync {
 /// refusal at preflight — before Quiesce (`79f6256`), with victims and the
 /// resident model untouched. Lives here, not in `main`, so the gate has a test.
 ///
-/// # Errors
-///
-/// Infallible today; `Result` mirrors the adapter constructors' contract for the
-/// day a registry validation can reject a config-referenced binary.
+/// Infallible: every adapter is constructed from already-validated config values,
+/// and no registry check can reject one today. When chunk 10's `EnginePolicy`
+/// validation can reject a config-referenced binary, that is the day this signature
+/// gains a `Result` — until then a documented `# Errors` section would describe a
+/// return type this function does not have (FINDINGS2-0910 [7]).
 #[must_use]
 pub fn default_adapters(
     config: &crate::config::AppConfig,
