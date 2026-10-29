@@ -6,7 +6,9 @@
 //! reason rides in the tooltip), **amber** = no verdict — a category still `Pending`
 //! after the boot grace, or a status fetch that returned nothing, yellow = a
 //! load/unload in flight, green = a model is loaded, gray = nothing loaded. Per-job
-//! errors are *not* red; they ride in the tooltip. Left click does nothing; the
+//! errors are *not* red; they ride in the tooltip. This is the LISTENER palette and
+//! stays untouched by config-state marking: the page's `stale_config` amber (Axis-2
+//! ruling 2026-10-29, the row dot) is the CONFIG palette's and never drives the icon. Left click does nothing; the
 //! right-click menu is Open Web UI / Unload All Models / Unload WORK / Unload RP /
 //! Unload All AUX / Unload EMB / Exit.
 //!
@@ -929,6 +931,8 @@ mod tests {
             idle_s: model.map(|_| 0),
             serve_id: None,
             loading_job: None,
+            launched_at: None,
+            stale_config: None,
             loaded_at: std::time::Instant::now(),
         }
     }

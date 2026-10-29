@@ -672,45 +672,53 @@
       "category": "WORK",
       "idle_s": 15,
       "index": 0,
+      "launched_at": "2026-10-29T03:55:12Z",
       "loading_job": null,
       "model": "strata-fp4local-bf16ple",
       "need_gib": 55,
       "pid": 41616,
       "port": 18109,
-      "serve_id": "qwen3.8-flash-next-fp4local"
+      "serve_id": "qwen3.8-flash-next-fp4local",
+      "stale_config": false
     },
     {
       "category": "RP",
       "idle_s": null,
       "index": 0,
+      "launched_at": null,
       "loading_job": null,
       "model": null,
       "need_gib": null,
       "pid": null,
       "port": null,
-      "serve_id": null
+      "serve_id": null,
+      "stale_config": null
     },
     {
       "category": "AUX",
       "idle_s": null,
       "index": 0,
+      "launched_at": null,
       "loading_job": null,
       "model": null,
       "need_gib": null,
       "pid": null,
       "port": null,
-      "serve_id": null
+      "serve_id": null,
+      "stale_config": null
     },
     {
       "category": "EMB",
       "idle_s": null,
       "index": 0,
+      "launched_at": null,
       "loading_job": null,
       "model": null,
       "need_gib": null,
       "pid": null,
       "port": null,
-      "serve_id": null
+      "serve_id": null,
+      "stale_config": null
     }
   ],
   "version": "1.0.0"

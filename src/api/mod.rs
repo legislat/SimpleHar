@@ -983,6 +983,20 @@ async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
 /// (Step 14: one push replaces the page's state).
 async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
     let scheduler = state.scheduler.status().await.map_err(ApiError::from)?;
+    Ok(render_status_document(state, &scheduler).await)
+}
+
+/// The render half of `/har/status`: everything comes from ONE scheduler snapshot
+/// already in hand plus the cached witness/config reads — no model-file stat, no
+/// second actor round-trip. Keeping the fs-free shape explicit is what makes
+/// `/har/status`, the SSE build, and `/har/models` stat-free reads by construction
+/// (Axis-2 ruling 2026-10-29's one-stat-per-event rule: `stale_config`'s stats live
+/// on install, the reload turn, and harness write-backs — pinned by
+/// `the_status_and_models_render_paths_never_touch_the_filesystem` (structural, this
+/// file), `the_snapshot_reads_the_cached_verdict_and_never_stats` (scheduler), and
+/// the api_surface hidden-file leg of
+/// `a_flag_edit_never_ambers_its_own_loaded_model_and_status_never_stats`).
+async fn render_status_document(state: &ApiState, scheduler: &SchedulerStatus) -> Value {
     let categories: Vec<Value> = state
         .config
         .categories
@@ -1017,7 +1031,7 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
     // three fields are now three reads of ONE clone, through the registry's own
     // predicates (`is_down`/`is_pending`), never a re-derived match.
     let verdicts = state.listeners.snapshot();
-    Ok(json!({
+    json!({
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
         "extended_logging": crate::observability::extended_logging(),
@@ -1033,13 +1047,13 @@ async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
         // port, `pending` is a category nobody has spoken for (the tray's amber).
         "listeners_down": verdicts.values().any(crate::listeners::ListenerState::is_down),
         "listeners_pending": verdicts.values().any(crate::listeners::ListenerState::is_pending),
-        "mem": mem_section(state, &scheduler).await,
-        "slots": scheduler.slots,
-        "jobs": scheduler.jobs,
+        "mem": mem_section(state, scheduler).await,
+        "slots": &scheduler.slots,
+        "jobs": &scheduler.jobs,
         "last_error": last_error,
-        "catalog_errors": scheduler.catalog_errors,
+        "catalog_errors": &scheduler.catalog_errors,
         "config_errors": [],
-    }))
+    })
 }
 
 /// The `409` for a catalog that claims one identity twice (FINDINGS-11 [4]).
@@ -1200,13 +1214,51 @@ async fn har_unload(
     })
 }
 
+/// The loaded-side facts for one model row, joined server-side from ONE scheduler
+/// snapshot (Axis 2, ruling 2026-10-29): the page reads these fields and derives
+/// nothing (`stale_config === true` and `launched_at` verbatim are pinned in
+/// `webui`). Same-name occupants (one model serving in two categories) merge
+/// honestly: `launched_at` is the EARLIEST install among them (fixed-width UTC ISO
+/// sorts lexicographically = chronologically), `stale_config` is ANY-of — one
+/// resident on stale bytes makes the row amber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedRow {
+    launched_at: String,
+    stale_config: bool,
+}
+
+fn loaded_rows(slots: &[crate::scheduler::SlotStatus]) -> BTreeMap<String, LoadedRow> {
+    let mut rows: BTreeMap<String, LoadedRow> = BTreeMap::new();
+    for slot in slots {
+        let (Some(model), Some(launched_at)) = (slot.model.as_ref(), slot.launched_at.as_ref())
+        else {
+            continue;
+        };
+        let stale = slot.stale_config.unwrap_or(false);
+        rows.entry(model.clone())
+            .and_modify(|row| {
+                if launched_at < &row.launched_at {
+                    row.launched_at = launched_at.clone();
+                }
+                row.stale_config |= stale;
+            })
+            .or_insert(LoadedRow {
+                launched_at: launched_at.clone(),
+                stale_config: stale,
+            });
+    }
+    rows
+}
+
 /// The one harness-facing model-listing shape: OpenAI fields plus the extras the
-/// page's table renders (A5: `context`, `serve_model`, `model_ref`). Single
-/// builder for `merged_state` and `/har/models` so they cannot drift. The
+/// page's table renders (A5: `context`, `serve_model`, `model_ref`) and the loaded
+/// row's server-computed facts (`launched_at`, `stale_config` — absent when the
+/// model is not loaded, never null: not-loaded is a state, not an empty value).
+/// Single builder for `merged_state` and `/har/models` so they cannot drift. The
 /// client-facing listener `/v1/models` is deliberately minimal — local file
 /// paths stay off the LAN-facing surface.
-fn model_json(entry: &ModelEntry) -> Value {
-    json!({
+fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>) -> Value {
+    let mut body = json!({
         "id": entry.name,
         "object": "model",
         "owned_by": "simplehar",
@@ -1237,15 +1289,25 @@ fn model_json(entry: &ModelEntry) -> Value {
         "context": entry.raw.get("context"),
         "serve_model": entry.serve_model,
         "model_ref": entry.model_ref,
-    })
+    });
+    if let Some(loaded) = loaded {
+        body["launched_at"] = json!(loaded.launched_at);
+        body["stale_config"] = json!(loaded.stale_config);
+    }
+    body
 }
 
 /// The merged document every `har_state` event carries: one push replaces the
 /// page's per-panel polling (Step 14).
 async fn merged_state(state: &ApiState) -> Result<Value, ApiError> {
+    let scheduler = state.scheduler.status().await.map_err(ApiError::from)?;
+    let loaded = loaded_rows(&scheduler.slots);
     let catalog = state.catalog().await?;
-    let models: Vec<Value> = catalog.iter().map(model_json).collect();
-    let mut document = status_document(state).await?;
+    let models: Vec<Value> = catalog
+        .iter()
+        .map(|entry| model_json(entry, loaded.get(&entry.name)))
+        .collect();
+    let mut document = render_status_document(state, &scheduler).await;
     document["models"] = Value::Array(models);
     Ok(document)
 }
@@ -1566,7 +1628,12 @@ async fn har_log(
 /// per-listener `/v1/models` stays category-filtered).
 async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, ApiError> {
     let catalog = state.catalog().await?;
-    let models: Vec<Value> = catalog.iter().map(model_json).collect();
+    let scheduler = state.scheduler.status().await.map_err(ApiError::from)?;
+    let loaded = loaded_rows(&scheduler.slots);
+    let models: Vec<Value> = catalog
+        .iter()
+        .map(|entry| model_json(entry, loaded.get(&entry.name)))
+        .collect();
     Ok(Json(json!({ "object": "list", "data": models })))
 }
 
@@ -1713,6 +1780,15 @@ async fn har_config_model(
     // between the two — 1g's non-atomic defect, not replicated here.
     crate::model::writeback::set_flags_on_file(&path, &refs)
         .map_err(|error| ApiError::from_writeback(&path, error))?;
+    // Axis-2 interlock 5: the harness's own flag edit is not a config change since
+    // launch. Re-baseline any resident's spawn-side capture from this file BEFORE
+    // the reload — the actor's mailbox orders the re-baseline ahead of the reload
+    // turn's verdict refresh, so toggling a flag never amber-dots its own model.
+    if let Some(fingerprint) = crate::model::fingerprint(&path) {
+        state
+            .scheduler
+            .note_model_file_written(&entry.name, &path, fingerprint);
+    }
     // The catalog must reflect the file the moment the operator looks again.
     state.scheduler.reload().await.map_err(ApiError::from)?;
 
@@ -2414,14 +2490,17 @@ mod tests {
         };
         for truthy in ["true", "1", "on"] {
             assert_eq!(
-                model_json(&entry(truthy))["cpu_offload"],
+                model_json(&entry(truthy), None)["cpu_offload"],
                 json!(true),
                 "`{truthy}` is engine-truthy"
             );
         }
-        assert_eq!(model_json(&entry("yes"))["cpu_offload"], json!(false));
-        assert_eq!(model_json(&entry("false"))["cpu_offload"], json!(false));
-        let body = model_json(&entry("true"));
+        assert_eq!(model_json(&entry("yes"), None)["cpu_offload"], json!(false));
+        assert_eq!(
+            model_json(&entry("false"), None)["cpu_offload"],
+            json!(false)
+        );
+        let body = model_json(&entry("true"), None);
         assert_eq!(body["context"], json!("262144"));
         assert_eq!(body["model_ref"], json!(r"F:\m.gguf"));
         assert_eq!(body["cost"], json!("fixed"));
@@ -2449,10 +2528,10 @@ mod tests {
             file: None,
             raw: BTreeMap::new(),
         };
-        let body = model_json(&entry);
+        let body = model_json(&entry, None);
         assert_eq!(body["est_vram_gb"], json!(23.0 * 1.15 + 2.0));
         entry.measured_gb = Some(70.5);
-        let body = model_json(&entry);
+        let body = model_json(&entry, None);
         assert_eq!(body["measured_gb"], json!(70.5));
         assert!(
             body["est_vram_gb"].is_null(),
@@ -2605,6 +2684,126 @@ mod tests {
             Arc::new(crate::budget::LedgerOnlyWitness),
             boot,
         )
+    }
+
+    /// Axis 2 (ruling 2026-10-29): the loaded row's two new facts are server-computed
+    /// and **absent when not loaded** (never null — not-loaded is a state, not an
+    /// empty value), and the same-name merge is honest: earliest launch (fixed-width
+    /// UTC ISO sorts as it compares), any-of stale. Falsifier: emitting nulls for
+    /// unloaded rows (the page would read them as falsy-but-present) or a max/latest
+    /// merge of `launched_at` fails the respective leg.
+    #[test]
+    fn model_json_marks_loaded_rows_and_nobody_else() {
+        let entry = ModelEntry::from_flat(
+            &BTreeMap::from([("name".to_string(), "m".to_string())]),
+            "m",
+        )
+        .expect("entry");
+        let plain = model_json(&entry, None);
+        assert!(
+            plain.get("launched_at").is_none() && plain.get("stale_config").is_none(),
+            "an unloaded row carries neither key, not even null: {plain}"
+        );
+        let loaded = LoadedRow {
+            launched_at: "2026-10-29T03:55:12Z".to_string(),
+            stale_config: true,
+        };
+        let body = model_json(&entry, Some(&loaded));
+        assert_eq!(body["launched_at"], json!("2026-10-29T03:55:12Z"));
+        assert_eq!(body["stale_config"], json!(true));
+
+        let slot = |model: &str, launched: &str, stale: bool| crate::scheduler::SlotStatus {
+            category: CategoryId::Work,
+            index: 0,
+            model: Some(model.to_string()),
+            port: Some(1),
+            pid: Some(1),
+            need_gib: Some(4.0),
+            idle_s: Some(0),
+            serve_id: None,
+            loading_job: None,
+            launched_at: Some(launched.to_string()),
+            stale_config: Some(stale),
+            loaded_at: Instant::now(),
+        };
+        let rows = loaded_rows(&[
+            slot("twin", "2026-05-05T00:00:00Z", false),
+            slot("twin", "2026-01-01T00:00:00Z", true),
+            slot("single", "2026-10-29T03:55:12Z", false),
+        ]);
+        assert_eq!(
+            rows["twin"],
+            LoadedRow {
+                launched_at: "2026-01-01T00:00:00Z".to_string(),
+                stale_config: true,
+            },
+            "same-name occupants merge: EARLIEST launch, ANY stale"
+        );
+        assert!(!rows["single"].stale_config, "clean slot, clean row");
+        assert!(!rows.contains_key("ghost"));
+    }
+
+    /// The structural tier of the status-zero-stat rule (the repo's established
+    /// `include_str!` seam): the render/read bodies that publish `stale_config` and
+    /// `launched_at` may not reach for the filesystem or the clock — the verdict is
+    /// computed only at install, the reload turn, and harness write-backs.
+    ///
+    /// The two-layer contract, stated honestly: the ban-list convicts SYNONYMS
+    /// (bare `fs::` catches `std::fs::` and `tokio::fs::`; `metadata(` catches
+    /// `std::fs::metadata`, `Path::metadata()` and `MetadataExt` spellings;
+    /// `SystemTime::now` is banned because the stamp is stored at the actor for
+    /// exactly that reason), inside these bodies only. What the net CANNOT see: a
+    /// stat whose result is discarded — inert by definition, it cannot move a
+    /// verdict — and a stat behind a helper not on the heads list. Anything whose
+    /// result REACHES the published verdict is convicted by the behavioural tier
+    /// too, regardless of spelling: the cache-probe in `scheduler`'s
+    /// `the_snapshot_reads_the_cached_verdict_and_never_stats` and the api_surface
+    /// hidden-file leg of `a_flag_edit_never_ambers_its_own_loaded_model_and_status_never_stats`.
+    /// Tail sentinels assert each slice covers its body's end.
+    ///
+    /// Falsifier: a `fs::`/`metadata(`/`fingerprint(`/`SystemTime::now` token
+    /// appearing in any scanned body trips this tripwire before a hot-path stall
+    /// can ship — including FINDINGS-BATCH-2026-10-28P [P-1]'s M-E synonym form.
+    #[test]
+    fn the_status_and_models_render_paths_never_touch_the_filesystem() {
+        let source = include_str!("mod.rs");
+        for (head, tail) in [
+            ("async fn render_status_document(", "\"config_errors\""),
+            ("fn loaded_rows(", "or_insert"),
+            ("fn model_json(", "stale_config"),
+            ("async fn har_models(", "\"object\": \"list\""),
+            ("async fn merged_state(", "Value::Array(models)"),
+        ] {
+            let start = source
+                .find(head)
+                .unwrap_or_else(|| panic!("{head} is still here"));
+            let close = source[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("{head} closes at column 0"));
+            let body = &source[start..start + close];
+            assert!(
+                body.contains(tail),
+                "the scan slice must reach {head}'s tail (early-close fragility)"
+            );
+            for banned in [
+                "fs::",
+                "fingerprint(",
+                "read_to_string(",
+                "metadata(",
+                "modified(",
+                "try_exists",
+                "File::",
+                "FileTimes",
+                "OpenOptions",
+                "SystemTime::now",
+                "read_dir",
+            ] {
+                assert!(
+                    !body.contains(banned),
+                    "`{head}` may only render cached scheduler/config state; found `{banned}`"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3808,6 +4007,8 @@ mod tests {
             idle_s: Some(0),
             serve_id: Some("mock-model".to_string()),
             loading_job: None,
+            launched_at: None,
+            stale_config: None,
             loaded_at,
         }
     }
@@ -3900,6 +4101,8 @@ mod tests {
             idle_s: None,
             serve_id: None,
             loading_job: None,
+            launched_at: None,
+            stale_config: None,
             loaded_at: now,
         };
         let status = SchedulerStatus {

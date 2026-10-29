@@ -255,6 +255,9 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
 .sh-dot[data-state="serving"] { background: var(--sh-accent-solid); }
 .sh-dot[data-state="loading"] { background: var(--sh-warn); }
 .sh-dot[data-state="failed"] { background: var(--sh-bad); }
+/* Axis 2 (ruling 2026-10-29): a serving row whose config file moved since launch.
+   The tray's listener amber is a different palette; this is the config one. */
+.sh-dot[data-stale="amber"] { background: var(--sh-warn); }
 
 .sh-row-actions { display: flex; gap: 0.35rem; justify-content: flex-end; }
 .sh-row-actions button { padding: 0.25rem 0.7rem; font-size: 0.8rem; margin: 0; }

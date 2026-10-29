@@ -121,6 +121,56 @@ mod tests {
         );
     }
 
+    /// Axis 2 (operator ruling 2026-10-29): the row dot's amber reads the SERVER's
+    /// boolean directly (`model.stale_config === true`, the exact-compare the K-round
+    /// listener-verdict rule demands — `undefined` must not slip through as truthy),
+    /// carries the ruling's tooltip wording, and prints `model.launched_at` verbatim
+    /// with no client-side date math (the only `new Date(` the page may keep is the
+    /// log panel's pre-existing `entry.ts_ms` formatting — asserted scoped, not
+    /// blanket-absent). The amber rule's existence in the served stylesheet is pinned
+    /// at the byte level because CSS is untestable in the DOM stub (GOTCHAS [ui]).
+    ///
+    /// Nature, declared: a source-content assertion over the exact `include_str!`
+    /// bytes `/app.js` and `/style.css` answer (not a render test — the render legs
+    /// are `tests/webui/webui_dom_test.mjs`).
+    ///
+    /// # Falsifier
+    ///
+    /// Drop the `=== true` and the exact-compare assert fails; re-derive staleness
+    /// page-side from file times (a `Date` around `launched_at`) and the scoped
+    /// absence asserts fail; delete the CSS rule and its assert fails.
+    #[test]
+    fn served_app_js_renders_the_stale_bool_and_launch_stamp_as_given() {
+        assert!(
+            APP_JS.contains("model.stale_config === true"),
+            "the amber must read the server's own boolean exactly"
+        );
+        assert!(
+            APP_JS.contains("\"data-stale\": \"amber\""),
+            "the serving row's stale marker must carry the attribute the stylesheet paints"
+        );
+        assert!(
+            APP_JS.contains(
+                "title: \"config file changed since launch \\u2014 unload + reload to apply\""
+            ),
+            "the tooltip must be the ruling's true sentence, byte-exact"
+        );
+        assert!(
+            APP_JS.contains("model.launched_at ? [text(` \\u00b7 launched ${model.launched_at}`)]"),
+            "the launch stamp must render verbatim from the server's string"
+        );
+        for derived in ["new Date(model", "Date.parse(model", "launched_at.toLocale"] {
+            assert!(
+                !APP_JS.contains(derived),
+                "no date math around the launch field: found `{derived}`"
+            );
+        }
+        assert!(
+            STYLE_CSS.contains(".sh-dot[data-stale=\"amber\"]") && STYLE_CSS.contains("--sh-warn"),
+            "the amber needs a rule in the served stylesheet or it renders as the green dot"
+        );
+    }
+
     /// FINDINGS-16 [4]: the header badge reads the two verdicts `/har/status` computes
     /// and no longer decodes the serde shape of `listeners` in the browser.
     ///

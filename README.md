@@ -169,14 +169,22 @@ until one is renamed.
 `http://127.0.0.1:8708/` — slot cards + memory bars (observed VRAM from the card's
 own reading, with the reserve marked as a hatched band and in-flight bookings noted, host RAM), category tabs, per-model rows
 (Load / Set default, state dot + name, category select, CPU checkbox, Engine,
-Ctx, Cost, Files), recent jobs, collapsible harness log.
-Updates push over SSE (`/har/events`) and degrade to polling; adaptive light/dark
+Ctx, Cost, Files), recent jobs, collapsible harness log. A loaded row also shows
+`launched_at` — the wall-clock moment its engine became serving, formatted by the
+server (ISO-8601 UTC, printed verbatim) — and its dot turns **amber** while
+`stale_config` says the model's yaml differs from the bytes that launch used: the
+verdict is recomputed only at install and on Rescan (the status path never touches
+the file), the tooltip reads "config file changed since launch — unload + reload to
+apply", and the amber is info only: the resident keeps serving, keeps its measured
+range, and is evicted like any other. Updates push over SSE (`/har/events`) and
+degrade to polling; adaptive light/dark
 theme with a toggle.
 
 ## Tray
 
 Four states: green = loaded, yellow = swap in flight, gray = idle, **red =
-listener down**. Left-click does nothing; the menu offers Open Web UI, Unload
+listener down** — the listener palette only; the page's config amber never drives
+the icon. Left-click does nothing; the menu offers Open Web UI, Unload
 All / per-category, Exit.
 
 ## HTTP control API (control listener, 8708)

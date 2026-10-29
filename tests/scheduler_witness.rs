@@ -366,6 +366,78 @@ async fn serving_window_folds_total_diff_into_the_yaml_measured_range() {
     );
 }
 
+#[tokio::test]
+async fn the_measured_fold_never_ambers_its_own_resident() {
+    // Interlock 5 end-to-end (Axis 2, ruling 2026-10-29): the fold rewrites the
+    // resident's own yaml with `measured_*` keys — bytes the install-time capture
+    // never saw. The success path re-baselines that capture (ModelFileWritten), so
+    // the next rescan must find the resident clean; a `false` here on both legs
+    // would also be green if the verdict machinery were dead, so the operator-edit
+    // leg proves it alive. Falsifier: no-op the fold's success-path send (or
+    // `on_model_file_written`) and the post-fold rescan ambers — the first assert
+    // fails.
+    let witness = FakeWitness::with(vec![sample(72.0, 30.0, vec![])]);
+    let cfg = AppConfig {
+        measured_sample_s: 1,
+        ..AppConfig::default()
+    };
+    let (handle, dir) = harness_models(
+        cfg,
+        &[("foldy", CategoryId::Work, 8.0)],
+        Arc::new(witness.clone()),
+    );
+    let Reply::Loaded(_) = handle
+        .swap("foldy", CategoryId::Work)
+        .await
+        .expect("foldy loads")
+    else {
+        panic!("expected Loaded");
+    };
+    // The card filling by 10 GiB is foldy's own footprint: the fold writes
+    // measured_gb/min into the yaml.
+    witness.set(sample(72.0, 40.0, vec![]));
+    await_measured(&handle, "foldy", (Some(10.0), Some(10.0))).await;
+    // FINDINGS-BATCH-2026-10-28P [P-2], measured not fixed: `await_measured` sees
+    // the in-memory commit, so the rename+note land a few syscalls later; the
+    // reload's ScanFinished can only beat the note if the blocking thread stalls
+    // between them. Stress evidence: 40/40 targeted runs under 6 concurrent suites
+    // + 5 clean full suites, zero flakes. If this pin ever goes red on these two
+    // asserts, do NOT disable it — add the reviewer's sync point: subscribe before
+    // the swap and await one more publish after `await_measured` (the note handler
+    // publishes), then reload.
+    let path = dir.join("foldy.yaml");
+    let yaml = std::fs::read_to_string(&path).expect("yaml readable");
+    assert!(
+        yaml.contains("measured_gb: 10.0"),
+        "the fold really rewrote the resident's yaml (the pin would be vacuous otherwise): {yaml}"
+    );
+    handle.reload().await.expect("rescan applied");
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        status
+            .slots
+            .iter()
+            .find(|s| s.model.as_deref() == Some("foldy"))
+            .and_then(|s| s.stale_config),
+        Some(false),
+        "the harness's own fold must never amber its own model"
+    );
+    // Verdict machinery alive: an operator edit + rescan DOES amber.
+    let with_note = format!("{yaml}# operator note\n");
+    std::fs::write(&path, with_note).expect("operator edit");
+    handle.reload().await.expect("rescan applied");
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        status
+            .slots
+            .iter()
+            .find(|s| s.model.as_deref() == Some("foldy"))
+            .and_then(|s| s.stale_config),
+        Some(true),
+        "if the fold leg could not amber anything, the first assert was vacuous — this leg proves it could"
+    );
+}
+
 /// The measured pair currently on a catalog entry.
 async fn measured_of(handle: &SchedulerHandle, model: &str) -> (Option<f64>, Option<f64>) {
     let catalog = handle.catalog().await.expect("actor alive");

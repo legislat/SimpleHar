@@ -1226,6 +1226,127 @@ async fn config_model_reports_writeback_refusals_by_http_class() {
 }
 
 #[tokio::test]
+async fn a_flag_edit_never_ambers_its_own_loaded_model_and_status_never_stats() {
+    // Axis-2 interlock 5 (api side) plus the zero-stat counter-probe, together on
+    // the surface the page reads:
+    //  * the loaded row carries `launched_at` (server-formatted) + `stale_config`
+    //    false, and an unloaded row carries NEITHER key (absent, not null);
+    //  * the harness's own `cpu` edit rewrites the yaml through the handler's
+    //    reload and must not amber its own model (re-baseline rides the write);
+    //  * with the file deleted from under the readers, `/har/models` and
+    //    `/har/status` keep answering from cache — a status path that statted the
+    //    model file would flip the verdict here (behavioural leg; the structural
+    //    leg is the api-source tripwire in the lib tests);
+    //  * and the verdict IS alive: the next rescan accuses the deleted file.
+    // Falsifier: drop the `note_model_file_written` send in `har_config_model` and
+    // the post-edit assert fails — the handler's own reload ambering the row it
+    // just edited is the exact UX lie the interlock forbids.
+    let (control, _work, _rp, _aux, _runtime, modelconf) = build_app(
+        AppConfig::default(),
+        &[
+            ("llamaline", "llama", CategoryId::Work, Some(4.0)),
+            ("plainrow", "mock", CategoryId::Work, Some(4.0)),
+        ],
+        &[("llama", Arc::new(MockAdapter))],
+    );
+    let (_, body) = get_json(&control, "/har/models").await;
+    let row_of = |body: &Value, id: &str| -> Value {
+        body["data"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .find(|m| m["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} in the listing: {body}"))
+    };
+    let unloaded = row_of(&body, "plainrow");
+    assert!(
+        unloaded.get("launched_at").is_none() && unloaded.get("stale_config").is_none(),
+        "absent when not loaded, never null: {unloaded}"
+    );
+
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"llamaline"}"#).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (_, body) = get_json(&control, "/har/models").await;
+    let loaded = row_of(&body, "llamaline");
+    let stamp = loaded["launched_at"]
+        .as_str()
+        .expect("server-formatted stamp")
+        .to_string();
+    assert_eq!(
+        stamp.len(),
+        20,
+        "ISO-8601 seconds, printed verbatim by the page: {stamp}"
+    );
+    assert_eq!(loaded["stale_config"], false, "{loaded}");
+    assert!(
+        row_of(&body, "plainrow").get("launched_at").is_none(),
+        "the edit rode only the loaded row"
+    );
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"llamaline","cpu":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (_, body) = get_json(&control, "/har/models").await;
+    let after_edit = row_of(&body, "llamaline");
+    assert_eq!(after_edit["cpu_offload"], true, "{after_edit}");
+    assert_eq!(
+        after_edit["stale_config"], false,
+        "the harness's own flag edit never ambers its own model"
+    );
+    assert_eq!(
+        after_edit["launched_at"].as_str(),
+        Some(stamp.as_str()),
+        "and never moves the launch stamp"
+    );
+
+    // Counter-probe: the file leaves the disk entirely; the read paths answer from
+    // cache, verdict unmoved (a statting status path would flip it right here).
+    std::fs::remove_file(modelconf.join("llamaline.yaml")).expect("delete the yaml");
+    let (status, models) = get_json(&control, "/har/models").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the model list still serves from cache"
+    );
+    let hidden = row_of(&models, "llamaline");
+    assert_eq!(
+        hidden["stale_config"], false,
+        "the verdict is a cache, not a stat: {hidden}"
+    );
+    assert_eq!(hidden["launched_at"].as_str(), Some(stamp.as_str()));
+    let (status, doc) = get_json(&control, "/har/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let slot = doc["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .find(|s| s["model"] == "llamaline")
+        .expect("the resident still holds its slot");
+    assert_eq!(slot["stale_config"], false, "status answers from cache too");
+
+    // The verdict is alive: the rescan accuses the deleted file (the marker's
+    // deleted-file leg, end to end).
+    let (status, _) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, doc) = get_json(&control, "/har/status").await;
+    let slot = doc["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .find(|s| s["model"] == "llamaline")
+        .expect("reload never unloads the resident");
+    assert_eq!(
+        slot["stale_config"], true,
+        "a vanished file is evidence of change: the amber lands on the rescan"
+    );
+}
+
+#[tokio::test]
 async fn cpu_edit_is_refused_on_models_whose_engine_never_reads_the_key() {
     // FINDINGS-BATCH-2026-10-28F [3]: with B shipped, a scripted `cpu` write to a
     // strata (or mock) row would make the harness itself the #1 producer of the

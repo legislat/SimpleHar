@@ -341,6 +341,57 @@ const driver = `
   check("llama rows keep their CPU checkbox",
     cpuBoxes["measuredone"] === 1 && cpuBoxes["rangeone"] === 1,
     JSON.stringify(cpuBoxes));
+
+  // Axis 2 (ruling 2026-10-29): the amber and the launch stamp are SERVER verdicts
+  // rendered as given — stale_config === true paints the dot amber with the true
+  // tooltip, launched_at prints verbatim, and an unloaded row (no field) prints
+  // neither.
+  const launchedStamp = "2026-10-29T03:55:12Z";
+  applyState({
+    ...fixtures["/har/status"],
+    slots: [{ category: "WORK", index: 0, model: "staleone", port: 8111, pid: 1,
+      need_gib: 4.0, idle_s: 0, serve_id: null, loading_job: null,
+      launched_at: launchedStamp, stale_config: true }],
+    models: [
+      { id: "staleone", engine: "llama", category: "WORK", vram_gb: 4, cost: "fixed",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "F:/s.gguf", serve_model: null, cpu_offload: false,
+        launched_at: launchedStamp, stale_config: true },
+      { id: "cleanone", engine: "llama", category: "WORK", vram_gb: 4, cost: "fixed",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "F:/c.gguf", serve_model: null, cpu_offload: false,
+        launched_at: "2026-10-29T04:00:00Z", stale_config: false },
+      { id: "unloadedone", engine: "llama", category: "WORK", vram_gb: 4, cost: "fixed",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "F:/u.gguf", serve_model: null, cpu_offload: false },
+    ],
+  });
+  const staleMarks = {};
+  const nameCells = {};
+  for (const tr of findAll(document.getElementById("sh-main"), "tr")) {
+    const tds = findAll(tr, "td");
+    const strong = tds.map((td) => findAll(td, "strong")[0]).find(Boolean);
+    if (!strong) continue;
+    const cell = tds.find((td) => td.attrs.class === "sh-name");
+    const dot = findAll(cell, "span", "sh-dot")[0];
+    staleMarks[textOf(strong)] = dot && dot.attrs["data-stale"] === "amber"
+      ? dot.attrs.title : null;
+    nameCells[textOf(strong)] = cell ? textOf(cell) : "";
+  }
+  check("stale resident dot is amber with the true tooltip",
+    staleMarks["staleone"] === "config file changed since launch \u2014 unload + reload to apply",
+    String(staleMarks["staleone"]));
+  check("a row the server did not mark stale has no amber marker",
+    staleMarks["cleanone"] === null && staleMarks["unloadedone"] === null,
+    JSON.stringify(staleMarks));
+  check("launch stamp prints verbatim on the loaded rows",
+    nameCells["staleone"].includes(launchedStamp)
+      && nameCells["cleanone"].includes("2026-10-29T04:00:00Z"),
+    nameCells["staleone"] + " | " + nameCells["cleanone"]);
+  check("unloaded row prints no launch stamp",
+    !nameCells["unloadedone"].includes("launched"),
+    nameCells["unloadedone"]);
+
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
 
   // ---- FINDINGS-16 [4]: the header badge reads the server-computed verdicts ----

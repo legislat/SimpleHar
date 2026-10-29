@@ -2987,3 +2987,142 @@ async fn rescan_retires_a_parked_twin_of_a_serving_model_without_touching_the_sl
         "no engine ever spawned for the retired twin"
     );
 }
+
+#[tokio::test]
+async fn a_serving_model_gains_its_launch_stamp_and_ambers_on_the_next_rescan() {
+    // Axis-2 end-to-end, resident side (ruling 2026-10-29): the serving slot
+    // carries the server-formatted wall-clock launch stamp from INSTALL, the
+    // verdict moves ONLY on a rescan (the pre-rescan leg proves the status path
+    // never stats), and the stamp never moves under the marker.
+    // Falsifier: removing the install-time capture makes the rescan unable to
+    // amber (third assert); computing the verdict in the snapshot flips the
+    // pre-rescan assert early.
+    let (handle, _runtime, dir, _gate) =
+        drift_harness(&[("stamponly", "mock", CategoryId::Work, Some(4.0), "")], 1);
+    let Reply::Loaded(_receipt) = handle
+        .swap("stamponly", CategoryId::Work)
+        .await
+        .expect("stamponly loads")
+    else {
+        panic!("expected Loaded");
+    };
+    let status = handle.status().await.expect("actor alive");
+    let slot = status
+        .slots
+        .iter()
+        .find(|s| s.category == CategoryId::Work)
+        .expect("WORK slot");
+    assert_eq!(slot.model.as_deref(), Some("stamponly"));
+    let stamp = slot
+        .launched_at
+        .clone()
+        .expect("a serving slot carries its wall-clock launch, server-formatted");
+    assert_eq!(stamp.len(), 20, "fixed-width ISO-8601 seconds: {stamp}");
+    assert_eq!(&stamp[4..5], "-");
+    assert_eq!(
+        &stamp[10..11],
+        "T",
+        "the delimiter the page prints verbatim: {stamp}"
+    );
+    assert!(
+        stamp.ends_with('Z'),
+        "UTC, no client-side offset math: {stamp}"
+    );
+    assert_eq!(slot.stale_config, Some(false), "clean at install");
+
+    std::fs::write(
+        dir.join("stamponly.yaml"),
+        "name: stamponly\nengine: mock\ncategory: WORK\nvram_gb: 44\n",
+    )
+    .expect("operator edit");
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        status
+            .slots
+            .iter()
+            .find(|s| s.category == CategoryId::Work)
+            .and_then(|s| s.stale_config),
+        Some(false),
+        "an edit is invisible to status reads until a rescan: stat on reload/install ONLY"
+    );
+    handle.reload().await.expect("rescan applied");
+    let status = handle.status().await.expect("actor alive");
+    let slot = status
+        .slots
+        .iter()
+        .find(|s| s.category == CategoryId::Work)
+        .expect("WORK slot");
+    assert_eq!(slot.stale_config, Some(true), "the rescan is the judge");
+    assert_eq!(
+        slot.launched_at.as_deref(),
+        Some(stamp.as_str()),
+        "the launch stamp rides the install, not the marker"
+    );
+}
+
+#[tokio::test]
+async fn one_edit_retires_the_queue_and_ambers_the_resident_on_the_same_rescan() {
+    // Interlock 3: the same operator edit, one rescan, two honest surfaces — the
+    // parked intent retires with the round-1 rescan wording AND the resident of
+    // the same model ambers. Neither may swallow the other, and the armed (frozen)
+    // swap is untouched by both. Falsifier: retiring the resident kills the slot
+    // assert; queue-only marking kills the stale assert.
+    let (handle, runtime, dir, _gate) = drift_harness(
+        &drift_specs(DRIFT_RESIDENT, DRIFT_FROZEN, DRIFT_QUEUED, CategoryId::Work),
+        1,
+    );
+    let (_resident, _queued_reply) = drift_park(
+        &handle,
+        DRIFT_RESIDENT,
+        DRIFT_FROZEN,
+        DRIFT_QUEUED,
+        CategoryId::Work,
+    )
+    .await;
+    let client = handle.clone();
+    let name = DRIFT_RESIDENT.to_string();
+    let twin = tokio::spawn(async move { client.swap(&name, CategoryId::Work).await });
+    wait_until(&handle, 5, |s| {
+        s.jobs.iter().any(|j| {
+            j.model == DRIFT_RESIDENT
+                && j.kind == JobKind::Load
+                && !j.terminal
+                && j.state == SwapState::Idle
+        })
+    })
+    .await;
+    std::fs::write(
+        dir.join(format!("{DRIFT_RESIDENT}.yaml")),
+        "name: drift-resident\nengine: mock-hold-kill\ncategory: WORK\nvram_gb: 44\n",
+    )
+    .expect("edit the resident's yaml");
+    handle.reload().await.expect("rescan applied");
+    let answered = twin
+        .await
+        .expect("twin caller alive")
+        .expect_err("the parked intent retires");
+    assert!(
+        matches!(&answered, SchedulerError::Cancelled(reason)
+            if reason.contains("superseded by rescan") && reason.contains("changed since queued")),
+        "{answered:?}"
+    );
+    let status = handle.status().await.expect("actor alive");
+    let slot = status
+        .slots
+        .iter()
+        .find(|s| s.category == CategoryId::Work)
+        .expect("WORK slot");
+    assert_eq!(
+        slot.model.as_deref(),
+        Some(DRIFT_RESIDENT),
+        "the resident still serves"
+    );
+    assert_eq!(
+        slot.stale_config,
+        Some(true),
+        "and the same rescan ambers it — the pair lands together"
+    );
+    runtime.release_held_kills();
+    wait_until(&handle, 10, |s| s.jobs.iter().all(|j| j.terminal)).await;
+    assert_eq!(runtime.spawn_count(), 1, "no engine for the retired intent");
+}

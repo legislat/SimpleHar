@@ -164,6 +164,17 @@ pub struct SlotStatus {
     pub serve_id: Option<String>,
     /// Job currently running for this slot, if any.
     pub loading_job: Option<JobId>,
+    /// Wall-clock launch of the occupant, server-formatted ISO-8601 UTC
+    /// (Axis-2 ruling 2026-10-29: the operator sees when the model launched; the
+    /// page prints this string verbatim — no date math in the browser). Empty slot:
+    /// absent.
+    pub launched_at: Option<String>,
+    /// The server-computed `stale_config` verdict for the occupant (Axis 2 = B):
+    /// `true` when the model's yaml differs — by the install-time fingerprint —
+    /// from the bytes this engine launched from. Refreshed only at install, on the
+    /// reload turn, and on harness write-backs; reading it performs no stat.
+    /// Empty slot: absent.
+    pub stale_config: Option<bool>,
     /// When the occupant was loaded (copy of the actor's `Occupant::loaded_at`).
     /// Empty slots carry the snapshot time, mirroring the `map_or(Instant::now(),
     /// |o| o.loaded_at)` policy of the scheduler's own LRU picks. Not serialized:
@@ -444,6 +455,25 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ActorGone)
     }
 
+    /// Tells the actor that a harness-owned writer just rewrote this model's own
+    /// yaml, carrying the post-write fingerprint (Axis-2 interlock 5: the measured
+    /// fold and the API's flag edit must never amber their own model). Send it
+    /// **before** `reload()` when one follows: the actor's mailbox orders the
+    /// re-baseline ahead of the reload's verdict refresh. Fire-and-forget — a gone
+    /// actor means no resident left to mark.
+    pub fn note_model_file_written(
+        &self,
+        model: &str,
+        path: &std::path::Path,
+        fingerprint: crate::model::FileFingerprint,
+    ) {
+        let _ = self.tx.send(ActorMsg::ModelFileWritten {
+            model: model.to_string(),
+            path: path.to_path_buf(),
+            fingerprint,
+        });
+    }
+
     async fn call(&self, cmd: Command) -> Result<Reply, SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -561,6 +591,16 @@ enum ActorMsg {
         offload: Option<bool>,
         file: Option<PathBuf>,
     },
+    /// A harness-owned writer just rewrote a resident model's own yaml (the measured
+    /// persist's success path, or `har_config_model`'s edit — the complete list):
+    /// re-baseline that resident's spawn-side capture so the harness's own write is
+    /// never a "config changed since launch" (Axis-2 interlock 5). Carries the
+    /// fingerprint the writer took directly after its atomic rename, off-thread.
+    ModelFileWritten {
+        model: String,
+        path: PathBuf,
+        fingerprint: crate::model::FileFingerprint,
+    },
     /// Periodic sweep from the tick task: idles out occupants per category policy.
     Tick,
     Event {
@@ -599,6 +639,26 @@ struct Occupant {
     port: u16,
     ticket: SpawnTicket,
     loaded_at: Instant,
+    /// Wall-clock counterpart of `loaded_at`, taken at the same install (the moment
+    /// the engine started serving — not the spawn: a cold start runs seconds to
+    /// minutes before anyone is served, and the operator's question is when this
+    /// model became reachable). `Instant` has no wall-clock meaning outside the
+    /// process, so the human-facing launch stamp needs `SystemTime`
+    /// (Axis-2 ruling 2026-10-29: "the operator can always see ... launch model
+    /// time").
+    launched_at_wall: std::time::SystemTime,
+    /// The model's yaml as this launch came from: the fold anchor's file paired with
+    /// its install-time stat — the spawn-side half of the `stale_config` verdict
+    /// (Axis 2 = B). Composed with the anchor, not copied from it: the fold keeps
+    /// writing through its own handle. `None` = no backing file, or the stat was
+    /// unreadable at install: no capture, and the verdict never accuses on absence
+    /// of evidence (same posture as the queued row's KEEP legs).
+    spawn_config: Option<(PathBuf, crate::model::FileFingerprint)>,
+    /// The cached verdict the snapshot reads (zero fs on the status path,
+    /// FINDINGS2-04 [2]): refreshed at install, on the reload turn
+    /// ([`ActorState::refresh_stale_markers`]) and on the harness's own
+    /// [`ActorState::on_model_file_written`] — never anywhere else.
+    stale_config: bool,
     /// The engine's self-reported model id (discovered at readiness, F-4 fix);
     /// proxy rewriting targets this, falling back to the harness name.
     serve_id: Option<String>,
@@ -965,6 +1025,14 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 offload,
                 file,
             } => state.on_measured_persist_failed(&model, high, low, offload, file),
+            ActorMsg::ModelFileWritten {
+                model,
+                path,
+                fingerprint,
+            } => {
+                state.on_model_file_written(&model, &path, fingerprint);
+                state.publish();
+            }
             ActorMsg::Tick => {
                 state.on_tick();
                 state.publish();
@@ -1133,6 +1201,73 @@ impl ActorState {
         self.catalog = models;
         self.catalog_errors = errors;
         self.invalidate_queued_loads();
+        self.refresh_stale_markers();
+    }
+
+    /// The resident half of reload (Axis 2 = B, operator ruling 2026-10-29): on the
+    /// reload turn — and only here, at install, and on a harness write-back — the
+    /// `stale_config` verdict is recomputed for every resident: the yaml it launched
+    /// from, re-stat'ed, against the install-time capture. The status/SSE path reads
+    /// this cache and performs zero fs syscalls (FINDINGS2-04 [2]'s one-stat-per-event
+    /// rule extended to the marker; pinned by the api-side hidden-file counter-probe).
+    ///
+    /// Verdict rules, stated plainly:
+    /// - no capture (synthetic row, or the stat failed at install): never accuses;
+    ///   absence of evidence is not evidence of change (the queued rows' KEEP posture).
+    /// - capture exists, current stat `None` (file deleted/volume ejected since
+    ///   launch): accuses — the file demonstrably is not what it was.
+    /// - capture exists, stat differs (either leg): accuses. The comparison is
+    ///   against the SPAWN capture, so re-saving byte-identical content does not
+    ///   clear the verdict (the mtime moved) — honest conservatism: the operator's
+    ///   gesture that matters is unload + reload, and a respawned engine re-captures
+    ///   cleanly.
+    fn refresh_stale_markers(&mut self) {
+        for slot in &mut self.slots {
+            let Some(occupant) = slot.occupant.as_mut() else {
+                continue;
+            };
+            let Some((file, then)) = occupant.spawn_config.as_ref() else {
+                continue;
+            };
+            let then = *then;
+            occupant.stale_config = crate::model::fingerprint(file) != Some(then);
+        }
+    }
+
+    /// Re-baselines the spawn-side capture after a **harness-owned** write to a
+    /// resident's own yaml (Axis-2 interlock 5: the measured fold and the API's flag
+    /// edit must never amber their own model). The legitimate mutators are a CLOSED
+    /// set — the measured persist (this file's fold success path) and
+    /// `har_config_model`'s rewrite (api, note sent before its reload) — and the
+    /// closure is pinned by `the_writeback_mutator_set_stays_closed_to_the_rebaseline_table`
+    /// (FINDINGS-BATCH-2026-10-28P [P-4]): a new writer must register here with its
+    /// note, or the amber accuses the harness of its own edit.
+    ///
+    /// A verdict already `true` is never erased: only a clean resident re-baselines.
+    /// Known accepted edge (mirrors 28O [O-7]'s over-retirement in the opposite
+    /// direction): an operator edit that was never seen by a rescan can be folded
+    /// under a later harness write's re-baseline — the window closes on the next
+    /// unload + reload, which is the operator's apply gesture anyway.
+    fn on_model_file_written(
+        &mut self,
+        model: &str,
+        path: &std::path::Path,
+        written: crate::model::FileFingerprint,
+    ) {
+        for slot in &mut self.slots {
+            let Some(occupant) = slot.occupant.as_mut() else {
+                continue;
+            };
+            if occupant.model == model
+                && !occupant.stale_config
+                && occupant
+                    .spawn_config
+                    .as_ref()
+                    .is_some_and(|(file, _)| file == path)
+            {
+                occupant.spawn_config = Some((path.to_path_buf(), written));
+            }
+        }
     }
 
     /// The queued-intent half of reload (Axis 1 = **1b**, operator ruling
@@ -1874,24 +2009,39 @@ impl ActorState {
                 if let Some(stamp) = stamp_text.as_deref() {
                     edits.push(("measured_offload", Some(stamp)));
                 }
-                if let Err(error) = crate::model::writeback::set_flags_on_file(&path, &edits) {
-                    tracing::warn!(
-                        error = %error,
-                        model = %name,
-                        "cannot persist the measured range"
-                    );
-                    // Warn alone left memory booking a range the file never got
-                    // (FINDINGS-13 [4]'s degraded tail): hand the exact refused
-                    // triple back to the actor, which drains it from the catalog.
-                    // The file rides with it so the drain can only land on the row
-                    // this write targeted — never on a same-name twin.
-                    let _ = tx.send(ActorMsg::MeasuredPersistFailed {
-                        model: name,
-                        high,
-                        low,
-                        offload,
-                        file: Some(anchor_file),
-                    });
+                match crate::model::writeback::set_flags_on_file(&path, &edits) {
+                    Ok(()) => {
+                        // Axis-2 interlock 5: the fold's own bytes are not a config
+                        // change since launch. The fingerprint rides from here —
+                        // off-thread, directly after the atomic rename — so the
+                        // resident's cached verdict never amber-self over a measurement.
+                        if let Some(fingerprint) = crate::model::fingerprint(&path) {
+                            let _ = tx.send(ActorMsg::ModelFileWritten {
+                                model: name,
+                                path,
+                                fingerprint,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            model = %name,
+                            "cannot persist the measured range"
+                        );
+                        // Warn alone left memory booking a range the file never got
+                        // (FINDINGS-13 [4]'s degraded tail): hand the exact refused
+                        // triple back to the actor, which drains it from the catalog.
+                        // The file rides with it so the drain can only land on the row
+                        // this write targeted — never on a same-name twin.
+                        let _ = tx.send(ActorMsg::MeasuredPersistFailed {
+                            model: name,
+                            high,
+                            low,
+                            offload,
+                            file: Some(anchor_file),
+                        });
+                    }
                 }
             });
         }
@@ -3052,12 +3202,30 @@ impl ActorState {
             if let Some(job) = self.jobs.get_mut(&job_id) {
                 job.other_need_at_admit = others_booked;
             }
+            // Axis 2 (ruling 2026-10-29): capture the yaml this launch came from at
+            // install — one stat, on the actor, for the one event that creates a
+            // resident. The path is the fold anchor's own file (the identity the
+            // measured persist writes), so the marker and the fold never drift onto
+            // different files; an unreadable stat (or a synthetic row) yields no
+            // capture, and the verdict then never accuses.
+            let spawn_config = self
+                .jobs
+                .get(&job_id)
+                .and_then(|job| job.measured.as_ref())
+                .and_then(|anchor| {
+                    anchor.file.as_ref().and_then(|file| {
+                        crate::model::fingerprint(file).map(|fp| (file.clone(), fp))
+                    })
+                });
             self.slots[slot].occupant = Some(Occupant {
                 model: job_model,
                 need: job_need,
                 port: port.port,
                 ticket: job_ticket.clone(),
                 loaded_at: Instant::now(),
+                launched_at_wall: std::time::SystemTime::now(),
+                spawn_config,
+                stale_config: false,
                 serve_id: serve_id.clone(),
                 measure: None,
             });
@@ -3427,6 +3595,11 @@ impl ActorState {
                     }),
                     serve_id: s.occupant.as_ref().and_then(|o| o.serve_id.clone()),
                     loading_job: s.job,
+                    launched_at: s
+                        .occupant
+                        .as_ref()
+                        .map(|o| crate::model::iso8601_utc(o.launched_at_wall)),
+                    stale_config: s.occupant.as_ref().map(|o| o.stale_config),
                     loaded_at: s.occupant.as_ref().map_or(now, |o| o.loaded_at),
                 })
                 .collect(),
@@ -3898,6 +4071,9 @@ mod tests {
                 port,
                 ticket: ticket.clone(),
                 loaded_at: Instant::now(),
+                launched_at_wall: std::time::SystemTime::now(),
+                spawn_config: None,
+                stale_config: false,
                 serve_id: None,
                 measure: None,
             }),
@@ -4821,6 +4997,9 @@ mod tests {
                 port: 19_004,
                 ticket: unanchored.clone(),
                 loaded_at: Instant::now(),
+                launched_at_wall: std::time::SystemTime::now(),
+                spawn_config: None,
+                stale_config: false,
                 serve_id: None,
                 measure: None,
             }),
@@ -4976,6 +5155,420 @@ mod tests {
             "{:?}",
             state.jobs[&id].error
         );
+    }
+
+    /// Shared fixture for the Axis-2 resident pins: one `ActorState` with one
+    /// resident whose `spawn_config` is a real capture of a real yaml (the state
+    /// `install` produces — same fields, taken from the same helper), the file's
+    /// fingerprint, and the entry pair the fold would have written.
+    fn resident_on_a_file() -> (
+        ActorState,
+        std::path::PathBuf,
+        crate::model::FileFingerprint,
+    ) {
+        let dir = crate::testutil::temp_dir("stale-resident");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let yaml = dir.join("m.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 10.0\nmeasured_gb_min: 8.0\n",
+        )
+        .expect("seed");
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+        let capture = crate::model::fingerprint(&yaml).expect("seeded file fingerprints");
+        let ticket = SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 4242,
+            port: 18_431,
+        };
+        state.catalog = vec![entry_from(&yaml, "m")];
+        state.slots = vec![Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_431,
+            occupant: Some(Occupant {
+                model: "m".to_string(),
+                need: Gibibytes(4.0),
+                port: 18_431,
+                ticket,
+                loaded_at: Instant::now(),
+                launched_at_wall: std::time::SystemTime::now(),
+                spawn_config: Some((yaml.clone(), capture)),
+                stale_config: false,
+                serve_id: None,
+                measure: None,
+            }),
+            job: None,
+        }];
+        (state, yaml, capture)
+    }
+
+    fn entry_from(path: &std::path::Path, name: &str) -> ModelEntry {
+        let text = std::fs::read_to_string(path).expect("readable");
+        let (map, _) = crate::model::scan::parse_flat_yaml(&text);
+        let mut entry = ModelEntry::from_flat(&map, name).expect("entry");
+        entry.file = Some(path.to_path_buf());
+        entry
+    }
+
+    /// The reload-turn rescan the pins drive: re-parse the file the operator (or the
+    /// harness) just wrote and land it through `apply_catalog` — the only judge
+    /// between install and the next launch.
+    fn rescan(state: &mut ActorState, yaml: &std::path::Path, name: &str) {
+        state.apply_catalog(
+            crate::model::scan::Catalog {
+                models: vec![entry_from(yaml, name)],
+                errors: Vec::new(),
+            },
+            None,
+        );
+    }
+
+    /// Axis 2 = B (ruling 2026-10-29), reload leg: an edit only ambers when a rescan
+    /// lands — between the edit and the rescan the status path must not notice
+    /// (one-stat-per-event: the snapshot never stats). Falsifier: removing
+    /// `refresh_stale_markers` from `apply_catalog` fails the amber assert; moving
+    /// the verdict computation into the snapshot (or any status read) fails the
+    /// pre-rescan assert.
+    #[test]
+    fn a_resident_ambers_on_the_reload_that_finds_newer_bytes_than_its_launch() {
+        let (mut state, yaml, _) = resident_on_a_file();
+        let stamp = state.snapshot().slots[0]
+            .launched_at
+            .clone()
+            .expect("a resident carries its wall-clock launch");
+        assert_eq!(state.snapshot().slots[0].stale_config, Some(false));
+        let original = std::fs::read_to_string(&yaml).expect("read");
+        std::fs::write(&yaml, format!("{original}# operator note\n")).expect("operator edit");
+        assert_eq!(
+            state.snapshot().slots[0].stale_config,
+            Some(false),
+            "an edit without a rescan must not move the verdict from a status read: \
+             the snapshot never stats"
+        );
+        rescan(&mut state, &yaml, "m");
+        let after = state.snapshot();
+        assert_eq!(
+            after.slots[0].stale_config,
+            Some(true),
+            "newer bytes than the spawn capture must amber on the reload turn"
+        );
+        assert_eq!(
+            after.slots[0].launched_at.as_deref(),
+            Some(stamp.as_str()),
+            "the launch stamp rides the install, not the rescan"
+        );
+    }
+
+    /// Interlock (4), stated plainly: the comparison rides the SPAWN capture
+    /// (mtime + size), so re-saving byte-identical content does NOT clear the
+    /// verdict — the clock moved. The apply gesture is unload + reload, and a
+    /// respawned engine re-captures cleanly. Falsifier: a verdict that compares
+    /// content, or that clears on size-equality, takes the final assert from true
+    /// to false here (the size/mtime probes prove the leg is real either way).
+    #[test]
+    fn restoring_identical_bytes_does_not_clear_the_stale_verdict() {
+        let (mut state, yaml, capture) = resident_on_a_file();
+        let original = std::fs::read(&yaml).expect("read");
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 444.0\nmeasured_gb_min: 8.0\n",
+        )
+        .expect("diverge (size moves: no dependence on the clock tick)");
+        rescan(&mut state, &yaml, "m");
+        assert_eq!(state.snapshot().slots[0].stale_config, Some(true));
+        std::fs::write(&yaml, &original).expect("restore the identical bytes");
+        // A same-tick rewrite can leave the recorded mtime unmoved (Windows clock
+        // granularity), so force the clock forward: the restore is byte-identical,
+        // the timestamp factually newer — the state a re-save really produces.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&yaml)
+            .expect("open for the clock bump");
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(
+                capture
+                    .mtime
+                    .checked_add(Duration::from_millis(60_000))
+                    .expect("mtime in range"),
+            ),
+        )
+        .expect("force the mtime forward");
+        drop(file);
+        let now = crate::model::fingerprint(&yaml).expect("stat");
+        assert_eq!(
+            now.size, capture.size,
+            "byte-identical restore: the SIZE cannot tell it apart"
+        );
+        assert_ne!(
+            now.mtime, capture.mtime,
+            "and the clock moved (pre {:?} vs post {:?}) — this is the leg size-only would miss",
+            capture.mtime, now.mtime
+        );
+        rescan(&mut state, &yaml, "m");
+        assert_eq!(
+            state.snapshot().slots[0].stale_config,
+            Some(true),
+            "byte-identical content restored later is STILL stale: honest conservatism, \
+             the operator applies with unload + reload"
+        );
+    }
+
+    /// Interlock (1): stale is INFO, not policy. An amber resident keeps its
+    /// measured pair, its cost basis and its slot exactly as a clean one does —
+    /// the marker never touches what admission books or who holds the card.
+    /// Falsifier: gating `cost_source`/measured validity (or the slot) on
+    /// `stale_config` fails this while the verdict pins stay green.
+    #[test]
+    fn a_stale_resident_keeps_serving_its_measured_range() {
+        let (mut state, yaml, _) = resident_on_a_file();
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 10.0\nmeasured_gb_min: 8.0\n# operator note\n",
+        )
+        .expect("operator edit that keeps the measured keys intact");
+        rescan(&mut state, &yaml, "m");
+        let after = state.snapshot();
+        assert_eq!(after.slots[0].stale_config, Some(true), "amber first");
+        let entry = state
+            .catalog
+            .iter()
+            .find(|m| m.name == "m")
+            .expect("resident's row");
+        assert_eq!(
+            (entry.measured_gb, entry.measured_min_gb),
+            (Some(10.0), Some(8.0)),
+            "the measured pair is witness truth: an amber marker does not void it"
+        );
+        assert_eq!(
+            entry.cost_source(),
+            crate::model::CostSource::Measured,
+            "and admission still books from it — stale never demotes the cost basis"
+        );
+        let occupant = after.slots[0].clone();
+        assert_eq!(occupant.model.as_deref(), Some("m"));
+        assert_eq!(occupant.port, Some(18_431), "the resident keeps its slot");
+    }
+
+    /// Interlock (5), actor side: a harness-owned write (the measured fold, the API
+    /// flag edit) re-baselines the spawn capture — never through the verdict, never
+    /// over a true one. Falsifiers: no-op-ing `on_model_file_written` makes the
+    /// unchanged rescan after the write amber (L1 fails); re-baselining regardless
+    /// of the verdict erases the operator's earned amber (L2's final assert fails).
+    #[test]
+    fn the_harness_own_write_rebaselines_a_clean_resident_captured_spawn_side() {
+        // L1: clean resident + harness write + carried fingerprint -> the verdict
+        // stays false AND survives the next unchanged rescan (the capture moved).
+        let (mut state, yaml, _) = resident_on_a_file();
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 12.0\nmeasured_gb_min: 8.0\n",
+        )
+        .expect("fold write");
+        let written = crate::model::fingerprint(&yaml).expect("stat");
+        state.on_model_file_written("m", &yaml, written);
+        rescan(&mut state, &yaml, "m");
+        assert_eq!(
+            state.snapshot().slots[0].stale_config,
+            Some(false),
+            "the harness's own write never ambers its own model"
+        );
+
+        // L2: an already-true verdict is never erased: neither by the message nor
+        // by the unchanged rescan that follows it (which would go false had the
+        // capture been moved under an earned amber).
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 120.0\nmeasured_gb_min: 8.0\n",
+        )
+        .expect("operator edit (size moves)");
+        rescan(&mut state, &yaml, "m");
+        assert_eq!(state.snapshot().slots[0].stale_config, Some(true));
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 120.0\nmeasured_gb_min: 8.0\n",
+        )
+        .expect("fold write over an amber resident");
+        let written = crate::model::fingerprint(&yaml).expect("stat");
+        state.on_model_file_written("m", &yaml, written);
+        assert_eq!(
+            state.snapshot().slots[0].stale_config,
+            Some(true),
+            "a harness write must not clear a verdict the operator's edit earned"
+        );
+        rescan(&mut state, &yaml, "m");
+        assert_eq!(
+            state.snapshot().slots[0].stale_config,
+            Some(true),
+            "and must not re-baseline the capture under it: the unchanged rescan would \
+             go false if it had"
+        );
+
+        // L3: a resident with no capture stays unaccused through the same message.
+        if let Some(occupant) = state.slots[0].occupant.as_mut() {
+            occupant.spawn_config = None;
+            occupant.stale_config = false;
+        }
+        state.on_model_file_written("m", &yaml, written);
+        rescan(&mut state, &yaml, "m");
+        assert_eq!(
+            state.snapshot().slots[0].stale_config,
+            Some(false),
+            "absence of a capture is absence of evidence, never an accusation"
+        );
+    }
+
+    /// The hard invariant's STRUCTURAL tier (established `include_str!` seam, same
+    /// shape as the api's `swap_for_port` tripwire): the `snapshot` body — the one
+    /// status-path reader of the marker — may never reach for the filesystem or the
+    /// clock. The ban-list convicts SYNONYMS, not just the lazy spelling: bare
+    /// `fs::` catches `std::fs::` and `tokio::fs::` alike, `metadata(` catches
+    /// `std::fs::metadata`, `Path::metadata()` and the `MetadataExt` forms, and
+    /// `SystemTime::now` is banned because the stamp is stored at install
+    /// (`launched_at_wall`) for exactly that reason.
+    ///
+    /// The two-layer contract, stated honestly: what the NET cannot see is a stat
+    /// whose result is DISCARDED — inert by definition, it cannot move a verdict —
+    /// and a stat parked behind a helper name outside the scan. What it convicts is
+    /// every spelling of a reaching fs/clock call inside the read path's own bodies.
+    /// The BEHAVIOURAL backstop (the hidden-file probe below, and the api-side
+    /// `/har/models` leg) catches anything whose result reaches the published
+    /// verdict regardless of spelling: a stat feeding the verdict is convicted by
+    /// BOTH tiers; a stat whose result is dropped is harmless to the verdict by
+    /// construction, and the net still keeps the synonym out of the hot path.
+    /// The tail sentinel asserts the slice actually covers the body's end (a
+    /// future early column-4 `}` cannot silently shrink what is scanned).
+    ///
+    /// Falsifier: move the verdict computation into `snapshot` (any spelling) and
+    /// the net plus both probes fire; inject an inert `Path::new(f).metadata()` and
+    /// the net fires (FINDINGS-BATCH-2026-10-28P [P-1]'s M-E).
+    #[test]
+    fn the_snapshot_reads_the_cached_verdict_and_never_stats() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("    fn snapshot(&self) -> SchedulerStatus {")
+            .expect("snapshot is still in this file");
+        let body = &source[start
+            ..start
+                + source[start..]
+                    .find("\n    }\n")
+                    .expect("the function closes")];
+        assert!(
+            body.contains("loaded_at:"),
+            "the scan slice must reach the body's tail (early-close fragility)"
+        );
+        for banned in [
+            "fs::",
+            "fingerprint(",
+            "read_to_string(",
+            "metadata(",
+            "modified(",
+            "try_exists",
+            "File::",
+            "FileTimes",
+            "OpenOptions",
+            "SystemTime::now",
+            "read_dir",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "the snapshot may only read cached state; found `{banned}` in its body"
+            );
+        }
+        let (state, yaml, _) = resident_on_a_file();
+        let before = state.snapshot();
+        assert_eq!(before.slots[0].stale_config, Some(false));
+        std::fs::remove_file(&yaml).expect("hide the file");
+        let after = state.snapshot();
+        assert_eq!(
+            before.slots[0].stale_config, after.slots[0].stale_config,
+            "hiding the file from under the status path changes nothing: the verdict \
+             is a cache, not a stat (a statting snapshot would flip to Some(true))"
+        );
+        assert_eq!(before.slots[0].launched_at, after.slots[0].launched_at);
+    }
+
+    /// The production half of a source file: everything before its test module (if
+    /// no `mod tests` boundary exists, the whole file counts as production — the
+    /// safe direction).
+    fn production_half(source: &str) -> &str {
+        let cut = [
+            "#[cfg(test)]\nmod tests {",
+            "#[cfg(test)]\npub(crate) mod tests {",
+        ]
+        .iter()
+        .filter_map(|marker| source.find(marker))
+        .min()
+        .unwrap_or(source.len());
+        &source[..cut]
+    }
+
+    /// P-4 (FINDINGS-BATCH-2026-10-28P): the re-baseline table documented at
+    /// [`ActorState::on_model_file_written`] claims a CLOSED set of legitimate model-
+    /// yaml mutators — the measured persist (this file, its note riding the success
+    /// path) and `har_config_model`'s flag edit (api, its note sent before the
+    /// handler's reload). "True today" was grep-only; this pin makes the claim
+    /// structural, the repo's established `include_str!` style: every scanned source
+    /// keeps exactly its allowed count of writeback call sites in its production
+    /// half, and each mutator file must also carry its note. A third caller must
+    /// register the write in the re-baseline table (send `ModelFileWritten` /
+    /// `note_model_file_written` with the write) or the amber blames the harness for
+    /// its own write — the exact lie interlock 5 forbids.
+    /// Falsifier: inject `let _ = crate::model::writeback::set_flags_on_file(
+    /// std::path::Path::new("x"), &[]);` into any scanned production body and this
+    /// is the sole failing test; add the call to api WITHOUT the note and the note
+    /// leg fires too.
+    #[test]
+    fn the_writeback_mutator_set_stays_closed_to_the_rebaseline_table() {
+        for (file, source, allowed) in [
+            ("scheduler/mod.rs", include_str!("mod.rs"), 1usize),
+            ("api/mod.rs", include_str!("../api/mod.rs"), 1),
+            ("main.rs", include_str!("../main.rs"), 0),
+            ("catalog.rs", include_str!("../catalog.rs"), 0),
+            ("tray.rs", include_str!("../tray.rs"), 0),
+            ("model/mod.rs", include_str!("../model/mod.rs"), 0),
+            ("engine/mod.rs", include_str!("../engine/mod.rs"), 0),
+        ] {
+            let production = production_half(source);
+            let calls = production.matches("set_flags_on_file(").count()
+                + production.matches("set_flag_on_file(").count();
+            assert_eq!(
+                calls, allowed,
+                "{file} carries {calls} writeback mutator call sites; the closed table \
+                 allows {allowed} (the measured persist here, har_config_model's flag edit \
+                 in api). A new writer must register in the re-baseline table — send the \
+                 ModelFileWritten note with the write (see ActorState::on_model_file_written) \
+                 — or the stale marker lies about the harness's own write: \
+                 FINDINGS-BATCH-2026-10-28P [P-4]."
+            );
+            if allowed == 1 {
+                let notes = if file.starts_with("api") {
+                    production.contains("note_model_file_written(")
+                } else {
+                    production.contains("ActorMsg::ModelFileWritten")
+                };
+                assert!(
+                    notes,
+                    "{file} mutates a model yaml but never sends the re-baseline note: \
+                     the write would self-amber its resident"
+                );
+            }
+        }
     }
 
     #[test]

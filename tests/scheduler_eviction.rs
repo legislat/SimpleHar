@@ -115,6 +115,19 @@ fn harness_rt(
     witness: Arc<dyn VramWitness>,
     settle_timeout_s: u64,
 ) -> (SchedulerHandle, MockRuntime) {
+    let (handle, runtime, _dir) =
+        harness_rt_dir(aux_slots, write_modelconf(specs), witness, settle_timeout_s);
+    (handle, runtime)
+}
+
+/// [`harness_rt`]'s body with the ModelConf dir caller-owned (stale-marker pins
+/// edit yaml bytes through it).
+fn harness_rt_dir(
+    aux_slots: usize,
+    dir: PathBuf,
+    witness: Arc<dyn VramWitness>,
+    settle_timeout_s: u64,
+) -> (SchedulerHandle, MockRuntime, PathBuf) {
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
@@ -129,12 +142,12 @@ fn harness_rt(
         .max_models = aux_slots;
     let handle = Scheduler::start(
         cfg,
-        write_modelconf(specs),
+        dir.clone(),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
         witness,
     );
-    (handle, runtime)
+    (handle, runtime, dir)
 }
 
 /// Polls status until `cond` holds (used by suites sharing this harness shape;
@@ -255,6 +268,85 @@ async fn work_load_evicts_aux_victim_when_short() {
         .find(|job| job.model == "work50")
         .expect("swap job recorded");
     assert_eq!(swap_job.victims_released, vec!["aux30".to_string()]);
+}
+
+#[tokio::test]
+async fn a_stale_resident_is_evicted_like_any_other() {
+    // Interlock 2 (Axis 2, ruling 2026-10-29): the amber is INFO, not policy. A
+    // resident the marker has judged stale must be evicted exactly like a clean one
+    // — same deficit math, same victim record, no sparing and no preference.
+    // Falsifier: filter stale occupants out of the victim pool and the WORK load
+    // strands into a refusal here; prefer them and the clean-victim pins fail.
+    let witness = FakeWitness::with(vec![sample(72.0, 30.0)]);
+    let (handle, _runtime, dir) = harness_rt_dir(
+        1,
+        write_modelconf(&[
+            ("stale30", "mock", CategoryId::Aux, 30.0),
+            ("work50", "mock", CategoryId::Work, 50.0),
+        ]),
+        Arc::new(witness.clone()),
+        5,
+    );
+    let Reply::Loaded(_) = handle
+        .swap("stale30", CategoryId::Aux)
+        .await
+        .expect("aux loads")
+    else {
+        panic!("expected Loaded");
+    };
+    // Amber it the honest way: edit the bytes, then rescan (the only judge).
+    std::fs::write(
+        dir.join("stale30.yaml"),
+        "name: stale30\nengine: mock\ncategory: AUX\nvram_gb: 30.0\n# operator note\n",
+    )
+    .expect("edit");
+    handle.reload().await.expect("rescan applied");
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        status
+            .slots
+            .iter()
+            .find(|s| s.category == CategoryId::Aux)
+            .and_then(|s| s.stale_config),
+        Some(true),
+        "amber first, then evict"
+    );
+
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work50", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work50" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    witness.set_used(0.0);
+    let Reply::Loaded(receipt) = loading
+        .await
+        .expect("task alive")
+        .expect("work loads after evicting the amber resident")
+    else {
+        panic!("expected Loaded");
+    };
+    assert_eq!(receipt.model, "work50");
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        model_of(&status, CategoryId::Aux),
+        None,
+        "stale did not spare it"
+    );
+    let swap_job = status
+        .jobs
+        .iter()
+        .find(|job| job.model == "work50")
+        .expect("swap job recorded");
+    assert_eq!(
+        swap_job.victims_released,
+        vec!["stale30".to_string()],
+        "and the ledger records it like any other eviction"
+    );
 }
 
 #[tokio::test]

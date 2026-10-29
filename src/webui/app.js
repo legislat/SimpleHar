@@ -391,6 +391,11 @@ function modelRow(status, model, category) {
   // row dot and the headline can never disagree (review, 2026-10-26).
   const failed = !!last && last.is_fault === true;
   const dotState = serving ? "serving" : loading ? "loading" : failed ? "failed" : "idle";
+  // Axis 2 (operator ruling 2026-10-29): the amber is the server's own boolean read
+  // directly — the page never compares file times or dates (the K-round
+  // page-must-not-derive rule). It rides an attribute, not `dotState`, so the
+  // Unload/Load button logic stays exactly the serving-row logic.
+  const stale = serving && model.stale_config === true;
   const row = el("tr", {});
   // Operator layout (2026-10-26): actions first, then the name, then the rest —
   // the buttons stay in view at any width without scrolling. The primary button
@@ -448,8 +453,23 @@ function modelRow(status, model, category) {
     el(
       "td",
       { class: "sh-name" },
-      el("span", { class: "sh-dot", "data-state": dotState }),
+      el(
+        "span",
+        {
+          class: "sh-dot",
+          "data-state": dotState,
+          ...(stale
+            ? {
+                "data-stale": "amber",
+                title: "config file changed since launch \u2014 unload + reload to apply",
+              }
+            : {}),
+        },
+      ),
       el("strong", {}, text(model.id)),
+      // The launch stamp the server formatted (Axis 2): printed verbatim, no date
+      // math on the page. Absent = not loaded, and nothing renders.
+      ...(model.launched_at ? [text(` \u00b7 launched ${model.launched_at}`)] : []),
     ),
   );
 

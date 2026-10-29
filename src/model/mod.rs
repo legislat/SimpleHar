@@ -170,6 +170,40 @@ pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
     })
 }
 
+/// Renders a wall-clock instant as the fixed-width UTC second form the page prints
+/// verbatim (`2026-10-29T03:55:12Z`, Axis-2 ruling 2026-10-29: the server owns the
+/// format, no date math in the browser — the K-round page-must-not-derive rule, and
+/// fixed-width UTC also sorts lexicographically by time, which `/har/models`' merge
+/// relies on). Civil date from days via Hinnant's `civil_from_days`; sub-second is
+/// truncated, which is what a launch stamp means to an operator. An instant before
+/// the epoch (a clock set backwards — pathological, never produced by `now()`)
+/// saturates to `1970-01-01T00:00:00Z` rather than fabricate a negative day.
+#[must_use]
+pub fn iso8601_utc(at: std::time::SystemTime) -> String {
+    let secs = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_097 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11], March-based
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{year:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
 /// The one GiB parser for every size-valued yaml key. Rust's `f64` parse accepts
 /// `nan`/`inf`/`1e400`, and every NaN comparison is false — an unchecked value
 /// would sail through `< 0.0` guards and silently disable the gates it feeds
@@ -498,6 +532,53 @@ mod tests {
             crate::model::fingerprint(&dir.join("gone.yaml")),
             None,
             "unreadable is None: no evidence either way"
+        );
+    }
+
+    /// The server-owned format of the launch stamp (Axis 2, ruling 2026-10-29):
+    /// the page prints these bytes verbatim, so fixed-width fields, UTC, second
+    /// truncation and the leap/century boundaries are all this side's contract.
+    /// The vectors were generated against an independent oracle
+    /// (`[DateTimeOffset]::FromUnixTimeSeconds`). Falsifier: an off-by-one civil
+    /// (era/civic arithmetic), a local-time render, or lost padding fails its
+    /// vector; sub-second leakage makes the truncation leg non-reproducible.
+    #[test]
+    fn iso8601_utc_renders_wall_clock_as_the_page_prints_it() {
+        let at = |secs: u64| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        assert_eq!(crate::model::iso8601_utc(at(0)), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            crate::model::iso8601_utc(at(1_709_209_845)),
+            "2024-02-29T12:30:45Z",
+            "leap day"
+        );
+        assert_eq!(
+            crate::model::iso8601_utc(at(951_782_400)),
+            "2000-02-29T00:00:00Z",
+            "the leap century"
+        );
+        assert_eq!(
+            crate::model::iso8601_utc(at(1_793_232_000)),
+            "2026-10-29T00:00:00Z"
+        );
+        assert_eq!(
+            crate::model::iso8601_utc(at(4_107_456_000)),
+            "2100-02-28T00:00:00Z",
+            "2100 is NOT a leap year"
+        );
+        assert_eq!(
+            crate::model::iso8601_utc(at(4_107_542_400)),
+            "2100-03-01T00:00:00Z",
+            "and 2100-02-29 never exists"
+        );
+        assert_eq!(
+            crate::model::iso8601_utc(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)),
+            "1970-01-01T00:00:00Z",
+            "a pre-epoch instant is a clock pathology: saturate, never fabricate a negative day"
+        );
+        assert_eq!(
+            crate::model::iso8601_utc(at(0) + std::time::Duration::from_millis(999)),
+            "1970-01-01T00:00:00Z",
+            "sub-second truncates, never rounds"
         );
     }
 
