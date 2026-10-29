@@ -84,6 +84,29 @@ naming no model is served by the category's loaded occupant (the most-recently
 used one at AUX); when nothing is loaded it loads that category's
 `default_model` instead of erroring.
 
+### Unloading priority
+
+The "Evicted by" column is a priority matrix, and it is the only thing that
+decides who is unloaded to make room. When a load does not fit the card's free
+VRAM, the scheduler unloads a set of **other** categories' occupants before it
+refuses; the matrix is a one-way hard filter — a category yields only to the
+categories that list it.
+
+- **Same-slot replacement is always allowed**: loading a different model into a
+  category evicts that category's own occupant, regardless of the matrix.
+- **WORK is the most protected** (evicted by nobody); **AUX and EMB the most
+  disposable** (evicted by both WORK and RP); **RP** sits between (evicted only
+  by WORK).
+- When several victims would cover the deficit, the planner takes the **cheapest
+  sufficient set** (lowest total VRAM need); on a tie it releases the **most
+  disposable** category first, never by slot order — so RP (costliest to bring
+  back) is spared when a cheaper, more disposable AUX/EMB would do.
+- A refusal that cannot free enough VRAM names the blockers, e.g.
+  `only WORK can evict RP`.
+
+It is data, not code: edit `categories[].evictable_by` in `simplehar-se.json`
+and restart to change who yields to whom.
+
 ## Configuration: `simplehar-se.json`
 
 Lives beside the executable; override the path with the `SIMPLEHAR_CONFIG`
