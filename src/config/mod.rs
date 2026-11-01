@@ -1170,6 +1170,24 @@ mod tests {
             None,
             "the SE internal default must stay free of every host namespace"
         );
+        // An operator-edited plan is judged by the SAME resolved plan the slots
+        // are built from: an explicit engine port and a moved listener claim
+        // exactly like the defaults.
+        let mut edited = AppConfig::default();
+        edited.categories[0].engine_ports = vec![20_500];
+        edited.categories[1].public_port = 9_999;
+        assert!(
+            cfg.port_claim(20_500).is_none(),
+            "the default plan does not own an explicit plan's port"
+        );
+        let owned = edited
+            .port_claim(20_500)
+            .expect("the edited explicit plan owns its port");
+        assert!(owned.contains("engine port"), "{owned}");
+        assert!(edited
+            .port_claim(9_999)
+            .expect("a moved listener owns its number")
+            .contains("listener"));
     }
 
     /// FINDINGS-15 [9] pin (b): the exposure the finding named is the ring, so this

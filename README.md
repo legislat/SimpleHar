@@ -258,7 +258,9 @@ IMAGE="ninfer-mymodel:local"          # the image your artifact requires
 MODEL_NAME="My-Model-NInfer"          # directory name holding the artifact
 ARTIFACT="my-model.ninfer"            # file name inside the model directory
 MODEL_ID="my-model"                   # OpenAI-style served id (== serve_model in yaml)
-INTERNAL_PORT=8005                    # port the server listens on inside the container
+INTERNAL_PORT=8808                    # R10: the SE internal number (87xx family +100),
+                                      # never a manual (protected 80xx) or harness
+                                      # (87xx listener / 181xx engine) port number
 
 # Model directories to search for ARTIFACT (first hit wins).
 MODEL_ROOTS=(
@@ -289,7 +291,7 @@ else
   API_KEY_ARGS=()
 fi
 
-PUBLISH="${3:-$INTERNAL_PORT}"        # host port assigned by the harness
+PUBLISH="${3:?harness must pass the publish port as arg 3}"  # host port from the harness (required)
 
 # Idempotent: reclaim a stale container of OUR name before starting.
 docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -322,6 +324,13 @@ Notes:
   WSL boot outside any harness decision, with no ledger entry and no reap path
   (the NINFER-8004 incident). Template mode hard-codes it; keep it in a legacy
   script.
+- R10 namespaces: the container's internal port is a **third namespace**, disjoint
+  from the manual (`protected_ports`) and harness (listeners, engine plan) sets —
+  keep your legacy script's `INTERNAL_PORT` clear of all three (8808 is the SE
+  internal number). The harness validates its `$3` offer but never rewrites your
+  script; a legacy row that also declares `ninfer_internal_port` is refused at
+  load for a borrowed number even though the script would ignore the key, so
+  legacy rows should leave that key unset.
 - The name-scoped `docker rm -f` before `docker run` makes the launch idempotent
   and complements the harness's orphan reconciliation.
 - The `--log-driver json-file --log-opt` pair bounds container logs; template
