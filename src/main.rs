@@ -1235,6 +1235,7 @@ Start Port    End Port
             measured_offload: None,
             measured_attribution: None,
             measured_profile: None,
+            fit_gb: None,
             model_ref: model_ref.map(str::to_string),
             serve_model: None,
             file: None,

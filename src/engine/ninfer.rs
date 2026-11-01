@@ -880,6 +880,7 @@ mod tests {
             measured_offload: None,
             measured_attribution: None,
             measured_profile: None,
+            fit_gb: None,
             model_ref: Some("ninfer://ninfer-x:8004/served".to_string()),
             serve_model: Some("served".to_string()),
             file: None,

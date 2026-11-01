@@ -1301,6 +1301,7 @@ fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>) -> Value {
         "cost_basis": match entry.cost_source() {
             crate::model::CostSource::Declared => "declared",
             crate::model::CostSource::Measured => "measured",
+            crate::model::CostSource::Fit => "fit",
             crate::model::CostSource::Estimate => "estimate",
             crate::model::CostSource::Undeclared => "undeclared",
         },
@@ -1330,6 +1331,12 @@ fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>) -> Value {
         "serve_model": entry.serve_model,
         "model_ref": entry.model_ref,
     });
+    // R11: the Fit projection rides the payload only when it exists — a key
+    // that is absent is not a key that is null (not-probed is a state), and a
+    // fixture row that has never been probed keeps its byte-identical shape.
+    if let Some(fit) = entry.fit_gb {
+        body["fit_gb"] = json!(fit);
+    }
     if let Some(loaded) = loaded {
         body["launched_at"] = json!(loaded.launched_at);
         body["stale_config"] = json!(loaded.stale_config);
@@ -2556,6 +2563,7 @@ mod tests {
             measured_offload: None,
             measured_attribution: None,
             measured_profile: None,
+            fit_gb: None,
             model_ref: Some(r"F:\m.gguf".to_string()),
             serve_model: None,
             file: None,
@@ -2583,6 +2591,55 @@ mod tests {
         assert!(body["launch_floor_gb"].is_null());
         assert!(body["load_timeout_s"].is_null());
         assert!(body["measured_gb"].is_null());
+        assert!(
+            body.get("fit_gb").is_none(),
+            "a never-probed row has no fit key at all: absent is not null, and the
+             fixture parity rides it"
+        );
+    }
+
+    /// R11: the page reads the gate's answer — `cost_basis: "fit"` only when
+    /// the projection actually books, and the `fit_gb` figure rides the payload
+    /// whenever it exists (even under a declared floor that keeps booking).
+    #[test]
+    fn the_fit_figure_rides_the_payload_only_as_the_gate_decides() {
+        let row = |fit: Option<f64>| ModelEntry {
+            fit_gb: fit,
+            ..ModelEntry {
+                name: "m".to_string(),
+                engine: "llama".to_string(),
+                category: CategoryId::Work,
+                vram_gb: Some(24.0),
+                gguf_size_gb: None,
+                cost: crate::model::CostClass::Fixed,
+                launch_floor_gb: None,
+                load_timeout_s: None,
+                measured_gb: None,
+                measured_min_gb: None,
+                measured_offload: None,
+                measured_attribution: None,
+                measured_profile: None,
+                fit_gb: None,
+                model_ref: None,
+                serve_model: None,
+                file: None,
+                raw: BTreeMap::new(),
+            }
+        };
+        let books = model_json(&row(Some(31.0)), None);
+        assert_eq!(books["cost_basis"], json!("fit"));
+        assert_eq!(books["fit_gb"], json!(31.0));
+        let floored = model_json(&row(Some(20.0)), None);
+        assert_eq!(
+            floored["cost_basis"],
+            json!("declared"),
+            "declared is a floor: a smaller projection displays but does not book"
+        );
+        assert_eq!(
+            floored["fit_gb"],
+            json!(20.0),
+            "the figure itself still rides the payload for the page"
+        );
     }
 
     #[test]
@@ -2601,6 +2658,7 @@ mod tests {
             measured_offload: None,
             measured_attribution: None,
             measured_profile: None,
+            fit_gb: None,
             model_ref: Some(r"F:\m.gguf".to_string()),
             serve_model: None,
             file: None,

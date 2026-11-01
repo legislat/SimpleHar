@@ -206,6 +206,19 @@ async fn run_control_command(program: &str, args: &[String]) -> ControlOutcome {
     run_control_command_with_stdin(program, args, &[]).await
 }
 
+/// [`run_control_command`] with an explicit deadline — the ONE control-command
+/// builder shared by the WSL commands and the R11 fit probes, so a probe gets
+/// the same hidden / kill-on-drop / scrubbed-environment posture and only the
+/// timeout is the caller's (the fit probes outlive the 10 s WSL default only
+/// by operator calibration, never by a new spawn path).
+async fn run_control_command_timeout(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> ControlOutcome {
+    run_control_command_with_stdin_timeout(program, args, &[], timeout).await
+}
+
 /// [`run_control_command`] with a stdin payload. The ONLY legitimate use is the
 /// staging driver: a program that must reach the distro shell *as data*, never as
 /// argv — the login-shell re-tokenization GOTCHAS `[ps]` warns about cannot touch
@@ -217,6 +230,18 @@ async fn run_control_command_with_stdin(
     program: &str,
     args: &[String],
     stdin: &[u8],
+) -> ControlOutcome {
+    run_control_command_with_stdin_timeout(program, args, stdin, CONTROL_TIMEOUT).await
+}
+
+/// The body behind [`run_control_command`], [`run_control_command_timeout`] and
+/// [`run_control_command_with_stdin`]: the ONE place a control [`Command`] is
+/// built, with the deadline as the only varying parameter.
+async fn run_control_command_with_stdin_timeout(
+    program: &str,
+    args: &[String],
+    stdin: &[u8],
+    timeout: Duration,
 ) -> ControlOutcome {
     let mut command = Command::new(program);
     command
@@ -246,7 +271,7 @@ async fn run_control_command_with_stdin(
             .await
             .map_err(|error| error.to_string())
     };
-    match tokio::time::timeout(CONTROL_TIMEOUT, run).await {
+    match tokio::time::timeout(timeout, run).await {
         Ok(Ok(output)) => ControlOutcome::Ran(output),
         Ok(Err(error)) => ControlOutcome::Failed(error),
         Err(_) => ControlOutcome::TimedOut,
@@ -1863,6 +1888,48 @@ impl EngineRuntime for ProcessRuntime {
                 error = %error,
                 "cannot write container log snapshot"
             ),
+        }
+    }
+
+    async fn run_probe_command(
+        &self,
+        program: &std::path::Path,
+        args: &[String],
+        timeout: Duration,
+    ) -> Option<String> {
+        // R11: the fit probes ride the ONE control-command builder — hidden,
+        // kill-on-drop, scrubbed to the OS baseline — never an engine spawn:
+        // no ticket, no port, nothing registered. Every failure path warns and
+        // answers `None`; the caller falls down the ladder, there is never an
+        // invented number.
+        match run_control_command_timeout(&program.to_string_lossy(), args, timeout).await {
+            ControlOutcome::Ran(output) if output.status.success() => {
+                Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+            ControlOutcome::Ran(output) => {
+                tracing::warn!(
+                    program = %program.display(),
+                    stderr = %excerpt(&output.stderr),
+                    "fit probe command refused; the row keeps its declared/estimate ladder"
+                );
+                None
+            }
+            ControlOutcome::Failed(error) => {
+                tracing::warn!(
+                    program = %program.display(),
+                    error = %error,
+                    "fit probe command could not start; the row keeps its declared/estimate ladder"
+                );
+                None
+            }
+            ControlOutcome::TimedOut => {
+                tracing::warn!(
+                    program = %program.display(),
+                    timeout_s = timeout.as_secs(),
+                    "fit probe timed out; the row keeps its declared/estimate ladder"
+                );
+                None
+            }
         }
     }
 
@@ -3519,5 +3586,35 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R11: the fit probe rides the ONE control-command family. A tool that is
+    /// not there answers `None` to the caller (the wrapper itself warned — a
+    /// spawn failure, never a fabricated projection), and a real child's stdout
+    /// travels verbatim toward the strict parser. `cmd.exe` is a harmless
+    /// stand-in: the fit tool itself is never exec'd by tests.
+    #[tokio::test]
+    async fn the_fit_probe_answers_stdout_when_the_tool_answers_and_none_when_it_cannot() {
+        let runtime = ProcessRuntime::new();
+        let missing = std::path::Path::new("C:\\simplehar-absent-volume\\llama-fit-params.exe");
+        assert_eq!(
+            runtime
+                .run_probe_command(missing, &["--version".to_string()], Duration::from_secs(2))
+                .await,
+            None,
+            "a tool that cannot start is silence to the caller, not an empty answer"
+        );
+        let answer = runtime
+            .run_probe_command(
+                std::path::Path::new("cmd.exe"),
+                &["/c".to_string(), "echo CUDA0 1 2 3".to_string()],
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("cmd.exe answers on every windows host");
+        assert!(
+            answer.contains("CUDA0 1 2 3"),
+            "stdout travels to the parser: {answer:?}"
+        );
     }
 }

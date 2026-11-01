@@ -492,6 +492,7 @@ mod tests {
             measured_offload: None,
             measured_attribution: None,
             measured_profile: None,
+            fit_gb: None,
             model_ref: None,
             serve_model: None,
             file: None,

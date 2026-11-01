@@ -29,6 +29,7 @@ use crate::ownership::{ResourceKind, SpawnTicket};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -48,6 +49,12 @@ const IDLE_TICK: Duration = Duration::from_secs(2);
 /// card was simply busy for, and the message names the fact the client can act on —
 /// unload the model still in that slot, then load again.
 const PARKED_SLOT_NOT_FREED: &str = "the load it was waiting on did not free the slot";
+
+/// R11: the deferral before a warm fit pass starts probing, so the queue never
+/// competes with the boot window (first bind, autostart loads). Long enough to
+/// stay clear of boot, short enough that the figures are warm before an
+/// operator's first click.
+const FIT_WARM_DELAY: Duration = Duration::from_millis(1500);
 
 /// Failures reported to swap/unload/cancel callers, with the numbers used (G13).
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -643,6 +650,24 @@ enum ActorMsg {
     /// with the stranded set (possibly empty); `None` = the probe could not run
     /// — silence, and the last-reported set stands untouched.
     ReconcileDone(Option<BTreeSet<String>>),
+    /// The R11 fit version probe finished (warm pass and every fit admit lead
+    /// with it): `Some` = the calculator's version line, `None` = the tool did
+    /// not answer and the fit pass stays silent. `gen` is the catalog epoch the
+    /// probe was born in — a stale epoch's answer is dropped at the door.
+    FitVersionDone {
+        gen: u64,
+        version: Option<String>,
+    },
+    /// An R11 fit row probe finished: `Ok` = (booked GiB, the model file's
+    /// fingerprint at computation); `Err` = why (warn + ladder, never a
+    /// fabricated figure). `key` is the probe argv hash the figure was computed
+    /// for — the cache identity.
+    FitRowDone {
+        gen: u64,
+        model: String,
+        key: u64,
+        outcome: Result<(f64, Option<crate::model::FileFingerprint>), String>,
+    },
     /// The blocking write-back of a measured figure was refused by the disk
     /// (Fork C, FINDINGS-13 [4] follow-through): the actor must stop booking in
     /// memory what disk rejected. Carries the exact figure — pair **and provenance
@@ -689,6 +714,123 @@ struct Reading {
     own: Option<f64>,
     total_gib: f64,
     used_gib: f64,
+}
+
+/// One cached R11 fit projection: the booked GiB and the model file's
+/// fingerprint at the moment it was computed. The cache is keyed by the probe
+/// argv hash (the void identity — a config change is a different key), and a
+/// figure survives on a row only while that fingerprint is unproven-changed:
+/// both sides known and differing voids it (absence of evidence is never
+/// evidence of change, the KEEP doctrine). In-process only — this figure never
+/// persists, so a restart re-derives it.
+#[derive(Debug, Clone)]
+struct FitEntry {
+    gib: f64,
+    fingerprint: Option<crate::model::FileFingerprint>,
+}
+
+/// One row a fit pass projects: the argv identity, the row it belongs to, and
+/// what the booking formula needs that argv does not carry (the vision
+/// surcharge flag, the model file to fingerprint).
+#[derive(Debug, Clone)]
+struct FitRowPlan {
+    model: String,
+    key: u64,
+    args: Vec<String>,
+    has_mmproj: bool,
+    model_file: Option<PathBuf>,
+}
+
+/// A whole fit pass resolved once off the actor: the config-sibling tool, the
+/// calibration constants, the rows to project.
+#[derive(Debug, Clone)]
+struct FitProbePlan {
+    program: PathBuf,
+    constants: crate::engine::fit::FitConstants,
+    rows: Vec<FitRowPlan>,
+}
+
+/// The version leg shared by the warm pass and the admit refresh: report what
+/// the calculator says it is, then answer whether rows may run at all — no
+/// answer is silence for the whole pass (a tool that will not say its version
+/// will not project either; one warn, not a probe per doomed row). A CHANGED
+/// answer does not stop the pass: the version message lands before every row
+/// message, so rows computed under the new tool are stamped under the new
+/// epoch the handler just minted.
+async fn run_fit_version_leg(
+    runtime: &Arc<dyn EngineRuntime>,
+    tx: &mpsc::UnboundedSender<ActorMsg>,
+    gen: u64,
+    plan: &FitProbePlan,
+) -> bool {
+    // Absence is checked and NAMED here (off the actor, immediately before the
+    // first probe), never guessed past: a missing calculator is one warn and
+    // the whole ladder stands — no version message, no rows, no silence about
+    // why. Async stat: no synchronous fs on the worker either, the
+    // FINDINGS2-04 [2] discipline this whole file keeps for its actor turn.
+    let tool_present = match tokio::fs::try_exists(&plan.program).await {
+        Ok(present) => present,
+        Err(error) => {
+            tracing::warn!(
+                path = %plan.program.display(),
+                error = %error,
+                "cannot stat the fit tool; the fit pass stays silent and the ladder stands"
+            );
+            false
+        }
+    };
+    if !tool_present {
+        tracing::warn!(
+            error = %crate::engine::fit::FitError::ToolMissing {
+                path: plan.program.display().to_string(),
+            },
+            "fit pass skipped"
+        );
+        return false;
+    }
+    let answer = runtime
+        .run_probe_command(
+            &plan.program,
+            &crate::engine::fit::version_args(),
+            plan.constants.probe_timeout,
+        )
+        .await;
+    let established = answer.is_some();
+    let _ = tx.send(ActorMsg::FitVersionDone {
+        gen,
+        version: answer,
+    });
+    established
+}
+
+/// One row leg: probe, strict-parse, book — a failure answers as the named
+/// `Err` the handler warns, never as a number. The fingerprint is taken AFTER
+/// the probe answered, so the figure and the file it describes are certified
+/// against the same reading (a rewrite during the probe shows as proven-change
+/// on the NEXT check, the safe direction).
+async fn run_fit_row_leg(
+    runtime: &Arc<dyn EngineRuntime>,
+    plan: &FitProbePlan,
+    row: &FitRowPlan,
+) -> Result<(f64, Option<crate::model::FileFingerprint>), String> {
+    match runtime
+        .run_probe_command(&plan.program, &row.args, plan.constants.probe_timeout)
+        .await
+    {
+        Some(stdout) => {
+            crate::engine::fit::parse_and_book(&stdout, row.has_mmproj, &plan.constants)
+                .map(|gib| {
+                    (
+                        gib,
+                        row.model_file
+                            .as_deref()
+                            .and_then(crate::model::fingerprint),
+                    )
+                })
+                .map_err(|error| error.to_string())
+        }
+        None => Err("the probe did not answer".to_string()),
+    }
 }
 
 /// One figure handed to [`ActorState::fold`], bundled with the launch it belongs to
@@ -1070,6 +1212,22 @@ struct ActorState {
     /// report. Warn fires only when the set CHANGES, so repeated rescans of the
     /// same stranded container never spam the ring.
     last_reported_stranded: Option<BTreeSet<String>>,
+    /// R11 fit cache (in-process only, never persisted): probe argv hash → the
+    /// projection and the model-file fingerprint it was computed against. A
+    /// figure is valid precisely while its argv AND the calculator that minted
+    /// it are unchanged — the version epoch and fingerprint checks are the two
+    /// halves of that identity.
+    fit_cache: HashMap<u64, FitEntry>,
+    /// The fit-tool version line the current cache was minted under. `None` =
+    /// never confirmed; no figure books before the first answer, and a version
+    /// change voids the whole cache (a figure belongs to the calculator that
+    /// minted it).
+    fit_version: Option<String>,
+    /// The catalog epoch the fit work is stamped with: bumped on every catalog
+    /// application, so a warm pass or an admit refresh born under a superseded
+    /// catalog is dropped at the handler instead of patching rows that may no
+    /// longer describe it.
+    fit_epoch: Arc<AtomicU64>,
     slots: Vec<Slot>,
     jobs: BTreeMap<JobId, Job>,
     /// Last proxy-side use per model (idle sweep input, Step 5).
@@ -1253,6 +1411,13 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 state.reconcile_in_flight = false;
                 state.on_reconcile_done(outcome);
             }
+            ActorMsg::FitVersionDone { gen, version } => state.on_fit_version(gen, version),
+            ActorMsg::FitRowDone {
+                gen,
+                model,
+                key,
+                outcome,
+            } => state.on_fit_row_done(gen, &model, key, outcome),
             ActorMsg::MeasuredPersistFailed { model, data, file } => {
                 state.on_measured_persist_failed(&model, &data, file);
             }
@@ -1333,6 +1498,9 @@ impl ActorState {
             snapshot_in_flight: HashSet::new(),
             reconcile_in_flight: false,
             last_reported_stranded: None,
+            fit_cache: HashMap::new(),
+            fit_version: None,
+            fit_epoch: Arc::new(AtomicU64::new(0)),
             slots,
             jobs: BTreeMap::new(),
             last_used: HashMap::new(),
@@ -1462,6 +1630,11 @@ impl ActorState {
         // declared container names are running with no claim. Off-thread like
         // every other engine touch; report-only by construction.
         self.spawn_unclaimed_reconcile();
+        // R11 warm fit pass: the same per-application rhythm projects the
+        // fit-capable rows (epoch-stamped, so the superseded catalog's probes
+        // drop on arrival). Deferred and off-thread like everything that
+        // touches a volume; a no-op when the probe is off.
+        self.spawn_fit_warm();
     }
 
     /// The resident half of reload (Axis 2 = B, operator ruling 2026-10-29): on the
@@ -2255,6 +2428,303 @@ impl ActorState {
         }
     }
 
+    /// The current fit epoch: a probe's answer counts only while its stamped
+    /// epoch still stands.
+    #[must_use]
+    fn fit_gen(&self) -> u64 {
+        self.fit_epoch.load(Ordering::Relaxed)
+    }
+
+    /// The probe identity of one catalog row, recomputed from the row itself: a
+    /// fit result only patches the row whose OWN argv still hashes to the key
+    /// the probe ran with (a rescan that edited the yaml mid-probe is not that
+    /// row anymore).
+    #[must_use]
+    fn fit_row_key(entry: &ModelEntry) -> Option<u64> {
+        crate::engine::fit::probe_args(&entry.raw)
+            .ok()
+            .map(|args| crate::engine::fit::args_hash(&args))
+    }
+
+    /// The model file a fit row projects — the `model:` GGUF whose fingerprint
+    /// guards the cache. `None` when the row has none (a `scheme://` sentinel
+    /// row has nothing local to have changed).
+    #[must_use]
+    fn fit_model_file(entry: &ModelEntry) -> Option<PathBuf> {
+        entry
+            .raw
+            .get("model")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty() && !v.contains("://"))
+            .map(PathBuf::from)
+    }
+
+    /// R11 warm fit pass (boot scan and every rescan alike): re-stamp the epoch
+    /// so probes born under a superseded catalog drop at the handler, then —
+    /// only with the probe switched on — project every fit-capable row,
+    /// serially and deferred, off-thread. Like R5's reconcile there is no I/O
+    /// in the actor loop and nothing here can gate, kill or invent: the answer
+    /// lands as a catalog patch through [`ActorState::on_fit_row_done`] or the
+    /// row keeps its ladder.
+    fn spawn_fit_warm(&mut self) {
+        self.fit_epoch.fetch_add(1, Ordering::Relaxed);
+        let Some(plan) = self.fit_probe_plan() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return; // sync test constructors: live-actor work has nothing to do
+        };
+        let gen = self.fit_gen();
+        let epoch = Arc::clone(&self.fit_epoch);
+        let runtime = Arc::clone(&self.runtime);
+        let tx = self.tx.clone();
+        handle.spawn(async move {
+            // Deferred, serial, cancellable-at-the-row-boundary: a projection
+            // competes with nothing at boot, and a rescan mid-pass makes every
+            // remaining row of THIS pass stale before its probe (the epoch
+            // moved), while answers already sent are dropped by the handler's
+            // own epoch guard.
+            tokio::time::sleep(FIT_WARM_DELAY).await;
+            if !run_fit_version_leg(&runtime, &tx, gen, &plan).await {
+                return;
+            }
+            for row in plan.rows.iter() {
+                if epoch.load(Ordering::Relaxed) != gen || tx.is_closed() {
+                    return;
+                }
+                let outcome = run_fit_row_leg(&runtime, &plan, row).await;
+                let _ = tx.send(ActorMsg::FitRowDone {
+                    gen,
+                    model: row.model.clone(),
+                    key: row.key,
+                    outcome,
+                });
+            }
+        });
+    }
+
+    /// Resolves the warm plan, or `None` (with the reason warned once per
+    /// catalog application) when the pass must stay silent: probe off is total
+    /// silence — zero probes, ladder unchanged — while an uncalibrated
+    /// constant is a named warn, never a silent zero pretending to be a
+    /// calibration.
+    fn fit_probe_plan(&self) -> Option<FitProbePlan> {
+        let llama = self.cfg.llama_fit()?;
+        if !self.cfg.llama_fit_probe_enabled() {
+            return None;
+        }
+        let constants = match crate::engine::fit::FitConstants::resolve(
+            llama.fit_margin_gb,
+            llama.mmproj_surcharge_gb,
+            llama.fit_probe_timeout_s,
+        ) {
+            Ok(constants) => constants,
+            Err(error) => {
+                tracing::warn!(error = %error, "fit probe is on but cannot book: the rows keep their ladder");
+                return None;
+            }
+        };
+        let rows: Vec<FitRowPlan> = self
+            .catalog
+            .iter()
+            .filter(|entry| crate::engine::policy::fit_capable(&entry.engine))
+            .filter_map(|entry| {
+                let args = match crate::engine::fit::probe_args(&entry.raw) {
+                    Ok(args) => args,
+                    Err(error) => {
+                        tracing::warn!(model = %entry.name, error = %error, "fit row is not probeable");
+                        return None;
+                    }
+                };
+                let key = crate::engine::fit::args_hash(&args);
+                Some(FitRowPlan {
+                    model: entry.name.clone(),
+                    key,
+                    args,
+                    has_mmproj: entry
+                        .raw
+                        .get("mmproj")
+                        .is_some_and(|v| !v.trim().is_empty()),
+                    model_file: Self::fit_model_file(entry),
+                })
+            })
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        Some(FitProbePlan {
+            program: crate::engine::fit::resolve_tool(&self.cfg.llama_server_exe),
+            constants,
+            rows,
+        })
+    }
+
+    /// The R11 admit-time fit refresh, run on the actor BEFORE the booking
+    /// decision. A cache hit (same argv, same tool epoch, model file not
+    /// proven-changed) books the projection for this load AND still rides the
+    /// version check fire-and-forget; a miss books the ladder now and fires
+    /// the probe with the version leg first. Either way a replaced calculator
+    /// is caught at every launch, not only at boot — the ruling words are
+    /// "version checked at boot AND launch". The refresh never parks the
+    /// admit: the physical gate is unchanged, and the next admit (and the
+    /// page) get the figure.
+    fn refresh_fit_on_admit(&mut self, entry: &mut ModelEntry) {
+        if !crate::engine::policy::fit_capable(&entry.engine) || !self.cfg.llama_fit_probe_enabled()
+        {
+            return;
+        }
+        let Some(key) = Self::fit_row_key(entry) else {
+            return;
+        };
+        let fingerprint = Self::fit_model_file(entry)
+            .as_deref()
+            .and_then(crate::model::fingerprint);
+        let hit = self
+            .fit_cache
+            .get(&key)
+            .filter(|cell| match (&cell.fingerprint, &fingerprint) {
+                (Some(have), Some(now)) => have == now,
+                // One side unstat'able is the absence of EVIDENCE: the figure
+                // stands (KEEP doctrine), not the row punished for a sleeping
+                // volume.
+                _ => true,
+            })
+            .map(|cell| cell.gib);
+        if let Some(gib) = hit {
+            entry.fit_gb = Some(gib);
+            self.patch_catalog_fit(&entry.name, key, gib);
+            // A booked hit still asks the tool who it is: an admit may not
+            // park behind a process spawn, so the check is fire-and-forget.
+            // A replaced calculator voids the cache and strips the row figures
+            // the moment its answer lands, and the NEXT admit is a miss
+            // (ladder); this admit books the figure it had already certified.
+            // Nothing a mismatch could leave behind persists, and the physical
+            // gate remains the witness.
+            if let Some(plan) = self.fit_probe_plan() {
+                let gen = self.fit_gen();
+                let runtime = Arc::clone(&self.runtime);
+                let tx = self.tx.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        run_fit_version_leg(&runtime, &tx, gen, &plan).await;
+                    });
+                }
+            }
+            return;
+        }
+        // The stale figure, if any, is dropped for THIS booking: the ladder —
+        // declared > measured > estimate — books a projection it cannot certify.
+        entry.fit_gb = None;
+        let Some(plan) = self.fit_probe_plan() else {
+            return;
+        };
+        let Some(row) = plan.rows.iter().find(|row| row.key == key).cloned() else {
+            return;
+        };
+        let gen = self.fit_gen();
+        let runtime = Arc::clone(&self.runtime);
+        let tx = self.tx.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            if !run_fit_version_leg(&runtime, &tx, gen, &plan).await {
+                return;
+            }
+            let outcome = run_fit_row_leg(&runtime, &plan, &row).await;
+            let _ = tx.send(ActorMsg::FitRowDone {
+                gen,
+                model: row.model,
+                key: row.key,
+                outcome,
+            });
+        });
+    }
+
+    /// The answer leg of the version probe: a moved epoch voids the whole cache
+    /// and strips every row's figure (a projection belongs to the calculator
+    /// that minted it); no answer is silence about THIS pass only — the
+    /// established epoch and its figures stand (a momentarily absent tool is
+    /// no evidence the tool changed).
+    fn on_fit_version(&mut self, gen: u64, version: Option<String>) {
+        if gen != self.fit_gen() {
+            return;
+        }
+        let Some(version) = version else {
+            tracing::warn!(
+                "llama-fit-params did not answer --version: this fit pass stays silent, \
+                 the rows keep their last certified state"
+            );
+            return;
+        };
+        if self.fit_version.as_deref() == Some(version.as_str()) {
+            return;
+        }
+        if self.fit_version.is_some() {
+            tracing::warn!(
+                previous = %self.fit_version.as_deref().unwrap_or_default(),
+                version = %version,
+                "the fit calculator changed under us: every cached projection is void \
+                 (a figure belongs to the tool that minted it)"
+            );
+        }
+        self.fit_version = Some(version);
+        self.fit_cache.clear();
+        for entry in &mut self.catalog {
+            if crate::engine::policy::fit_capable(&entry.engine) {
+                entry.fit_gb = None;
+            }
+        }
+        self.publish();
+    }
+
+    /// The answer leg of a row probe: Ok lands in the cache and patches the
+    /// catalog row that still carries the probed identity, Err is a named warn
+    /// and the ladder. A stale epoch's answer is dropped at the door — the
+    /// superseded catalog is not the catalog this answer describes.
+    fn on_fit_row_done(
+        &mut self,
+        gen: u64,
+        model: &str,
+        key: u64,
+        outcome: Result<(f64, Option<crate::model::FileFingerprint>), String>,
+    ) {
+        if gen != self.fit_gen() {
+            return;
+        }
+        let Ok((gib, fingerprint)) = outcome else {
+            tracing::warn!(
+                model,
+                error = %outcome.expect_err("checked non-Ok"),
+                "fit projection refused: the row keeps its declared/estimate ladder"
+            );
+            return;
+        };
+        self.fit_cache.insert(key, FitEntry { gib, fingerprint });
+        self.patch_catalog_fit(model, key, gib);
+    }
+
+    /// Patches the catalog row the probed identity still describes, then
+    /// republishes so the page's Cost column sees the same figure the gate
+    /// would book (one derivation — the duplication-review rule).
+    fn patch_catalog_fit(&mut self, model: &str, key: u64, gib: f64) {
+        let Some(entry) = self
+            .catalog
+            .iter_mut()
+            .find(|m| m.name == model && crate::engine::policy::fit_capable(&m.engine))
+        else {
+            return;
+        };
+        if Self::fit_row_key(entry) != Some(key) {
+            return;
+        }
+        if entry.fit_gb == Some(gib) {
+            return;
+        }
+        entry.fit_gb = Some(gib);
+        self.publish();
+    }
+
     fn fold(&mut self, plan: &FoldPlan) {
         let FoldPlan {
             model,
@@ -2764,13 +3234,66 @@ impl ActorState {
         job_id
     }
 
+    /// One decision (`ModelEntry::cost_source`) drives the gate; the page's Cost
+    /// column reads the same one, so the two cannot drift. The figure follows
+    /// the decision, not the key that happens to exist: a Measured source books
+    /// the measured figure - including the guarded engine_report that OVERSHADOWS
+    /// a smaller declared `vram_gb` (operator ruling 2026-11-01: reserve what the
+    /// container itself reserves), and so does a Fit projection (R11, the same
+    /// max truth). Greedy keeps nominal semantics: a post-spill measurement is
+    /// not a nominal size and must not shrink the booking (review, 2026-10-26);
+    /// `may_book_measured` keeps it off Measured anyway — but a greedy row with
+    /// a fit figure floors its booking at what the engine says it will reserve:
+    /// max truth is not the measured pair's monopoly, and a projection is not a
+    /// post-spill size that could wrongly SHRINK the booking. `Ok(None)` is the
+    /// legal unknown-size greedy load (an unknown nominal is allowed because
+    /// booking uses the room at admit).
+    fn booking_need(entry: &ModelEntry) -> Result<Option<Gibibytes>, AdmissionError> {
+        let need = match entry.cost_source() {
+            // `exact` is a precision claim: the engine's number, not an estimate.
+            // No `vram_gb`, no load — the size×1.15+2 fallback would be a guess.
+            crate::model::CostSource::Undeclared => Err(AdmissionError::ExactUndeclared),
+            crate::model::CostSource::Measured => budget::need_gb(
+                entry.measured_gb.map(Gibibytes),
+                entry.gguf_size_gb.map(Gibibytes),
+            ),
+            crate::model::CostSource::Fit => budget::need_gb(
+                entry.fit_gb.map(Gibibytes),
+                entry.gguf_size_gb.map(Gibibytes),
+            ),
+            crate::model::CostSource::Declared | crate::model::CostSource::Estimate => {
+                budget::need_gb(
+                    entry.vram_gb.map(Gibibytes),
+                    entry.gguf_size_gb.map(Gibibytes),
+                )
+            }
+        };
+        let fit_floor = (entry.cost == crate::model::CostClass::Greedy
+            && crate::engine::policy::fit_capable(&entry.engine))
+        .then(|| entry.fit_gb.map(Gibibytes))
+        .flatten();
+        match need {
+            Ok(need) => Ok(Some(match fit_floor {
+                Some(floor) if floor.0 > need.0 => floor,
+                _ => need,
+            })),
+            Err(_) if entry.cost == crate::model::CostClass::Greedy => Ok(fit_floor),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Arms a registered load row: takes over its slot, books the need, records the
     /// occupant it must release, and starts the witness sample that drives `Admit`.
     /// Arming clears any unload still queued behind a cancelled swap on that slot
     /// (FINDINGS-02 [2]): a load the operator asked for after pressing Unload is the
     /// later instruction.
-    fn start_queued_load(&mut self, job_id: JobId, slot: usize, entry: ModelEntry) {
+    fn start_queued_load(&mut self, job_id: JobId, slot: usize, mut entry: ModelEntry) {
         self.unload_after_finish.remove(&slot);
+        // R11: the row's live fit figure rides the booking decision — cache
+        // hit books the projection (through `cost_source`), a miss books the
+        // ladder now and fires the probe fire-and-forget (never parking the
+        // admit behind a volume). The version epoch rides every llama admit.
+        self.refresh_fit_on_admit(&mut entry);
         // R10 separation (operator 2026-11-01: "8003-8005 are manual only"): a
         // container's internal port is a third namespace; a row claiming a manual
         // or harness number is refused BEFORE spawn, whatever docker would have
@@ -2786,34 +3309,9 @@ impl ActorState {
                 return;
             }
         }
-        // One decision (`ModelEntry::cost_source`) drives the gate; the page's Cost
-        // column reads the same one, so the two cannot drift. The figure follows
-        // the decision, not the key that happens to exist: a Measured source books
-        // the measured figure - including the guarded engine_report that OVERSHADOWS
-        // a smaller declared `vram_gb` (operator ruling 2026-11-01: reserve what the
-        // container itself reserves). Greedy keeps nominal semantics: a post-spill
-        // measurement is not a nominal size and must not shrink the booking
-        // (review, 2026-10-26); `may_book_measured` keeps it off Measured anyway.
-        let need = match entry.cost_source() {
-            // `exact` is a precision claim: the engine's number, not an estimate.
-            // No `vram_gb`, no load — the size×1.15+2 fallback would be a guess.
-            crate::model::CostSource::Undeclared => Err(AdmissionError::ExactUndeclared),
-            crate::model::CostSource::Measured => budget::need_gb(
-                entry.measured_gb.map(Gibibytes),
-                entry.gguf_size_gb.map(Gibibytes),
-            ),
-            crate::model::CostSource::Declared | crate::model::CostSource::Estimate => {
-                budget::need_gb(
-                    entry.vram_gb.map(Gibibytes),
-                    entry.gguf_size_gb.map(Gibibytes),
-                )
-            }
-        };
-        // A greedy load's nominal size never binds — it offloads instead — so an
-        // unknown size is allowed (booking uses the room at admit).
-        let booking = match need {
-            Ok(need) => Some(need),
-            Err(_) if entry.cost == crate::model::CostClass::Greedy => None,
+        // The gate's figure, by the one decision the page also reads.
+        let booking = match Self::booking_need(&entry) {
+            Ok(booking) => booking,
             Err(error) => {
                 let error = SchedulerError::Admission(error);
                 self.slots[slot].job = Some(job_id);
@@ -4392,9 +4890,9 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::{
-        headline_fault, missing_binary_error, serve_model_warning, ActorMsg, ActorState, Gibibytes,
-        Job, JobId, JobKind, JobStatus, JobTimings, MeasuredAnchor, Occupant, Reply, ResourceKind,
-        ScanKind, Scheduler, Slot, SpawnTicket, SwapState,
+        headline_fault, missing_binary_error, serve_model_warning, ActorMsg, ActorState, FitEntry,
+        Gibibytes, Job, JobId, JobKind, JobStatus, JobTimings, MeasuredAnchor, Occupant, Reply,
+        ResourceKind, ScanKind, Scheduler, Slot, SpawnTicket, SwapState,
     };
     use crate::budget::LedgerOnlyWitness;
     use crate::config::CategoryId;
@@ -7376,6 +7874,465 @@ mod tests {
                 .expect("re-faulted")
                 .id,
             JobId(3)
+        );
+    }
+
+    /// Test double for the R11 fit probe: records every (program, argv) it is
+    /// asked to run and answers from two canned queues — one per `--version`
+    /// call, one per row call, in arrival order; an exhausted queue answers
+    /// `None` (the tool did not answer). It NEVER spawns: `cargo test` must
+    /// never exec a real `llama-fit-params.exe`, and a load reaching this
+    /// runtime is a test bug.
+    struct FitProbeRuntime {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+        version: Mutex<std::collections::VecDeque<Option<String>>>,
+        row: Mutex<std::collections::VecDeque<Option<String>>>,
+    }
+
+    impl FitProbeRuntime {
+        fn new(version: Vec<Option<String>>, row: Vec<Option<String>>) -> Self {
+            FitProbeRuntime {
+                calls: Mutex::new(Vec::new()),
+                version: Mutex::new(version.into()),
+                row: Mutex::new(row.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::EngineRuntime for FitProbeRuntime {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: crate::ownership::SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            panic!("the R11 fit pin must never load");
+        }
+        async fn kill(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<(), crate::engine::SpawnError> {
+            panic!("the R11 fit pin must never load");
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            panic!("the R11 fit pin must never load");
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            panic!("the R11 fit pin must never load");
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("the R11 fit pin must never load");
+        }
+        async fn run_probe_command(
+            &self,
+            program: &std::path::Path,
+            args: &[String],
+            _timeout: Duration,
+        ) -> Option<String> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push((program.display().to_string(), args.to_vec()));
+            let queue = if args == crate::engine::fit::version_args() {
+                &self.version
+            } else {
+                &self.row
+            };
+            let mut answers = queue.lock().expect("queue lock");
+            answers.pop_front().unwrap_or(None)
+        }
+    }
+
+    /// The live probe's captured answer (Search#40 §2): the same fixture the
+    /// parser pins, so the end-to-end expectation is the ruling's own number.
+    const FIT_CAPTURED: &str = "CUDA0 21484 8853 1380\nHost 994 0 296\n";
+
+    /// Config with the probe switched on (margin 0.5, no surcharge — this row
+    /// carries no mmproj) and the tool path under `tool_dir`.
+    fn fit_config(tool_dir: &std::path::Path) -> crate::config::AppConfig {
+        let mut cfg = crate::config::AppConfig::parse(
+            r#"{"engines": {"llama": {"fit_probe": true, "fit_margin_gb": 0.5}}}"#,
+        )
+        .expect("valid");
+        cfg.llama_server_exe = tool_dir.join("llama-server.exe");
+        cfg
+    }
+
+    /// The config sibling must EXIST for a pass to start (absence is a named
+    /// warn, not a silent skip): a zero-byte stand-in is enough, the mock
+    /// runtime is what answers, the file is only ever stat'ed.
+    fn seed_fit_tools(dir: &std::path::Path) {
+        std::fs::write(dir.join("llama-server.exe"), b"MZ").expect("server stand-in");
+        std::fs::write(dir.join("llama-fit-params.exe"), b"MZ").expect("tool stand-in");
+    }
+
+    fn fit_llama_entry(dir: &std::path::Path, name: &str) -> ModelEntry {
+        ModelEntry::from_flat(
+            &BTreeMap::from([
+                ("name".to_string(), name.to_string()),
+                ("engine".to_string(), "llama".to_string()),
+                ("category".to_string(), "work".to_string()),
+                ("vram_gb".to_string(), "24".to_string()),
+                (
+                    "model".to_string(),
+                    dir.join("turbo.gguf").display().to_string(),
+                ),
+                ("context".to_string(), "4096".to_string()),
+                ("ngl".to_string(), "99".to_string()),
+            ]),
+            name,
+        )
+        .expect("valid row")
+    }
+
+    /// State carrying one fit-capable row and the live calibration, never
+    /// loading anything.
+    fn fit_state(
+        cfg: crate::config::AppConfig,
+        runtime: Arc<dyn crate::engine::EngineRuntime>,
+    ) -> ActorState {
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "llama".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        ActorState::empty(
+            cfg,
+            crate::testutil::temp_dir("fit-state"),
+            adapters,
+            runtime,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        )
+    }
+
+    fn warns_holding(capture: &Arc<Mutex<Vec<CapturedWarn>>>, needle: &str) -> usize {
+        capture
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(message, fields)| {
+                message.contains(needle) || fields.values().any(|value| value.contains(needle))
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_default_build_emits_zero_fit_probes() {
+        // The inert default is total silence: no plan, no queue, nothing to
+        // cancel — the live build ships before the operator's card window with
+        // zero surprise probes.
+        let dir = crate::testutil::temp_dir("fit-inert");
+        let mut state = fit_state(
+            crate::config::AppConfig::default(),
+            Arc::new(FitProbeRuntime::new(Vec::new(), Vec::new()))
+                as Arc<dyn crate::engine::EngineRuntime>,
+        );
+        state.catalog = vec![fit_llama_entry(&dir, "inert-row")];
+        assert!(
+            state.fit_probe_plan().is_none(),
+            "probe off is no plan at all"
+        );
+        let mut entry = fit_llama_entry(&dir, "inert-row");
+        entry.fit_gb = None;
+        state.refresh_fit_on_admit(&mut entry);
+        assert_eq!(
+            entry.fit_gb, None,
+            "the ladder is untouched by a disabled pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_warm_pass_books_the_projection_and_never_touches_the_yaml() {
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("fit-warm");
+        seed_fit_tools(&dir);
+        std::fs::write(dir.join("turbo.gguf"), b"weights").expect("model stand-in");
+        let yaml = "name: fit-turbo\nengine: llama\ncategory: work\nvram_gb: 24\n\
+                    model: turbo.gguf\ncontext: 4096\nngl: 99\n";
+        std::fs::write(dir.join("fit-turbo.yaml"), yaml).expect("seed llama yaml");
+        let probe = Arc::new(FitProbeRuntime::new(
+            vec![Some("b11669".to_string())],
+            vec![Some(FIT_CAPTURED.to_string())],
+        ));
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "llama".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let handle = Scheduler::start(
+            fit_config(&dir),
+            dir.clone(),
+            adapters,
+            probe.clone() as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+        );
+        let expected = 31_717.0 / 1024.0 + 0.5;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let catalog = loop {
+            let catalog = handle.catalog().await.expect("actor alive");
+            if catalog
+                .models
+                .iter()
+                .any(|m| m.name == "fit-turbo" && m.fit_gb.is_some())
+            {
+                break catalog;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the warm pass never landed a figure (warns: {:?})",
+                capture.lock().expect("capture lock")
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let row = catalog
+            .models
+            .iter()
+            .find(|m| m.name == "fit-turbo")
+            .expect("the row is there");
+        assert_eq!(
+            row.fit_gb,
+            Some(expected),
+            "the captured device sum, Host excluded, + one active device's margin"
+        );
+        let calls = probe.calls.lock().expect("calls lock");
+        assert_eq!(calls.len(), 2, "one version leg, one row leg: {calls:?}");
+        let program = std::path::Path::new(&calls[0].0);
+        assert_eq!(
+            program.file_stem().expect("stem"),
+            "llama-fit-params",
+            "the probe is the config sibling, never the server itself"
+        );
+        assert_eq!(
+            calls[0].1,
+            crate::engine::fit::version_args(),
+            "the epoch rides first"
+        );
+        assert_eq!(
+            calls[1].1,
+            vec![
+                "-m",
+                "turbo.gguf",
+                "-c",
+                "4096",
+                "-ngl",
+                "99",
+                "--fit-print",
+                "on",
+            ],
+            "only the memory-relevant flags, --fit-print last, nothing the server forces"
+        );
+        let row_args = calls[1].1.join(" ");
+        for forbidden in ["--host", "--port", "--jinja", "--mmproj"] {
+            assert!(
+                !row_args.contains(forbidden),
+                "fit-params rejects or ignores {forbidden}: {row_args}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fit-turbo.yaml")).expect("yaml readable"),
+            yaml,
+            "the figure never reaches the operator's bytes: warm booking does not write"
+        );
+    }
+
+    #[test]
+    fn a_replaced_calculator_voids_every_projection() {
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("fit-epoch");
+        let mut state = fit_state(
+            fit_config(&dir),
+            Arc::new(FitProbeRuntime::new(Vec::new(), Vec::new()))
+                as Arc<dyn crate::engine::EngineRuntime>,
+        );
+        let mut row = fit_llama_entry(&dir, "epoch-row");
+        row.fit_gb = Some(31.0);
+        state.catalog = vec![row];
+        state.fit_version = Some("b11669".to_string());
+        state.fit_cache.insert(
+            7,
+            FitEntry {
+                gib: 31.0,
+                fingerprint: None,
+            },
+        );
+        let gen = state.fit_gen();
+        state.on_fit_version(gen, Some("b12000".to_string()));
+        assert_eq!(
+            state.fit_cache.len(),
+            0,
+            "a figure belongs to the tool that minted it"
+        );
+        assert_eq!(
+            state.catalog[0].fit_gb, None,
+            "a stripped row falls back to the ladder"
+        );
+        assert_eq!(state.fit_version.as_deref(), Some("b12000"));
+        assert!(
+            warns_holding(&capture, "the fit calculator changed under us") >= 1,
+            "the void must be named, not silent"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_version_check_is_silence_about_this_pass_only() {
+        // A momentarily absent tool is no evidence the tool CHANGED: the
+        // established epoch and its figures stand, the pass simply goes quiet.
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("fit-silent");
+        let mut state = fit_state(
+            fit_config(&dir),
+            Arc::new(FitProbeRuntime::new(Vec::new(), Vec::new()))
+                as Arc<dyn crate::engine::EngineRuntime>,
+        );
+        let mut row = fit_llama_entry(&dir, "silent-row");
+        row.fit_gb = Some(3.0);
+        state.catalog = vec![row];
+        state.fit_version = Some("b11669".to_string());
+        let gen = state.fit_gen();
+        state.on_fit_version(gen, None);
+        assert_eq!(state.fit_version.as_deref(), Some("b11669"));
+        assert_eq!(state.catalog[0].fit_gb, Some(3.0));
+        assert!(warns_holding(&capture, "did not answer --version") >= 1);
+    }
+
+    #[test]
+    fn a_stale_epoch_fit_answer_is_dropped_at_the_door() {
+        // A rescan bumps the epoch mid-probe: the answer describes a catalog
+        // that no longer exists and may not patch anything.
+        let dir = crate::testutil::temp_dir("fit-stale");
+        let mut state = fit_state(
+            fit_config(&dir),
+            Arc::new(FitProbeRuntime::new(Vec::new(), Vec::new()))
+                as Arc<dyn crate::engine::EngineRuntime>,
+        );
+        let entry = fit_llama_entry(&dir, "stale-row");
+        let key = ActorState::fit_row_key(&entry).expect("probeable");
+        state.catalog = vec![entry];
+        let stale = state.fit_gen().wrapping_add(1);
+        state.on_fit_row_done(stale, "stale-row", key, Ok((31.0, None)));
+        assert_eq!(
+            state.catalog[0].fit_gb, None,
+            "the superseded epoch's figure is void"
+        );
+        assert_eq!(state.fit_cache.len(), 0, "and it never seeds the cache");
+    }
+
+    #[tokio::test]
+    async fn an_admit_hit_books_the_projection_a_proven_change_voids_it() {
+        let dir = crate::testutil::temp_dir("fit-admit");
+        seed_fit_tools(&dir);
+        let probe = Arc::new(FitProbeRuntime::new(Vec::new(), Vec::new()));
+        let mut state = fit_state(
+            fit_config(&dir),
+            Arc::clone(&probe) as Arc<dyn crate::engine::EngineRuntime>,
+        );
+        let entry = fit_llama_entry(&dir, "admit-row");
+        let key = ActorState::fit_row_key(&entry).expect("probeable");
+        state.catalog = vec![entry.clone()];
+
+        // Unstat'able model file (both sides absent): no evidence, figure stands.
+        state.fit_cache.insert(
+            key,
+            FitEntry {
+                gib: 31.0,
+                fingerprint: None,
+            },
+        );
+        let mut probe_row = entry.clone();
+        state.refresh_fit_on_admit(&mut probe_row);
+        assert_eq!(probe_row.fit_gb, Some(31.0), "same argv, same tool, KEEP");
+        assert_eq!(
+            state.catalog[0].fit_gb,
+            Some(31.0),
+            "the page reads the figure the admit booked"
+        );
+
+        // The ruled lock is "version checked at boot AND launch": a booked
+        // hit is no exemption — the admit still asks the calculator its
+        // version, fire-and-forget (this admit never parks behind it).
+        let mut version_checked = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let first_call = probe.calls.lock().expect("calls lock").first().cloned();
+            if let Some((_, args)) = first_call {
+                assert_eq!(
+                    args,
+                    crate::engine::fit::version_args(),
+                    "the FIRST thing a hit admit asks is the tool identity"
+                );
+                version_checked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            version_checked,
+            "a cache-hit admit never checked the version"
+        );
+
+        // A PROVEN model-file change (both fingerprints known, differing) is the
+        // only thing that voids the hit — and this admit books the ladder now
+        // while the refresh re-projects.
+        std::fs::write(dir.join("turbo.gguf"), b"weights").expect("model file");
+        let fresh = crate::model::fingerprint(&dir.join("turbo.gguf")).expect("stat");
+        let stale_stamp = crate::model::FileFingerprint {
+            mtime: fresh.mtime + std::time::Duration::from_secs(60),
+            size: fresh.size + 1,
+        };
+        state.fit_cache.insert(
+            key,
+            FitEntry {
+                gib: 31.0,
+                fingerprint: Some(stale_stamp),
+            },
+        );
+        let mut changed_row = entry.clone();
+        changed_row.fit_gb = Some(31.0);
+        state.refresh_fit_on_admit(&mut changed_row);
+        assert_eq!(
+            changed_row.fit_gb, None,
+            "a rewritten model file is a proven change: the current admit books the ladder"
+        );
+    }
+
+    #[test]
+    fn booking_need_applies_the_max_truth_including_the_greedy_floor() {
+        let mut row = fit_llama_entry(std::path::Path::new("."), "booked");
+        row.fit_gb = Some(31.0);
+        assert_eq!(
+            ActorState::booking_need(&row),
+            Ok(Some(Gibibytes(31.0))),
+            "the projection overshadows the smaller declared floor"
+        );
+        row.vram_gb = Some(40.0);
+        assert_eq!(
+            ActorState::booking_need(&row),
+            Ok(Some(Gibibytes(40.0))),
+            "a declared floor above the projection stands"
+        );
+        row.vram_gb = None;
+        row.gguf_size_gb = None;
+        row.fit_gb = Some(31.0);
+        row.cost = crate::model::CostClass::Greedy;
+        assert_eq!(
+            ActorState::booking_need(&row),
+            Ok(Some(Gibibytes(31.0))),
+            "greedy never wears the Fit class but its launch floor reads the figure"
+        );
+        row.engine = "ninfer".to_string();
+        assert_eq!(
+            ActorState::booking_need(&row),
+            Ok(None),
+            "a projection no other engine owns floors nothing"
         );
     }
 }

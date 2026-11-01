@@ -5,6 +5,7 @@
 //! constructible from data alone — no adapter may hide a decision a template could
 //! express. Readiness is typed, never a string heuristic (defect D7/E1 class).
 
+pub(crate) mod fit;
 pub mod llama;
 pub mod mock;
 pub mod ninfer;
@@ -343,6 +344,25 @@ pub trait EngineRuntime: Send + Sync {
     /// forensic survival of the next `docker rm -f` (R9), pruning that model's
     /// container logs to the keep-N. No-op by default (mocks, non-container runtimes).
     async fn save_container_log(&self, _model: &str, _text: &str) {}
+
+    /// R11 Fit seam: run ONE harness-internal probe command — the config's
+    /// sibling `llama-fit-params.exe` with a printed projection or `--version`
+    /// — and return its stdout, `None` for any failure (spawn refused,
+    /// non-zero exit, timeout: the caller warns and falls down the ladder,
+    /// there is no invented number). The process runtime runs it through its
+    /// ONE gated control-command builder (hidden, kill-on-drop, scrubbed
+    /// environment — the FINDINGS2-0910 [4] discipline); it is NOT an engine
+    /// spawn: no ticket, no port, no log file, nothing registered. Default
+    /// `None`: only the process runtime answers, so every mock is inert and
+    /// `cargo test` never execs a real `llama-fit-params.exe`.
+    async fn run_probe_command(
+        &self,
+        _program: &std::path::Path,
+        _args: &[String],
+        _timeout: std::time::Duration,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// Production boot's adapter map (FINDINGS-10 [3]): llama + strata + ninfer always,

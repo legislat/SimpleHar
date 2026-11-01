@@ -212,6 +212,14 @@ pub struct ModelEntry {
     /// discovery at readiness — a mismatch is a recorded warning, never trusted
     /// (F-4 fix, Step 10).
     pub serve_model: Option<String>,
+    /// The R11 Fit projection in GiB — the engine's own pre-spawn word from
+    /// `llama-fit-params --fit-print on` (rule 2026-11-01). **In-process
+    /// only**: the scanner never fills it, no writer persists it, and it is
+    /// absent from `raw`, so a Fit computation can never reach the yaml. The
+    /// scheduler patches the current value in after each probe; a stale one
+    /// is dropped (set back to `None`), never trusted (the args-hash cache is
+    /// the void identity).
+    pub fit_gb: Option<f64>,
     /// File the entry came from; `None` for synthetic entries (tests, mock).
     pub file: Option<PathBuf>,
     /// Every raw `key: value` from the source file, verbatim — the passthrough the
@@ -480,16 +488,24 @@ fn parse_bool_stamp(field: &str, raw: &str) -> Result<bool, ModelError> {
 /// how the page could show a number the gate ignored (duplication review, 2026-10-26).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostSource {
-    /// The declared `vram_gb` — including where a guarded `engine_report` exists
-    /// but does not exceed it (the declared floor then stands).
+    /// The declared `vram_gb` — including where a guarded `engine_report` or a
+    /// Fit projection exists but does not exceed it (the declared floor then
+    /// stands).
     Declared,
     /// The harness-measured footprint of an earlier run: the booking basis for
     /// `fixed`/`exact` rows without a binding declaration, and the override of a
     /// declared value a guarded `engine_report` exceeds.
     Measured,
+    /// The engine's own pre-spawn projection (`llama-fit-params --fit-print`,
+    /// R11): books for `fixed`/`exact` rows without a binding declaration and
+    /// overshadows a declared `vram_gb` it exceeds — the same amended-15(ii)
+    /// max truth as the container's word. `greedy` never books it as a class
+    /// (its launch-floor input does read it); never persisted.
+    Fit,
     /// GGUF size × 1.15 + 2.
     Estimate,
-    /// `exact` with nothing declared: refused, never guessed.
+    /// `exact` with nothing declared and no self-reported figure or Fit
+    /// projection: refused, never guessed.
     Undeclared,
 }
 
@@ -545,23 +561,53 @@ impl ModelEntry {
             && reported > declared
     }
 
+    /// Whether this row's in-process Fit projection (R11) may book at all:
+    /// the figure is present, the row's engine policy row is the fit-capable
+    /// one (the llama row alone — never an engine-name match), and the cost
+    /// class may charge a projected figure. `greedy` is excluded from the
+    /// CLASS exactly as it is for a measured pair (a projection is not a
+    /// nominal size; the scheduler's greedy launch-floor input reads the
+    /// figure directly); `fixed` and `exact` accept it — the projection is
+    /// the engine's own calculator, a real source, which is what `exact`
+    /// demands.
+    #[must_use]
+    fn fit_bookable(&self) -> bool {
+        self.fit_gb.is_some()
+            && self.cost != CostClass::Greedy
+            && crate::engine::policy::fit_capable(&self.engine)
+    }
+
     /// The booking precedence: declared → measured (only where the cost class may
-    /// book it, per [`Self::may_book_measured`]) → GGUF estimate, with
-    /// `exact`-without-`vram_gb`-and-without-a-self-reported-measurement refused.
+    /// book it, per [`Self::may_book_measured`]) → the R11 Fit projection → GGUF
+    /// estimate, with `exact`-without-`vram_gb`-and-without-a-real-source refused.
     /// A guarded `engine_report` ABOVE the declared value books instead of it
-    /// ([`Self::engine_report_outranks_declared`]) — the container's word is the
-    /// bigger truth, so the max of the two is what admission charges.
+    /// ([`Self::engine_report_outranks_declared`]), and so does a Fit projection
+    /// above it (rule 2026-11-01, the same amended-15(ii) max truth): the booking
+    /// is what the engine itself will take, the declared number is a floor, never
+    /// a ceiling.
     #[must_use]
     pub fn cost_source(&self) -> CostSource {
-        if self.vram_gb.is_some() {
-            return if self.engine_report_outranks_declared() {
-                CostSource::Measured
+        let fit = self.fit_bookable().then_some(self.fit_gb).flatten();
+        if let Some(declared) = self.vram_gb {
+            if self.engine_report_outranks_declared() {
+                return CostSource::Measured;
+            }
+            return if fit.is_some_and(|fit| fit > declared) {
+                CostSource::Fit
             } else {
                 CostSource::Declared
             };
         }
         if self.may_book_measured() {
-            return CostSource::Measured;
+            // Both real sources present: the higher books (max truth), the
+            // lower stands as the display figure it is.
+            return match (self.measured_gb, fit) {
+                (Some(measured), Some(fit)) if fit > measured => CostSource::Fit,
+                _ => CostSource::Measured,
+            };
+        }
+        if fit.is_some() {
+            return CostSource::Fit;
         }
         if self.cost == CostClass::Exact {
             return CostSource::Undeclared;
@@ -713,6 +759,10 @@ impl ModelEntry {
             measured_profile: measured.profile,
             model_ref: keys.get("model").cloned(),
             serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
+            // A hand-written `fit_gb:` in a yaml is inert by construction: the
+            // figure is the engine's live word, only ever set in-process by
+            // the scheduler's probe, never read from disk.
+            fit_gb: None,
             file: None,
             // v3.3's `external: true` is scrapped (operator 2026-10-26): skipped here
             // so a copied-back v3.3 yaml cannot keep advertising a meaning nothing has,
@@ -721,10 +771,14 @@ impl ModelEntry {
             // (operator ruling 2026-10-28, "forensic manual only"): its value can
             // neither surface on the page nor be re-emitted by write-back. The
             // operator's file bytes are left alone — only the parsed entry drops it.
+            // R11's `fit_gb:` drops for the same reason run deeper: the figure is
+            // the engine's live in-process word, and a stale one carried into the
+            // write-back source could persist what the ruling forbids persisting.
             raw: keys
                 .iter()
                 .filter(|(key, _)| {
                     key.as_str() != "external"
+                        && key.as_str() != "fit_gb"
                         && !crate::model::scan::SILENT_KEYS.contains(&key.as_str())
                 })
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -1277,6 +1331,100 @@ mod tests {
         let exact =
             ModelEntry::from_flat(&flat(&[("name", "m"), ("cost", "exact")]), "m").expect("valid");
         assert_eq!(exact.cost_source(), CostSource::Undeclared);
+    }
+
+    /// R11 (rule 2026-11-01): the fit projection books with the SAME max truth
+    /// as the guarded engine_report — declared is a floor, never a ceiling —
+    /// it verifies `exact` rows (a real source, not an estimate), it never
+    /// labels a `greedy` booking, and it is scoped to the fit-capable engine
+    /// row, never to whichever engine happens to answer to a name.
+    #[test]
+    fn the_fit_projection_books_max_truth_on_the_llama_row_only() {
+        let mut row = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("engine", "llama"), ("vram_gb", "24")]),
+            "m",
+        )
+        .expect("valid");
+        row.fit_gb = Some(31.0);
+        assert_eq!(
+            row.cost_source(),
+            CostSource::Fit,
+            "the engine's own word above the declared floor books"
+        );
+        row.fit_gb = Some(24.0);
+        assert_eq!(
+            row.cost_source(),
+            CostSource::Declared,
+            "declared is a floor: equal does not overshadow"
+        );
+        row.fit_gb = Some(20.0);
+        assert_eq!(row.cost_source(), CostSource::Declared);
+        // No declaration: the fit pair and a certified measured figure compete
+        // the same max-truth way.
+        let mut row = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("engine", "llama"), ("measured_gb", "28")]),
+            "m",
+        )
+        .expect("valid");
+        row.fit_gb = Some(31.0);
+        assert_eq!(row.cost_source(), CostSource::Fit);
+        row.fit_gb = Some(26.0);
+        assert_eq!(row.cost_source(), CostSource::Measured);
+        // `exact` without a declaration verifies THROUGH the projection: a fit
+        // figure is a real source, so the row is no longer undeclared.
+        let mut exact = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("engine", "llama"), ("cost", "exact")]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(exact.cost_source(), CostSource::Undeclared);
+        exact.fit_gb = Some(12.0);
+        assert_eq!(exact.cost_source(), CostSource::Fit);
+        // `greedy` never wears the Fit label (its launch floor reads the figure
+        // directly in the scheduler, exactly as for a measured pair).
+        let mut greedy = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("engine", "llama"), ("cost", "greedy")]),
+            "m",
+        )
+        .expect("valid");
+        greedy.fit_gb = Some(12.0);
+        assert_eq!(
+            greedy.cost_source(),
+            CostSource::Estimate,
+            "greedy refuses a projection as a CLASS"
+        );
+        // Row scope: only the llama policy row is fit-capable.
+        let mut ninfer = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("engine", "ninfer"), ("vram_gb", "24")]),
+            "m",
+        )
+        .expect("valid");
+        ninfer.fit_gb = Some(31.0);
+        assert_eq!(
+            ninfer.cost_source(),
+            CostSource::Declared,
+            "a figure from a tool no other engine owns is not that engine's word"
+        );
+    }
+
+    /// Never-persisted, in both directions: a hand-written `fit_gb:` in a yaml
+    /// is inert (the figure is only ever the scheduler's live in-process word),
+    /// and the typed field never joins `raw` (the write-back source).
+    #[test]
+    fn fit_gb_is_never_read_from_disk_nor_written_to_it() {
+        let entry = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("engine", "llama"), ("fit_gb", "99")]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            entry.fit_gb, None,
+            "a stale yaml figure is inert by construction"
+        );
+        assert!(
+            !entry.raw.contains_key("fit_gb"),
+            "an unknown key must not survive into the write-back passthrough either"
+        );
     }
 
     /// R1/F1(b) + ruling 15 (ii): the provenance stamp, not the bare presence of a

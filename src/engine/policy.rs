@@ -407,6 +407,15 @@ pub(crate) fn knob_readers(key: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Whether the row for `engine` may book from the R11 Fit projection (the
+/// llama row's `supports_fit` cell is the single answer — the ladder and the
+/// warm queue ask this instead of matching engine ids). An unknown engine id
+/// (no row) is never fit-capable.
+#[must_use]
+pub(crate) fn fit_capable(engine: &str) -> bool {
+    engine_policy(engine).is_some_and(|row| row.supports_fit)
+}
+
 /// The canonical ninfer autostart script the harness renders and stages for
 /// every ninfer launch (operator ruling 2026-10-31: "we create a valid template
 /// we can control and adopt for each ninfer start"). The staged copy is what
@@ -588,6 +597,11 @@ pub(crate) struct EnginePolicy {
     /// when the config grows an engine-scoped key that joins neither a row nor
     /// the config-only list.
     pub config_knobs: &'static [&'static str],
+    /// Whether this engine has an R11 Fit cost class: its row is the only one
+    /// whose launches may book from the `llama-fit-params` projection. The
+    /// ladder and the scheduler ask this cell instead of matching engine names
+    /// (row-scoped, no new match-arm sprawl).
+    pub supports_fit: bool,
 }
 
 static MOCK_ROW: EnginePolicy = EnginePolicy {
@@ -605,6 +619,7 @@ static MOCK_ROW: EnginePolicy = EnginePolicy {
     serve_template: None,
     profile_field: None,
     config_knobs: &["allow_mock_engine"],
+    supports_fit: false,
 };
 
 static LLAMA_ROW: EnginePolicy = EnginePolicy {
@@ -631,7 +646,16 @@ static LLAMA_ROW: EnginePolicy = EnginePolicy {
     custody_data_roots: &[],
     serve_template: None,
     profile_field: None,
-    config_knobs: &["llama_server_exe"],
+    // R11: the Fit probe switch and its calibration constants live in the
+    // harness config `engines:` section (slice 10d idiom), claimed here.
+    config_knobs: &[
+        "llama_server_exe",
+        "engines.llama.fit_probe",
+        "engines.llama.fit_margin_gb",
+        "engines.llama.mmproj_surcharge_gb",
+        "engines.llama.fit_probe_timeout_s",
+    ],
+    supports_fit: true,
 };
 
 static STRATA_ROW: EnginePolicy = EnginePolicy {
@@ -670,6 +694,7 @@ static STRATA_ROW: EnginePolicy = EnginePolicy {
     // (slice 10d); the dotted claims are the knob-parity test's pointers into
     // that section, which the test walks in a populated serialization.
     config_knobs: &["engines.strata.python", "engines.strata.cwd"],
+    supports_fit: false,
 };
 
 static NINFER_ROW: EnginePolicy = EnginePolicy {
@@ -690,6 +715,7 @@ static NINFER_ROW: EnginePolicy = EnginePolicy {
     serve_template: Some(CANONICAL_NINFER_SCRIPT),
     profile_field: None,
     config_knobs: &["wsl_distro", "wsl_user"],
+    supports_fit: false,
 };
 
 static POLICIES: &[&EnginePolicy] = &[&MOCK_ROW, &LLAMA_ROW, &STRATA_ROW, &NINFER_ROW];
@@ -878,6 +904,7 @@ mod tests {
             measured_offload: None,
             measured_attribution: None,
             measured_profile: None,
+            fit_gb: None,
             model_ref: None,
             serve_model: None,
             file: None,
@@ -1107,6 +1134,12 @@ mod tests {
                         "C:/Strata/.venv/Scripts/python.exe",
                     )),
                     cwd: Some(std::path::PathBuf::from("C:/Strata")),
+                }),
+                llama: Some(crate::config::LlamaEngineConfig {
+                    fit_probe: Some(true),
+                    fit_margin_gb: Some(2.5),
+                    mmproj_surcharge_gb: Some(1.25),
+                    fit_probe_timeout_s: Some(20),
                 }),
             }),
             ..crate::config::AppConfig::default()

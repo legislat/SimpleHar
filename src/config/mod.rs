@@ -317,17 +317,22 @@ pub const STRATA_CWD_DEFAULT: &str = r"C:\Strata";
 /// out of the serialized file (existing configs keep their exact shape, the
 /// GOTCHAS serialization discipline), while an unknown key is refused
 /// (`deny_unknown_fields`) rather than silently ignored.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnginesConfig {
     /// strata engine defaults; absent means the documented v3.3 fallbacks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strata: Option<StrataEngineConfig>,
+    /// llama engine defaults (R11: the Fit probe switch and its Wave-C
+    /// calibration constants); absent means fully inert — no probe is ever
+    /// run unless `fit_probe` is explicitly turned on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama: Option<LlamaEngineConfig>,
 }
 
 /// strata harness-side defaults. The per-model yaml knobs `strata_python` and
 /// `strata_cwd` still override these values for a single model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StrataEngineConfig {
     /// Interpreter binary (`argv[0]`) the strata launch starts.
@@ -336,6 +341,35 @@ pub struct StrataEngineConfig {
     /// Working directory handed to the child process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<std::path::PathBuf>,
+}
+
+/// llama harness-side defaults for the R11 Fit cost class (rule 2026-11-01,
+/// Search#40). Every value here is *calibration*, not decoration: the margin
+/// and surcharge are meant to be measured in the Wave-C card window, so an
+/// unset one is treated as **unconfigured** (warn + declared/estimate ladder)
+/// rather than defaulted to a number that would pretend to be calibrated.
+/// `fit_probe` itself defaults OFF, so the build lands inert: nothing probes,
+/// no warm queue runs, and the ladder behaves exactly as before until the
+/// operator turns it on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlamaEngineConfig {
+    /// Master switch for the pre-spawn `llama-fit-params --fit-print on`
+    /// probe and its boot/rescan warm queue. Unset/false = zero probes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_probe: Option<bool>,
+    /// Per-active-device safety margin in GiB (CUDA context, compute graphs —
+    /// outside the projection). Required while the probe is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_margin_gb: Option<f64>,
+    /// Vision surcharge in GiB applied to rows carrying `mmproj:` (fit-params
+    /// rejects `--mmproj`, so the projection cannot see it). Required for a
+    /// vision row while the probe is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmproj_surcharge_gb: Option<f64>,
+    /// Per-probe deadline in seconds; unset keeps the control-command floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_probe_timeout_s: Option<u64>,
 }
 
 /// Root of [`CONFIG_FILE`].
@@ -686,6 +720,26 @@ impl AppConfig {
             .unwrap_or_else(|| std::path::PathBuf::from(STRATA_CWD_DEFAULT))
     }
 
+    /// The llama Fit rows: `engines.llama` when the operator wrote the section.
+    /// `None` is the inert default — the probe stays off and the ladder
+    /// unchanged (R11: the build lands before the card window with zero
+    /// surprise probes).
+    #[must_use]
+    pub fn llama_fit(&self) -> Option<&LlamaEngineConfig> {
+        self.engines
+            .as_ref()
+            .and_then(|engines| engines.llama.as_ref())
+    }
+
+    /// Whether the pre-spawn Fit probe may run at all (R11). Unset is false:
+    /// the live build is inert until the operator turns it on.
+    #[must_use]
+    pub fn llama_fit_probe_enabled(&self) -> bool {
+        self.llama_fit()
+            .and_then(|llama| llama.fit_probe)
+            .unwrap_or(false)
+    }
+
     /// Cross-field validation (§0.2 step 2 namespace check). Returns every problem.
     ///
     /// # Errors
@@ -729,6 +783,35 @@ impl AppConfig {
                             .to_string(),
                     });
                 }
+            }
+        }
+        // R11 Fit calibration: every figure that feeds a VRAM booking must be
+        // finite and non-negative (the `parse_gib` doctrine — a NaN comparison
+        // is false, and a negative margin would shrink bookings below the
+        // projection). A timeout of 0 would refuse the probe outright.
+        if let Some(llama) = self.llama_fit() {
+            for (field, value) in [
+                ("engines.llama.fit_margin_gb", llama.fit_margin_gb),
+                (
+                    "engines.llama.mmproj_surcharge_gb",
+                    llama.mmproj_surcharge_gb,
+                ),
+            ] {
+                if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                    errors.push(ConfigError::Invalid {
+                        field: field.to_string(),
+                        reason: "must be a finite non-negative GiB figure (these are Wave-C \
+                                 calibrations feeding the VRAM booking)"
+                            .to_string(),
+                    });
+                }
+            }
+            if llama.fit_probe_timeout_s == Some(0) {
+                errors.push(ConfigError::Invalid {
+                    field: "engines.llama.fit_probe_timeout_s".to_string(),
+                    reason: "must be at least 1 second; omit the key to keep the default"
+                        .to_string(),
+                });
             }
         }
         let mut seen = BTreeSet::new();
@@ -1494,6 +1577,12 @@ mod tests {
                     )),
                     cwd: Some(std::path::PathBuf::from("C:/Strata")),
                 }),
+                llama: Some(LlamaEngineConfig {
+                    fit_probe: Some(true),
+                    fit_margin_gb: Some(2.5),
+                    mmproj_surcharge_gb: Some(1.25),
+                    fit_probe_timeout_s: Some(20),
+                }),
             }),
             ..AppConfig::default()
         };
@@ -1510,6 +1599,38 @@ mod tests {
         assert!(
             unset.get("engines").is_none(),
             "an unset section stays out of the file: existing shape must not change"
+        );
+        // The R11 half: a half-written llama section round-trips with its
+        // absent keys ABSENT, never null (the unset-not-serialized rule).
+        let half = AppConfig {
+            engines: Some(EnginesConfig {
+                strata: None,
+                llama: Some(LlamaEngineConfig {
+                    fit_probe: Some(true),
+                    fit_margin_gb: None,
+                    mmproj_surcharge_gb: None,
+                    fit_probe_timeout_s: None,
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        let half_json: serde_json::Value =
+            serde_json::from_str(&write_back_text(&half)).expect("half section serializes");
+        let llama = &half_json["engines"]["llama"];
+        assert_eq!(llama["fit_probe"], serde_json::json!(true));
+        for absent in [
+            "fit_margin_gb",
+            "mmproj_surcharge_gb",
+            "fit_probe_timeout_s",
+        ] {
+            assert!(
+                llama.get(absent).is_none(),
+                "`{absent}` must stay out of the file, not arrive as null"
+            );
+        }
+        assert_eq!(
+            AppConfig::parse(&write_back_text(&half)).expect("half parses back"),
+            half
         );
     }
 
@@ -1533,6 +1654,7 @@ mod tests {
                     python: Some(std::path::PathBuf::from("D:/other/python.exe")),
                     cwd: None,
                 }),
+                llama: None,
             }),
             ..AppConfig::default()
         };
@@ -1549,7 +1671,9 @@ mod tests {
 
     /// A blank engines path is a mistake that must refuse boot (the
     /// `control_token` doctrine), and a typo — a section for an engine with no
-    /// harness-side defaults at all — is refused, not ignored.
+    /// harness-side defaults at all — is refused, not ignored. R11 gave the
+    /// llama row a real defaults section, so the refused stand-in moved to an
+    /// engine that still owns none.
     #[test]
     fn a_blank_or_unknown_engines_entry_is_refused() {
         let blank =
@@ -1564,9 +1688,48 @@ mod tests {
             "a misspelled engines subkey must not be silently ignored"
         );
         assert!(
-            AppConfig::parse(r#"{"engines": {"llama": {}}}"#).is_err(),
-            "the harness owns no llama-side defaults section to accept"
+            AppConfig::parse(r#"{"engines": {"llama": {"fit_margin": 2.5}}}"#).is_err(),
+            "a misspelled llama subkey must not be silently ignored"
         );
+        assert!(
+            AppConfig::parse(r#"{"engines": {"ninfer": {}}}"#).is_err(),
+            "the harness owns no ninfer-side defaults section to accept"
+        );
+    }
+
+    /// R11 inertness, pinned: the default config probes NOTHING. The probe
+    /// only exists when the operator writes `fit_probe: true`, and even then
+    /// the calibration constants stay unset (a warning at use time, never a
+    /// silent default that pretends to be measured).
+    #[test]
+    fn the_llama_fit_probe_is_inert_until_the_operator_turns_it_on() {
+        assert!(!AppConfig::default().llama_fit_probe_enabled());
+        assert!(AppConfig::default().llama_fit().is_none());
+        let off =
+            AppConfig::parse(r#"{"engines": {"llama": {"fit_probe": false}}}"#).expect("parses");
+        assert!(!off.llama_fit_probe_enabled());
+        assert!(off.validate().is_empty());
+        let on = AppConfig::parse(
+            r#"{"engines": {"llama": {"fit_probe": true, "fit_margin_gb": 2.0}}}"#,
+        )
+        .expect("parses");
+        assert!(on.llama_fit_probe_enabled());
+        assert!(on.validate().is_empty(), "{:?}", on.validate());
+        assert!(
+            on.llama_fit().and_then(|l| l.mmproj_surcharge_gb).is_none(),
+            "an unset calibration stays unset: there is no honest default"
+        );
+        for bad in [
+            r#"{"engines": {"llama": {"fit_margin_gb": -1}}}"#,
+            r#"{"engines": {"llama": {"mmproj_surcharge_gb": -1}}}"#,
+            r#"{"engines": {"llama": {"fit_probe_timeout_s": 0}}}"#,
+        ] {
+            let config = AppConfig::parse(bad).expect("parses as json");
+            assert!(
+                !config.validate().is_empty(),
+                "a nonsense calibration must refuse boot: {bad}"
+            );
+        }
     }
 
     /// True when `validate()` reports at least one problem naming `field`.
