@@ -16,8 +16,10 @@
 //! an existing `.exe` **file** (it is the launched program), and `strata_cwd` an
 //! existing directory. That is "refuse garbage early", not custody: the profile's
 //! *contents* are never policy-checked, and the roots that decide which paths are
-//! admissible at all are the `custody_roots` column of chunk 10's `EnginePolicy` row
-//! with the values moving to the config's `engines:` section (§20-9 Fork C).
+//! admissible at all are the strata `custody_*` cells of the
+//! [`crate::engine::policy`] `EnginePolicy` table (§20-9 Fork C), still open in
+//! 10a with the root values moving to the config's `engines:` section in a later
+//! custody slice.
 
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
@@ -56,20 +58,16 @@ impl StrataAdapter {
         }
     }
 
-    /// The argv exactly as v3.3 built it: interpreter, module, engine, profile,
-    /// harness-assigned port. Nothing else reaches the child.
+    /// The argv exactly as v3.3 built it: interpreter, then the forced tokens
+    /// rendered from the `strata` row of the [`crate::engine::policy`] table
+    /// (module, engine tag, profile position, harness-assigned port). Nothing
+    /// else reaches the child.
     fn argv(&self, python: &str, config: &str, port: u16) -> Vec<String> {
-        vec![
-            python.to_string(),
-            "-m".to_string(),
-            "serve.server".to_string(),
-            "--engine".to_string(),
-            "strata".to_string(),
-            "--config".to_string(),
-            config.to_string(),
-            "--port".to_string(),
-            port.to_string(),
-        ]
+        let row = super::policy::engine_policy("strata")
+            .expect("the compiled-in table ships a strata row");
+        let mut argv = vec![python.to_string()];
+        argv.extend(super::policy::render_forced(row, port, Some(config)));
+        argv
     }
 }
 
@@ -114,7 +112,8 @@ impl EngineAdapter for StrataAdapter {
         // `.exe`, matching how the llama adapter refuses a missing binary. The
         // rest of this cell — an interpreter under a config-declared root, the
         // profile under a declared profile root, policy keys inside the profile
-        // itself — is the `custody_roots` column of chunk 10's `EnginePolicy` row
+        // itself — is the two custody-root columns (exec vs data) of chunk 10's
+        // `EnginePolicy` row
         // and the `engines:` config section (`DECISIONS` §20-9 Fork C), not here;
         // a batch shim renamed to `.exe` therefore still needs that ruling, which
         // is why this is called a floor and not a control.

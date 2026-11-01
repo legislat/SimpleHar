@@ -572,8 +572,10 @@ async fn reap_container(distro: &str, user: &str, name: &str) -> bool {
 /// The in-distro directory a harness-rendered autostart script is staged into.
 /// Deliberately outside every model directory and outside the operator's script
 /// tree: a staged file can never shadow or be confused with a hand-written one
-/// (template adoption, operator ruling 2026-10-31).
-const STAGED_AUTOSTART_DIR: &str = ".simplehar/autostart";
+/// (template adoption, operator ruling 2026-10-31). The value is the ninfer row's
+/// executed-path custody root in the [`crate::engine::policy`] table (§20-9
+/// Fork C single source).
+const STAGED_AUTOSTART_DIR: &str = crate::engine::policy::NINFER_STAGED_SCRIPTS_ROOT;
 
 /// How many staged renders of one model's slug survive in the staging directory
 /// (the staging driver prunes older `<slug>-<hash>.sh` files past this many). A
@@ -1560,15 +1562,6 @@ impl EngineRuntime for ProcessRuntime {
     }
 }
 
-/// The argv positions that carry a model file to the engine: llama takes
-/// `-m <path>`, strata takes its profile as `--config <path>` (its `-m` names the
-/// Python module, which [`looks_like_local_path`] rejects as a path candidate).
-/// A missing file at one of these slots turns the bare exit status of a fast-fail
-/// into the file the operator must restore (FINDINGS-13 [2]'s load-path companion);
-/// the catalog is never mutated from here (operator ruling — a transient deletion
-/// must not silently rewrite the page).
-const PATH_FLAGS: &[&str] = &["-m", "--config"];
-
 /// Whether an argv word is a local path a missing-file diagnosis may name:
 /// `scheme://` sentinels name no local file, and a bare module token
 /// (`serve.server`) has no path shape at all — checking it would misname the
@@ -1584,9 +1577,16 @@ fn looks_like_local_path(candidate: &str) -> bool {
 /// a local model/profile file that is gone, the reason names it; otherwise the
 /// pre-existing text is preserved verbatim. Pure given the filesystem — the stat
 /// is its only effect-free input — so the decision is testable without a spawn.
+/// The argv positions that carry a model file come from the `EnginePolicy`
+/// table's `path_markers` cells (llama `-m <path>`, strata `--config <path>`);
+/// a missing file at one of these slots turns the bare exit status of a
+/// fast-fail into the file the operator must restore (FINDINGS-13 [2]'s
+/// load-path companion); the catalog is never mutated from here (operator
+/// ruling — a transient deletion must not silently rewrite the page).
 fn early_exit_report(argv: &[String], status: &str) -> (String, Option<String>) {
+    let markers = crate::engine::policy::path_markers();
     let missing = argv.windows(2).find_map(|window| {
-        (PATH_FLAGS.contains(&window[0].as_str())
+        (markers.contains(&window[0].as_str())
             && looks_like_local_path(&window[1])
             && std::path::Path::new(&window[1]).metadata().is_err())
         .then(|| window[1].clone())

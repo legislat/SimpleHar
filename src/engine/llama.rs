@@ -46,54 +46,14 @@ use std::path::PathBuf;
 /// actually bound (FINDINGS-09 [1]).
 pub const LLAMA_ENGINE_HOST: &str = "127.0.0.1";
 
-/// The CLOSED allow-list of `extra_args` option words an operator may pass through
-/// (FINDINGS2-0910 [1]): the inversion of the old `HARNESS_OWNED_FLAGS` denial list,
-/// which could only ever name ten of the pinned build's ~200 options and therefore
-/// left the harness-owned decisions — which weights serve, the bind host/port, the
-/// key, the transport, the served static roots, egress and port reuse — reachable
-/// from a single yaml line. A word passes iff it names one of these entries
-/// (or, for a value-taking entry, that spelling with `=value` appended); the
-/// entry's `arity` following words are its values and pass verbatim as data.
-/// Everything else is refused, so the parser is never reached from the catalog.
-///
-/// Adding a word here is a review decision, and the entry must state which
-/// harness-owned decision it cannot move. The set is admitted because every entry
-/// is (a) present in the pinned build (checked against the `llama-common.dll`
-/// option string table, so an admitted word is one the engine actually parses) and
-/// (b) unable to choose weights, bind address, port, authentication, TLS, static
-/// roots, download/RPC egress, `--reuse-port`, or to flip a flag the harness itself
-/// emits. Deliberately absent — reviewed and refused, along with everything else:
-/// `-m`/`--model`/`--model-url`/`--hf-repo`/`--hf-file`/`--docker-repo` (which
-/// weights serve), `--models-dir`/`--models-preset`/`--models-autoload` (an
-/// engine-side router file), `--mmproj` (a second weights file), `--host`/`--port`
-/// and `-ngl` with all its alias spellings (harness-forced), `--api-key*`,
-/// `--ssl-*`, `--rpc`, `--path`, `--reuse-port`, `--lora*`, `--control-vector*`,
-/// `--override-kv` and `--jinja`/`--no-jinja` (each moves a harness-owned decision
-/// or rewrites the template the harness would have emitted).
-const EXTRA_ARGS_ALLOWED: &[(&str, usize)] = &[
-    // Reply shape only: serves embeddings instead of chat. No weights, bind, key,
-    // root or egress choice; `/health` still answers, so readiness is unaffected.
-    // `--embedding` is the pinned build's legacy alias of the canonical
-    // `--embeddings`, and it is the spelling the live catalog uses
-    // (ModelConf/embeddinggemma-2-GGUF.yaml).
-    ("--embedding", 0),
-    ("--embeddings", 0),
-    // How an embeddings reply is pooled; the value is a mode name, not a path.
-    ("--pooling", 1),
-    // Sampling defaults: token choice within the loaded model. Cannot select a
-    // model, a bind, a key or a root, and cannot affect `/health`.
-    ("--temp", 1),
-    ("--top-k", 1),
-    ("--top-p", 1),
-    ("--min-p", 1),
-    ("--repeat-penalty", 1),
-    ("--seed", 1),
-    // Pre-tokenization timing: moves work between startup and the first request,
-    // so it can only ever shift when `/health` turns up, never what it serves;
-    // `load_timeout` remains the harness's own deadline either way.
-    ("--warmup", 0),
-    ("--no-warmup", 0),
-];
+/// The CLOSED allow-list of `extra_args` option words an operator may pass
+/// through (FINDINGS2-0910 [1], inverted from the old denial list — the full
+/// rationale lives with the data now). The list itself is the `llama` row's
+/// `allow_words` cell in the [`crate::engine::policy`] table (§20-9 Fork C,
+/// "one mechanism, four instances"); this alias keeps every read in this
+/// adapter pointed at that single source, so the refusal text and the
+/// enforcement can never cite two different lists.
+const EXTRA_ARGS_ALLOWED: &[(&str, usize)] = crate::engine::policy::LLAMA_EXTRA_ARGS;
 
 /// What one `extra_args` word is under [`EXTRA_ARGS_ALLOWED`].
 struct AllowedWord {
@@ -252,14 +212,17 @@ pub fn jinja_on(value: &str) -> bool {
 /// (the deliberate deviation: the forced flags move to the tail): `-m` first
 /// (required), `--mmproj`, the remaining mapped flags with non-empty
 /// values, `--jinja` when truthy, then the admitted `extra_args` words, and the
-/// harness-forced flags at the tail (`--host`, `--port`, and `-ngl 0` when
-/// `cpu_offload` is on) so forced values win under any parser that honors last
-/// occurrence. `extra_args` is filtered by the closed [`EXTRA_ARGS_ALLOWED`] list,
-/// so nothing but a reviewed word can reach the engine at all.
+/// harness-forced flags at the tail, rendered from the `llama` row of the
+/// [`crate::engine::policy`] table (`--host`, `--port`, plus `-ngl 0` when
+/// `cpu_offload` is on — a knob-scoped conditional force, not a static table
+/// cell) so forced values win under any parser that honors last occurrence.
+/// `extra_args` is filtered by the closed [`EXTRA_ARGS_ALLOWED`] list, so
+/// nothing but a reviewed word can reach the engine at all.
 ///
-/// Crate-internal: `host` is only ever [`LLAMA_ENGINE_HOST`] in production (from
-/// [`LlamaAdapter::spec`]); a public host knob would be the struct-literal bypass
-/// `ff235e6` deleted from the adapter, back in parameter form.
+/// Crate-internal with no host knob on purpose: the bind address is the row's
+/// forced [`LLAMA_ENGINE_HOST`] literal and nothing else can emit it — a
+/// caller-supplied host would be the struct-literal bypass `ff235e6` deleted,
+/// back in parameter form.
 ///
 /// # Errors
 ///
@@ -269,7 +232,6 @@ pub fn jinja_on(value: &str) -> bool {
 ///   naming the offending token.
 pub(crate) fn build_args(
     raw: &BTreeMap<String, String>,
-    host: &str,
     port: u16,
     model_name: &str,
 ) -> Result<Vec<String>, EngineError> {
@@ -307,8 +269,11 @@ pub(crate) fn build_args(
         args.push("--jinja".to_string());
     }
     args.extend(extra.iter().map(|word| (*word).to_string()));
-    args.extend(["--host".to_string(), host.to_string()]);
-    args.extend(["--port".to_string(), port.to_string()]);
+    args.extend(super::policy::render_forced(
+        super::policy::engine_policy("llama").expect("the compiled-in table ships a llama row"),
+        port,
+        None,
+    ));
     if cpu_offload {
         args.extend(["-ngl".to_string(), "0".to_string()]);
     }
@@ -339,7 +304,7 @@ impl EngineAdapter for LlamaAdapter {
     }
 
     fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
-        let argv = build_args(&model.raw, LLAMA_ENGINE_HOST, port, &model.name)?;
+        let argv = build_args(&model.raw, port, &model.name)?;
         Ok(LaunchSpec {
             argv: [self.exe.to_string_lossy().into_owned()]
                 .into_iter()
@@ -384,7 +349,6 @@ mod tests {
                 ("flash_attn", "1"),
                 ("extra_args", "--embedding --pooling last"),
             ]),
-            "127.0.0.1",
             18109,
             "test",
         )
@@ -436,7 +400,6 @@ mod tests {
                 ("fit_target", "0.9"),
                 ("fit_ctx", "2048"),
             ]),
-            "127.0.0.1",
             18109,
             "test",
         )
@@ -480,7 +443,7 @@ mod tests {
 
     #[test]
     fn missing_model_refuses_to_launch() {
-        let error = build_args(&raw(&[]), "127.0.0.1", 18109, "ghost").expect_err("must refuse");
+        let error = build_args(&raw(&[]), 18109, "ghost").expect_err("must refuse");
         assert!(matches!(error, EngineError::MissingField { .. }));
     }
 
@@ -548,13 +511,8 @@ mod tests {
     /// The reason text of the `Rejected` one `extra_args` value earns, or a panic
     /// naming the value that was wrongly admitted.
     fn refused_reason(extra: &str) -> String {
-        let error = build_args(
-            &raw(&[("model", "m"), ("extra_args", extra)]),
-            "127.0.0.1",
-            18109,
-            "t",
-        )
-        .expect_err("a word outside the allow-list must be refused");
+        let error = build_args(&raw(&[("model", "m"), ("extra_args", extra)]), 18109, "t")
+            .expect_err("a word outside the allow-list must be refused");
         let text = error.to_string();
         match error {
             EngineError::Rejected {
@@ -741,13 +699,8 @@ mod tests {
             ("--temp -0.5", "-0.5"),
             ("--pooling=last", "--pooling=last"),
         ] {
-            let args = build_args(
-                &raw(&[("model", "m"), ("extra_args", extra)]),
-                "127.0.0.1",
-                18109,
-                "t",
-            )
-            .unwrap_or_else(|error| panic!("`{extra}` must be admitted: {error}"));
+            let args = build_args(&raw(&[("model", "m"), ("extra_args", extra)]), 18109, "t")
+                .unwrap_or_else(|error| panic!("`{extra}` must be admitted: {error}"));
             assert!(
                 args.iter().any(|word| word == value),
                 "`{extra}` lost `{value}`: {args:?}"
@@ -772,7 +725,6 @@ mod tests {
         // The only real usage in the catalog (ModelConf/embeddinggemma-2-GGUF.yaml).
         let args = build_args(
             &raw(&[("model", "m"), ("extra_args", "--embedding --pooling last")]),
-            "127.0.0.1",
             18109,
             "t",
         )
@@ -792,7 +744,6 @@ mod tests {
                 ("cpu_offload", "true"),
                 ("extra_args", "--embedding --pooling last"),
             ]),
-            "127.0.0.1",
             18109,
             "t",
         )
@@ -817,7 +768,6 @@ mod tests {
     fn cpu_offload_forces_ngl_zero_and_suppresses_ngl() {
         let args = build_args(
             &raw(&[("model", "m"), ("ngl", "99"), ("cpu_offload", "true")]),
-            "127.0.0.1",
             18109,
             "t",
         )
@@ -830,26 +780,16 @@ mod tests {
     #[test]
     fn jinja_follows_the_scripts_truth_set_not_generic_truthy() {
         for on in ["true", "1", "on"] {
-            let args = build_args(
-                &raw(&[("model", "m"), ("jinja", on)]),
-                "127.0.0.1",
-                18109,
-                "t",
-            )
-            .expect("valid");
+            let args =
+                build_args(&raw(&[("model", "m"), ("jinja", on)]), 18109, "t").expect("valid");
             assert!(
                 args.contains(&"--jinja".to_string()),
                 "{on} must enable jinja"
             );
         }
         // start.ps1: 'yes' is NOT in the truth set.
-        let args = build_args(
-            &raw(&[("model", "m"), ("jinja", "yes")]),
-            "127.0.0.1",
-            18109,
-            "t",
-        )
-        .expect("valid");
+        let args =
+            build_args(&raw(&[("model", "m"), ("jinja", "yes")]), 18109, "t").expect("valid");
         assert!(!args.contains(&"--jinja".to_string()));
     }
 
@@ -857,7 +797,6 @@ mod tests {
     fn empty_values_are_skipped_but_zero_survives() {
         let args = build_args(
             &raw(&[("model", "m"), ("context", ""), ("ngl", "0")]),
-            "127.0.0.1",
             18109,
             "t",
         )

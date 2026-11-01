@@ -58,7 +58,8 @@ pub struct NinferAdapter {
 /// whole story. Every autostart path in the live catalog is already absolute
 /// (`/home/...`), and profile words never need it. What this rule still does NOT do
 /// is bound *which* absolute paths are admissible: the distro-side root allow-list
-/// is the ninfer `custody_roots` cell of chunk 10's `EnginePolicy` row.
+/// is the ninfer `custody_exec_roots` cell of the [`crate::engine::policy`]
+/// `EnginePolicy` table (still open admission in 10a; the custody slice enforces it).
 fn valid_word(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('-')
@@ -188,33 +189,6 @@ fn valid_word_list(value: &str) -> bool {
     !value.is_empty() && value.split(',').all(valid_word)
 }
 
-/// The serve flags a yaml may never contribute: the ones the canonical script owns
-/// for the network bind, the key, the container's lifecycle/log discipline (the
-/// incident-review trio plus the auth path), and the capacity figures the VRAM
-/// booking is computed from — a serve arg that resized the context or KV pool
-/// would silently invalidate every cost estimate the scheduler filed from this
-/// model. `ninfer_serve_args` rides LAST in the launch line, and a later duplicate
-/// overrides an earlier one — so these names are refused outright, not merely
-/// discouraged, and the refusal names the flag.
-const FORBIDDEN_SERVE_FLAGS: [&str; 16] = [
-    "--host",
-    "--port",
-    "--api-key",
-    "--data-dir",
-    "--data-dir-permissions",
-    "--model",
-    "--model-id",
-    "--log-level",
-    "--log-dir",
-    "--uds",
-    "--ssl-keyfile",
-    "--ssl-certfile",
-    "--max-context",
-    "--kv-capacity",
-    "--max-concurrency",
-    "--kv-dtype",
-];
-
 /// One `ninfer_serve_args` token: an option token is *supposed* to start with `-`
 /// (it goes to `ninfer-serve`, not to the login shell), and a bare value token is
 /// admitted too — the engine's own parsers (the Bonsai fork's `serve` AND the
@@ -223,8 +197,9 @@ const FORBIDDEN_SERVE_FLAGS: [&str; 16] = [
 /// `--spec dflash2` must stay spellable; every token is quoted at substitution,
 /// so a value cannot shell out. The charset stays shell-bare — no space, quote,
 /// `$`, backtick, semicolon, pipe, redirect, paren, brace, or `~` — and the
-/// harness-owned flags above are refused. `--model-id` has its own key
-/// (`ninfer_model_id`), so it is refused here too. The denylist is checked
+/// harness-owned flags in `forbidden` (the ninfer row's `forbidden_words` cell
+/// of the [`crate::engine::policy`] table) are refused. `--model-id` has its own
+/// key (`ninfer_model_id`), so it is refused here too. The denylist is checked
 /// against an option token's *name* (so `--flag=value` cannot smuggle past a
 /// whole-token comparison) and against every strict *prefix* of one, because
 /// argparse-style parsers (the Python precedent behind this engine) resolve
@@ -233,7 +208,7 @@ const FORBIDDEN_SERVE_FLAGS: [&str; 16] = [
 /// in-repo precedent for closing the abbreviation door rather than betting on
 /// the parser being strict. A value token that begins with `-` is refused, so a
 /// value can never disguise itself as another flag.
-fn valid_serve_arg(token: &str) -> bool {
+fn valid_serve_arg(token: &str, forbidden: &[&str]) -> bool {
     let name = token.split('=').next().unwrap_or(token);
     !token.is_empty()
         && token.chars().all(|c| {
@@ -243,7 +218,7 @@ fn valid_serve_arg(token: &str) -> bool {
             // Long options only: this engine's parsers speak `--flag`, and a
             // single-dash token is more likely a stray short flag than a value.
             name.starts_with("--")
-                && !FORBIDDEN_SERVE_FLAGS
+                && !forbidden
                     .iter()
                     .any(|flag| name.starts_with(flag) || flag.starts_with(name))
         } else {
@@ -251,81 +226,9 @@ fn valid_serve_arg(token: &str) -> bool {
         }
 }
 
-/// The canonical ninfer autostart script the harness renders and stages for every
-/// ninfer launch (operator ruling 2026-10-31: "we create a valid template we can
-/// control and adopt for each ninfer start"). The staged copy is what runs — the
-/// operator's hand-written scripts are no longer on the launch path — so the launch
-/// is exactly what [`crate::process`] staged and verified. Placeholders are filled
-/// by [`render_canonical`] from validated yaml values; nothing here reads the
-/// network, the catalog, or the harness environment.
-///
-/// The three properties the incident review demanded of every launch
-/// (`NINFER-8004-INCIDENT-2026-10-31`): `--restart no` (nothing revives on WSL boot
-/// without the harness deciding), loopback-only publish (the served port never
-/// leaves the machine's loopback interface, §5), and bounded container logs
-/// (`json-file`, 25 MiB × 5 — a week of a serving engine never fills the distro).
-/// The pre-reap of our own name makes `docker run` idempotent, and the final echo
-/// is the machine-readable launch stamp the harness's readiness forensics read.
-const CANONICAL_NINFER_SCRIPT: &str = r#"#!/usr/bin/env bash
-# simplehar-se canonical ninfer autostart — rendered by the harness from its embedded
-# template; staged content-addressed and launched INSTEAD of any operator script.
-# Do not edit the staged copy: it is rewritten from the model yaml before every load.
-# Profile {{PROFILE}} ({{PROFILE_SOURCE}}): ctx={{MAX_CTX}} kv={{KV_CAP}} conc={{CONC}} kv_dtype={{KV_DTYPE}}
-set -euo pipefail
-
-NAME="{{NAME}}"
-IMAGE="{{IMAGE}}"
-MODEL_NAME="{{MODEL_NAME}}"
-ARTIFACT="{{ARTIFACT}}"
-PORT="{{PORT}}"
-SERVE_CMD="{{SERVE_CMD}}"
-MODEL_ROOTS=(
-{{MODEL_ROOTS}}
-)
-SERVE_ARGS=({{SERVE_ARGS}})
-API_KEY_FILE="{{KEY_FILE}}"
-WITH_KEY="{{KEY}}"
-
-MODEL_DIR=""
-for root in "${MODEL_ROOTS[@]}"; do
-  if [[ -f "$root/$MODEL_NAME/$ARTIFACT" ]]; then MODEL_DIR="$root/$MODEL_NAME"; break; fi
-done
-if [[ -z "$MODEL_DIR" ]]; then
-  echo "autostart: no artifact '$ARTIFACT' for model '$MODEL_NAME' under ${MODEL_ROOTS[*]}" >&2
-  exit 1
-fi
-
-PUBLISH="${3:?harness must pass the publish port as arg 3}"
-
-API_KEY_ARGS=()
-if [[ "$WITH_KEY" == "key" ]]; then
-  if [[ ! -s "$API_KEY_FILE" ]]; then
-    echo "autostart: '$NAME' requires an API key but '$API_KEY_FILE' is missing or empty" >&2
-    exit 1
-  fi
-  API_KEY_ARGS=(--api-key "$(cat "$API_KEY_FILE")")
-fi
-
-docker rm -f "$NAME" >/dev/null 2>&1 || true
-
-docker run -d --name "$NAME" \
-  --gpus '"device={{GPU_DEVICE}}"' \
-  --restart no \
-  --publish "127.0.0.1:${PUBLISH}:${PORT}" \
-  --volume "$MODEL_DIR:/models:ro" \
-  --log-driver json-file --log-opt max-size=25m --log-opt max-file=5 \
-  {{ENV_ARGS}}"$IMAGE" \
-  "$SERVE_CMD" "/models/$ARTIFACT" \
-  --host 0.0.0.0 \
-  --port "$PORT" \
-  --max-context "{{MAX_CTX}}" \
-  --kv-capacity "{{KV_CAP}}" \
-  --max-concurrency "{{CONC}}" \
-  --kv-dtype "{{KV_DTYPE}}" \
-  {{MODEL_ID_ARG}}${SERVE_ARGS[@]+"${SERVE_ARGS[@]}"}
-
-echo "autostart: '$NAME' profile '{{PROFILE}}' (ctx={{MAX_CTX}} kv={{KV_CAP}} conc={{CONC}} kvdtype={{KV_DTYPE}} key=$([[ "$WITH_KEY" == key ]] && echo on || echo off)) on port $PUBLISH->$PORT"
-"#;
+// The canonical ninfer autostart script template lives in the ninfer row of
+// the [`crate::engine::policy`] `EnginePolicy` table (its `serve_template`
+// cell, `CANONICAL_NINFER_SCRIPT`); `render_canonical` substitutes it.
 
 /// Every value the canonical script needs, each already validated against the shape
 /// its substitution site demands; built by [`template_params`] and consumed by
@@ -501,6 +404,14 @@ fn profile_override(
 /// refusal names the key the operator has to fix (G6); nothing is defaulted except
 /// the documented optional keys.
 fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, EngineError> {
+    let row = super::policy::engine_policy(NINFER_ENGINE)
+        .expect("the compiled-in table ships a ninfer row");
+    // The one directory a key file may live in is the row's data-custody root,
+    // not a literal repeated in code: single-source per §20-9 Fork C.
+    let keys_root = row
+        .custody_data_roots
+        .first()
+        .expect("the ninfer row ships its key custody root");
     let rejected = |reason: String| EngineError::Rejected {
         engine: NINFER_ENGINE.to_string(),
         model: model.name.clone(),
@@ -569,7 +480,7 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
         .map(|line| line.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
     for arg in &serve_args {
-        if !valid_serve_arg(arg) {
+        if !valid_serve_arg(arg, row.forbidden_words) {
             return Err(rejected(format!(
                 "`ninfer_serve_args` tokens must be shell-bare serve flags (option-shaped, \
                  no spaces or shell metacharacters, never a harness-owned flag such as \
@@ -596,13 +507,13 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
     // `$HOME/.simplehar/keys/<file>.key`, with `<file>` a single bare word
     // (chunk-10 custody doctrine: engines obey only harness-owned locations).
     let key_file = optional_param(model, "ninfer_key_file")
-        .unwrap_or_else(|| format!("$HOME/.simplehar/keys/{container}.key"));
+        .unwrap_or_else(|| format!("{keys_root}/{container}.key"));
     let key_file_ok = key_file
-        .strip_prefix("$HOME/.simplehar/keys/")
+        .strip_prefix(&format!("{keys_root}/"))
         .is_some_and(|file| file.ends_with(".key") && valid_path_word(file) && !file.contains('/'));
     if !key_file_ok {
         return Err(rejected(format!(
-            "`ninfer_key_file` must be a plain file inside `$HOME/.simplehar/keys/` ending in \
+            "`ninfer_key_file` must be a plain file inside `{keys_root}/` ending in \
              `.key` (no traversal, no subdirectories, no shell metacharacters): {key_file}"
         )));
     }
@@ -659,11 +570,16 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
     })
 }
 
-/// Substitutes every placeholder in [`CANONICAL_NINFER_SCRIPT`]. Each value is
-/// validated at its own substitution site, so a leftover `{{...}}` is structurally
-/// impossible — kept as a hard assertion rather than trust (a template edit that
-/// adds a placeholder must fail the load, not launch a script with braces in it).
+/// Substitutes every placeholder in the row's `serve_template` cell
+/// ([`crate::engine::policy::CANONICAL_NINFER_SCRIPT`]). Each value is
+/// validated at its own substitution site, so a leftover `{{...}}` is
+/// structurally impossible — kept as a hard assertion rather than trust (a
+/// template edit that adds a placeholder must fail the load, not launch a
+/// script with braces in it).
 fn render_canonical(params: &NinferParams) -> Result<String, EngineError> {
+    let template = super::policy::engine_policy(NINFER_ENGINE)
+        .and_then(|row| row.serve_template)
+        .expect("the compiled-in table ships the ninfer serve template");
     let roots = params
         .model_roots
         .iter()
@@ -688,7 +604,7 @@ fn render_canonical(params: &NinferParams) -> Result<String, EngineError> {
         .iter()
         .map(|pair| format!("--env \"{pair}\" \\\n  "))
         .collect::<String>();
-    let script = CANONICAL_NINFER_SCRIPT
+    let script = template
         .replace("{{PROFILE_SOURCE}}", &params.profile_source)
         .replace("{{PROFILE}}", &params.profile)
         .replace("{{MAX_CTX}}", &params.max_ctx)

@@ -8,6 +8,7 @@
 pub mod llama;
 pub mod mock;
 pub mod ninfer;
+pub mod policy;
 pub mod strata;
 
 use crate::model::ModelEntry;
