@@ -2551,26 +2551,27 @@ impl ActorState {
     fn start_queued_load(&mut self, job_id: JobId, slot: usize, entry: ModelEntry) {
         self.unload_after_finish.remove(&slot);
         // One decision (`ModelEntry::cost_source`) drives the gate; the page's Cost
-        // column reads the same one, so the two cannot drift.
+        // column reads the same one, so the two cannot drift. The figure follows
+        // the decision, not the key that happens to exist: a Measured source books
+        // the measured figure - including the guarded engine_report that OVERSHADOWS
+        // a smaller declared `vram_gb` (operator ruling 2026-11-01: reserve what the
+        // container itself reserves). Greedy keeps nominal semantics: a post-spill
+        // measurement is not a nominal size and must not shrink the booking
+        // (review, 2026-10-26); `may_book_measured` keeps it off Measured anyway.
         let need = match entry.cost_source() {
             // `exact` is a precision claim: the engine's number, not an estimate.
             // No `vram_gb`, no load — the size×1.15+2 fallback would be a guess.
             crate::model::CostSource::Undeclared => Err(AdmissionError::ExactUndeclared),
-            source => budget::need_gb(
-                entry
-                    .vram_gb
-                    .map(Gibibytes)
-                    // `fixed` consults the harness-measured footprint of an earlier
-                    // run before the size estimate. Greedy keeps nominal semantics: a
-                    // post-spill measurement is not a nominal size and must not shrink
-                    // the booking (review, 2026-10-26).
-                    .or_else(|| {
-                        (source == crate::model::CostSource::Measured)
-                            .then(|| entry.measured_gb.map(Gibibytes))
-                            .flatten()
-                    }),
+            crate::model::CostSource::Measured => budget::need_gb(
+                entry.measured_gb.map(Gibibytes),
                 entry.gguf_size_gb.map(Gibibytes),
             ),
+            crate::model::CostSource::Declared | crate::model::CostSource::Estimate => {
+                budget::need_gb(
+                    entry.vram_gb.map(Gibibytes),
+                    entry.gguf_size_gb.map(Gibibytes),
+                )
+            }
         };
         // A greedy load's nominal size never binds — it offloads instead — so an
         // unknown size is allowed (booking uses the room at admit).

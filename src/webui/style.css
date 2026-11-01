@@ -46,13 +46,16 @@ h1, h2, h3, .sh-title {
   letter-spacing: -0.01em;
 }
 
-/* Persistent header: always visible while the model tabs scroll under it. */
+/* Persistent header: always visible while the model table scrolls under it.
+ * Compaction (operator 2026-11-01): one title row, one merged tab/slot/control
+ * strip, one slim memory row - the old endpoints row and the slot-card band
+ * folded into the strip. */
 header.sh-header {
   position: sticky;
   top: 0;
   z-index: 10;
-  padding: 0.7rem 1rem 0.9rem;
-  margin-bottom: 1rem;
+  padding: 0.5rem 1rem 0.6rem;
+  margin-bottom: 0.8rem;
   background: var(--pico-card-background-color);
   border-bottom: 1px solid var(--pico-card-border-color);
   box-shadow: var(--sh-card-shadow);
@@ -87,65 +90,100 @@ header.sh-header {
  * nor red. Same ink as the loading dot, so one amber exists on the page. */
 .sh-badge[data-tone="warn"] { background: #d89b1d40; color: var(--sh-warn); }
 
-.sh-endpoints {
+/* Merged slot/tab/control strip (operator compaction, 2026-11-01): the tab buttons
+ * ARE the slot cards - each pill carries the dot, category, port, occupant and its
+ * Unload; the row also carries the default, Unload all, Rescan and the logging
+ * toggle. It lives inside the sticky header, so it never scrolls away. */
+.sh-controls {
   display: flex;
-  gap: 1rem;
+  align-items: center;
+  gap: 0.45rem;
   flex-wrap: wrap;
-  color: var(--pico-muted-color);
-  font-size: 0.8rem;
-  margin-top: 0.25rem;
+  margin-top: 0.55rem;
+  /* Pico redefines --pico-color (to #fff) on every button element, so pill ink is
+   * captured here, on a non-button ancestor, where --pico-color is the real text
+   * color of the current theme. */
+  --sh-tab-ink: var(--pico-color);
 }
 
-.sh-endpoints a { color: var(--pico-muted-color); }
-
-/* Slot cards: one per category; the AUX card is a horizontal stack of one-line
- * occupant rows (operator mockup, 2026-10-25). */
-.sh-slots {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 0.6rem;
-  margin-top: 0.7rem;
+.sh-tab-item {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
 }
 
-.sh-slot {
+/* The button IS the pill (operator 2026-11-01): the entire tab, port and occupant
+ * included, is the click target - generous padding, clear selected state. */
+.sh-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
   border: 1px solid var(--pico-card-border-color);
   border-radius: var(--sh-radius);
-  padding: 0.55rem 0.7rem;
   background: var(--pico-background-color);
+  color: var(--sh-tab-ink);
+  padding: 0.35rem 0.8rem;
+  margin: 0;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 0.85rem;
+  width: auto;
 }
 
-.sh-slot h4 {
-  margin: 0 0 0.3rem;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+.sh-tab:hover { border-color: var(--sh-accent-solid); }
+
+.sh-tab[aria-selected="true"] {
+  background: var(--sh-accent);
+  border-color: var(--sh-accent-solid);
+}
+
+.sh-tab .sh-dot { margin-right: 0; }
+
+/* The Unload is the tab's second segment (operator 2026-11-01): flat shared edge,
+ * matching corners - two buttons that read as one entity. */
+.sh-tab.sh-tab-part {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  border-right: 0;
+}
+
+.sh-tab-side {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: 0;
+  border-color: var(--pico-card-border-color);
+  font-weight: 600;
+}
+
+.sh-tab-port {
   color: var(--pico-muted-color);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+  font-size: 0.75rem;
+  font-weight: 400;
 }
 
-.sh-slot-main {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  min-height: 1.9rem;
+.sh-tab-model {
+  font-weight: 600;
+  font-size: 0.8rem;
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.sh-occupant { font-weight: 600; overflow-wrap: anywhere; }
 .sh-empty { color: var(--pico-muted-color); font-style: italic; }
 
-.sh-occupant-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  min-height: 1.9rem;
-  padding: 0.1rem 0;
-  border-top: 1px dashed var(--pico-card-border-color);
+.sh-tab-spacer { flex: 1 1 auto; }
+
+.sh-default {
+  color: var(--pico-muted-color);
+  font-size: 0.8rem;
+  white-space: nowrap;
 }
-.sh-occupant-row:first-of-type { border-top: 0; }
+
+.sh-x {
+  padding: 0.1rem 0.45rem;
+  line-height: 1.1;
+}
 
 /* Memory bars: ledger numbers labeled honestly (NVML witness is not wired yet). */
 .sh-mem {
@@ -177,6 +215,11 @@ header.sh-header {
   white-space: nowrap;
 }
 .sh-tablewrap { overflow-x: auto; }
+/* Cost cell: the number only, colour carries the provenance (operator 2026-11-01):
+ * green = the gate books a launch-validated figure, yellow = unchecked. */
+.sh-cost { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sh-cost-checked { color: var(--sh-accent-solid); }
+.sh-cost-unchecked { color: var(--sh-warn); }
 .sh-models { min-width: 56rem; }
 .sh-models .sh-name { white-space: nowrap; }
 /* Buttons sit side by side and only slide under each other when the column is
@@ -194,48 +237,22 @@ table.sh-models td.sh-row-actions { width: max-content; }
 .sh-extlog input { margin: 0; }
 .sh-mem label { font-size: 0.75rem; color: var(--pico-muted-color); display: block; margin-bottom: 0.2rem; }
 
-/* Tabs: models live below the header (operator mockup). */
-.sh-tabs {
-  display: flex;
-  gap: 0.3rem;
-  margin: 0.6rem 0 0.8rem;
-  flex-wrap: wrap;
-  /* Pico redefines --pico-color (to #fff) on every button element, so tab ink is
-   * captured here, on a non-button ancestor, where --pico-color is the real text
-   * color of the current theme. */
-  --sh-tab-ink: var(--pico-color);
-}
-
-.sh-tab {
-  border: 1px solid var(--pico-card-border-color);
-  border-radius: var(--sh-radius) var(--sh-radius) 0 0;
-  background: transparent;
-  color: var(--sh-tab-ink);
-  padding: 0.45rem 0.9rem;
-  cursor: pointer;
-  font-weight: 600;
-}
-
-.sh-tab[aria-selected="true"] {
-  background: var(--pico-card-background-color);
-  border-bottom-color: var(--pico-card-background-color);
-}
-
+/* The model table fills the panel; the strip above it is the tab row (2026-11-01). */
 .sh-tabpanel {
   border: 1px solid var(--pico-card-border-color);
-  border-radius: 0 var(--sh-radius) var(--sh-radius) var(--sh-radius);
-  padding: 0.7rem 0.75rem;
+  border-radius: var(--sh-radius);
+  padding: 0.5rem 0.75rem;
   background: var(--pico-card-background-color);
 }
 
+/* The default chip's own row, in the panel head's empty space (operator 2026-11-01). */
 .sh-panel-head {
   display: flex;
-  gap: 0.8rem;
+  gap: 0.5rem;
   align-items: baseline;
-  flex-wrap: wrap;
   color: var(--pico-muted-color);
-  font-size: 0.82rem;
-  margin-bottom: 0.6rem;
+  font-size: 0.8rem;
+  padding: 0.1rem 0.1rem 0.45rem;
 }
 
 table.sh-models { margin-bottom: 0; }
@@ -264,6 +281,15 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
 
 /* Job strip: the last few ledger entries with their reasons. */
 .sh-jobs { margin-top: 1rem; }
+/* The harness log with the Extended Logging toggle beside it (operator 2026-11-01:
+ * the toggle belongs here, not in the sticky strip). */
+.sh-logrow {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+.sh-logrow > .sh-jobs { flex: 1 1 auto; min-width: 0; }
+.sh-logrow .sh-extlog { margin: 1.2rem 0.4rem 0; }
 .sh-job {
   display: flex;
   gap: 0.8rem;

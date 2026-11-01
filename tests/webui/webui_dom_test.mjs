@@ -111,6 +111,7 @@ globalThis.fetch = async (path, init) => {
     }
   }
   if (init && init.method === "POST") {
+    (globalThis.posts ??= []).push({ path, body: (init && init.body) || "" });
     if (globalThis.failNextPost !== null) {
       const message = globalThis.failNextPost;
       return { ok: false, status: 400, json: async () => ({ message }) };
@@ -130,10 +131,11 @@ function textOf(node) {
 }
 function findAll(root, tag, cls) {
   const out = [];
+  const hasCls = (c) => (c.attrs.class || "").split(/\s+/).includes(cls);
   const walk = (n) => {
     for (const c of n.children ?? []) {
       if (c instanceof El) {
-        if (c.tag === tag && (cls === undefined || c.attrs.class === cls)) out.push(c);
+        if (c.tag === tag && (cls === undefined || hasCls(c))) out.push(c);
         walk(c);
       }
     }
@@ -152,11 +154,31 @@ const driver = `
   const check = (name, ok, extra) => results.push([name, !!ok, extra ?? ""]);
   await refresh();
   const main = document.getElementById("sh-main");
-  const tabs = findAll(main, "button", "sh-tab");
+  const header = document.getElementById("sh-header");
+  // 2026-11-01 compaction: the tabs ARE the slot cards and they sit in the sticky
+  // header strip; the model table lives alone in main.
+  const tabs = findAll(header, "button", "sh-tab");
   check("four tabs rendered", tabs.length === 4, "got " + tabs.length);
-  check("tab labels not empty",
-    tabs.map(textOf).join(",") === "WORK,RP,AUX,EMB",
+  // The whole pill is the tab (2026-11-01): the button text carries category, port
+  // and occupant - the category must LEAD the clickable target, not hide in a link.
+  check("tab labels lead their pills",
+    tabs.map((b) => textOf(b).replace(/[^A-Z].*$/, "")).join(",") === "WORK,RP,AUX,EMB",
     "labels=[" + tabs.map(textOf).join("|") + "]");
+  check("tabs moved out of main",
+    findAll(main, "button", "sh-tab").length === 0);
+  const pills = findAll(header, "span", "sh-tab-item");
+  check("one slot pill per category", pills.length === 4, "got " + pills.length);
+  check("pill carries the category port",
+    textOf(pills[0]).includes(":8708"), textOf(pills[0]));
+  check("the port is inside the clickable tab, never a lone anchor",
+    findAll(pills[0], "a").length === 0 && textOf(tabs[0]).includes(":8708"),
+    textOf(pills[0]));
+  check("occupied pill carries the occupant and an Unload",
+    textOf(pills[0]).includes("strata-fp4local-bf16ple") &&
+      findAll(pills[0], "button").some((b) => textOf(b) === "Unload"),
+    textOf(pills[0]));
+  check("pill carries the explicit Unload all scope",
+    findAll(header, "button").some((b) => textOf(b) === "Unload all"));
   const flash = document.getElementById("sh-flash");
   check("no render error flashed", !flash.textContent && flash.hidden !== false, flash.textContent);
 
@@ -183,30 +205,45 @@ const driver = `
   const d3 = findAll(document.getElementById("sh-main"), "details")[0];
   check("closed stays closed", d3.attrs.open === undefined && state.logOpen === false);
 
-  const rpTab = findAll(document.getElementById("sh-main"), "button", "sh-tab")[1];
+  const rpTab = findAll(document.getElementById("sh-header"), "button", "sh-tab")[1];
   rpTab.dispatch("click", {});
   check("tab click switches", state.activeTab === "RP");
-  const head = findAll(document.getElementById("sh-main"), "div", "sh-panel-head")[0];
-  check("panel shows RP port", textOf(head).includes(":8709"), textOf(head));
+  const rpPill = findAll(document.getElementById("sh-header"), "span", "sh-tab-item")[1];
+  check("RP pill shows its port", textOf(rpPill).includes(":8709"), textOf(rpPill));
+  check("panel head shows the active tab's default",
+    textOf(document.getElementById("sh-main")).includes("default: starlight-synthesis-31b"),
+    "no default text in main");
+  // Bars above the tab strip (operator 2026-11-01): headline, memory, controls.
+  const hdrWrap = document.getElementById("sh-header").children[0];
+  check("memory bars sit above the tab strip",
+    (hdrWrap.children[1].attrs.class || "") === "sh-mem"
+      && (hdrWrap.children[2].attrs.class || "") === "sh-controls",
+    hdrWrap.children.map((c) => c.attrs.class).join("|"));
 
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
   check("SSE full-doc render ok", !document.getElementById("sh-flash").textContent);
 
   // Memory-bar honesty (2026-10-26 review + ledger demotion): one bar, the card's
   // own reading, labeled with its source; no ledger bar, no fabricated zero.
-  const barLabels = findAll(document.getElementById("sh-header"), "label").map(textOf);
-  const vramBars = barLabels.filter(function (t) {
-    return t.indexOf("VRAM ") === 0;
+  // Compaction (2026-11-01): the label carries only the number; the honesty
+  // sentence lives in the label's tooltip - same words, asserted here.
+  const fullText = (l) => (l.attrs.title || "") + " " + textOf(l);
+  const barLabels = findAll(document.getElementById("sh-header"), "label");
+  const vramEls = barLabels.filter(function (l) {
+    return textOf(l).indexOf("VRAM ") === 0;
   });
-  const vramLabel = vramBars[0] || "";
+  const vramLabel = vramEls.length ? fullText(vramEls[0]) : "";
   const mem = fixtures["/har/status"].mem;
-  check("exactly one VRAM bar", vramBars.length === 1, barLabels.join(" || "));
+  check("exactly one VRAM bar", vramEls.length === 1, barLabels.map(textOf).join(" || "));
+  check("bar label itself is compact",
+    vramEls.length === 1 && !textOf(vramEls[0]).includes("("),
+    vramEls.length ? textOf(vramEls[0]) : "missing");
   check("ledger bar is gone",
-    barLabels.every(function (t) {
-      return t.indexOf("ledger") < 0 && t.indexOf("what admission budgets") < 0;
+    barLabels.every(function (l) {
+      return textOf(l).indexOf("ledger") < 0 && fullText(l).indexOf("what admission budgets") < 0;
     }),
-    barLabels.join(" || "));
-  check("observed bar rendered", vramLabel.length > 0, barLabels.join(" || "));
+    barLabels.map(textOf).join(" || "));
+  check("observed bar rendered", vramLabel.length > 0, barLabels.map(textOf).join(" || "));
   check("vram bar names its source", vramLabel.indexOf("(" + mem.source + ";") >= 0, vramLabel);
   check("vram bar states attribution",
     mem.attributed_gb == null
@@ -227,21 +264,21 @@ const driver = `
     degraded.mem.attribution = "unavailable";
     degraded.mem.container_reported_gb = null;
     applyState({ ...degraded, models: fixtures["/har/models"].data });
-    const dl = findAll(document.getElementById("sh-header"), "label").filter(function (t) {
-      return textOf(t).indexOf("VRAM ") === 0;
+    const dl = findAll(document.getElementById("sh-header"), "label").filter(function (l) {
+      return textOf(l).indexOf("VRAM ") === 0;
     })[0];
     check("unavailable attribution is stated, not inferred from absence",
-      textOf(dl).indexOf("per-process attribution unavailable") >= 0, textOf(dl));
+      fullText(dl).indexOf("per-process attribution unavailable") >= 0, fullText(dl));
     check("a container that never reported says nothing, not zero",
-      textOf(dl).indexOf("containers report") < 0, textOf(dl));
+      fullText(dl).indexOf("containers report") < 0, fullText(dl));
     const idle = JSON.parse(JSON.stringify(degraded));
     idle.mem.attribution = "per_process";
     applyState({ ...idle, models: fixtures["/har/models"].data });
-    const il = findAll(document.getElementById("sh-header"), "label").filter(function (t) {
-      return textOf(t).indexOf("VRAM ") === 0;
+    const il = findAll(document.getElementById("sh-header"), "label").filter(function (l) {
+      return textOf(l).indexOf("VRAM ") === 0;
     })[0];
     check("a capable but idle card is not called unavailable",
-      textOf(il).indexOf("per-process capable (card idle)") >= 0, textOf(il));
+      fullText(il).indexOf("per-process capable (card idle)") >= 0, fullText(il));
     applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
   }
   check("vram bar never claims external", vramLabel.indexOf("external") < 0, vramLabel);
@@ -257,7 +294,7 @@ const driver = `
 
   // A5: Model Engine Ctx Cost Files Cat CPU actions = 8 columns.
   const workModels = fixtures["/har/models"].data.filter((m) => m.category === "WORK");
-  const workTab = findAll(document.getElementById("sh-main"), "button", "sh-tab")[0];
+  const workTab = findAll(document.getElementById("sh-header"), "button", "sh-tab")[0];
   workTab.dispatch("click", {});
   const rows = findAll(document.getElementById("sh-main"), "tr");
   check("eight column headers", findAll(rows[0], "th").length === 8,
@@ -274,19 +311,78 @@ const driver = `
     check("Files cell shows gguf basename", false, "no WORK models to check");
   }
 
+  // Booking truth (operator 2026-11-01): a loaded row's Cost IS the live slot's
+  // booked figure - the container's own word beats the declared one - and the
+  // page remembers it for the session, so the truth survives the unload.
+  {
+    const bookedModel = {
+      id: "bookedone", engine: "ninfer", category: "WORK", vram_gb: 34, cost: "fixed",
+      cost_basis: "declared", launch_floor_gb: null, measured_gb: null,
+      measured_min_gb: null, context: null, model_ref: "ninfer://box:8004/served",
+      serve_model: null, cpu_offload: false,
+    };
+    const bookedSlot = {
+      category: "WORK", index: 0, model: "bookedone", port: 18109, pid: 1,
+      need_gib: 44, idle_s: 0, serve_id: null, loading_job: null,
+      launched_at: "2026-11-01T04:48:19Z", stale_config: false,
+      container_reported_gb: 44.0,
+    };
+    const rowCost = (id) => {
+      for (const tr of findAll(document.getElementById("sh-main"), "tr")) {
+        const tds = findAll(tr, "td");
+        const strong = tds.map((td) => findAll(td, "strong")[0]).find(Boolean);
+        if (strong && textOf(strong) === id) {
+          return { text: textOf(tds[6]), cls: tds[6].attrs.class || "", title: tds[6].attrs.title || "" };
+        }
+      }
+      return { text: "row missing", cls: "", title: "" };
+    };
+    applyState({ ...fixtures["/har/status"], slots: [bookedSlot], models: [bookedModel] });
+    check("the loaded row books the slot's live figure, checked",
+      rowCost("bookedone").text === "44.0 GiB" &&
+        rowCost("bookedone").cls.includes("sh-cost-checked"), JSON.stringify(rowCost("bookedone")));
+    const unloadedSlot = { ...bookedSlot, model: null, container_reported_gb: null };
+    applyState({ ...fixtures["/har/status"], slots: [unloadedSlot], models: [bookedModel] });
+    const after = rowCost("bookedone");
+    check("the session keeps the last loaded figure in the tooltip",
+      after.text === "34 GiB" && after.cls.includes("sh-cost-unchecked")
+        && after.title.includes("44.0 GiB on last load"), JSON.stringify(after));
+    applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+  }
+
+  // Unload all is the explicit {} scope (T12.4), never an implicit one.
+  {
+    globalThis.posts = [];
+    const unloadAll = findAll(document.getElementById("sh-header"), "button")
+      .find((b) => textOf(b) === "Unload all");
+    check("strip offers Unload all", !!unloadAll);
+    unloadAll.dispatch("click", {});
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    const hit = (globalThis.posts || []).some(
+      (p) => p.path === "/har/unload" && p.body === "{}",
+    );
+    check("Unload all posts the explicit {} scope", hit, JSON.stringify(globalThis.posts));
+  }
+
   const withFault = { ...fixtures["/har/status"], models: fixtures["/har/models"].data, last_error: "broken@WORK: never became ready" };
   applyState(withFault);
-  const errline = findAll(document.getElementById("sh-header"), "div", "sh-errline")[0];
-  check("last_error renders errline", !!errline && textOf(errline).includes("broken@WORK"),
-    errline ? textOf(errline) : "missing");
+  const errJobs = findAll(document.getElementById("sh-main"), "div", "sh-errline");
+  check("last fault renders beside the job ledger",
+    errJobs.length === 1 && textOf(errJobs[0]).includes("broken@WORK"),
+    errJobs.map(textOf).join(" | "));
+  check("the sticky header no longer carries the fault line",
+    findAll(document.getElementById("sh-header"), "div", "sh-errline").length === 0);
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
   check("errline absent when last_error null",
-    findAll(document.getElementById("sh-header"), "div", "sh-errline").length === 0);
+    findAll(document.getElementById("sh-main"), "div", "sh-errline").length === 0 &&
+      findAll(document.getElementById("sh-header"), "div", "sh-errline").length === 0);
 
-  const extBoxes = findAll(document.getElementById("sh-header"), "input")
+  const extBoxes = findAll(document.getElementById("sh-main"), "input")
     .filter((i) => i.attrs["aria-label"] === "extended logging");
-  check("header has Extended Logging checkbox", extBoxes.length === 1
-    && extBoxes[0].attrs.type === "checkbox", String(extBoxes.length));
+  check("Extended Logging lives beside the harness log, not the strip",
+    extBoxes.length === 1 && extBoxes[0].attrs.type === "checkbox"
+      && findAll(header, "input").length === 0, String(extBoxes.length));
 
   const mkJob = (model, kind, error) => ({
     id: 9, kind, model, category: "WORK", state: "Idle", terminal: true,
@@ -354,22 +450,42 @@ const driver = `
   for (const tr of findAll(document.getElementById("sh-main"), "tr")) {
     const tds = findAll(tr, "td");
     const strong = tds.map((td) => findAll(td, "strong")[0]).find(Boolean);
-    if (strong && tds[6]) costs[textOf(strong)] = textOf(tds[6]);
+    if (strong && tds[6]) {
+      costs[textOf(strong)] = {
+        text: textOf(tds[6]),
+        cls: tds[6].attrs.class || "",
+        title: tds[6].attrs.title || "",
+      };
+    }
   }
-  check("greedy row shows floor, never nominal",
-    costs["greedyone"] === "greedy · floor 65 GiB", JSON.stringify(costs));
-  check("measured row shows measured",
-    costs["measuredone"] === "measured 29.9 GiB", JSON.stringify(costs));
+  // Colour is the provenance (2026-11-01): the cell carries ONLY the number;
+  // green = the gate books a validated figure, yellow = unchecked, sentence in
+  // the tooltip.
+  check("greedy row is unchecked floor, number only",
+    costs["greedyone"].text === "65 GiB" &&
+      costs["greedyone"].cls.includes("sh-cost-unchecked") &&
+      costs["greedyone"].title.includes("floor 65 GiB"), JSON.stringify(costs["greedyone"]));
+  check("measured row is checked, number only",
+    costs["measuredone"].text === "29.9 GiB" &&
+      costs["measuredone"].cls.includes("sh-cost-checked"), JSON.stringify(costs["measuredone"]));
   check("measured row shows the range when a low end exists",
-    costs["rangeone"] === "measured 24.3-41.7 GiB", JSON.stringify(costs));
+    costs["rangeone"].text === "24.3-41.7 GiB" &&
+      costs["rangeone"].cls.includes("sh-cost-checked"), JSON.stringify(costs["rangeone"]));
   // R9: the Cost column shows exactly what the gate books (cost_basis), and says
   // whose number a measured figure is. A total-diff never books, so its row shows
-  // the estimate the gate really charges; an engine-reported figure is labelled as
-  // the container's own reservation.
+  // the estimate the gate really charges; an engine-reported figure books and is
+  // labelled — colour now says whose number it is, prose lives in the tooltip.
   check("a total-diff never shows as the booking basis",
-    costs["totaldiffone"] === "27.4 GiB (est.)", JSON.stringify(costs));
+    costs["totaldiffone"].text === "27.4 GiB" &&
+      costs["totaldiffone"].cls.includes("sh-cost-unchecked"), JSON.stringify(costs["totaldiffone"]));
   check("an engine-reported figure books and is labelled",
-    costs["engineone"] === "measured 31.2 GiB (engine-reported)", JSON.stringify(costs));
+    costs["engineone"].text === "31.2 GiB" &&
+      costs["engineone"].cls.includes("sh-cost-checked") &&
+      costs["engineone"].title.includes("engine-reported"), JSON.stringify(costs["engineone"]));
+  check("a declared row is unchecked with its sentence in the tooltip",
+    costs["ninferone"].text === "26 GiB" &&
+      costs["ninferone"].cls.includes("sh-cost-unchecked") &&
+      costs["ninferone"].title.includes("declared 26 GiB"), JSON.stringify(costs["ninferone"]));
   // cpu_offload engine scoping: the CPU column (td 3) offers its control only
   // for OFFLOAD_ENGINES rows; a strata row gets a dash and NO checkbox.
   const cpuBoxes = {};
@@ -505,8 +621,9 @@ const driver = `
     JSON.stringify(flashBox.textContent));
   check("refused Set default re-reads the server", globalThis.statusFetches > beforeSet,
     beforeSet + " -> " + globalThis.statusFetches);
-  const clearDefault = rowButton("Clear default");
-  check("panel offers Clear default", !!clearDefault);
+  const clearDefault = findAll(document.getElementById("sh-main"), "button")
+    .find((b) => textOf(b) === "\u2715");
+  check("panel head offers Clear default on the default chip", !!clearDefault);
   quietFlash();
   const beforeClear = globalThis.statusFetches;
   clearDefault.dispatch("click", {});

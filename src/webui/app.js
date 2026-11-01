@@ -19,6 +19,10 @@ let state = {
   logOpen: false,
   logLoaded: false,
   logEntries: null,
+  // What each container admitted it reserves (R9 post-ready triple), remembered per
+  // model for the page session: a row can only be seen booked while it is loaded,
+  // and the page forgets on reload. Display memory, never a booking input.
+  lastReported: {},
 };
 
 // ---------- tiny helpers ----------
@@ -178,58 +182,59 @@ function slotJobsFor(status, category) {
   return status.jobs.filter((job) => job.category === category && !job.terminal);
 }
 
-function renderSlotCard(status, category) {
+// The tab IS the slot card (operator compaction, 2026-11-01), and the whole pill is
+// the click target (operator follow-up, 2026-11-01): dot, category, port, occupant
+// live INSIDE the tab button - a port rendered as a bare link read as chrome, not
+// as the tab. Only the Unload sits outside the button, as a button cannot nest one.
+function renderTabItem(status, category) {
+  const entry = status.categories.find((cat) => cat.id === category);
   const slots = status.slots.filter((slot) => slot.category === category);
+  const occupants = slots.map((slot) => slot.model).filter(Boolean);
   const loading = slotJobsFor(status, category).length > 0;
-  const card = el("article", { class: "sh-slot" });
-  const head = el("h4", {}, text(category), el("span", {}, text(categoryPort(status, category))));
-  card.append(head);
-  if (category === "AUX") {
-    // The AUX card splits horizontally: one slim row per occupant (operator spec).
-    if (slots.length === 0) card.append(el("div", { class: "sh-empty" }, text("no slots")));
-    for (const slot of slots) {
-      const row = el("div", { class: "sh-occupant-row" });
-      if (slot.model) {
-        row.append(el("span", { class: "sh-occupant" }, text(slot.model)));
-        row.append(unloadButton(category));
-      } else if (slot.loading_job !== null) {
-        row.append(el("span", { class: "sh-empty" }, text("loading…")));
-      } else {
-        row.append(el("span", { class: "sh-empty" }, text("—")));
-      }
-      card.append(row);
-    }
-    return card;
-  }
-  const main = el("div", { class: "sh-slot-main" });
-  const slot = slots[0];
-  if (slot && slot.model) {
-    main.append(el("span", { class: "sh-occupant" }, text(slot.model)));
-    main.append(unloadButton(category));
-  } else if (loading) {
-    main.append(el("span", { class: "sh-empty" }, text("loading…")));
-  } else {
-    main.append(el("span", { class: "sh-empty" }, text("—")));
-  }
-  card.append(main);
-  return card;
-}
-
-function unloadButton(category) {
-  return el(
+  // Local name kept clear of the module-level UI `state` object (shadowing here
+  // would send the onclick handler reading a string).
+  const dotState = occupants.length > 0 ? "serving" : loading ? "loading" : "idle";
+  const button = el(
     "button",
     {
-      class: "sh-mini",
-      onclick: () =>
-        postJson("/har/unload", { category }).catch((error) => flashError(error)),
+      class: occupants.length > 0 ? "sh-tab sh-tab-part" : "sh-tab",
+      role: "tab",
+      "aria-selected": String(state.activeTab === category),
+      title: `${category} listener :${entry ? entry.public_port : "?"}` +
+        (occupants.length > 0 ? ` - ${occupants.join(", ")}` : ""),
+      onclick: () => {
+        state.activeTab = category;
+        render();
+      },
     },
-    text("Unload"),
+    el("span", { class: "sh-dot", "data-state": dotState }),
+    text(category),
   );
-}
-
-function categoryPort(status, category) {
-  const entry = status.categories.find((cat) => cat.id === category);
-  return entry ? `:${entry.public_port}` : "";
+  if (entry) button.append(el("span", { class: "sh-tab-port" }, text(`:${entry.public_port}`)));
+  if (loading && occupants.length === 0) {
+    button.append(el("span", { class: "sh-tab-model sh-empty" }, text("loading…")));
+  } else if (occupants.length > 0) {
+    button.append(el("span", { class: "sh-tab-model" }, text(occupants[0])));
+    if (occupants.length > 1) button.append(text(` +${occupants.length - 1}`));
+  }
+  const item = el("span", { class: "sh-tab-item" }, button);
+  if (occupants.length > 0) {
+    // The Unload is the tab's second segment (operator 2026-11-01): flush against
+    // the pill, shared border - two parts of one entity, not a stray button.
+    item.append(
+      el(
+        "button",
+        {
+          class: "sh-mini sh-tab-side",
+          title: `unload every ${category} slot`,
+          onclick: () =>
+            postJson("/har/unload", { category }).catch((error) => flashError(error)),
+        },
+        text("Unload"),
+      ),
+    );
+  }
+  return item;
 }
 
 function renderMemory(status) {
@@ -266,16 +271,20 @@ function renderMemory(status) {
       mem.container_reported_gb != null && mem.container_reported_gb > 0
         ? "; containers report " + mem.container_reported_gb.toFixed(1) + " GiB reserved"
         : "";
+    // Compaction (operator 2026-11-01): the bar label carries only the number the
+    // operator reads; the honesty sentence - source, attribution, booking, reserve
+    // hatch - moved to the tooltip, same words, still one VRAM bar and never a
+    // fabricated zero.
     bars.push(
       el(
         "div",
         {},
         el(
           "label",
-          {},
-          text(
-            `VRAM ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (${mem.source}; ${attribution}${booked}${reported}; hatched = ${mem.reserve_gb.toFixed(1)} GiB reserve)`,
-          ),
+          {
+            title: `VRAM ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (${mem.source}; ${attribution}${booked}${reported}; hatched = ${mem.reserve_gb.toFixed(1)} GiB reserve)`,
+          },
+          text(`VRAM ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB`),
         ),
         el(
           "div",
@@ -299,10 +308,10 @@ function renderMemory(status) {
         {},
         el(
           "label",
-          {},
-          text(
-            `RAM ${mem.ram_used_gb.toFixed(1)} / ${mem.ram_total_gb.toFixed(0)} GiB (host, informational)`,
-          ),
+          {
+            title: `RAM ${mem.ram_used_gb.toFixed(1)} / ${mem.ram_total_gb.toFixed(0)} GiB (host, informational)`,
+          },
+          text(`RAM ${mem.ram_used_gb.toFixed(1)} / ${mem.ram_total_gb.toFixed(0)} GiB`),
         ),
         el("div", { class: "sh-bar", "data-tone": "ram" }, el("i", { style: `width:${ramPct}%` })),
       ),
@@ -335,15 +344,21 @@ function renderHeader(status) {
         ? el("span", { class: "sh-badge", "data-tone": "warn" }, text("listener pending"))
         : null,
   );
-  const endpoints = el(
-    "div",
-    { class: "sh-endpoints" },
-    ...status.categories.map((cat) =>
-      el(
-        "a",
-        { href: `http://${window.location.hostname}:${cat.public_port}/v1/models` },
-        text(`${cat.id} :${cat.public_port}${cat.control ? " (control)" : ""}`),
-      ),
+  const controls = el("div", { class: "sh-controls" });
+  for (const category of CATEGORY_ORDER) controls.append(renderTabItem(status, category));
+  controls.append(
+    el("span", { class: "sh-tab-spacer" }),
+    el(
+      "button",
+      {
+        class: "sh-mini",
+        // `{}` is the explicit unload-all scope (T12.4) - never an implicit one.
+        onclick: () =>
+          postJson("/har/unload", {})
+            .then(refresh)
+            .catch((error) => flashError(error)),
+      },
+      text("Unload all"),
     ),
     el(
       "button",
@@ -353,43 +368,30 @@ function renderHeader(status) {
       },
       text("Rescan"),
     ),
-    el(
-      "label",
-      { class: "sh-extlog" },
-      el("input", {
-        type: "checkbox",
-        "aria-label": "extended logging",
-        ...(status.extended_logging ? { checked: "" } : {}),
-        onchange: (event) =>
-          postJson("/har/config/logging", { enabled: event.target.checked }).catch(
-            (error) => flashError(error),
-          ),
-      }),
-      text("Extended Logging"),
-    ),
-  );
-  const slots = el(
-    "div",
-    { class: "sh-slots" },
-    ...CATEGORY_ORDER.map((category) => renderSlotCard(status, category)),
   );
   const errors = (status.catalog_errors || []).map(
     (error) => `${error.file}: ${error.reason}`,
   );
+  // Operator order (2026-11-01): numbers first, tabs under them; the Extended
+  // Logging toggle belongs with the harness log at the page bottom, not the strip.
   return el(
     "div",
     {},
     headline,
-    endpoints,
-    slots,
     renderMemory(status),
-    status.last_error
-      ? el("div", { class: "sh-errline", role: "alert" }, text(`last fault: ${status.last_error}`))
-      : null,
+    controls,
     errors.length > 0
       ? el("div", { class: "sh-catalog-errors" }, text(errors.join(" · ")))
       : null,
   );
+}
+
+// What a loaded slot's container admitted it reserves (R9 display chain), or null.
+function slotReportedGb(status, category, modelId) {
+  const slot = status.slots.find(
+    (s) => s.category === category && s.model === modelId && s.container_reported_gb != null,
+  );
+  return slot ? slot.container_reported_gb : null;
 }
 
 function modelRow(status, model, category) {
@@ -525,42 +527,71 @@ function modelRow(status, model, category) {
 
   row.append(el("td", {}, text(model.engine)));
   row.append(el("td", {}, text(model.context ?? "—")));
+  // Cost honesty, server-decided (R9): the gate says via `cost_basis` which figure
+  // it books. GREEN cells show that booked figure verbatim; YELLOW cells show
+  // context, not a booking — declared or estimate sizes, and for greedy the launch
+  // floor (the gate books greedy by nominal/estimate, never the floor). Provenance
+  // is colour, not prose (operator 2026-11-01); the full sentence lives in the
+  // tooltip. A row the page saw loaded keeps that session memory in the tooltip.
+  const slotReported = serving ? slotReportedGb(status, category, model.id) : null;
+  let costText;
+  let costChecked = false;
+  let costTitle;
+  if (slotReported) {
+    costText = `${slotReported.toFixed(1)} GiB`;
+    costChecked = true;
+    costTitle = `engine-reported: this container reserves ${slotReported.toFixed(1)} GiB`;
+  } else if (
+    model.cost_basis === "measured" &&
+    model.measured_gb !== null &&
+    model.measured_gb !== undefined
+  ) {
+    const range =
+      model.measured_min_gb !== null &&
+      model.measured_min_gb !== undefined &&
+      model.measured_min_gb < model.measured_gb
+        ? model.measured_min_gb.toFixed(1) + "-" + model.measured_gb.toFixed(1)
+        : model.measured_gb.toFixed(1);
+    costText = `${range} GiB`;
+    costChecked = true;
+    costTitle = `measured ${range} GiB · the gate books it` +
+      (model.measured_attribution === "engine_report" ? " (engine-reported)" : "") +
+      (model.cost === "greedy" ? " (greedy)" : "");
+  } else if (model.cost === "greedy") {
+    costChecked = false;
+    costText =
+      model.launch_floor_gb !== null && model.launch_floor_gb !== undefined
+        ? `${model.launch_floor_gb} GiB`
+        : "greedy";
+    costTitle =
+      model.launch_floor_gb !== null && model.launch_floor_gb !== undefined
+        ? `greedy: floor ${model.launch_floor_gb} GiB, unchecked class`
+        : "greedy: no floor declared, unchecked";
+  } else if (model.vram_gb !== null) {
+    costText = `${model.vram_gb} GiB`;
+    costTitle = `declared ${model.vram_gb} GiB · unchecked until a launch measures it`;
+  } else if (model.est_vram_gb !== null && model.est_vram_gb !== undefined) {
+    costText = `${model.est_vram_gb.toFixed(1)} GiB`;
+    costTitle = `GGUF estimate ${model.est_vram_gb.toFixed(1)} GiB · unchecked`;
+  } else {
+    costText = "—";
+    costTitle = "nothing the gate can book yet";
+  }
+  if (
+    !slotReported &&
+    !serving &&
+    state.lastReported[model.id] !== undefined
+  ) {
+    costTitle += ` · reserved ${state.lastReported[model.id].toFixed(1)} GiB on last load`;
+  }
   row.append(
     el(
       "td",
-      {},
-      text(
-        // Cost honesty, server-decided (R9): the gate says which figure it books via
-        // `cost_basis`, and the page shows exactly that number — a measured pair only
-        // when it really is the booking basis, never a stand-in over a declared
-        // number. The range's low end is where the session started, the high end is
-        // what admission books; the provenance token says whose number it is.
-        model.cost_basis === "measured" &&
-          model.measured_gb !== null &&
-          model.measured_gb !== undefined
-          ? `measured ${
-              model.measured_min_gb !== null &&
-              model.measured_min_gb !== undefined &&
-              model.measured_min_gb < model.measured_gb
-                ? model.measured_min_gb.toFixed(1) + "-" + model.measured_gb.toFixed(1)
-                : model.measured_gb.toFixed(1)
-            } GiB${
-              model.measured_attribution === "total_diff"
-                ? " (total-diff)"
-                : model.measured_attribution === "engine_report"
-                  ? " (engine-reported)"
-                  : ""
-            }${model.cost === "greedy" ? " (greedy)" : ""}`
-          : model.cost === "greedy"
-            ? model.launch_floor_gb !== null && model.launch_floor_gb !== undefined
-              ? `greedy · floor ${model.launch_floor_gb} GiB`
-              : "greedy"
-            : model.vram_gb !== null
-              ? `${model.vram_gb} GiB`
-              : model.est_vram_gb !== null && model.est_vram_gb !== undefined
-                ? `${model.est_vram_gb.toFixed(1)} GiB (est.)`
-                : "est.",
-      ),
+      {
+        class: "sh-cost sh-cost-" + (costChecked ? "checked" : "unchecked"),
+        title: costTitle,
+      },
+      text(costText),
     ),
   );
   // A5 (v3.3 parity): the backing GGUF + serve_model id, basename on screen,
@@ -583,19 +614,22 @@ function modelRow(status, model, category) {
 }
 
 function renderTab(status, category) {
-  const entry = status.categories.find((cat) => cat.id === category);
   const models = state.models.filter((model) => model.category === category);
-  const panel = el("div", { class: "sh-panel-head" });
-  panel.append(text(`listener :${entry ? entry.public_port : "?"} · `));
-  panel.append(
+  const entry = status.categories.find((cat) => cat.id === category);
+  // The default chip lives here, on the panel's own empty head row - it names the
+  // tab below, not the strip above (operator 2026-11-01).
+  const head = el(
+    "div",
+    { class: "sh-panel-head" },
     text(entry && entry.default_model ? `default: ${entry.default_model}` : "default: none"),
   );
   if (entry && entry.default_model) {
-    panel.append(
+    head.append(
       el(
         "button",
         {
-          class: "sh-mini",
+          class: "sh-mini sh-x",
+          title: "clear the default",
           // Refused (e.g. the row raced a retag from another tab) it must flash and
           // re-read, exactly like `Set default` (FINDINGS-16 [3]).
           onclick: () =>
@@ -606,7 +640,7 @@ function renderTab(status, category) {
                 refresh();
               }),
         },
-        text("Clear default"),
+        text("\u2715"),
       ),
     );
   }
@@ -640,25 +674,8 @@ function renderTab(status, category) {
   table.append(body);
   // Small windows: the table scrolls inside its own wrapper — the page itself
   // never overflows and the action buttons stay reachable (review, 2026-10-26).
-  return el("div", { class: "sh-tabpanel" }, panel, el("div", { class: "sh-tablewrap" }, table));
-}
-
-function renderTabs() {
-  const tabs = el("div", { class: "sh-tabs", role: "tablist" });
-  for (const category of CATEGORY_ORDER) {
-    tabs.append(
-      el("button", {
-        class: "sh-tab",
-        role: "tab",
-        "aria-selected": String(state.activeTab === category),
-        onclick: () => {
-          state.activeTab = category;
-          render();
-        },
-      }, text(category)),
-    );
-  }
-  return tabs;
+  // The default chip sits on the panel's own head row (operator 2026-11-01).
+  return el("div", { class: "sh-tabpanel" }, head, el("div", { class: "sh-tablewrap" }, table));
 }
 
 function logLine(entry) {
@@ -689,9 +706,17 @@ async function toggleLog(details) {
 
 function renderJobs(status) {
   const recent = status.jobs.slice(-5).reverse();
-  if (recent.length === 0) return null;
+  // The last fault moved down here from the sticky header (operator 2026-11-01):
+  // a stale fault is history, and history belongs beside the job ledger, not
+  // above the live controls.
+  if (recent.length === 0 && !status.last_error) return null;
   const wrap = el("div", { class: "sh-jobs" });
   wrap.append(el("h3", {}, text("Recent jobs")));
+  if (status.last_error) {
+    wrap.append(
+      el("div", { class: "sh-errline", role: "alert" }, text(`last fault: ${status.last_error}`)),
+    );
+  }
   for (const job of recent) {
     const line = el("div", { class: "sh-job" });
     line.append(text(`${job.id} · ${job.model} · ${job.state}`));
@@ -732,10 +757,27 @@ function render() {
     logBody,
   );
   mainHost.replaceChildren(
-    renderTabs(),
     renderTab(status, state.activeTab),
     ...(jobs ? [jobs] : []),
-    logBox,
+    el(
+      "div",
+      { class: "sh-logrow" },
+      logBox,
+      el(
+        "label",
+        { class: "sh-extlog" },
+        el("input", {
+          type: "checkbox",
+          "aria-label": "extended logging",
+          ...(status.extended_logging ? { checked: "" } : {}),
+          onchange: (event) =>
+            postJson("/har/config/logging", { enabled: event.target.checked }).catch(
+              (error) => flashError(error),
+            ),
+        }),
+        text("Extended Logging"),
+      ),
+    ),
     el(
       "footer",
       { class: "sh-footer" },
@@ -749,11 +791,24 @@ function render() {
 let pollTimer = null;
 let sse = null;
 
+// Remember every live `container_reported_gb` seen, keyed by model: the truth a
+// container speaks exists only while its slot lives, so the page holds it for the
+// rest of the session. Recording is display-only, never a gate input.
+function recordReportedFootprints(doc) {
+  if (!doc || !Array.isArray(doc.slots)) return;
+  for (const slot of doc.slots) {
+    if (slot && slot.model && slot.container_reported_gb != null) {
+      state.lastReported[slot.model] = slot.container_reported_gb;
+    }
+  }
+}
+
 function applyState(doc) {
   // The SSE document IS the full /har/status body plus `models` — one shape
   // everywhere, no per-panel re-derivation.
   state.status = doc;
   state.models = doc.models || [];
+  recordReportedFootprints(doc);
   render();
 }
 
@@ -779,6 +834,7 @@ async function refresh() {
   }
   state.status = status;
   state.models = catalog.data;
+  recordReportedFootprints(status);
   try {
     render();
   } catch (error) {

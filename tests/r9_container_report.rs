@@ -311,11 +311,14 @@ async fn an_unparseable_or_incomplete_report_never_books() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Declared wins unconditionally (ruling 15 (ii) bound): the report may PERSIST its
-/// honest pair next to a declared row — the forensic value stands — while the slot
-/// keeps charging the operator's declared figure.
+/// The raise (operator ruling 2026-11-01, amending ruling 15 (ii)'s
+/// declared-always-leg): a report PERSISTS its honest pair next to a declared row
+/// (the forensic value stands) and the mid-session slot keeps charging the
+/// declared figure — the raise is not retroactive — but the NEXT admit books the
+/// container's certified reservation instead of the smaller declaration. A
+/// declared floor at or above the report still stands (unit-pinned in `model`).
 #[tokio::test]
-async fn a_declared_row_persists_the_report_but_charges_declared() {
+async fn a_declared_row_below_the_report_raises_the_next_admit() {
     let (handle, runtime, dir) = harness(&[(
         "r9-declared",
         "ninfer",
@@ -346,7 +349,43 @@ async fn a_declared_row_persists_the_report_but_charges_declared() {
     assert_eq!(
         need,
         Some(8.0),
-        "the declared figure wins the charge no matter what the engine reserved:\n{text}"
+        "the raise is not retroactive: the resident keeps the charge it was armed with:\n{text}"
+    );
+
+    // The next admit reads the amended precedence: 31.2 (guarded engine_report)
+    // overshadows the 8.0 declaration.
+    handle.unload(CategoryId::Work).await.expect("unload");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = handle.status().await.expect("actor alive");
+        let slot = status
+            .slots
+            .iter()
+            .find(|s| s.category == CategoryId::Work)
+            .expect("WORK slot");
+        if slot.model.is_none() && slot.loading_job.is_none() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "unload never settled");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    expect_loaded(
+        handle
+            .swap("r9-declared", CategoryId::Work)
+            .await
+            .expect("reload"),
+        "r9-declared",
+    );
+    let status = handle.status().await.expect("actor alive");
+    let need = status
+        .slots
+        .iter()
+        .find(|s| s.category == CategoryId::Work)
+        .and_then(|s| s.need_gib);
+    assert_eq!(
+        need,
+        Some(31.2),
+        "admission must keep free what the container itself reserves:\n{text}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

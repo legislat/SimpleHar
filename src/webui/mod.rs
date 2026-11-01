@@ -1,7 +1,8 @@
 //! Control page (DESIGN Step 14, operator mockup 2026-10-25): Pico CSS + vanilla
 //! JavaScript, assets embedded with `include_str!` — the page only renders `/har/*`
-//! JSON and every action is a headless API call. The header is persistent (slot
-//! cards + memory bars never scroll away); the category tabs live below it.
+//! JSON and every action is a headless API call. The header is persistent (the
+//! merged slot/tab strip and the memory bars never scroll away, compacted
+//! 2026-11-01); the model table lives below it.
 
 use crate::api::ApiState;
 use axum::http::{header, StatusCode};
@@ -225,6 +226,27 @@ mod tests {
             STYLE_CSS.contains(".sh-badge[data-tone=\"warn\"]") && STYLE_CSS.contains("--sh-warn"),
             "the amber badge needs a rule in the served stylesheet or it renders as the \
              default green badge"
+        );
+    }
+
+    /// Cost provenance is colour, not prose (operator 2026-11-01): the served
+    /// page paints a gate-validated figure green and an unchecked one yellow,
+    /// and the CSS rules both colours need exist in the served stylesheet —
+    /// untestable in the DOM stub (GOTCHAS [ui][test]), so pinned byte-level.
+    ///
+    /// Nature: a source-content assertion over the `include_str!` bytes.
+    /// Falsifier: dropping either rule, or colouring both states from one token,
+    /// fails.
+    #[test]
+    fn served_assets_colour_the_cost_cell_by_validation() {
+        assert!(
+            APP_JS.contains("sh-cost-\" + (costChecked ? \"checked\" : \"unchecked\")"),
+            "the cost cell must carry exactly the checked/unchecked class token"
+        );
+        assert!(
+            STYLE_CSS.contains(".sh-cost-checked { color: var(--sh-accent-solid); }")
+                && STYLE_CSS.contains(".sh-cost-unchecked { color: var(--sh-warn); }"),
+            "green must be the accent and yellow the warn token, each with its own rule"
         );
     }
 }

@@ -166,9 +166,11 @@ pub struct ModelEntry {
     /// served (`measured_gb:`, written back after Install; see
     /// [`ModelEntry::measured_min_gb`] for the low end). The page shows the range as
     /// truth for every cost class; admission consults it when the provenance stamp
-    /// says it may book (`fixed` without a declared `vram_gb`, or `exact` on an
-    /// `engine_report` figure — ruling 15 (ii)); a `total_diff` displays but never
-    /// books (greedy keeps nominal semantics; exact refuses without a source).
+    /// says it may book (`fixed` without a declared `vram_gb`, or a guarded
+    /// `engine_report` figure — above the declared floor too, per the 2026-11-01
+    /// amendment of ruling 15 (ii); `exact` only on a self-reported figure); a
+    /// `total_diff` displays but never books (greedy keeps nominal semantics;
+    /// exact refuses without a source).
     pub measured_gb: Option<f64>,
     /// Low end of the measured range (`measured_gb_min:`): the smallest witness
     /// total-diff seen while the model served. The spread is what the model actually
@@ -466,9 +468,12 @@ fn parse_bool_stamp(field: &str, raw: &str) -> Result<bool, ModelError> {
 /// how the page could show a number the gate ignored (duplication review, 2026-10-26).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostSource {
-    /// The declared `vram_gb`.
+    /// The declared `vram_gb` — including where a guarded `engine_report` exists
+    /// but does not exceed it (the declared floor then stands).
     Declared,
-    /// The harness-measured footprint of an earlier run (`fixed` only).
+    /// The harness-measured footprint of an earlier run: the booking basis for
+    /// `fixed`/`exact` rows without a binding declaration, and the override of a
+    /// declared value a guarded `engine_report` exceeds.
     Measured,
     /// GGUF size × 1.15 + 2.
     Estimate,
@@ -511,13 +516,37 @@ impl ModelEntry {
         }
     }
 
+    /// Whether the engine's own guarded report outranks the declared `vram_gb`:
+    /// the container certified reserving MORE than the operator declared, and
+    /// `read_measured` still certifies the report against the current profile
+    /// stamp. Operator ruling 2026-11-01 (amends the declared-always-wins leg of
+    /// the 2026-10-30 R9 design): the booking is the max truth — what admission
+    /// must keep free is what the container actually reserves. A declared value
+    /// at or above the report stays the operator's chosen floor.
+    #[must_use]
+    fn engine_report_outranks_declared(&self) -> bool {
+        let (Some(declared), Some(reported)) = (self.vram_gb, self.measured_gb) else {
+            return false;
+        };
+        self.measured_attribution == Some(MeasuredAttribution::EngineReport)
+            && self.may_book_measured()
+            && reported > declared
+    }
+
     /// The booking precedence: declared → measured (only where the cost class may
     /// book it, per [`Self::may_book_measured`]) → GGUF estimate, with
     /// `exact`-without-`vram_gb`-and-without-a-self-reported-measurement refused.
+    /// A guarded `engine_report` ABOVE the declared value books instead of it
+    /// ([`Self::engine_report_outranks_declared`]) — the container's word is the
+    /// bigger truth, so the max of the two is what admission charges.
     #[must_use]
     pub fn cost_source(&self) -> CostSource {
         if self.vram_gb.is_some() {
-            return CostSource::Declared;
+            return if self.engine_report_outranks_declared() {
+                CostSource::Measured
+            } else {
+                CostSource::Declared
+            };
         }
         if self.may_book_measured() {
             return CostSource::Measured;
@@ -569,8 +598,9 @@ impl ModelEntry {
         let vram_gb = match keys.get("vram_gb") {
             Some(raw) => {
                 let v = parse_gib("vram_gb", raw)?;
-                // A declared 0 is not a declared cost: the declared number wins
-                // unconditionally at admission (`cost_source` → Declared), so
+                // A declared 0 is not a declared cost: the declared number books at
+                // admission (`cost_source` → Declared; since the 2026-11-01 amendment
+                // a guarded report may stand above it, never a zero below it), so
                 // `vram_gb: 0` books any model free — gate deficit 0, ledger 0, and
                 // the next load spends the same bytes (FINDINGS-12 [2]). Zero stays
                 // legal for `launch_only_with_at_least_vram_free` below: a floor of
@@ -1225,8 +1255,8 @@ mod tests {
                 "{token}: a bookable provenance is a source for exact"
             );
         }
-        // Declared still wins unconditionally over any measured figure (DECISIONS
-        // LOCKED: the container number is bounded, never sovereign).
+        // A declared value at or above the report is the operator's floor and
+        // stands (ruling 2026-11-01 amends only the OVERSHADOWED leg below).
         let declared_wins = ModelEntry::from_flat(
             &flat(&[
                 ("name", "m"),
@@ -1240,7 +1270,73 @@ mod tests {
             "m",
         )
         .expect("valid");
-        assert_eq!(declared_wins.cost_source(), CostSource::Declared);
+        assert_eq!(
+            declared_wins.cost_source(),
+            CostSource::Declared,
+            "a report smaller than the declared floor must not shrink the booking"
+        );
+        // The amendment (operator ruling 2026-11-01): a guarded engine_report that
+        // EXCEEDS the declared value books — admission must keep free what the
+        // container itself reserved. Only the engine's own word, still certified by
+        // its profile stamp, gets to overshadow; a witness `per_process` figure
+        // (weaker staleness guard, no profile stamp) stays annotation over a
+        // declared row.
+        let report_overshadows = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("cost", "fixed"),
+                ("vram_gb", "34"),
+                ("measured_gb", "44"),
+                ("measured_attribution", "engine_report"),
+                ("measured_profile", "b"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            report_overshadows.cost_source(),
+            CostSource::Measured,
+            "the container's certified reservation IS the booking"
+        );
+        let witness_does_not = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "llama"),
+                ("cost", "fixed"),
+                ("vram_gb", "34"),
+                ("measured_gb", "44"),
+                ("measured_attribution", "per_process"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            witness_does_not.cost_source(),
+            CostSource::Declared,
+            "a witness fold does not overshadow a declared value"
+        );
+        // Greedy stays untouched by the amendment: its class may never book a
+        // measurement (nominal semantics), so a certified report cannot raise it
+        // either — the overshadow leg stops at `may_book_measured`.
+        let greedy_untouched = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("cost", "greedy"),
+                ("vram_gb", "34"),
+                ("measured_gb", "44"),
+                ("measured_attribution", "engine_report"),
+                ("measured_profile", "b"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            greedy_untouched.cost_source(),
+            CostSource::Declared,
+            "a greedy row books its declared nominal even under a bigger report"
+        );
     }
 
     #[test]
