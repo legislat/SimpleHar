@@ -360,6 +360,16 @@ fn defaulted_word(model: &ModelEntry, key: &str, fallback: &str) -> Result<Strin
     }
 }
 
+/// The first present `ninfer_profile_<built-in>` key — one this module's
+/// precedence can never read in EITHER launch mode, so both refuse it
+/// (review L-2: the legacy branch once ignored it silently).
+fn dead_built_in_profile_key(raw: &BTreeMap<String, String>) -> Option<&'static str> {
+    BUILT_IN_PROFILES
+        .iter()
+        .map(|(name, ..)| *name)
+        .find(|name| raw.contains_key(&format!("ninfer_profile_{name}")))
+}
+
 /// The four numbers a profile stands for, resolved from the built-in table or from
 /// the `ninfer_profile_<name>` override key a custom `ninfer_profile:` names. The
 /// override is one line of `key=value` pairs so the operator never has to know the
@@ -381,14 +391,11 @@ fn profile_override(
     // test 2026-11-01: a `ninfer_profile_b` line promising int8/conc 2 launched
     // fp8/conc 1 with no word), so an override line naming any built-in is a
     // refusal, whatever `ninfer_profile` selects.
-    for (name, ..) in BUILT_IN_PROFILES {
-        let dead = format!("ninfer_profile_{name}");
-        if raw.contains_key(&dead) {
-            return Err(rejected(format!(
-                "`{dead}` can never be read: `{name}` is a built-in profile and the \
-                 built-in table wins; rename the profile to a custom name"
-            )));
-        }
+    if let Some(name) = dead_built_in_profile_key(raw) {
+        return Err(rejected(format!(
+            "`ninfer_profile_{name}` can never be read: `{name}` is a built-in profile and the \
+             built-in table wins; rename the profile to a custom name"
+        )));
     }
     if let Some((_, ctx, kv, conc, dtype)) =
         BUILT_IN_PROFILES.iter().find(|(name, ..)| *name == profile)
@@ -752,6 +759,16 @@ impl EngineAdapter for NinferAdapter {
         if !valid_word(&profile) {
             return Err(rejected(format!(
                 "ninfer_profile must be a plain word (no spaces or shell metacharacters): {profile}"
+            )));
+        }
+        // Dead built-in-name override lines are refused in EITHER launch mode:
+        // the template path refuses through `profile_override`, and the legacy
+        // path — which never resolves the override — must refuse too rather
+        // than pass `$1` and ignore the line silently (review L-2).
+        if let Some(dead) = dead_built_in_profile_key(&model.raw) {
+            return Err(rejected(format!(
+                "`ninfer_profile_{dead}` can never be read: `{dead}` is a built-in profile \
+                 and the built-in table wins; rename the profile to a custom name"
             )));
         }
         let key = if model
@@ -1152,7 +1169,7 @@ mod tests {
             ),
             (
                 "ninfer_serve_args",
-                "--spec=dflash2 --draft-tokens=7 --vision",
+                "--spec dflash2 --draft-tokens 7 --vision",
             ),
         ]
     }
@@ -1210,6 +1227,31 @@ mod tests {
             assert!(reason.contains(dead), "{selected}/{dead}: {reason}");
             assert!(reason.contains("built-in"), "{selected}/{dead}: {reason}");
         }
+    }
+
+    /// Legacy rows refuse the dead built-in-name override too, even though the
+    /// legacy path never resolves an override (the README promises the refusal
+    /// at launch in EITHER mode; review L-2). Falsifier: a legacy branch that
+    /// accepts the line while only the template path refuses.
+    #[test]
+    fn legacy_mode_refuses_the_dead_built_in_override_key_too() {
+        let error = NinferAdapter::new("Ubuntu", "ops")
+            .spec(
+                &entry(&[
+                    ("ninfer_autostart", "/s.sh"),
+                    ("ninfer_container", "c"),
+                    (
+                        "ninfer_profile_b",
+                        "ctx=262144 kv=262144 conc=2 kv_dtype=int8",
+                    ),
+                ]),
+                18109,
+            )
+            .expect_err("a dead override key must refuse in legacy mode too");
+        assert!(
+            format!("{error}").contains("ninfer_profile_b"),
+            "the refusal must name the key: {error}"
+        );
     }
 
     /// The `ninfer_env` allow-list is a review gate, not a parse rule: the one
@@ -1292,7 +1334,7 @@ mod tests {
         assert!(script.contains("PORT=\"8004\""), "{script}");
         assert!(script.contains("SERVE_CMD=\"ninfer-serve\""), "{script}");
         assert!(script.contains("  \"/mnt/d/Models\""), "{script}");
-        assert!(script.contains("\"--spec=dflash2\""), "{script}");
+        assert!(script.contains("\"--spec\" \"dflash2\""), "{script}");
         assert!(script.contains("profile 'b'"), "{script}");
         assert!(
             script.contains("ctx=262144 kv=262144 conc=1 kvdtype=fp8"),
@@ -1562,43 +1604,71 @@ pub struct EngineReport {
     pub available_after_startup_bytes: u64,
 }
 
-/// The engine's own post-ready resident footprint: the `weights ready | W GiB`
-/// line plus the `runtime R GiB` figure on the `capacity` line, both from the
-/// same `docker logs` stream as [`parse_startup_memory`]. The startup record
+/// The engine's own post-ready resident footprint (GiB): `weights ready | W
+/// GiB` plus the `runtime R` of the `capacity` line, both from the same
+/// `docker logs` stream as [`parse_startup_memory`]. The startup record
 /// predates the weight stream, so this is the same container speaking *after*
 /// it installed — per-engine and unaffected by other card residents (live
 /// proof 2026-11-01: 27.5 + 16.5 = 44.0 against a witness-observed 44.1).
-///
-/// Returns `None` unless BOTH figures are present; host-side lines (`host KV
-/// pinned | 8.00 GiB`, `host cache budget`) are deliberately never scanned, so
-/// host RAM can never enter a VRAM booking. Each figure is the LAST occurrence,
-/// so a container that restarted in place speaks with its newest voice.
+/// Each figure is the LAST occurrence, so a container that restarted in place
+/// speaks with its newest voice; `None` when any guard fails.
 #[must_use]
 pub fn parse_resident_footprint(log: &str) -> Option<f64> {
-    let weights = last_gib_after(log, "weights ready")?;
-    let runtime = last_gib_after(log, "runtime")?;
-    if weights > 0.0 && runtime > 0.0 && weights.is_finite() && runtime.is_finite() {
-        Some(weights + runtime)
-    } else {
-        None
-    }
+    resident_figures(log).map(|(resident, _total)| resident)
 }
 
-/// The GiB amount in the LAST line with a usable figure under `label` — the
-/// number immediately followed by `GiB` after that label (e.g. `weights ready
-/// | 27.5 GiB`). Lines carrying the label without a parseable figure are
-/// skipped, not fatal: the newest *readable* voice wins.
+/// `(resident, implied_total)` in GiB from the engine's own post-ready lines.
+/// The `runtime`/`free` figures are read ONLY from lines framing a `capacity`
+/// record — elsewhere in the log the word `runtime` may ride host memory
+/// lines, and host RAM must never reach a VRAM booking (review M-1). Fails
+/// (`None`) unless every figure is finite, weights and runtime are positive,
+/// free is non-negative, and `W + R <= W + R + F`.
+fn resident_figures(log: &str) -> Option<(f64, f64)> {
+    let weights = last_gib_after(log, "weights ready")?;
+    let (runtime, free) = capacity_runtime_free(log)?;
+    let resident = weights + runtime;
+    let total = resident + free;
+    (weights > 0.0
+        && runtime > 0.0
+        && free >= 0.0
+        && resident.is_finite()
+        && total.is_finite()
+        && resident <= total)
+        .then_some((resident, total))
+}
+
+/// The `runtime R GiB` and `free F GiB` figures of the LAST `capacity` line —
+/// the engine's only post-ready device statement, anchored there on purpose.
+fn capacity_runtime_free(log: &str) -> Option<(f64, f64)> {
+    log.lines()
+        .rev()
+        .filter(|line| line.contains("capacity"))
+        .find_map(|line| {
+            let runtime = gib_in_line(line, "runtime")?;
+            let free = gib_in_line(line, "free")?;
+            (runtime > 0.0 && free >= 0.0 && runtime.is_finite() && free.is_finite())
+                .then_some((runtime, free))
+        })
+}
+
+/// The GiB amount in the LAST line with a usable figure under `label` (e.g.
+/// `weights ready | 27.5 GiB`). Lines carrying the label without a parseable
+/// figure are skipped, not fatal: the newest *readable* voice wins.
 fn last_gib_after(log: &str, label: &str) -> Option<f64> {
     log.lines()
         .rev()
-        .filter_map(|line| {
-            let at = line.rfind(label)? + label.len();
-            let rest = &line[at..];
-            let gib = rest.find("GiB")?;
-            let number = rest[..gib].split_whitespace().last()?.replace(',', "");
-            number.parse::<f64>().ok().filter(|v| *v > 0.0)
-        })
+        .filter_map(|line| gib_in_line(line, label))
         .next()
+}
+
+/// The GiB figure under `label` within ONE line: the number immediately
+/// followed by the first `GiB` after the label's last occurrence.
+fn gib_in_line(line: &str, label: &str) -> Option<f64> {
+    let at = line.rfind(label)? + label.len();
+    let rest = &line[at..];
+    let gib = rest.find("GiB")?;
+    let number = rest[..gib].split_whitespace().last()?.replace(',', "");
+    number.parse::<f64>().ok().filter(|v| *v >= 0.0)
 }
 
 /// Pull the engine's startup device-memory accounting out of `docker logs` output.
@@ -1645,6 +1715,21 @@ pub fn parse_startup_memory(log: &str) -> Option<EngineReport> {
             total_device_memory_bytes: total,
             available_after_startup_bytes: available,
         });
+    }
+    // Both shipped builds write the startup JSON only to the
+    // `--request-log-jsonl` ops log, which never reaches `docker logs`
+    // (review M-2, live proof 2026-11-01): without this branch the
+    // post-ready booking would be dead code on the very boxes it was made
+    // for. The implied total comes from the engine's own three post-ready
+    // figures, so even the clamp stays the engine's own word.
+    if found.is_none() {
+        if let Some((resident, total)) = resident_figures(log) {
+            found = Some(EngineReport {
+                required_to_free_gb: resident,
+                total_device_memory_bytes: (total * GIB).round() as u64,
+                available_after_startup_bytes: ((total - resident) * GIB).round() as u64,
+            });
+        }
     }
     found
 }
@@ -1814,5 +1899,32 @@ mod startup_tests {
             format!("{old}\nINFO weights ready | 66.0 GiB\nINFO capacity | runtime 66.0 GiB\n");
         let report = parse_startup_memory(&huge).expect("parses");
         assert!((report.required_to_free_gb - 28.0).abs() < 1e-6);
+    }
+
+    /// Review M-2 (live proof): the shipped builds route the startup JSON to
+    /// `--request-log-jsonl`, invisible to `docker logs` — the post-ready
+    /// triple alone must book, with the total implied by the engine's own
+    /// figures. Review M-1: a host-side line merely SAYING `runtime` must
+    /// never feed the capacity figures.
+    #[test]
+    fn the_post_ready_triple_alone_books_and_host_words_cannot_join() {
+        let text_only = "2026-11-01 03:43:54.192  INFO  weights ready | 27.5 GiB | 2m 17.6s\n\
+            2026-11-01 03:44:07.842  INFO  host KV pinned | 8.00 GiB | 8.5s\n\
+            2026-11-01 03:44:07.842  INFO  capacity | KV 262,144 tokens, int8, explicit | runtime 16.5 GiB | free 27.4 GiB\n";
+        let report = parse_startup_memory(text_only).expect("the triple books alone");
+        assert!((report.required_to_free_gb - 44.0).abs() < 1e-6);
+        assert!(
+            (report.total_device_memory_bytes as f64 / GIB - 71.4).abs() < 1e-6,
+            "total {}",
+            report.total_device_memory_bytes
+        );
+
+        // A `runtime` word outside any `capacity` line contributes nothing,
+        // and no complete triple means no report at all (fallback stays
+        // labelled total_diff, never a silent zero).
+        let host_words = "INFO weights ready | 27.5 GiB\n\
+            WARNING runtime host cache budget | 8.00 GiB total\n";
+        assert_eq!(parse_resident_footprint(host_words), None);
+        assert_eq!(parse_startup_memory(host_words), None);
     }
 }
