@@ -951,6 +951,10 @@ struct Job {
     /// was down. The release re-check and the settle gate take the more
     /// conservative figure against this (operator 2026-10-26).
     observed_at_admit: Option<f64>,
+    /// Ruling 2026-11-01 (revisable): this same-slot swap already took the
+    /// release-first path — it destroyed its victim on the booked credit and
+    /// re-gates on the physically re-sampled card instead of dying on paper.
+    release_first: bool,
     /// Detached WSL container backing the spawn (ninfer): suppresses the
     /// pid-attributed measured footprint, which is meaningless for a client
     /// process that exits before the container is ready (review, 2026-10-26).
@@ -1882,6 +1886,7 @@ impl ActorState {
             gate_target: None,
             free_at_admit: None,
             observed_at_admit: None,
+            release_first: false,
             container: None,
             timings: JobTimings::default(),
             t0: Instant::now(),
@@ -2576,6 +2581,7 @@ impl ActorState {
             need: None,
             free_at_admit: None,
             observed_at_admit: None,
+            release_first: false,
             container: None,
             timings: JobTimings::default(),
             t0: Instant::now(),
@@ -2828,23 +2834,41 @@ impl ActorState {
                     );
                 }
                 Err((considered, blockers)) => {
-                    self.step(job_id, SwapState::AdmitFail);
-                    let reserve = Gibibytes(self.cfg.vram_reserve_gb);
-                    // R3 (operator GO 2026-11-01): the refusal must name the
-                    // memory no eviction can reclaim — the card minus the
-                    // same-slot replacement and every evictable candidate.
-                    // Blockers ride inside it (they are exactly the part the
-                    // harness may not release) and are named beside it.
-                    let mut facts = facts;
-                    if observed_free.is_some() {
-                        let releasable =
-                            victim_need + considered.iter().map(|v| v.need_gib).sum::<f64>();
-                        facts.unreleasable = Some(Gibibytes((occupied - releasable).max(0.0)));
-                        facts.used_gib = Some(Gibibytes(occupied));
-                        facts.booked_total = Some(self.ledger_sum());
-                    }
-                    let error =
-                        if floor_deficit > 0.0 && floor_deficit >= need_deficit {
+                    // Ruling (operator 2026-11-01, REVISABLE): release-then-resample
+                    // for same-slot replacements. The victim's booked need can
+                    // understate what it actually holds, and a swap that physically
+                    // fits must not die on paper (the round-2(A) 5 GiB paper deficit).
+                    // Destroy the victim — it was being replaced by request anyway —
+                    // and let the settle window re-gate the load against the card as
+                    // physically re-sampled. Cross-slot victims are NOT queued here:
+                    // the planner found no sufficient set, and nothing beyond the
+                    // already-doomed resident may be killed on a paper decision.
+                    if self.jobs[&job_id].victim.is_some() && !self.jobs[&job_id].release_first {
+                        if let Some(job) = self.jobs.get_mut(&job_id) {
+                            job.release_first = true;
+                        }
+                        tracing::info!(
+                            %job_id,
+                            deficit_gib = deficit,
+                            "admission short on the booked credit: releasing the same-slot victim first and re-gating on the physical card (release-first)"
+                        );
+                    } else {
+                        self.step(job_id, SwapState::AdmitFail);
+                        let reserve = Gibibytes(self.cfg.vram_reserve_gb);
+                        // R3 (operator GO 2026-11-01): the refusal must name the
+                        // memory no eviction can reclaim — the card minus the
+                        // same-slot replacement and every evictable candidate.
+                        // Blockers ride inside it (they are exactly the part the
+                        // harness may not release) and are named beside it.
+                        let mut facts = facts;
+                        if observed_free.is_some() {
+                            let releasable =
+                                victim_need + considered.iter().map(|v| v.need_gib).sum::<f64>();
+                            facts.unreleasable = Some(Gibibytes((occupied - releasable).max(0.0)));
+                            facts.used_gib = Some(Gibibytes(occupied));
+                            facts.booked_total = Some(self.ledger_sum());
+                        }
+                        let error = if floor_deficit > 0.0 && floor_deficit >= need_deficit {
                             AdmissionError::BelowLaunchFloor {
                                 min_free: Gibibytes(floor.expect(
                                     "invariant: floor_deficit > 0 implies a configured floor",
@@ -2867,13 +2891,14 @@ impl ActorState {
                                 blockers,
                             }
                         };
-                    self.log_refusal(job_id, &SchedulerError::Admission(error.clone()), "gate");
-                    self.finish(
-                        job_id,
-                        Err(SchedulerError::Admission(error)),
-                        "admission refused",
-                    );
-                    return;
+                        self.log_refusal(job_id, &SchedulerError::Admission(error.clone()), "gate");
+                        self.finish(
+                            job_id,
+                            Err(SchedulerError::Admission(error)),
+                            "admission refused",
+                        );
+                        return;
+                    }
                 }
             }
         }
@@ -4576,6 +4601,7 @@ mod tests {
                 gate_target: Some(2.0),
                 free_at_admit: Some(Gibibytes(20.0)),
                 observed_at_admit: Some(20.0),
+                release_first: false,
                 container: None,
                 timings: JobTimings::default(),
                 t0: Instant::now(),

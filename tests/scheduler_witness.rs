@@ -245,6 +245,52 @@ async fn settle_passes_once_the_card_frees() {
 }
 
 #[tokio::test]
+async fn same_slot_swap_releases_first_when_the_booked_credit_understates_the_card() {
+    // Ruling (operator 2026-11-01, revisable): a victim's booked need can fall
+    // below the footprint it actually holds, and a swap that physically fits must
+    // not die on that paper deficit. Release-first destroys the (already doomed)
+    // resident and re-gates the load in the settle window against the physically
+    // re-sampled card. Falsifier: refusing at admission as before — b then never
+    // spawns and the reply is the Insufficient error, not Loaded.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
+    let cfg = AppConfig {
+        settle_timeout_s: 5,
+        ..AppConfig::default()
+    };
+    let (handle, _dir) = harness_models(
+        cfg,
+        &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 26.0)],
+        Arc::new(witness.clone()),
+    );
+    let Reply::Loaded(_) = handle.swap("a", CategoryId::Work).await.expect("a loads") else {
+        panic!("expected Loaded");
+    };
+    // `a` really holds 50 GiB: 54 of 72 used leaves free 16, the victim credits
+    // only its booked 8 — b admits against a 2 GiB deficit with an empty
+    // evictable set, the round-2(A) shape where the swap physically fits.
+    witness.set(sample(72.0, 54.0, vec![]));
+    let awaiting_b = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("b", CategoryId::Work).await })
+    };
+    // The victim is destroyed BEFORE the re-gate (slot empty, job in Dispose) —
+    // then the card is allowed to give a's bytes back.
+    wait_until(&handle, 5, |status| {
+        status.slots.iter().all(|slot| slot.model.is_none())
+            && status.jobs.iter().any(|job| {
+                job.model == "b" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            })
+    })
+    .await;
+    witness.set(sample(72.0, 4.0, vec![]));
+    let reply = awaiting_b
+        .await
+        .expect("task alive")
+        .expect("b loads after the physical re-gate");
+    assert!(matches!(reply, Reply::Loaded(_)), "got {reply:?}");
+}
+
+#[tokio::test]
 async fn settle_fails_closed_when_the_witness_dies_mid_window() {
     // The card is held full so the settle window is genuinely waiting, then the
     // witness dies. A confirmed release proves the port closed, never that the VRAM

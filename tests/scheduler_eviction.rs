@@ -527,7 +527,12 @@ async fn rp_load_cannot_evict_work_and_refuses_with_blockers() {
 async fn aux_load_cannot_evict_anything_cross_category() {
     // AUX x2 holds 30 + 20 (ledger 50, free 20); a 55 GiB AUX load replaces its
     // LRU own occupant (allowed) but still falls 5 short - and AUX may evict
-    // nobody outside its own slots: refuse, both AUX occupants survive.
+    // nobody outside its own slots. Release-first (ruling 2026-11-01, revisable):
+    // the same-slot victim is destroyed on the booked credit and the SETTLE window
+    // re-gates on the re-sampled card - the card stays full, so the load refuses
+    // with the settle numbers. aux20 (a cross-category non-candidate) survives;
+    // aux30 is the accepted casualty of a swap that did not fit. Falsifier:
+    // refusing before the kill (pre-ruling shape) leaves aux30 serving.
     let witness = FakeWitness::with(vec![sample(72.0, 30.0), sample(72.0, 50.0)]);
     let handle = harness(
         2,
@@ -550,33 +555,21 @@ async fn aux_load_cannot_evict_anything_cross_category() {
     let error = handle
         .swap("aux55", CategoryId::Aux)
         .await
-        .expect_err("AUX may not evict other categories");
+        .expect_err("the card never frees what release-first spent");
     let message = error.to_string();
-    // G13: the message prints the figure the gate compared — the 20.0 GiB ledger
-    // free plus the 30.0 GiB same-slot release it was about to reclaim — and names
-    // both truths it was derived from (review, 2026-10-26).
+    assert!(message.contains("settle timeout"), "was: {message}");
     assert!(
-        message.contains("insufficient VRAM: need 55.0 GiB, free 50.0 GiB"),
-        "was: {message}"
-    );
-    assert!(
-        message.contains("budget 20.0 GiB") && message.contains("observed free 22.0 GiB"),
-        "the refusal must name the budget and the observed reading: {message}"
-    );
-    // FINDINGS-20 [11]: the non-empty-evictor-list blocker arm. The two AUX
-    // occupants ARE evictable — just not by AUX (`evictable_by = [WORK, RP]`), so
-    // the operator's only guidance on who could free the memory is this sentence.
-    // A regression to the `nothing may evict AUX` wording (or to printing no
-    // blocker at all) fails here; the `nothing may evict` arm is pinned by
-    // `rp_load_cannot_evict_work_and_refuses_with_blockers`.
-    assert!(
-        message.contains("only WORK and RP can evict AUX"),
-        "the refusal must name who COULD evict the blockers: {message}"
+        message.contains("22.0 GiB free after release, 55.0 GiB required"),
+        "the re-gate must name the physical truth: {message}"
     );
     let status = handle.status().await.expect("actor alive");
     let aux = aux_models(&status);
-    assert!(aux.contains(&Some("aux30".to_string())), "{aux:?}");
     assert!(aux.contains(&Some("aux20".to_string())), "{aux:?}");
+    assert!(
+        !aux.contains(&Some("aux30".to_string())),
+        "the same-slot victim was released first: {aux:?}"
+    );
+    assert!(!aux.contains(&Some("aux55".to_string())), "{aux:?}");
 }
 
 #[tokio::test]
