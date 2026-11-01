@@ -1343,6 +1343,27 @@ impl ActorState {
                 }
             }
         }
+        // The rescan twin of the R10 arm-time refusal (`start_queued_load`): the
+        // page names a borrowed port number before the load dies, never after.
+        for entry in &models {
+            if let Some(port) = crate::engine::ninfer::declared_internal_port(entry) {
+                if let Some(claim) = self.cfg.port_claim(port) {
+                    errors.push(ScanError {
+                        kind: ScanKind::Other,
+                        file: entry
+                            .file
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| format!("<synthetic `{}`>", entry.name)),
+                        reason: format!(
+                            "`ninfer_internal_port` {port} claims {claim}: a container's \
+                             internal port must live in its own namespace (loads are refused)"
+                        ),
+                    });
+                }
+            }
+        }
         // Page-visible twin of the boot banner's warn (`main.rs`): the banner says
         // it once, this says it on every scan, so a binary configured away mid-day
         // is visible on `/har/status` rather than only in the boot log.
@@ -2550,6 +2571,21 @@ impl ActorState {
     /// later instruction.
     fn start_queued_load(&mut self, job_id: JobId, slot: usize, entry: ModelEntry) {
         self.unload_after_finish.remove(&slot);
+        // R10 separation (operator 2026-11-01: "8003-8005 are manual only"): a
+        // container's internal port is a third namespace; a row claiming a manual
+        // or harness number is refused BEFORE spawn, whatever docker would have
+        // done with it. `apply_catalog` reports the same verdict at rescan.
+        if let Some(port) = crate::engine::ninfer::declared_internal_port(&entry) {
+            if let Some(claim) = self.cfg.port_claim(port) {
+                let error = SchedulerError::Admission(AdmissionError::PortClaimed { port, claim });
+                self.slots[slot].job = Some(job_id);
+                self.step(job_id, SwapState::Admit);
+                self.step(job_id, SwapState::AdmitFail);
+                self.log_refusal(job_id, &error, "config");
+                self.finish(job_id, Err(error), "port claimed");
+                return;
+            }
+        }
         // One decision (`ModelEntry::cost_source`) drives the gate; the page's Cost
         // column reads the same one, so the two cannot drift. The figure follows
         // the decision, not the key that happens to exist: a Measured source books
@@ -6465,6 +6501,87 @@ mod tests {
                 reason: "TerminateProcess failed".to_string(),
             }),
             "a real kill failure must still fail the job"
+        );
+    }
+
+    /// R10 (operator 2026-11-01: "8003-8005 are manual only"): a ninfer row
+    /// borrowing a manual number as its container-internal port is refused before
+    /// spawn, the default (8080, the images' EXPOSE) arms like any ordinary row,
+    /// and the rescan twin names the key on the page before any load tries.
+    #[tokio::test]
+    async fn a_borrowed_internal_port_is_refused_at_the_gate_and_reported_at_rescan() {
+        use super::{AdmissionError, SchedulerError};
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "ninfer".to_string(),
+            Arc::new(crate::engine::ninfer::NinferAdapter::new("Ubuntu", "ops"))
+                as Arc<dyn EngineAdapter>,
+        );
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            crate::testutil::temp_dir("r10-port"),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+        state.slots = vec![Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_109,
+            occupant: None,
+            job: None,
+        }];
+        let ninfer_row = |port: &str| -> ModelEntry {
+            let mut map = BTreeMap::new();
+            map.insert("engine".to_string(), "ninfer".to_string());
+            map.insert("vram_gb".to_string(), "4".to_string());
+            if !port.is_empty() {
+                map.insert("ninfer_internal_port".to_string(), port.to_string());
+            }
+            ModelEntry::from_flat(&map, "nin").expect("entry")
+        };
+        // A manual number is dead on arrival: a named refusal, no spawn.
+        let stolen = ninfer_row("8004");
+        let id = state.register_queued_load(0, &stolen, Vec::new());
+        state.start_queued_load(id, 0, stolen);
+        let job = &state.jobs[&id];
+        assert!(job.terminal, "a borrowed port must never reach spawn");
+        assert!(
+            matches!(
+                job.error,
+                Some(SchedulerError::Admission(AdmissionError::PortClaimed {
+                    port: 8004,
+                    ..
+                }))
+            ),
+            "{:?}",
+            job.error
+        );
+        // The engine's own EXPOSE number arms like any ordinary row.
+        let ordinary = ninfer_row("");
+        let id = state.register_queued_load(0, &ordinary, Vec::new());
+        state.start_queued_load(id, 0, ordinary);
+        assert!(
+            !state.jobs[&id].terminal,
+            "8080 is no namespace's to refuse: {:?}",
+            state.jobs[&id].error
+        );
+        // The page twin: the rescan names the key before any load tries.
+        state.apply_catalog(
+            crate::model::scan::Catalog {
+                models: vec![ninfer_row("8005")],
+                errors: Vec::new(),
+            },
+            None,
+        );
+        assert!(
+            state.catalog_errors.iter().any(|e| {
+                e.reason.contains("ninfer_internal_port") && e.reason.contains("8005")
+            }),
+            "{:?}",
+            state.catalog_errors
         );
     }
 

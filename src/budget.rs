@@ -95,6 +95,19 @@ pub enum AdmissionError {
     /// rather than booked on faith).
     #[error("cost `exact` requires an explicit `vram_gb` (the engine's computed requirement)")]
     ExactUndeclared,
+    /// A ninfer row declared a harness- or manual-owned port number as its
+    /// container-internal port (R10 separation, operator 2026-11-01: "8003-8005
+    /// are manual only"): the container inside is its own namespace and must
+    /// carry its own number — no docker collision is needed to make the
+    /// confusion real (the 8004 post-mortem misread exactly such a number).
+    #[error("`ninfer_internal_port` {port} claims {claim}: a container's internal port must live in its own namespace")]
+    PortClaimed {
+        /// The claimed number from the yaml (`ninfer_internal_port`, or the
+        /// default the row would bind without the key).
+        port: u16,
+        /// The namespace that already owns it, named for the operator.
+        claim: &'static str,
+    },
     /// The card could not be read at all (NVML and the `nvidia-smi` fallback both
     /// failed) and this is a real GPU box, so there is no honest number to budget
     /// against. Refused rather than guessed: admission is the product, and a stale
@@ -481,6 +494,17 @@ mod tests {
         assert!(AdmissionError::ExactUndeclared
             .to_string()
             .contains("exact"));
+        let claimed = AdmissionError::PortClaimed {
+            port: 8004,
+            claim: "in `protected_ports` (the manual namespace)",
+        }
+        .to_string();
+        assert!(
+            claimed.contains("ninfer_internal_port")
+                && claimed.contains("8004")
+                && claimed.contains("manual namespace"),
+            "the R10 refusal must name key, number, and namespace: {claimed}"
+        );
     }
 
     #[test]

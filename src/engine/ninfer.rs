@@ -97,6 +97,34 @@ const ALLOWED_KV_DTYPES: [&str; 6] = ["fp8", "nvfp4", "fp16", "bf16", "int8", "r
 /// yaml edit.
 const ALLOWED_ENV_VARS: [(&str, &[&str]); 1] = [("CUDA_MODULE_LOADING", &["EAGER", "LAZY"])];
 
+/// The port a ninfer container binds when its yaml names no `ninfer_internal_port`:
+/// the documented `EXPOSE 8080` both ninfer images carry. R10 (operator
+/// 2026-11-01: "8003-8005 are manual only"): the container inside is a third
+/// namespace disjoint from both the manual ports and the harness plan, so the
+/// harness defaults to the engine's own number and refuses to borrow a manual or
+/// harness one for it — reusing 8004 internally was what misdirected the whole
+/// 8004 post-mortem, and `PUBLISH="${3:?…}"` removed the last path where a
+/// missing publish argument could host-publish the internal number itself.
+pub const DEFAULT_INTERNAL_PORT: &str = "8080";
+
+/// The internal port a ninfer row will bind, resolved exactly as
+/// [`template_params`] resolves it (yaml key, else [`DEFAULT_INTERNAL_PORT`]),
+/// for the scheduler-side namespace check. `None` for non-ninfer rows and for
+/// ninfer rows whose key does not parse — those die at spawn naming the key, so
+/// the check must not invent a number for them.
+#[must_use]
+pub fn declared_internal_port(entry: &ModelEntry) -> Option<u16> {
+    if entry.engine != NINFER_ENGINE {
+        return None;
+    }
+    let raw = optional_param(entry, "ninfer_internal_port")
+        .unwrap_or_else(|| DEFAULT_INTERNAL_PORT.to_string());
+    if !valid_number(&raw, 1, 65_535) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
 /// The identity an `engine_report` figure is comparable to: the selected profile
 /// **plus the `--kv-capacity` it resolves to** — the reserved KV is what binds the
 /// figure, and a custom profile's override line can move the capacity without the
@@ -265,7 +293,7 @@ if [[ -z "$MODEL_DIR" ]]; then
   exit 1
 fi
 
-PUBLISH="${3:-$PORT}"
+PUBLISH="${3:?harness must pass the publish port as arg 3}"
 
 API_KEY_ARGS=()
 if [[ "$WITH_KEY" == "key" ]]; then
@@ -494,7 +522,12 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
             "`ninfer_artifact` must be a plain word without `..` traversal: {artifact}"
         )));
     }
-    let port = required_param(model, "ninfer_internal_port")?;
+    // Optional since R10 (operator 2026-11-01: "8003-8005 are manual only"):
+    // the container's inside is its own namespace, so the default is the
+    // images' documented `EXPOSE 8080` rather than any borrowed manual number,
+    // and `AppConfig::port_claim` refuses manual/harness numbers at the gate.
+    let port = optional_param(model, "ninfer_internal_port")
+        .unwrap_or_else(|| DEFAULT_INTERNAL_PORT.to_string());
     if !valid_number(&port, 1, 65_535) {
         return Err(rejected(format!(
             "`ninfer_internal_port` must be a port number: {port}"
@@ -1162,7 +1195,7 @@ mod tests {
                 "ninfer_artifact",
                 "Swift_1_5_qwen3_8_27b_uncensored_nvfp4.ninfer",
             ),
-            ("ninfer_internal_port", "8004"),
+            ("ninfer_internal_port", "8090"),
             (
                 "ninfer_model_roots",
                 "/mnt/d/Models,/home/legislat/ai/models",
@@ -1317,6 +1350,10 @@ mod tests {
             "{script}"
         );
         assert!(
+            script.contains("PUBLISH=\"${3:?"),
+            "a missing publish argument fails closed instead of host-publishing the internal port: {script}"
+        );
+        assert!(
             script.contains("--log-opt max-size=25m --log-opt max-file=5"),
             "{script}"
         );
@@ -1331,7 +1368,7 @@ mod tests {
         );
         assert!(script.contains("NAME=\"ninfer-x\""), "{script}");
         assert!(script.contains("IMAGE=\"ninfer:local\""), "{script}");
-        assert!(script.contains("PORT=\"8004\""), "{script}");
+        assert!(script.contains("PORT=\"8090\""), "{script}");
         assert!(script.contains("SERVE_CMD=\"ninfer-serve\""), "{script}");
         assert!(script.contains("  \"/mnt/d/Models\""), "{script}");
         assert!(script.contains("\"--spec\" \"dflash2\""), "{script}");
@@ -1363,6 +1400,38 @@ mod tests {
             "argv names the bytes that will be staged"
         );
         assert_eq!(spec.container.as_deref(), Some("ninfer-x"));
+    }
+
+    /// R10 (operator 2026-11-01): the container's inside is a third namespace. A
+    /// row without `ninfer_internal_port` renders the images' `EXPOSE 8080`, and
+    /// the gate's namespace helper reports exactly the number the template would
+    /// bind — never inventing one for a row the adapter will refuse.
+    #[test]
+    fn an_internal_port_defaults_to_the_exposed_number_and_the_helper_follows_the_yaml() {
+        let without = {
+            let mut pairs = template_pairs();
+            pairs.retain(|(key, _)| *key != "ninfer_internal_port");
+            entry(&pairs)
+        };
+        let spec = NinferAdapter::new("Ubuntu", "ops")
+            .spec(&without, 18109)
+            .expect("the key is optional");
+        let script = spec.script.expect("template renders");
+        assert!(script.contains("PORT=\"8080\""), "{script}");
+        assert_eq!(declared_internal_port(&without), Some(8080));
+        assert_eq!(
+            declared_internal_port(&entry(&template_pairs())),
+            Some(8090),
+            "a declared number is the number"
+        );
+        let mut broken = template_pairs();
+        broken.retain(|(key, _)| *key != "ninfer_internal_port");
+        broken.push(("ninfer_internal_port", "80a4"));
+        assert_eq!(
+            declared_internal_port(&entry(&broken)),
+            None,
+            "an unparseable row has no number to claim: spawn refuses it naming the key"
+        );
     }
 
     #[test]

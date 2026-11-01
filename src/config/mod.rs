@@ -558,6 +558,37 @@ impl AppConfig {
         plan
     }
 
+    /// Which host-side namespace already claims a port number: the manual
+    /// `protected_ports` set, a category public listener, or a resolved engine
+    /// port. R10 (operator 2026-11-01: "8003-8005 are manual only") extends the
+    /// harness/manual separation to the container-internal namespace: a ninfer
+    /// row may not borrow one of these numbers as `ninfer_internal_port`, even
+    /// though the netns makes a real collision impossible — the 8004 post-mortem
+    /// turned on exactly this confusion. Returns the claim, or `None` when the
+    /// number is free of the host namespaces.
+    #[must_use]
+    pub fn port_claim(&self, port: u16) -> Option<&'static str> {
+        if self.protected_ports.contains(&port) {
+            return Some("in `protected_ports` (the manual namespace)");
+        }
+        if self
+            .categories
+            .iter()
+            .any(|category| category.public_port == port)
+        {
+            return Some("a category public listener port");
+        }
+        if self
+            .effective_engine_ports()
+            .values()
+            .flatten()
+            .any(|engine| *engine == port)
+        {
+            return Some("a harness engine port");
+        }
+        None
+    }
+
     /// The category whose listener hosts `/har/*` and the control page (Step 11).    ///
     /// # Panics
     ///
@@ -1113,6 +1144,24 @@ mod tests {
             !text.contains("SENTINEL-B"),
             "the value still must not appear: {text}"
         );
+    }
+
+    /// R10 (operator 2026-11-01: "8003-8005 are manual only"): the claim helper the
+    /// container-internal check consults names each host-side namespace it owns —
+    /// the manual protected set, a category listener, the engine plan — and leaves
+    /// the engines' own `EXPOSE` numbers free.
+    #[test]
+    fn a_port_claim_names_the_namespace_that_owns_the_number() {
+        let cfg = AppConfig::default();
+        let manual = cfg.port_claim(8004).expect("8004 is the manual namespace");
+        assert!(manual.contains("protected_ports"), "{manual}");
+        let listener = cfg.port_claim(8708).expect("8708 is a listener");
+        assert!(listener.contains("listener"), "{listener}");
+        let engine = cfg
+            .port_claim(18109)
+            .expect("18109 is the first engine port");
+        assert!(engine.contains("engine port"), "{engine}");
+        assert_eq!(cfg.port_claim(8080), None, "the images' EXPOSE stays free");
     }
 
     /// FINDINGS-15 [9] pin (b): the exposure the finding named is the ring, so this
