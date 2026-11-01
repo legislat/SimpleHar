@@ -375,8 +375,8 @@ async fn serving_window_folds_total_diff_into_the_yaml_measured_range() {
     // `measured_sample_s` and persisted as `measured_gb` (the high end `fixed`
     // books) and `measured_gb_min` (the low end the page shows). The pair is
     // engine-agnostic witness truth, so it mints here on `engine: mock`; the
-    // `cpu_offload` stamp does NOT — mock sits outside `OFFLOAD_ENGINES`
-    // (engine/llama.rs), so its yaml must never gain a `measured_offload` line.
+    // `cpu_offload` stamp does NOT — the mock row lacks the `cpu_offload` knob
+    // (engine/policy.rs), so its yaml must never gain a `measured_offload` line.
     // The stamp-mint path is pinned on llama by
     // `only_offload_engines_stamp_measured_offload` (src/scheduler/mod.rs).
     // A foreign process already holds 30 GiB. The baseline is the free memory this load

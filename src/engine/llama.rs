@@ -93,19 +93,24 @@ fn valid_extra_value(value: &str) -> bool {
 /// The refusal voice for every `extra_args` verdict: the typed [`EngineError::Rejected`]
 /// naming the offending word, so a refused launch says what to delete (G6). The
 /// reason carries the whole list, generated from the const, so the operator-facing
-/// text cannot drift from the rule.
-fn rejected_extra(model_name: &str, detail: String) -> EngineError {
+/// text cannot drift from the rule; a word the harness owns outright also names
+/// the mechanism that owns the decision (slice 10c), so the operator edits the
+/// live yaml key instead of fighting the closed list.
+fn rejected_extra(model_name: &str, detail: String, owner_word: Option<&str>) -> EngineError {
     let listed = EXTRA_ARGS_ALLOWED
         .iter()
         .map(|(flag, _)| format!("`{flag}`"))
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect::<Vec<_>>();
+    let listed = listed.join(" ");
+    let owner = owner_word
+        .and_then(crate::engine::policy::llama_extra_arg_owner)
+        .map_or(String::new(), |owner| format!(" \u{2014} {owner}"));
     EngineError::Rejected {
         engine: "llama".to_string(),
         model: model_name.to_string(),
         reason: format!(
-            "extra_args {detail}; the closed allow-list is {listed} (an allowed flag's own \
-             value tokens pass through unchanged, and any other option is refused)"
+            "extra_args {detail}{owner}; the closed allow-list is {listed} (an allowed flag's \
+             own value tokens pass through unchanged, and any other option is refused)"
         ),
     }
 }
@@ -128,6 +133,7 @@ fn check_extra_args(words: &[&str], model_name: &str) -> Result<(), EngineError>
             return Err(rejected_extra(
                 model_name,
                 format!("word `{word}` is not allowed"),
+                Some(word),
             ));
         };
         for _ in 0..allowed.arity {
@@ -135,18 +141,38 @@ fn check_extra_args(words: &[&str], model_name: &str) -> Result<(), EngineError>
                 return Err(rejected_extra(
                     model_name,
                     format!("flag `{word}` is missing its value"),
+                    None,
                 ));
             };
             if !valid_extra_value(value) {
                 return Err(rejected_extra(
                     model_name,
                     format!("flag `{word}` cannot take option-shaped value `{value}`"),
+                    Some(value),
                 ));
             }
             index += 1;
         }
     }
     Ok(())
+}
+
+/// The llama row's [`ExtraWordsContract`] check over one raw `extra_args`
+/// value: the exact whitespace tokenization the render path uses, so a word
+/// refused at scan is the same word the launch would have refused, and a word
+/// that passes at scan is a word the render will admit.
+///
+/// [`ExtraWordsContract`]: crate::engine::policy::ExtraWordsContract
+///
+/// # Errors
+///
+/// [`EngineError::Rejected`] as for [`check_extra_args`].
+pub(crate) fn check_extra_words_value(
+    _engine: &str,
+    model_name: &str,
+    value: &str,
+) -> Result<(), EngineError> {
+    check_extra_args(&value.split_whitespace().collect::<Vec<_>>(), model_name)
 }
 
 /// yaml key -> llama-server flag, in `start.ps1` order. Empty values are skipped,
@@ -168,24 +194,27 @@ pub(crate) const FLAG_TABLE: &[(&str, &str)] = &[
     ("fit_ctx", "--fit-ctx"),
 ];
 
-/// Engine ids for which `cpu_offload` is a live concept: this table is
-/// **the first row of the §20-9 Fork C `EnginePolicy` knob table** — scoping
-/// data, not scattered `if entry.engine == "llama"` tests, so chunk 10 replaces
-/// one lookup rather than a scatter. An absent `engine:` key resolves to
-/// `"llama"` ([`crate::model::ModelEntry::from_flat`]), the scan default, so it
-/// is in scope through that default. `mock` is deliberately absent: it
-/// impersonates other engines in tests and its adapter reads no offload knob,
-/// so claiming it live would be the engine-neutrality lie this scoping exists
-/// to remove; tests that need llama offload semantics name `engine: llama`.
-/// Sibling llama knobs (`ngl`, `fit`, `context`, ...) are knowingly unscoped
-/// here for now — the full knob table is chunk 10's object.
+/// Engine ids for which `cpu_offload` is a live concept. Since slice 10c the
+/// single source is the rows' `knobs` cell; this record stays only as the
+/// page's gate-list parity partner (`webui` pins the served JS list against
+/// it), and `the_knob_table_owns_every_engine_scoped_yaml_key` in the policy
+/// table test fails the moment the two disagree.
+#[cfg(test)]
 pub(crate) const OFFLOAD_ENGINES: &[&str] = &["llama"];
 
-/// Whether `engine` reads `cpu_offload` anywhere (spawn, stamp, void). The
-/// engine string must already carry the absent-key default (`"llama"`).
+/// Whether `engine` reads `cpu_offload` anywhere (spawn, stamp, void): the
+/// `llama` row's `knobs` cell is now the one source (slice 10c retired the
+/// const's authority — "chunk 10 replaces one lookup rather than a scatter").
+/// An absent `engine:` key resolves to `"llama"`
+/// ([`crate::model::ModelEntry::from_flat`]), the scan default, so it is in
+/// scope through that default. `mock` is deliberately outside: it impersonates
+/// other engines in tests and its adapter reads no offload knob, so claiming
+/// it live would be the engine-neutrality lie the scoping exists to remove;
+/// tests that need llama offload semantics name `engine: llama`. Sibling llama
+/// knobs (`ngl`, `fit`, `context`, ...) answer to the same knob table.
 #[must_use]
 pub(crate) fn offload_live(engine: &str) -> bool {
-    OFFLOAD_ENGINES.contains(&engine)
+    crate::engine::policy::knob_live("cpu_offload", engine)
 }
 
 /// The harness's own truth set for `jinja` (and the canonical read of

@@ -904,7 +904,8 @@ async fn events_stream_serves_sse_with_an_immediate_state() {
 #[tokio::test]
 async fn config_model_writes_back_to_the_yaml_file() {
     // The CPU leg rides a `llama` row since the FINDINGS-BATCH-2026-10-28F [3]
-    // gate: a `cpu` edit is refused for engines outside OFFLOAD_ENGINES (the
+    // gate: a `cpu` edit is refused for engines without the `cpu_offload` knob
+    // (the
     // refusal legs are pinned by
     // `cpu_edit_is_refused_on_models_whose_engine_never_reads_the_key`); the
     // category leg keeps the mock row, proving category writes stay engine-blind.
@@ -1400,7 +1401,7 @@ async fn cpu_edit_is_refused_on_models_whose_engine_never_reads_the_key() {
     // InertKey noise it just invented. The page offers no control there (C) and
     // the API now agrees: 400 naming the key, the row engine and the owning set —
     // while the engine-blind category write and the llama cpu write keep working.
-    // Falsifier: removing the OFFLOAD_ENGINES gate in `har_config_model` returns
+    // Falsifier: removing the offload-knob gate in `har_config_model` returns
     // 200 here and lands a dead `cpu_offload` line in the yaml.
     let (control, _, _, _, _, modelconf) = build_app(
         AppConfig::default(),

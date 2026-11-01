@@ -197,18 +197,19 @@ fn valid_word_list(value: &str) -> bool {
 /// `--spec dflash2` must stay spellable; every token is quoted at substitution,
 /// so a value cannot shell out. The charset stays shell-bare — no space, quote,
 /// `$`, backtick, semicolon, pipe, redirect, paren, brace, or `~` — and the
-/// harness-owned flags in `forbidden` (the ninfer row's `forbidden_words` cell
-/// of the [`crate::engine::policy`] table) are refused. `--model-id` has its own
-/// key (`ninfer_model_id`), so it is refused here too. The denylist is checked
-/// against an option token's *name* (so `--flag=value` cannot smuggle past a
-/// whole-token comparison) and against every strict *prefix* of one, because
-/// argparse-style parsers (the Python precedent behind this engine) resolve
-/// unique abbreviations: `--max-cont` is `--max-context` to such a parser, and
-/// the llama `extra_args` deny-list leak (FINDINGS2-0910, 8/8 smuggles) is the
-/// in-repo precedent for closing the abbreviation door rather than betting on
-/// the parser being strict. A value token that begins with `-` is refused, so a
-/// value can never disguise itself as another flag.
-fn valid_serve_arg(token: &str, forbidden: &[&str]) -> bool {
+/// harness-owned flags of the ninfer row's `forbidden_words` cell
+/// ([`crate::engine::policy::NINFER_FORBIDDEN_SERVE_FLAGS`], walked by
+/// [`crate::engine::policy::forbidden_serve_flag`]) are refused. `--model-id`
+/// has its own key (`ninfer_model_id`), so it is refused here too. The denylist
+/// is checked against an option token's *name* (so `--flag=value` cannot
+/// smuggle past a whole-token comparison) and against every strict *prefix* of
+/// one, because argparse-style parsers (the Python precedent behind this
+/// engine) resolve unique abbreviations: `--max-cont` is `--max-context` to
+/// such a parser, and the llama `extra_args` deny-list leak (FINDINGS2-0910,
+/// 8/8 smuggles) is the in-repo precedent for closing the abbreviation door
+/// rather than betting on the parser being strict. A value token that begins
+/// with `-` is refused, so a value can never disguise itself as another flag.
+fn valid_serve_arg(token: &str) -> bool {
     let name = token.split('=').next().unwrap_or(token);
     !token.is_empty()
         && token.chars().all(|c| {
@@ -217,13 +218,56 @@ fn valid_serve_arg(token: &str, forbidden: &[&str]) -> bool {
         && if name.starts_with('-') {
             // Long options only: this engine's parsers speak `--flag`, and a
             // single-dash token is more likely a stray short flag than a value.
-            name.starts_with("--")
-                && !forbidden
-                    .iter()
-                    .any(|flag| name.starts_with(flag) || flag.starts_with(name))
+            // The denylist matcher (the row's `forbidden_words` data) closes
+            // the abbreviation door: `--max-cont` is refused like `--max-context`.
+            name.starts_with("--") && super::policy::forbidden_serve_flag(name).is_none()
         } else {
             true
         }
+}
+
+/// The ninfer row's [`ExtraWordsContract`] check over one raw
+/// `ninfer_serve_args` value: the same whitespace tokenization the template
+/// render uses, so the scan refuses exactly the words the launch would have
+/// refused. A word that collides with a harness-owned flag (spelling or unique
+/// abbreviation) also names the mechanism that owns the decision (slice 10c);
+/// a word that is merely not shell-bare keeps the shape refusal.
+///
+/// [`ExtraWordsContract`]: crate::engine::policy::ExtraWordsContract
+///
+/// # Errors
+///
+/// [`EngineError::Rejected`] naming the offending token.
+pub(crate) fn check_serve_args_value(
+    engine: &str,
+    model: &str,
+    value: &str,
+) -> Result<(), EngineError> {
+    for token in value.split_whitespace() {
+        if valid_serve_arg(token) {
+            continue;
+        }
+        let name = token.split('=').next().unwrap_or(token);
+        let reason = match super::policy::forbidden_serve_flag(name) {
+            Some(flag) => format!(
+                "`ninfer_serve_args` refuses `{name}` \u{2014} harness-owned flag: {}; \
+                 remove the word from the yaml",
+                super::policy::ninfer_serve_arg_owner(flag)
+                    .unwrap_or("the canonical script writes it")
+            ),
+            None => format!(
+                "`ninfer_serve_args` tokens must be shell-bare serve flags (option-shaped, \
+                 no spaces or shell metacharacters, never a harness-owned flag such as \
+                 --host/--port/--api-key/--model-id): {token}"
+            ),
+        };
+        return Err(EngineError::Rejected {
+            engine: engine.to_string(),
+            model: model.to_string(),
+            reason,
+        });
+    }
+    Ok(())
 }
 
 // The canonical ninfer autostart script template lives in the ninfer row of
@@ -476,18 +520,15 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
     let profile = optional_param(model, "ninfer_profile").unwrap_or_else(|| "b".to_string());
     let (max_ctx, kv_cap, conc, kv_dtype, profile_source) =
         profile_override(&model.name, &model.raw, &profile)?;
+    // The row's `extra_words` contract, re-run at render (defense in depth):
+    // the scan refuses a hostile file with this same check, and a hand-built
+    // entry that bypassed the scan meets the identical typed refusal here.
+    if let Some(line) = optional_param(model, "ninfer_serve_args") {
+        check_serve_args_value(NINFER_ENGINE, &model.name, &line)?;
+    }
     let serve_args: Vec<String> = optional_param(model, "ninfer_serve_args")
         .map(|line| line.split_whitespace().map(str::to_string).collect())
         .unwrap_or_default();
-    for arg in &serve_args {
-        if !valid_serve_arg(arg, row.forbidden_words) {
-            return Err(rejected(format!(
-                "`ninfer_serve_args` tokens must be shell-bare serve flags (option-shaped, \
-                 no spaces or shell metacharacters, never a harness-owned flag such as \
-                 --host/--port/--api-key/--model-id): {arg}"
-            )));
-        }
-    }
     let model_id = match optional_param(model, "ninfer_model_id") {
         Some(id) if valid_word(&id) => Some(id),
         Some(id) => {

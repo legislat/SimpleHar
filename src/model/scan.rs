@@ -48,15 +48,18 @@ pub enum ScanKind {
     /// reserved forensic class that stays silent by operator ruling); warn-only,
     /// the entry still publishes.
     UnknownKey,
-    /// A real harness key — a member of [`CONSUMED_KEYS`] — that only engines
-    /// listed in [`crate::engine::llama::OFFLOAD_ENGINES`] read, appearing on a
-    /// model whose engine is not one of them. The opposite of
+    /// A real harness key — a member of [`CONSUMED_KEYS`] — that only the rows
+    /// of *other* engines list in their `EnginePolicy` `knobs` cell, appearing
+    /// on a model whose row does not read it. The opposite of
     /// [`ScanKind::UnknownKey`] (a key the harness owns nowhere, i.e. a typo):
-    /// here the key is live config for a *different* engine, so it is not a typo
-    /// and cannot be silenced by [`CONSUMED_KEYS`] membership alone. Warn-only,
-    /// exactly the retired `host:`/`port:` policy-hint posture: the entry still
-    /// publishes. The only key scoped this way today: `cpu_offload` on a
-    /// non-offload row (§20-9 Fork C knob-table row 1).
+    /// here the key is live config for a *different* engine, so it is not a
+    /// typo and cannot be silenced by [`CONSUMED_KEYS`] membership alone.
+    /// Warn-only, exactly the retired `host:`/`port:` policy-hint posture: the
+    /// entry still publishes. The mechanism is the knob table (slice 10c
+    /// generalization of the 2026-10-28 `cpu_offload` ruling): every
+    /// engine-scoped key — `cpu_offload` and its llama siblings, the strata
+    /// and ninfer key families — is scoped the same data-driven way, so a new
+    /// row knob needs no new scan code.
     InertKey,
     /// A yaml file the scan refuses to publish (Fork C doctrine): it carried at
     /// least one problem line — then the `reason` names every offending line — or it
@@ -70,6 +73,13 @@ pub enum ScanKind {
     /// naming every claimant; the API's `409` stays the refusal, so nothing here is a
     /// boot-style rejection of a file that is otherwise loadable.
     DuplicateName,
+    /// The file claims a harness-owned surface and is **refused** (never published):
+    /// an operator-extra word (`extra_args`, `ninfer_serve_args`) outside the engine
+    /// row's closed word surface, or a policy field (`host`, `port`, key) inside the
+    /// strata profile it points at — engine-side files decide nothing (22[1]), so
+    /// the refusal names the word/field and the mechanism that owns the decision
+    /// (chunk 10 slice 10c).
+    PolicyRefused,
     /// Every pre-existing report shape: unreadable files or dirs, typed field
     /// rejects, duplicate containers, unresolved `default_model`s.
     Other,
@@ -185,12 +195,15 @@ const PORT_POLICY_HINT: &str =
 
 /// Builds the [`ScanKind::InertKey`] sentence for one engine-scoped key: the
 /// same named-policy-hint posture as [`HOST_POLICY_HINT`]/[`PORT_POLICY_HINT`]
-/// (§20-9 Fork C knob-table row 1, `cpu_offload` off its engines).
-fn inert_key_reason(key: &str, engine: &str) -> String {
+/// (§20-9 Fork C knob table — slice 10c: the owners come from the table itself,
+/// so every row knob is scoped by the same mechanism, not by a key list here).
+/// `pub(crate)` because the API's refusal to WRITE an inert key quotes the
+/// identical sentence (the scan hint and the 400 must never diverge).
+pub(crate) fn inert_key_reason(key: &str, engine: &str) -> String {
     format!(
         "`{key}` is read only by the {} engine(s) \u{2014} engine `{engine}` never reads it; \
          this key does nothing here",
-        crate::engine::llama::OFFLOAD_ENGINES.join("/")
+        crate::engine::policy::knob_readers(key).join("/")
     )
 }
 
@@ -587,9 +600,12 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                     }
                 }
                 entry.gguf_size_gb = stat.map(|meta| meta.len() as f64 / (1024.0_f64).powi(3));
-                // A strata entry is its profile JSON: unreadable JSON is a dead
-                // load, and an absolute path the profile names and the disk lacks
-                // is the same doomed spawn one layer deeper. Relative profile
+                // A strata entry is its profile JSON, validated by the strata
+                // row's own check (slice 10c): unreadable JSON is a dead load,
+                // an absolute path the profile names and the disk lacks is the
+                // same doomed spawn one layer deeper, and a policy field
+                // (`host`, `port`, key) claimed inside the file decides nothing
+                // and refuses the entry outright (22[1]). Relative profile
                 // paths are exempt (the engine resolves them against the profile
                 // dir — chunk 10 backlog); the `log` key is exempt entirely (a log
                 // target's existence is not a load precondition).
@@ -599,55 +615,40 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                         .map(|v| v.trim())
                         .filter(|v| !v.is_empty())
                     {
-                        let unreadable = || ScanError {
-                            kind: ScanKind::ProfileUnreadable,
-                            file: file_name.clone(),
-                            reason: format!("strata profile not readable: {profile}"),
-                        };
-                        let Ok(text) = std::fs::read_to_string(profile) else {
-                            catalog.errors.push(unreadable());
-                            continue;
-                        };
-                        // A UTF-8 BOM is ignored, not refused (same doctrine as
-                        // `parse_flat_yaml`; RFC 8259 permits it, and the strata
-                        // engine reads BOM'd profiles today — the live
-                        // `strata-qwen-gptq-nvfp4.json` carries one).
-                        let json = text.strip_prefix('\u{feff}').unwrap_or(&text);
-                        let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
-                            catalog.errors.push(unreadable());
-                            continue;
-                        };
-                        if let Some((key, missing)) = missing_profile_path(&root) {
+                        if let Err(problem) =
+                            crate::engine::strata::validate_profile(Path::new(profile))
+                        {
+                            let kind = match &problem {
+                                crate::engine::strata::ProfileProblem::Unreadable => {
+                                    ScanKind::ProfileUnreadable
+                                }
+                                crate::engine::strata::ProfileProblem::MissingPath { .. } => {
+                                    ScanKind::ModelPathMissing
+                                }
+                                crate::engine::strata::ProfileProblem::PolicyField { .. } => {
+                                    ScanKind::PolicyRefused
+                                }
+                            };
                             catalog.errors.push(ScanError {
-                                kind: ScanKind::ModelPathMissing,
+                                kind,
                                 file: file_name.clone(),
-                                reason: format!(
-                                    "strata profile references missing path: {key} = {missing}"
-                                ),
+                                reason: problem.describe(profile),
                             });
                             continue;
                         }
                     }
-                }
-                // Engine-scoped knobs on a row whose engine never reads them
-                // (§20-9 Fork C row 1): a real harness key, so `UnknownKey` would
-                // lie, and consumed, so silence would hide a dead click. Report it
-                // as a policy hint and publish — the `host:`/`port:` posture.
-                if map.contains_key("cpu_offload")
-                    && !crate::engine::llama::offload_live(&entry.engine)
-                {
-                    catalog.errors.push(ScanError {
-                        kind: ScanKind::InertKey,
-                        file: file_name.clone(),
-                        reason: inert_key_reason("cpu_offload", &entry.engine),
-                    });
                 }
                 // Unknown keys are reported, never fatal (README doctrine), but
                 // never silent: an operator's typo'd `contex:` is a config that
                 // does nothing, and the page must be able to say so. The one
                 // silent class is [`SILENT_KEYS`] — reserved forensic keys
                 // ("forensic manual only", operator ruling), which are neither
-                // warned nor logged nor surfaced.
+                // warned nor logged nor surfaced. The same walk also scopes
+                // every engine knob (slice 10c generalization of the
+                // `cpu_offload` ruling): a consumed key the row's engine never
+                // reads is live config for a *different* row — not a typo, so
+                // not `UnknownKey`; a policy hint, so not silent: `InertKey`
+                // warns and the entry publishes (ruling D stands).
                 for key in map.keys() {
                     if SILENT_KEYS.contains(&key.as_str()) {
                         continue;
@@ -681,6 +682,16 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                     if profile_override_key {
                         continue;
                     }
+                    if !crate::engine::policy::knob_live(key, &entry.engine)
+                        && !crate::engine::policy::knob_readers(key).is_empty()
+                    {
+                        catalog.errors.push(ScanError {
+                            kind: ScanKind::InertKey,
+                            file: file_name.clone(),
+                            reason: inert_key_reason(key, &entry.engine),
+                        });
+                        continue;
+                    }
                     if !CONSUMED_KEYS.contains(&key.as_str()) {
                         let reason = match key.as_str() {
                             "host" => HOST_POLICY_HINT.to_string(),
@@ -702,8 +713,15 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 catalog.models.push(entry);
             }
             Err(error) => {
+                // The extra-words refusal is the policy surface (slice 10c),
+                // not a typed-field reject: triage must be able to tell a
+                // harness-owned-surface claim from a bad number.
+                let kind = match &error {
+                    crate::model::ModelError::ExtraWordsRefused { .. } => ScanKind::PolicyRefused,
+                    _ => ScanKind::Other,
+                };
                 catalog.errors.push(ScanError {
-                    kind: ScanKind::Other,
+                    kind,
                     file: file_name,
                     reason: error.to_string(),
                 });
@@ -751,58 +769,6 @@ pub fn scan_dir(dir: &Path) -> Catalog {
     }
     catalog.models.sort_by(|a, b| a.name.cmp(&b.name));
     catalog
-}
-
-/// The first (key, path) a strata profile value references that does not exist.
-/// Every string under every key is judged; the `log` key is exempt (its target's
-/// existence is irrelevant to loading). A trailing `:float` is stripped first:
-/// llama's `--control-vector-scaled <path>:1.0` shape carries the scale inside the
-/// same word, and it is the path — not `path:1.0` — that must exist.
-fn missing_profile_path(root: &serde_json::Value) -> Option<(String, String)> {
-    walk_profile(root, "profile")
-}
-
-fn walk_profile(value: &serde_json::Value, key: &str) -> Option<(String, String)> {
-    match value {
-        serde_json::Value::Object(map) => map.iter().find_map(|(inner_key, inner)| {
-            if inner_key == "log" {
-                None
-            } else {
-                walk_profile(inner, inner_key)
-            }
-        }),
-        serde_json::Value::Array(items) => items.iter().find_map(|inner| walk_profile(inner, key)),
-        serde_json::Value::String(text) => profile_path_candidate(text)
-            .filter(|path| std::fs::metadata(path).is_err())
-            .map(|path| (key.to_string(), path)),
-        _ => None,
-    }
-}
-
-/// The absolute-path shape this check judges: a Windows drive path (`X:\` or
-/// `X:/`) or a UNC (`\\server\share`), never a relative path (exempt: the engine
-/// resolves those against the profile dir). A trailing `:float` is the llama
-/// control-vector scale and is stripped before the existence check.
-fn profile_path_candidate(text: &str) -> Option<String> {
-    if !is_absolute_shape(text) {
-        return None;
-    }
-    if let Some((head, tail)) = text.rsplit_once(':') {
-        if is_absolute_shape(head) && tail.parse::<f64>().is_ok() {
-            return Some(head.to_string());
-        }
-    }
-    Some(text.to_string())
-}
-
-/// Drive-letter or UNC absolute-path shape (checked bytewise: the grammar is ASCII).
-fn is_absolute_shape(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    (bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/'))
-        || text.starts_with("\\\\")
 }
 
 /// The did-you-mean tail of an unknown-key report: only when exactly one consumed
@@ -2051,6 +2017,171 @@ mod tests {
         assert_eq!(catalog.models[1].engine, "llama");
     }
 
+    /// Slice 10c (sibling-knob scoping): the mechanism that scoped
+    /// `cpu_offload` now covers every row knob — a llama key on a ninfer row
+    /// warns `InertKey` and publishes exactly like its offload sibling, and
+    /// the key stays silent on its own row. This is the live catalog's shape:
+    /// the ninfer/strata yamls carry `context:` the harness only reads for
+    /// llama, and the page must be able to say so (warn-only, ruling D posture).
+    /// Falsifier: a hardcoded `cpu_offload` key filter, or scoping the knob
+    /// table away from the scan, fails one leg here.
+    #[test]
+    fn sibling_llama_knobs_are_inert_off_the_llama_row() {
+        let dir = crate::testutil::temp_dir("scan-sibling-knobs");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("ninfer-row.yaml"),
+            "engine: ninfer\nvram_gb: 26\ncontext: 4096\nngl: 99\n",
+        )
+        .expect("write ninfer");
+        std::fs::write(
+            dir.join("llama-row.yaml"),
+            "engine: llama\nmodel: mock://m\ncontext: 4096\n",
+        )
+        .expect("write llama");
+        let catalog = scan_dir(&dir);
+        assert_eq!(
+            catalog.models.len(),
+            2,
+            "warn-only: both entries still publish: {:?}",
+            catalog.errors
+        );
+        for key in ["context", "ngl"] {
+            let named = format!("`{key}` is read only by the llama engine(s)");
+            assert!(
+                catalog.errors.iter().any(|e| e.kind == ScanKind::InertKey
+                    && e.file.contains("ninfer-row")
+                    && e.reason.contains(&named)),
+                "`{key}` on the ninfer row must warn: {:?}",
+                catalog.errors
+            );
+        }
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .all(|e| !e.file.contains("llama-row") || e.kind != ScanKind::InertKey),
+            "a knob on its own row stays silent: {:?}",
+            catalog.errors
+        );
+    }
+
+    /// Slice 10c (full `extra_args` enforcement): a hostile extra word refuses
+    /// the FILE at rescan — never published, never reaching a spawn that could
+    /// evict a resident for the doomed launch — and the refusal names both the
+    /// word and the mechanism that owns the decision. The benign family the
+    /// live catalog uses still publishes untouched.
+    #[test]
+    fn a_hostile_extra_word_refuses_the_file_naming_the_word_and_owner() {
+        let dir = crate::testutil::temp_dir("scan-hostile-extra");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("llama-bad.yaml"),
+            "engine: llama\nmodel: mock://m\nextra_args: --api-key sekrit\n",
+        )
+        .expect("write bad llama");
+        std::fs::write(
+            dir.join("llama-good.yaml"),
+            "engine: llama\nmodel: mock://m\nextra_args: --embedding --pooling last\n",
+        )
+        .expect("write good llama");
+        std::fs::write(
+            dir.join("ninfer-bad.yaml"),
+            "engine: ninfer\nvram_gb: 26\nninfer_serve_args: --max-context 999\n",
+        )
+        .expect("write bad ninfer");
+        let catalog = scan_dir(&dir);
+        assert_eq!(
+            catalog.models.len(),
+            1,
+            "only the benign row publishes: {:?}",
+            catalog.errors
+        );
+        assert_eq!(catalog.models[0].name, "llama-good");
+        let bad = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::PolicyRefused && e.file.contains("llama-bad"))
+            .expect("the hostile llama row must be refused");
+        assert!(
+            bad.reason.contains("`--api-key`")
+                && bad
+                    .reason
+                    .contains("request authentication is harness-owned")
+                && !bad.reason.contains("sekrit"),
+            "the refusal names the word and its owner, not the secret value: {}",
+            bad.reason
+        );
+        let bad = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::PolicyRefused && e.file.contains("ninfer-bad"))
+            .expect("the hostile ninfer row must be refused");
+        assert!(
+            bad.reason.contains("`--max-context`")
+                && bad.reason.contains("ninfer_profile")
+                && bad.reason.contains("harness-owned flag"),
+            "the refusal names the word and the profile line that owns it: {}",
+            bad.reason
+        );
+    }
+
+    /// Slice 10c (22[1]): policy fields are harness-forced and never obeyed
+    /// from engine-side files — a strata profile that declares `host`, `port`
+    /// or a key refuses its model at rescan, naming the field and the
+    /// mechanism. A profile that decides nothing (the reviewed shape) still
+    /// publishes; a model that merely points at a clean profile is unaffected.
+    #[test]
+    fn a_strata_profile_claiming_policy_fields_refuses_its_model() {
+        let dir = crate::testutil::temp_dir("scan-profile-policy");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (name, profile) in [
+            ("claims-port", r#"{"port": 8080}"#),
+            ("claims-host", r#"{"host": "0.0.0.0"}"#),
+            ("claims-key", r#"{"api_key": "hunter2"}"#),
+        ] {
+            std::fs::write(
+                dir.join(format!("{name}.yaml")),
+                format!(
+                    "engine: strata\nvram_gb: 8\nstrata_config: {}\n",
+                    dir.join(format!("{name}.json")).display()
+                ),
+            )
+            .expect("write yaml");
+            std::fs::write(dir.join(format!("{name}.json")), profile).expect("write profile");
+        }
+        std::fs::write(
+            dir.join("clean.yaml"),
+            format!(
+                "engine: strata\nvram_gb: 8\nstrata_config: {}\n",
+                dir.join("clean.json").display()
+            ),
+        )
+        .expect("write clean yaml");
+        std::fs::write(dir.join("clean.json"), r#"{"vision": {"enabled": true}}"#)
+            .expect("write clean profile");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        assert_eq!(catalog.models[0].name, "clean");
+        for (name, field) in [
+            ("claims-port", "port"),
+            ("claims-host", "host"),
+            ("claims-key", "api_key"),
+        ] {
+            let hit = catalog
+                .errors
+                .iter()
+                .find(|e| e.kind == ScanKind::PolicyRefused && e.file.contains(name))
+                .unwrap_or_else(|| panic!("{name} must be refused: {:?}", catalog.errors));
+            assert!(
+                hit.reason.contains(&format!("`{field}`"))
+                    && hit.reason.contains("never obeyed from engine-side files"),
+                "the refusal names the field and the ruling: {}",
+                hit.reason
+            );
+        }
+    }
+
     #[test]
     fn a_one_edit_typo_gets_a_unique_suggestion() {
         assert_eq!(did_you_mean("contex"), " (did you mean 'context'?)");
@@ -2064,10 +2195,12 @@ mod tests {
 
     /// The golden fixture pins the const from the front: every consumed key appears
     /// in a real file, and the whole file scans with ZERO unknown-key errors.
-    /// `cpu_offload` rides the `engine: mock` file deliberately: mock is outside
-    /// `OFFLOAD_ENGINES` (it impersonates engines and reads no offload knob), so
-    /// the fixture's one legal report is exactly the `InertKey` hint below — the
-    /// const-coverage claim stays honest without pretending the key is live on mock.
+    /// Every engine knob rides the `engine: mock` file deliberately: mock reads
+    /// none of them, so (slice 10c) the fixture's complete set of reports is the
+    /// `InertKey` hints — one per foreign knob, naming its owning row — and the
+    /// const-coverage claim stays honest without pretending any knob is live on
+    /// mock. Harness-blind keys (`name`, `model`, the `measured_*`...) stay
+    /// silent even here.
     #[test]
     fn the_golden_yaml_covers_every_consumed_key_and_scans_unknown_key_free() {
         let dir = crate::testutil::temp_dir("scan-golden");
@@ -2140,17 +2273,37 @@ mod tests {
             .iter()
             .filter(|e| e.kind == ScanKind::InertKey)
             .collect();
-        assert_eq!(
-            inert.len(),
-            1,
-            "mock is outside OFFLOAD_ENGINES: the golden file's only report is the \
-             cpu_offload inert-key hint: {:?}",
+        assert!(
+            catalog.errors.iter().all(|e| e.kind == ScanKind::InertKey),
+            "mock reads no knob: its only reports are the inert-key hints: {:?}",
             catalog.errors
         );
+        let mut foreign: Vec<(&str, &str)> = Vec::new();
+        for row in crate::engine::policy::all() {
+            if row.id != "mock" {
+                foreign.extend(row.knobs.iter().map(|key| (*key, row.id)));
+            }
+        }
+        assert_eq!(
+            inert.len(),
+            foreign.len(),
+            "exactly one hint per foreign engine knob: {:?}",
+            catalog.errors
+        );
+        for (key, owner) in &foreign {
+            let named = format!("`{key}` is read only by the {owner} engine(s)");
+            assert!(
+                inert.iter().any(|e| e.reason.contains(&named)),
+                "knob `{key}` must report `{owner}` as its owner: {:?}",
+                catalog.errors
+            );
+        }
         assert!(
-            inert[0].reason.contains("cpu_offload") && inert[0].reason.contains("mock"),
-            "{}",
-            inert[0].reason
+            inert
+                .iter()
+                .any(|e| e.reason.contains("cpu_offload") && e.reason.contains("llama")),
+            "the key the scoping ruling started with stays named where it was: {:?}",
+            catalog.errors
         );
         for key in CONSUMED_KEYS {
             if *key == "external" {
@@ -2315,12 +2468,18 @@ mod tests {
         );
     }
 
-    /// Fork C gate: the strict acceptance must not blind-side the live catalog —
-    /// every accepted file the operator keeps publishes, and the dir talks to
-    /// nobody: zero problem lines, zero reports of any kind. The expected count
-    /// is the dir's own accepted enumeration (FINDINGS-BATCH-2026-10-28 [6]):
-    /// adding or removing a live yaml is catalog state, not a test edit. Skipped
-    /// when the dir is absent.
+    /// Fork C gate: the strict acceptance must not blind-side the live catalog.
+    /// Since slice 10c "fully clean" is stated as a closed debt ledger: the
+    /// live dir publishes every file whose bytes carry no harness-owned claim,
+    /// and the reports are exactly the ruled ones — the `context` inert hints
+    /// on the ninfer rows (that key is live llama config; the ninfer context
+    /// rides its `ninfer_profile` line) and the policy-field refusals on the
+    /// strata profiles that still declare `host`/`port` (22[1]: the profiles
+    /// must drop the keys — an in-flight serve is unaffected, the refusal
+    /// lands on the next load gesture). Every entry is pinned by file and
+    /// kind: a live file growing any other report, or an unplanned new file,
+    /// fails here, and the ledger shrinks as each cleanup gesture lands.
+    /// Skipped when the dir is absent.
     #[test]
     fn the_live_modelconf_directory_scans_fully_clean() {
         let dir = Path::new("ModelConf");
@@ -2343,24 +2502,52 @@ mod tests {
             .count();
         assert!(accepted > 0, "an accepted-file count of zero pins nothing");
         let catalog = scan_dir(dir);
+        let mut got: BTreeMap<String, &'static str> = BTreeMap::new();
+        for error in &catalog.errors {
+            let label = match error.kind {
+                ScanKind::InertKey => "inert",
+                ScanKind::PolicyRefused => "refused",
+                ScanKind::InvalidYaml => {
+                    panic!("the live ModelConf grew an invalid-yaml file: {error:?}")
+                }
+                other => panic!("the live ModelConf grew an unplanned {other:?} report: {error:?}"),
+            };
+            let first = got.insert(error.file.clone(), label);
+            assert!(
+                first.is_none(),
+                "one file carried two ledger reports: {error:?}"
+            );
+        }
+        let mut want: BTreeMap<&str, &str> = BTreeMap::new();
+        for file in [
+            "ninfer-bonsai-heretic.yaml",
+            "ninfer-bonsai.yaml",
+            "ninfer-qwen-fp8.yaml",
+            "ninfer-swift-fp8.yaml",
+            "ninfer-swift-nvfp4.yaml",
+        ] {
+            want.insert(file, "inert");
+        }
+        for file in [
+            "strata-fp4local-bf16ple.yaml",
+            "strata-iq3s.yaml",
+            "strata-nvfp4-gptq.yaml",
+        ] {
+            want.insert(file, "refused");
+        }
+        let got: BTreeMap<&str, &str> = got
+            .iter()
+            .map(|(file, label)| (file.as_str(), *label))
+            .collect();
+        assert_eq!(
+            got, want,
+            "the live ModelConf ledger is closed: every report is one of the ruled 10c entries"
+        );
+        let refused = want.values().filter(|kind| **kind == "refused").count();
         assert_eq!(
             catalog.models.len(),
-            accepted,
-            "every accepted live file is problem-line-free and must publish: {:?}",
-            catalog.errors
-        );
-        let offenders: Vec<&ScanError> = catalog
-            .errors
-            .iter()
-            .filter(|e| e.kind == ScanKind::InvalidYaml)
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "the live ModelConf must scan with zero invalid-yaml files: {offenders:?}"
-        );
-        assert!(
-            catalog.errors.is_empty(),
-            "the live ModelConf must scan fully clean, not just publishable: {:?}",
+            accepted - refused,
+            "every accepted live file except the ruled refusals publishes: {:?}",
             catalog.errors
         );
     }
@@ -2448,6 +2635,7 @@ mod tests {
             (ScanKind::InertKey, "inert_key"),
             (ScanKind::InvalidYaml, "invalid_yaml"),
             (ScanKind::DuplicateName, "duplicate_name"),
+            (ScanKind::PolicyRefused, "policy_refused"),
             (ScanKind::Other, "other"),
         ] {
             let value = serde_json::to_value(ScanError {

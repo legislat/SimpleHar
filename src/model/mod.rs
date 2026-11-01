@@ -59,6 +59,17 @@ pub enum ModelError {
         /// The unparsable value as it appeared in the file.
         value: String,
     },
+    /// An operator-extra word (`extra_args`, `ninfer_serve_args`) outside the
+    /// engine row's closed word surface — refused at validate time (slice 10c,
+    /// full `extra_args` enforcement) so the file is reported at rescan instead
+    /// of failing at spawn, after admission may have evicted a resident for the
+    /// doomed launch. `reason` is the engine's own refusal voice naming the
+    /// word and the mechanism that owns the decision.
+    #[error("{reason}")]
+    ExtraWordsRefused {
+        /// The engine's refusal text (from its `EnginePolicy` extra-words check).
+        reason: String,
+    },
 }
 
 /// How a model's declared size participates in admission (operator design note,
@@ -178,7 +189,8 @@ pub struct ModelEntry {
     /// point would be a guess with false precision.
     pub measured_min_gb: Option<f64>,
     /// The `cpu_offload` setting the range was measured under (`measured_offload:`),
-    /// written with it on [`crate::engine::llama::OFFLOAD_ENGINES`] rows only. An
+    /// written with it on rows whose engine carries the `cpu_offload` knob
+    /// ([`crate::engine::llama::offload_live`]) only. An
     /// offloaded launch has no comparable footprint, so a flip between then and now
     /// voids the pair at scan time (measured values verify, they never mislead); on
     /// engines that never read the key the flip cannot describe the launch, so it
@@ -663,6 +675,27 @@ impl ModelEntry {
             .get("engine")
             .cloned()
             .unwrap_or_else(|| "llama".to_string());
+        // Full `extra_args` enforcement (slice 10c): a word outside the row's
+        // closed operator-word surface refuses the file here, with the engine's
+        // own refusal voice (word + owning mechanism) — the adapter keeps the
+        // same check at render, so the scan is the early report, not the only
+        // door. An engine id with no row has no surface to enforce; the actor's
+        // `EngineUnavailable` drop is that file's report.
+        if let Some(row) = crate::engine::policy::engine_policy(&engine) {
+            if let Some(contract) = row.extra_words {
+                if let Some(value) = keys
+                    .get(contract.yaml_key)
+                    .map(|v| v.trim())
+                    .filter(|v| !v.is_empty())
+                {
+                    if let Err(error) = (contract.check)(&engine, name, value) {
+                        return Err(ModelError::ExtraWordsRefused {
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+            }
+        }
         let measured = read_measured(&engine, keys)?;
         Ok(ModelEntry {
             name: name.trim().to_string(),
@@ -719,6 +752,63 @@ mod tests {
         assert_eq!(entry.category, CategoryId::Work);
         assert_eq!(entry.engine, "llama");
         assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
+    }
+
+    /// Full `extra_args` enforcement (slice 10c): a hostile operator-extra
+    /// word is refused by `from_flat` itself — the scan therefore reports the
+    /// file at rescan, before any load could evict a resident for the doomed
+    /// spawn — with the engine's own refusal voice naming the word and the
+    /// mechanism that owns the decision. The benign family the live catalog
+    /// uses passes through untouched. Falsifier: removing the row's
+    /// extra-words check from `from_flat` admits the hostile word here.
+    #[test]
+    fn a_hostile_extra_word_is_refused_with_the_engine_voice() {
+        let err = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "llama"),
+                ("model", "F:/m.gguf"),
+                ("extra_args", "--gpu-layers 99"),
+            ]),
+            "m",
+        )
+        .expect_err("a harness-owned word must refuse the file");
+        match err {
+            ModelError::ExtraWordsRefused { reason } => {
+                assert!(
+                    reason.contains("`--gpu-layers`")
+                        && reason.contains("`cpu_offload:` is the harness's offload decision")
+                        && reason.contains("engine `llama` rejected model `m`"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected ExtraWordsRefused, got {other:?}"),
+        }
+        let err = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("ninfer_serve_args", "--kv-dtype fp16"),
+            ]),
+            "m",
+        )
+        .expect_err("a harness-owned serve flag must refuse the file");
+        assert!(
+            matches!(&err, ModelError::ExtraWordsRefused { reason } if
+                reason.contains("`--kv-dtype`")
+                && reason.contains("harness-owned flag")
+                && reason.contains("ninfer_profile")),
+            "{err}"
+        );
+        ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("model", "F:/m.gguf"),
+                ("extra_args", "--embedding --pooling last"),
+            ]),
+            "m",
+        )
+        .expect("the benign family stays admitted");
     }
 
     /// The Axis 1 primitive of the 2026-10-29 reload-drift ruling: still with the
@@ -1096,7 +1186,7 @@ mod tests {
         for engine in ["strata", "ninfer", "mock"] {
             assert!(
                 !crate::engine::llama::offload_live(engine),
-                "{engine} must be outside OFFLOAD_ENGINES for this pin to mean anything"
+                "{engine} must be outside the offload knob table for this pin to mean anything"
             );
             let entry = ModelEntry::from_flat(
                 &flat(&[

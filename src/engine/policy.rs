@@ -167,6 +167,246 @@ pub(crate) const NINFER_FORBIDDEN_SERVE_FLAGS: &[&str] = &[
     "--kv-dtype",
 ];
 
+/// Which harness mechanism owns each flag a refused `ninfer_serve_args` word
+/// names (slice 10c): the refusal must tell the operator where the decision
+/// actually lives, not only that the word is refused. One entry per
+/// [`NINFER_FORBIDDEN_SERVE_FLAGS`] member (the table test fails on drift);
+/// abbreviation matches resolve through the same table, so `--max-cont` names
+/// the profile override just like the full spelling.
+pub(crate) const NINFER_SERVE_ARG_OWNERS: &[(&str, &str)] = &[
+    (
+        "--host",
+        "the canonical script binds loopback itself (\u{a7}5)",
+    ),
+    (
+        "--port",
+        "the port is harness-assigned from category config",
+    ),
+    ("--api-key", "the key rides `ninfer_key`/`ninfer_key_file`"),
+    (
+        "--data-dir",
+        "container lifecycle is the canonical script's",
+    ),
+    (
+        "--data-dir-permissions",
+        "container lifecycle is the canonical script's",
+    ),
+    (
+        "--model",
+        "`ninfer_model_name`/`ninfer_artifact` name the model",
+    ),
+    ("--model-id", "`ninfer_model_id` owns the served id"),
+    (
+        "--log-level",
+        "log discipline is fixed in the canonical script",
+    ),
+    (
+        "--log-dir",
+        "log discipline is fixed in the canonical script",
+    ),
+    ("--uds", "the socket path is the canonical script's"),
+    ("--ssl-keyfile", "TLS is harness-owned (loopback only)"),
+    ("--ssl-certfile", "TLS is harness-owned (loopback only)"),
+    (
+        "--max-context",
+        "the `ninfer_profile` line owns the capacity figures the VRAM booking is computed from",
+    ),
+    (
+        "--kv-capacity",
+        "the `ninfer_profile` line owns the capacity figures the VRAM booking is computed from",
+    ),
+    (
+        "--max-concurrency",
+        "the `ninfer_profile` line owns the capacity figures the VRAM booking is computed from",
+    ),
+    (
+        "--kv-dtype",
+        "the `ninfer_profile` line owns the capacity figures the VRAM booking is computed from",
+    ),
+];
+
+/// The denylist match a serve-args token fails: the token's *name* collides
+/// with a forbidden flag itself or as a unique abbreviation of one (argparse
+/// parsers resolve prefixes, so `--max-cont` is `--max-context` to the engine).
+/// `None` = the name is not harness-owned.
+#[must_use]
+pub(crate) fn forbidden_serve_flag(name: &str) -> Option<&'static str> {
+    NINFER_FORBIDDEN_SERVE_FLAGS
+        .iter()
+        .copied()
+        .find(|flag| name.starts_with(flag) || flag.starts_with(name))
+}
+
+/// Where the decision behind a refused serve-args flag actually lives.
+#[must_use]
+pub(crate) fn ninfer_serve_arg_owner(flag: &str) -> Option<&'static str> {
+    NINFER_SERVE_ARG_OWNERS
+        .iter()
+        .find(|(name, _)| *name == flag)
+        .map(|(_, owner)| *owner)
+}
+
+/// The harness mechanism that owns each decision a refused `extra_args` word
+/// moves (slice 10c): the refusal names the yaml key or forced line that owns
+/// it, so the operator edits the live key instead of fighting the closed list.
+/// One entry per [`LLAMA_FORBIDDEN_EXTRA_WORDS`] member (the table test fails
+/// on drift); unknown words have no owner and keep the plain list refusal.
+pub(crate) const LLAMA_EXTRA_ARG_OWNERS: &[(&str, &str)] = &[
+    ("-m", "`model:` names the weights"),
+    ("--model", "`model:` names the weights"),
+    ("--host", "the bind is harness-forced (loopback, \u{a7}5)"),
+    (
+        "--port",
+        "the port is harness-assigned from category config",
+    ),
+    ("-ngl", "`cpu_offload:` is the harness's offload decision"),
+    (
+        "--n-gpu-layers",
+        "`cpu_offload:` is the harness's offload decision",
+    ),
+    (
+        "--gpu-layers",
+        "`cpu_offload:` is the harness's offload decision",
+    ),
+    (
+        "-h",
+        "no harness key carries it (this build's `-h` is help)",
+    ),
+    (
+        "-p",
+        "no harness key carries it (not an option in this build)",
+    ),
+    ("--api-key", "request authentication is harness-owned"),
+    ("--api-key-file", "request authentication is harness-owned"),
+    ("--rpc", "RPC egress is harness-owned"),
+    ("--path", "static roots are harness-owned"),
+    (
+        "--models-dir",
+        "an engine-side model router is not catalog custody",
+    ),
+    (
+        "--models-preset",
+        "an engine-side model router is not catalog custody",
+    ),
+    (
+        "--models-autoload",
+        "an engine-side model router is not catalog custody",
+    ),
+    ("--ssl-key-file", "TLS is harness-owned (loopback only)"),
+    ("--ssl-cert-file", "TLS is harness-owned (loopback only)"),
+    (
+        "--model-url",
+        "download egress is harness-owned; `model:` names the weights",
+    ),
+    (
+        "--hf-repo",
+        "download egress is harness-owned; `model:` names the weights",
+    ),
+    (
+        "--hf-file",
+        "download egress is harness-owned; `model:` names the weights",
+    ),
+    (
+        "--docker-repo",
+        "download egress is harness-owned; `model:` names the weights",
+    ),
+    ("--reuse-port", "port reuse is harness-owned"),
+    ("--jinja", "`jinja:` is the harness's template decision"),
+    ("--no-jinja", "`jinja:` is the harness's template decision"),
+    ("--lora", "adapter loading is harness-owned"),
+    ("--override-kv", "the emitted KV values are harness-owned"),
+    (
+        "--mmproj",
+        "`mmproj:` is the harness's vision-file decision",
+    ),
+    ("-c", "`context:` owns the context size"),
+    ("-b", "`batch:` owns the batch size"),
+    ("--ubatch-size", "`ubatch:` owns the micro-batch size"),
+    ("--flash-attn", "`flash_attn:` owns the attention kernel"),
+    ("--cache-type-k", "`cache_type_k:` owns the K-cache type"),
+    ("--cache-type-v", "`cache_type_v:` owns the V-cache type"),
+    ("--parallel", "`parallel:` owns slot concurrency"),
+    ("--fit", "`fit:` owns the auto-fit switch"),
+    ("--fit-target", "`fit_target:` owns the fit target"),
+    ("--fit-ctx", "`fit_ctx:` owns the fit context"),
+];
+
+/// Where the decision behind a refused `extra_args` word actually lives.
+#[must_use]
+pub(crate) fn llama_extra_arg_owner(word: &str) -> Option<&'static str> {
+    let name = word.split_once('=').map_or(word, |(name, _)| name);
+    LLAMA_EXTRA_ARG_OWNERS
+        .iter()
+        .find(|(flag, _)| *flag == name)
+        .map(|(_, owner)| *owner)
+}
+
+/// The yaml keys this engine's harness-side reads consume: the knob table the
+/// §20-9 Fork C scoping ruling ends with — the row that `OFFLOAD_ENGINES` was
+/// the first cell of (2026-10-28) now owns the whole fact, siblings included.
+/// `cpu_offload` on a row without the knob warns via `InertKey` (published,
+/// never refused — ruling D stands); every other member of the table is scoped
+/// the same way: a key that is live config for a *different* engine's row is
+/// inert here, and the page must be able to say so. Harness keys (`category`,
+/// `vram_gb`, the `measured_*` triple, ...) are engine-blind reads and belong
+/// to no row.
+const LLAMA_KNOBS: &[&str] = &[
+    "cpu_offload",
+    "jinja",
+    "extra_args",
+    "mmproj",
+    "context",
+    "ngl",
+    "batch",
+    "ubatch",
+    "flash_attn",
+    "cache_type_k",
+    "cache_type_v",
+    "parallel",
+    "fit",
+    "fit_target",
+    "fit_ctx",
+];
+
+const STRATA_KNOBS: &[&str] = &["strata_config", "strata_python", "strata_cwd"];
+
+const NINFER_KNOBS: &[&str] = &[
+    "ninfer_autostart",
+    "ninfer_container",
+    "ninfer_profile",
+    "ninfer_key",
+    "ninfer_image",
+    "ninfer_model_name",
+    "ninfer_artifact",
+    "ninfer_internal_port",
+    "ninfer_model_roots",
+    "ninfer_serve_args",
+    "ninfer_gpu_device",
+    "ninfer_model_id",
+    "ninfer_key_file",
+    "ninfer_serve_cmd",
+    "ninfer_env",
+];
+
+/// Whether the row for `engine` reads yaml key `key` at all. An unknown engine
+/// id (no row) reads nothing — the actor's `EngineUnavailable` drop is its
+/// report, and no knob claim on it is judged.
+#[must_use]
+pub(crate) fn knob_live(key: &str, engine: &str) -> bool {
+    engine_policy(engine).is_some_and(|row| row.knobs.contains(&key))
+}
+
+/// The engine ids whose rows read `key` — the owner list the inert-key hint
+/// names ("read only by the llama engine(s)").
+#[must_use]
+pub(crate) fn knob_readers(key: &str) -> Vec<&'static str> {
+    POLICIES
+        .iter()
+        .filter(|row| row.knobs.contains(&key))
+        .map(|row| row.id)
+        .collect()
+}
+
 /// The canonical ninfer autostart script the harness renders and stages for
 /// every ninfer launch (operator ruling 2026-10-31: "we create a valid template
 /// we can control and adopt for each ninfer start"). The staged copy is what
@@ -267,6 +507,34 @@ pub(crate) struct ForcedField {
     pub value: ForcedValue,
 }
 
+/// The row's operator-extra-words surface: the yaml key the words ride and the
+/// row's own refusal voice. Slice 10c (full `extra_args` enforcement): the
+/// scan now runs this check when it validates the file, so a hostile word
+/// refuses the file at rescan — naming the word and the mechanism that owns
+/// the decision — instead of waiting to fail at spawn, after admission may
+/// already have evicted a resident for the doomed launch. The adapter keeps
+/// running the same check at render (defense in depth: a hand-built entry
+/// meets it too), so the L3 guarantee the 10a acceptance test pins stands.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExtraWordsContract {
+    /// The yaml key carrying the operator's extra words.
+    pub yaml_key: &'static str,
+    /// The engine's refusal voice over one raw value: tokenizes exactly like
+    /// the render path tokenizes, and returns the same typed rejection.
+    pub check: fn(engine: &str, model: &str, value: &str) -> Result<(), super::EngineError>,
+}
+
+// Equality is the key alone: fn-pointer addresses are not guaranteed unique
+// across comparisons, so deriving PartialEq over the cell would pin a lie
+// (the compiler says so). Two contracts with the same key are one surface.
+impl PartialEq for ExtraWordsContract {
+    fn eq(&self, other: &Self) -> bool {
+        self.yaml_key == other.yaml_key
+    }
+}
+
+impl Eq for ExtraWordsContract {}
+
 /// One engine's row: every compiled-in fact the harness owns about it. Rows
 /// carry only facts real code reads (10a cell rule); the §20-9 cells whose
 /// per-engine fact does not exist in the code yet (`stop_grace`, a per-engine
@@ -289,6 +557,14 @@ pub(crate) struct EnginePolicy {
     /// set is the enforcement and emptiness means "no extra-args surface".
     /// Read by the llama adapter for `extra_args`.
     pub allow_words: &'static [(&'static str, usize)],
+    /// The operator-extra-words surface the scan enforces at validate time
+    /// (slice 10c); `None` = the engine admits no operator word at all, so
+    /// there is nothing to refuse before render.
+    pub extra_words: Option<ExtraWordsContract>,
+    /// The yaml keys this engine's harness-side reads consume (the knob table;
+    /// see [`LLAMA_KNOBS`]). Drives the `InertKey` sibling-hint: a consumed key
+    /// owned by a different row warns here and publishes.
+    pub knobs: &'static [&'static str],
     /// The argv flags that mark a model/profile file for the runtime's
     /// early-exit diagnosis (llama `-m`, strata `--config`); the union feeds
     /// `process::early_exit_report`.
@@ -304,6 +580,10 @@ pub(crate) struct EnginePolicy {
     /// The L3 serve-args/script artifact the harness renders for this engine;
     /// `None` where the adapter builds argv directly.
     pub serve_template: Option<&'static str>,
+    /// The yaml key naming this engine's harness-owned L2 profile (strata's
+    /// `strata_config` is the only one today); the scheduler tracks the profile
+    /// layer through this cell instead of testing engine names.
+    pub profile_field: Option<&'static str>,
     /// Harness-config keys this engine consumes; the knob-parity test alarms
     /// when the config grows an engine-scoped key that joins neither a row nor
     /// the config-only list.
@@ -317,10 +597,13 @@ static MOCK_ROW: EnginePolicy = EnginePolicy {
     forced_fields: &[],
     forbidden_words: &[],
     allow_words: &[],
+    extra_words: None,
+    knobs: &[],
     path_markers: &[],
     custody_exec_roots: &[],
     custody_data_roots: &[],
     serve_template: None,
+    profile_field: None,
     config_knobs: &["allow_mock_engine"],
 };
 
@@ -338,10 +621,16 @@ static LLAMA_ROW: EnginePolicy = EnginePolicy {
     ],
     forbidden_words: LLAMA_FORBIDDEN_EXTRA_WORDS,
     allow_words: LLAMA_EXTRA_ARGS,
+    extra_words: Some(ExtraWordsContract {
+        yaml_key: "extra_args",
+        check: super::llama::check_extra_words_value,
+    }),
+    knobs: LLAMA_KNOBS,
     path_markers: &["-m"],
     custody_exec_roots: &[],
     custody_data_roots: &[],
     serve_template: None,
+    profile_field: None,
     config_knobs: &["llama_server_exe"],
 };
 
@@ -370,10 +659,13 @@ static STRATA_ROW: EnginePolicy = EnginePolicy {
     // profile and interpreter paths through the custody cells below.
     forbidden_words: &[],
     allow_words: &[],
+    extra_words: None,
+    knobs: STRATA_KNOBS,
     path_markers: &["--config"],
     custody_exec_roots: &[],
     custody_data_roots: &[],
     serve_template: None,
+    profile_field: Some("strata_config"),
     // `strata_python`/`strata_cwd` defaults are adapter constants today and
     // move to the config `engines:` section with the custody slice; when they
     // do, the knob-parity test starts requiring them here.
@@ -387,10 +679,16 @@ static NINFER_ROW: EnginePolicy = EnginePolicy {
     forced_fields: &[],
     forbidden_words: NINFER_FORBIDDEN_SERVE_FLAGS,
     allow_words: &[],
+    extra_words: Some(ExtraWordsContract {
+        yaml_key: "ninfer_serve_args",
+        check: super::ninfer::check_serve_args_value,
+    }),
+    knobs: NINFER_KNOBS,
     path_markers: &[],
     custody_exec_roots: &[NINFER_STAGED_SCRIPTS_ROOT],
     custody_data_roots: &[NINFER_KEYS_ROOT],
     serve_template: Some(CANONICAL_NINFER_SCRIPT),
+    profile_field: None,
     config_knobs: &["wsl_distro", "wsl_user"],
 };
 
@@ -774,5 +1072,110 @@ mod tests {
             row_ids, adapter_ids,
             "EnginePolicy rows and the adapter map must name the same engines"
         );
+    }
+
+    /// The knob table (slice 10c generalization of the `cpu_offload` scoping
+    /// ruling): the llama row owns exactly `FLAG_TABLE` plus the three keys the
+    /// adapter reads outside it (`cpu_offload`, `jinja`, `extra_args`) — a new
+    /// flag-table key or a new adapter read must join the row, and
+    /// `cpu_offload` answers to the llama row alone (the fact
+    /// `OFFLOAD_ENGINES` used to hold). Falsifier: dropping a knob from the row
+    /// would warn a live llama yaml's own key as inert at scan.
+    #[test]
+    fn the_knob_table_owns_every_engine_scoped_yaml_key() {
+        let llama = engine_policy("llama").expect("the table ships a llama row");
+        for (key, _) in crate::engine::llama::FLAG_TABLE {
+            assert!(
+                llama.knobs.contains(key),
+                "FLAG_TABLE key `{key}` must be a llama knob"
+            );
+        }
+        for key in ["cpu_offload", "jinja", "extra_args"] {
+            assert!(llama.knobs.contains(&key), "`{key}` must be a llama knob");
+        }
+        assert_eq!(
+            llama.knobs.len(),
+            crate::engine::llama::FLAG_TABLE.len() + 3,
+            "the llama knob list must be FLAG_TABLE plus the three documented extras, \
+             no stale members"
+        );
+        assert_eq!(knob_readers("cpu_offload"), ["llama"]);
+        assert_eq!(
+            crate::engine::llama::OFFLOAD_ENGINES,
+            knob_readers("cpu_offload"),
+            "the page-parity record must stand with the knob table"
+        );
+        assert!(!knob_live("cpu_offload", "mock"));
+        assert!(knob_live("cpu_offload", "llama"));
+        assert!(!knob_live("cpu_offload", "ninfer"));
+        // Unknown ids read nothing; the actor's EngineUnavailable drop is their report.
+        assert!(!knob_live("cpu_offload", "no-such-engine"));
+        // Every engine-scoped key answers to exactly one row (the hint text
+        // "read only by the X engine(s)" is only honest one way).
+        for row in all() {
+            for key in row.knobs {
+                assert_eq!(
+                    knob_readers(key),
+                    [row.id],
+                    "knob `{key}` must answer to exactly the `{}` row",
+                    row.id
+                );
+            }
+        }
+    }
+
+    /// Full `extra_args` enforcement (slice 10c): the scan-facing contract
+    /// exists exactly on the two rows that admit operator words, each on its
+    /// own key — and it refuses the same words the render refuses, so the file
+    /// dies at rescan rather than at spawn.
+    #[test]
+    fn only_the_word_admitting_rows_carry_an_extra_words_contract() {
+        let cases = [
+            ("llama", "extra_args", "--api-key sekrit"),
+            ("ninfer", "ninfer_serve_args", "--max-context 999"),
+        ];
+        for (id, key, hostile) in cases {
+            let row = engine_policy(id).expect("row");
+            let contract = row
+                .extra_words
+                .unwrap_or_else(|| panic!("`{id}` admits operator words and needs a contract"));
+            assert_eq!(contract.yaml_key, key);
+            let error = (contract.check)(id, "t", hostile)
+                .expect_err("`{hostile}` must refuse at validate time");
+            let text = error.to_string();
+            assert!(text.contains(id), "refusal names the engine: {text}");
+        }
+        for id in ["mock", "strata"] {
+            assert!(
+                engine_policy(id).expect("row").extra_words.is_none(),
+                "`{id}` admits no operator word and must carry no contract"
+            );
+        }
+    }
+
+    /// Every refused word's refusal must be able to name the owning mechanism
+    /// (slice 10c): the owner tables cover the reviewed forbidden records
+    /// exactly — a forbidden word without an owner sentence is a refusal that
+    /// cannot teach, and the scan's hostile word would say only "not allowed".
+    #[test]
+    fn every_forbidden_word_has_an_owner_sentence() {
+        for word in LLAMA_FORBIDDEN_EXTRA_WORDS {
+            assert!(
+                llama_extra_arg_owner(word).is_some(),
+                "`extra_args` word `{word}` has no owner sentence"
+            );
+        }
+        for flag in NINFER_FORBIDDEN_SERVE_FLAGS {
+            assert!(
+                ninfer_serve_arg_owner(flag).is_some(),
+                "`ninfer_serve_args` flag `{flag}` has no owner sentence"
+            );
+        }
+        // Abbreviations resolve through the denylist matcher to their full
+        // flag (the parser-resolves-prefixes rule), so they inherit the owner.
+        let abbreviated = forbidden_serve_flag("--max-cont").expect("--max-cont is --max-context");
+        assert!(ninfer_serve_arg_owner(abbreviated).is_some());
+        assert_eq!(forbidden_serve_flag("--spec"), None);
+        assert_eq!(llama_extra_arg_owner("--foo"), None);
     }
 }

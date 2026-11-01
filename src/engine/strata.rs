@@ -14,9 +14,12 @@
 //! What the adapter validates of the three yaml strings it passes on (FINDINGS2-0910
 //! [5] floor, 2026-10-29): `strata_config` must be an existing file, `strata_python`
 //! an existing `.exe` **file** (it is the launched program), and `strata_cwd` an
-//! existing directory. That is "refuse garbage early", not custody: the profile's
-//! *contents* are never policy-checked, and the roots that decide which paths are
-//! admissible at all are the strata `custody_*` cells of the
+//! existing directory. Since slice 10c the profile's *contents* are checked too —
+//! [`validate_profile`] runs at scan and again at spawn, so a profile that cannot
+//! be parsed, references a path the disk lacks, or claims a harness-forced policy
+//! field (`host`, `port`, key — FINDINGS-22 [1]) is refused before the child
+//! starts, never obeyed. The roots that decide which paths are admissible at
+//! all remain the strata `custody_*` cells of the
 //! [`crate::engine::policy`] `EnginePolicy` table (§20-9 Fork C), still open in
 //! 10a with the root values moving to the config's `engines:` section in a later
 //! custody slice.
@@ -30,6 +33,174 @@ use std::path::{Path, PathBuf};
 const DEFAULT_PYTHON: &str = r"C:\Strata\.venv\Scripts\python.exe";
 /// Fallback working directory when a yaml omits `strata_cwd:` (v3.3 default).
 const DEFAULT_CWD: &str = r"C:\Strata";
+
+/// The top-level profile fields that claim a harness-owned decision —
+/// FINDINGS-22 [1] / `DECISIONS` LOCKED "external engines obey only
+/// harness-owned configuration": the bind, the port and the key are forced
+/// from the harness side and are **never obeyed from engine-side files**
+/// (slice 10c enforcement; the 22[2] docs fix recorded the ruling, this is the
+/// refusal). Each entry names the mechanism that owns the decision so the
+/// refusal can teach, not just deny.
+const PROFILE_POLICY_FIELDS: &[(&str, &str)] = &[
+    (
+        "host",
+        "the engine bind is harness-forced (loopback, \u{a7}5)",
+    ),
+    (
+        "port",
+        "the engine port is harness-assigned from category config",
+    ),
+    ("key", "request authentication is harness-owned"),
+    ("api_key", "request authentication is harness-owned"),
+];
+
+/// The refusal sentence for a profile that claims one or more harness-forced
+/// fields (slice 10c): every claim is named at once, with the mechanism that
+/// owns it, so the operator's cleanup pass is one edit round, not one refusal
+/// per field. Shared by the scan report and the spawn refusal — the same file
+/// is refused the same way at both doors, and the engine is never silently
+/// launched on a claimed mix (FINDINGS-22 [1]).
+pub(crate) fn policy_field_claims(profile: &str, claims: &[(&str, &str)]) -> String {
+    let listed = claims
+        .iter()
+        .map(|(field, owner)| format!("`{field}` \u{2014} {owner}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "strata profile {profile} declares {listed}; policy fields are harness-forced and \
+         never obeyed from engine-side files: delete them from the profile"
+    )
+}
+
+/// Why a strata profile file is not loadable. The scan maps each leg to its
+/// `ScanKind` (and its established sentence), the adapter refuses every leg
+/// the same `EngineError::Rejected` way — one check, both doors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProfileProblem {
+    /// The file cannot be read, or is not valid JSON (BOM permitted).
+    Unreadable,
+    /// The JSON references an absolute path the disk lacks (the doomed spawn
+    /// one layer deeper; relative paths and the `log` key are exempt).
+    MissingPath {
+        /// Profile key carrying the path.
+        key: String,
+        /// The missing absolute path.
+        path: String,
+    },
+    /// The JSON declares top-level fields the harness forces (22[1]); every
+    /// claim the file carries is listed at once, each with its owning mechanism.
+    PolicyField {
+        /// `(field, owner)` for each claimed field.
+        claims: Vec<(&'static str, &'static str)>,
+    },
+}
+
+impl ProfileProblem {
+    /// The operator-facing sentence, with the profile path as the caller
+    /// names it (byte-identical to the established scan text for the two
+    /// pre-existing legs).
+    #[must_use]
+    pub(crate) fn describe(&self, profile: &str) -> String {
+        match self {
+            Self::Unreadable => format!("strata profile not readable: {profile}"),
+            Self::MissingPath { key, path } => {
+                format!("strata profile references missing path: {key} = {path}")
+            }
+            Self::PolicyField { claims } => policy_field_claims(profile, claims),
+        }
+    }
+}
+
+/// The strata row's profile check, shared by the scan (which reports it) and
+/// the adapter (which refuses the spawn with it — the profile is read by the
+/// child minutes after admission evicted any victim, so an unreadable file, a
+/// missing referenced path, or a policy-field claim all refuse at spec time,
+/// never launch on it). Order: readability, referenced paths, then policy
+/// fields — a profile that cannot even be parsed is reported as unreadable,
+/// exactly as the scan did before this shared helper existed.
+///
+/// # Errors
+///
+/// The first [`ProfileProblem`] the file shows.
+pub(crate) fn validate_profile(path: &Path) -> Result<(), ProfileProblem> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Err(ProfileProblem::Unreadable);
+    };
+    // A UTF-8 BOM is ignored, not refused (same doctrine as
+    // `parse_flat_yaml`; RFC 8259 permits it, and the strata engine reads
+    // BOM'd profiles today — the live `strata-qwen-gptq-nvfp4.json` carries
+    // one).
+    let json = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Err(ProfileProblem::Unreadable);
+    };
+    if let Some((key, missing)) = missing_profile_path(&root) {
+        return Err(ProfileProblem::MissingPath { key, path: missing });
+    }
+    let claims: Vec<(&'static str, &'static str)> = root.as_object().map_or(Vec::new(), |map| {
+        PROFILE_POLICY_FIELDS
+            .iter()
+            .filter(|(name, _)| map.contains_key(*name))
+            .copied()
+            .collect()
+    });
+    if !claims.is_empty() {
+        return Err(ProfileProblem::PolicyField { claims });
+    }
+    Ok(())
+}
+
+/// The first (key, path) a strata profile value references that does not exist.
+/// Every string under every key is judged; the `log` key is exempt (its target's
+/// existence is irrelevant to loading). A trailing `:float` is stripped first:
+/// llama's `--control-vector-scaled <path>:1.0` shape carries the scale inside the
+/// same word, and it is the path — not `path:1.0` — that must exist.
+fn missing_profile_path(root: &serde_json::Value) -> Option<(String, String)> {
+    walk_profile(root, "profile")
+}
+
+fn walk_profile(value: &serde_json::Value, key: &str) -> Option<(String, String)> {
+    match value {
+        serde_json::Value::Object(map) => map.iter().find_map(|(inner_key, inner)| {
+            if inner_key == "log" {
+                None
+            } else {
+                walk_profile(inner, inner_key)
+            }
+        }),
+        serde_json::Value::Array(items) => items.iter().find_map(|inner| walk_profile(inner, key)),
+        serde_json::Value::String(text) => profile_path_candidate(text)
+            .filter(|path| std::fs::metadata(path).is_err())
+            .map(|path| (key.to_string(), path)),
+        _ => None,
+    }
+}
+
+/// The absolute-path shape this check judges: a Windows drive path (`X:\` or
+/// `X:/`) or a UNC (`\\server\share`), never a relative path (exempt: the engine
+/// resolves those against the profile dir). A trailing `:float` is the llama
+/// control-vector scale and is stripped before the existence check.
+fn profile_path_candidate(text: &str) -> Option<String> {
+    if !is_absolute_shape(text) {
+        return None;
+    }
+    if let Some((head, tail)) = text.rsplit_once(':') {
+        if is_absolute_shape(head) && tail.parse::<f64>().is_ok() {
+            return Some(head.to_string());
+        }
+    }
+    Some(text.to_string())
+}
+
+/// Drive-letter or UNC absolute-path shape (checked bytewise: the grammar is ASCII).
+fn is_absolute_shape(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || text.starts_with("\\\\")
+}
 
 /// Strata adapter: argv from data, `/health` 200 **and** `loaded != false`.
 #[derive(Debug, Clone)]
@@ -105,6 +276,15 @@ impl EngineAdapter for StrataAdapter {
             } else {
                 format!("strata_config not found: {config}")
             }));
+        }
+        // The file is only the floor (10c): the profile's contents are the
+        // launch the child will actually obey, so the same check the scan ran
+        // is re-run here — a profile edited or swapped after the rescan cannot
+        // silently launch on a mix, and the refusal (unreadable, missing path,
+        // or claimed policy field — 22[1]) names the reason the scan would
+        // have named.
+        if let Err(problem) = validate_profile(config_path) {
+            return Err(rejected(problem.describe(config)));
         }
         // The interpreter is `argv[0]`, so it is the one yaml string that chooses
         // which program CreateProcessW starts. Refuse garbage early rather than
@@ -465,5 +645,72 @@ mod tests {
         assert_eq!(spec.argv[0], python.to_str().expect("utf-8 path"));
         assert_eq!(spec.cwd, std::env::temp_dir());
         let _ = std::fs::remove_file(config);
+    }
+
+    /// A profile written after the scan is re-validated at spawn (slice 10c):
+    /// claimed policy fields (22[1]), a broken reference, and unparseable JSON
+    /// all refuse the launch with the same sentence the scan would have
+    /// reported — the engine is never silently launched on a mix.
+    #[test]
+    fn a_profile_the_scan_would_refuse_is_refused_at_spawn_too() {
+        let dir = crate::testutil::temp_dir("strata-validate");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let python = std::env::current_exe().expect("a real .exe stand-in");
+        let adapter = StrataAdapter::new(python, std::env::temp_dir());
+        let cases = [
+            (
+                "claims-port",
+                r#"{"port": 8080}"#,
+                "`port`",
+                "never obeyed from engine-side files",
+            ),
+            (
+                "claims-host",
+                r#"{"host": "0.0.0.0"}"#,
+                "`host`",
+                "harness-forced",
+            ),
+            ("broken-json", "not json at all", "not readable", ""),
+            (
+                "missing-ref",
+                r#"{"model_file": "Z:\\nope\\weights.gguf"}"#,
+                "references missing path",
+                "Z:\\nope\\weights.gguf",
+            ),
+        ];
+        for (name, body, must_name, must_say) in cases {
+            let profile = dir.join(format!("{name}.json"));
+            std::fs::write(&profile, body).expect("write profile");
+            let err = adapter
+                .spec(&entry(&[("strata_config", file_str(&profile))]), 18109)
+                .expect_err("a refused profile must never launch");
+            let EngineError::Rejected { reason, .. } = &err else {
+                panic!("{name}: expected Rejected, got {err:?}");
+            };
+            assert!(
+                reason.contains(must_name) && (must_say.is_empty() || reason.contains(must_say)),
+                "{name}: {reason}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check that refuses a claimed field accepts a profile that decides
+    /// nothing the harness owns: nested objects and harness-blind names are
+    /// config, not claims.
+    #[test]
+    fn a_profile_deciding_nothing_harness_owned_launches() {
+        let dir = crate::testutil::temp_dir("strata-clean");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let profile = dir.join("clean.json");
+        std::fs::write(
+            &profile,
+            r#"{"vision": {"port_hint": 1}, "nested": {"key_note": "x"}, "log": "Z:\\logs"}"#,
+        )
+        .expect("write profile");
+        StrataAdapter::default()
+            .spec(&entry(&[("strata_config", file_str(&profile))]), 18109)
+            .expect("nested names are not top-level claims; `log` is exempt");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
