@@ -173,7 +173,9 @@ mod tests {
     }
 
     /// FINDINGS-16 [4]: the header badge reads the two verdicts `/har/status` computes
-    /// and no longer decodes the serde shape of `listeners` in the browser.
+    /// and no longer decodes the serde shape of `listeners` in the browser. The
+    /// stranded-reservation badge (R5) rides the same rule: it reads
+    /// `status.stranded_containers` and names only what the harness lists.
     ///
     /// Nature, declared: a source-content assertion over the exact `include_str!`
     /// bytes `/app.js` and `/style.css` answer, so an `include_str!`-stale exe cannot
@@ -204,6 +206,7 @@ mod tests {
         for field in [
             "status.listeners_down === true",
             "status.listeners_pending === true",
+            "status.stranded_containers",
         ] {
             assert!(
                 APP_JS.contains(field),
@@ -219,8 +222,9 @@ mod tests {
         );
         assert_eq!(
             APP_JS.matches(AMBER).count(),
-            1,
-            "one amber badge, for the no-verdict state (the tray's colour, page-side)"
+            2,
+            "two amber badges: the listener no-verdict state (the tray's colour, page-side) \
+             and the reservations the harness reports stranded"
         );
         assert!(
             STYLE_CSS.contains(".sh-badge[data-tone=\"warn\"]") && STYLE_CSS.contains("--sh-warn"),

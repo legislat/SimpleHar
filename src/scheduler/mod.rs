@@ -56,6 +56,16 @@ const PARKED_SLOT_NOT_FREED: &str = "the load it was waiting on did not free the
 /// operator's first click.
 const FIT_WARM_DELAY: Duration = Duration::from_millis(1500);
 
+/// R11 session cross-check: the slack added to `fit_margin_gb` to form the
+/// tolerance a live witness reading must fall inside to confirm a Fit booking
+/// for the page. A witness total-diff carries noise the deterministic
+/// projection does not (other tenants' sampling instants, KV growth under
+/// load), so the cross-check window is wider than the booking margin. This
+/// constant is a DOCUMENTED PLACEHOLDER pending the Wave-C calibration — the
+/// same window that calibrates `fit_margin_gb` itself owes this figure its
+/// real value.
+const FIT_VALIDATE_SLACK_GIB: f64 = 2.0;
+
 /// Failures reported to swap/unload/cancel callers, with the numbers used (G13).
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum SchedulerError {
@@ -158,6 +168,16 @@ pub struct SchedulerStatus {
     /// set, exactly like the warn dedupe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stranded_containers: Option<BTreeSet<String>>,
+    /// R11 session cross-check (rule 2026-11-01, display-only): the models whose
+    /// Fit booking a usable witness reading confirmed inside the session
+    /// tolerance while the current fit epoch stands — the page turns those rows
+    /// green. In-memory actor stamps filtered to the epoch, never persisted and
+    /// never a gate input; a rescan (epoch moves) or a calculator swap (version
+    /// invalidation) empties it. Skip-serialized because the verdict rides the
+    /// per-model rows (`/har/models` and the SSE document carry it), never as a
+    /// top-level list of `/har/status`.
+    #[serde(skip)]
+    pub fit_validated: BTreeSet<String>,
 }
 
 /// One slot as seen by `/har/status` (Step 12).
@@ -1021,6 +1041,13 @@ struct MeasuredAnchor {
     /// spawn never claims per-process attribution — its ticket pid is the dead
     /// `wsl.exe` client — so witness readings can only ever be `total_diff` there.
     container: bool,
+    /// The Fit projection (R11) that actually BOOKED this spawn: the figure
+    /// `cost_source()` answered `Fit` with at spawn time. `None` = this load was
+    /// not Fit-booked, so the session cross-check has nothing to confirm. Captured
+    /// at spawn like every other anchor field: the cross-check must compare the
+    /// witness against what this process was reserved by, not against whichever
+    /// catalog figure a later rescan patched under the same name.
+    fit_gb: Option<f64>,
 }
 
 impl MeasuredAnchor {
@@ -1051,6 +1078,9 @@ impl MeasuredAnchor {
                 .then(|| crate::engine::ninfer::profile_stamp(&entry.raw))
                 .flatten(),
             container: entry.engine == crate::ownership::NINFER_ENGINE,
+            fit_gb: (entry.cost_source() == crate::model::CostSource::Fit)
+                .then_some(entry.fit_gb)
+                .flatten(),
         }
     }
 }
@@ -1228,6 +1258,13 @@ struct ActorState {
     /// catalog is dropped at the handler instead of patching rows that may no
     /// longer describe it.
     fit_epoch: Arc<AtomicU64>,
+    /// R11 session cross-check verdicts (display-only): model → (fit epoch the
+    /// verdict was earned under, whether the witness fell inside the session
+    /// tolerance). A verdict counts only while its epoch stands, so a rescan
+    /// retires every session stamp; a calculator swap clears the map outright.
+    /// Never persisted, never a gate input — the folded measured pair is the
+    /// only booking consequence a witness reading may ever have.
+    fit_stamps: BTreeMap<String, (u64, bool)>,
     slots: Vec<Slot>,
     jobs: BTreeMap<JobId, Job>,
     /// Last proxy-side use per model (idle sweep input, Step 5).
@@ -1501,6 +1538,7 @@ impl ActorState {
             fit_cache: HashMap::new(),
             fit_version: None,
             fit_epoch: Arc::new(AtomicU64::new(0)),
+            fit_stamps: BTreeMap::new(),
             slots,
             jobs: BTreeMap::new(),
             last_used: HashMap::new(),
@@ -2468,6 +2506,11 @@ impl ActorState {
     /// row keeps its ladder.
     fn spawn_fit_warm(&mut self) {
         self.fit_epoch.fetch_add(1, Ordering::Relaxed);
+        // R11: the rescan's epoch retires every session cross-check stamp — a
+        // green the page showed described the superseded catalog. Clearing keeps
+        // the map bounded; the epoch equality is what makes stale entries read
+        // as absent even before this line runs.
+        self.fit_stamps.clear();
         let Some(plan) = self.fit_probe_plan() else {
             return;
         };
@@ -2670,6 +2713,10 @@ impl ActorState {
         }
         self.fit_version = Some(version);
         self.fit_cache.clear();
+        // R11: a replaced calculator voids the session cross-checks too — the
+        // tolerance's own margin belongs to the tool that minted the projection,
+        // so a verdict earned under the old one says nothing about the new.
+        self.fit_stamps.clear();
         for entry in &mut self.catalog {
             if crate::engine::policy::fit_capable(&entry.engine) {
                 entry.fit_gb = None;
@@ -3030,6 +3077,13 @@ impl ActorState {
                 }
             }
         }
+        // R11 session cross-check (rule 2026-11-01, display-only): a Fit-booked
+        // load gets its projection confirmed by THIS reading — it reached here
+        // only by surviving every fold gate, including the `ForeignDominated`
+        // grade above, so a contaminated window can never stamp it green.
+        if self.maybe_validate_fit(model, &anchor, rounded) {
+            self.publish();
+        }
         self.fold(&FoldPlan {
             model: model.to_string(),
             ticket: ticket.clone(),
@@ -3044,6 +3098,65 @@ impl ActorState {
                 .flatten(),
             fold_range: true,
         });
+    }
+
+    /// R11 session cross-check (rule 2026-11-01, display-only, never a gate
+    /// input): when a witness reading has survived every fold gate for a
+    /// Fit-booked load, compare it against the projection that booked the
+    /// spawn. The tolerance is `fit_margin_gb` + [`FIT_VALIDATE_SLACK_GIB`] —
+    /// an uncalibrated margin (constant absent) is NO defined tolerance, hence
+    /// never-validated, degrading silently like an unavailable reading. A hit
+    /// stamps the model under the current fit epoch; the stamp is in-memory
+    /// only, retires with the epoch (a rescan re-stamps it away), and a
+    /// calculator swap clears the map. The first refusal at an epoch warns
+    /// once — the numbers the operator needs if the projection was wrong —
+    /// and a later reading that lands inside tolerance still stamps. Returns
+    /// whether the verdict map changed, so the caller publishes only when the
+    /// page gained something to read.
+    fn maybe_validate_fit(&mut self, model: &str, anchor: &MeasuredAnchor, observed: f64) -> bool {
+        let Some(fit) = anchor.fit_gb else {
+            return false;
+        };
+        let Some(margin) = self
+            .cfg
+            .llama_fit()
+            .and_then(|llama| llama.fit_margin_gb)
+            .filter(|margin| margin.is_finite())
+        else {
+            return false;
+        };
+        let gen = self.fit_gen();
+        let seen = self.fit_stamps.get(model).copied();
+        if seen == Some((gen, true)) {
+            return false;
+        }
+        let tolerance = margin + FIT_VALIDATE_SLACK_GIB;
+        if (observed - fit).abs() > tolerance {
+            if seen == Some((gen, false)) {
+                return false;
+            }
+            tracing::warn!(
+                model,
+                observed,
+                fit_gb = fit,
+                tolerance,
+                "witness cross-check kept the Fit row amber: the live reading sits \
+                 outside the projection's session tolerance"
+            );
+            self.fit_stamps.insert(model.to_string(), (gen, false));
+            return true;
+        }
+        if seen == Some((gen, false)) {
+            tracing::warn!(
+                model,
+                observed,
+                fit_gb = fit,
+                "a later witness reading fell back inside the Fit projection's session \
+                 tolerance: the row turns green for the session"
+            );
+        }
+        self.fit_stamps.insert(model.to_string(), (gen, true));
+        true
     }
 
     /// Folds the container's one-shot startup `MemorySummary` figure (R9): the
@@ -4823,6 +4936,15 @@ impl ActorState {
                 .as_ref()
                 .filter(|names| !names.is_empty())
                 .cloned(),
+            // R11: only stamps earned under the CURRENT epoch answer — the page
+            // must never show a green carried across a rescan, and reading this
+            // is pure memory (no fs, no clock), like every other snapshot field.
+            fit_validated: self
+                .fit_stamps
+                .iter()
+                .filter(|(_, (epoch, ok))| *ok && *epoch == self.fit_gen())
+                .map(|(model, _)| model.clone())
+                .collect(),
             slots: self
                 .slots
                 .iter()
@@ -8047,6 +8169,248 @@ mod tests {
         assert_eq!(
             entry.fit_gb, None,
             "the ladder is untouched by a disabled pass"
+        );
+    }
+
+    /// A fold pin's state carrying the live Fit calibration (margin 0.5): the
+    /// session cross-check's tolerance exists only because this config names it.
+    fn fit_fold_state(dir: &std::path::Path) -> ActorState {
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "llama".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        ActorState::empty(
+            fit_config(dir),
+            dir.to_path_buf(),
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        )
+    }
+
+    /// A row the gate books from the engine's projection: declared floor 4 GiB,
+    /// projection 10 GiB (small enough for the witness pins' 24 GiB card), read
+    /// back through the real parser with its `file` set so the fold's persist
+    /// leg runs on real yaml.
+    fn fit_booked_entry(dir: &std::path::Path, name: &str) -> ModelEntry {
+        let yaml = dir.join(format!("{name}.yaml"));
+        std::fs::write(
+            &yaml,
+            format!("engine: llama\nvram_gb: 4\nmodel: {name}.gguf\ncontext: 4096\nngl: 99\n"),
+        )
+        .expect("seed yaml");
+        let mut entry = rescan_entry(&yaml, name);
+        entry.fit_gb = Some(10.0);
+        assert_eq!(
+            entry.cost_source(),
+            crate::model::CostSource::Fit,
+            "the pin must book from Fit, or the cross-check below proves nothing"
+        );
+        entry
+    }
+
+    /// Cross-check warns for ONE model: the capture is process-global and tests
+    /// run in parallel, so the model name is the quarantine.
+    fn fit_verdict_warns(
+        capture: &Arc<Mutex<Vec<CapturedWarn>>>,
+        name: &str,
+        needle: &str,
+    ) -> usize {
+        capture
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(message, fields)| {
+                message.contains(needle)
+                    && fields
+                        .get("model")
+                        .is_some_and(|m| m.trim_matches('"') == name)
+            })
+            .count()
+    }
+
+    /// R11 session cross-check: a witness reading that survived every fold gate
+    /// and lands inside the projection's session tolerance (margin 0.5 + slack)
+    /// stamps the row for the session — and the stamp stays in-process: the
+    /// folded measured pair is the only figure this reading ever writes.
+    /// Falsifier: drop the tolerance compare and the out-of-tolerance pin fails;
+    /// persist the stamp and the yaml leg fails.
+    #[tokio::test]
+    async fn a_witness_inside_the_fit_projection_stamps_the_row_for_the_session() {
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("fit-green");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut state = fit_fold_state(&dir);
+        let entry = fit_booked_entry(&dir, "fitgreen-row");
+        let yaml = entry.file.clone().expect("seeded file");
+        let ticket = fold_ticket(19_301);
+        state.catalog = vec![entry.clone()];
+        seat_spawn(&mut state, &entry, &ticket, 19_301);
+        state.witness("fitgreen-row", &ticket, 11.0);
+        assert!(
+            state.snapshot().fit_validated.contains("fitgreen-row"),
+            "11.0 sits 1.0 GiB from the projection, inside margin 0.5 plus slack"
+        );
+        assert_eq!(
+            fit_verdict_warns(&capture, "fitgreen-row", "kept the Fit row amber"),
+            0,
+            "an in-tolerance stamp is silence"
+        );
+        await_yaml_keys(&yaml, &["measured_gb: 11.0"]).await;
+        let persisted = std::fs::read_to_string(&yaml).expect("written yaml");
+        for token in ["fit_validated", "fit_gb"] {
+            assert!(
+                !persisted.contains(token),
+                "the verdict and the projection are in-process only; the yaml learned \
+                 about {token}:\n{persisted}"
+            );
+        }
+    }
+
+    /// The refusal side, warn-once: the first out-of-tolerance reading names its
+    /// numbers exactly once per epoch (the operator needs them exactly once), a
+    /// second refusal adds no noise, and a later reading back inside tolerance
+    /// still earns the stamp — with a warn naming the reversal.
+    #[tokio::test]
+    async fn an_out_of_tolerance_reading_warns_once_and_can_still_earn_the_stamp() {
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("fit-warn");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut state = fit_fold_state(&dir);
+        let entry = fit_booked_entry(&dir, "fitwarn-row");
+        let ticket = fold_ticket(19_302);
+        state.catalog = vec![entry.clone()];
+        seat_spawn(&mut state, &entry, &ticket, 19_302);
+        state.witness("fitwarn-row", &ticket, 20.0);
+        assert!(
+            !state.snapshot().fit_validated.contains("fitwarn-row"),
+            "20.0 sits 10 GiB from the projection: the row stays amber"
+        );
+        assert_eq!(
+            fit_verdict_warns(&capture, "fitwarn-row", "kept the Fit row amber"),
+            1,
+            "the first refusal names its numbers"
+        );
+        state.witness("fitwarn-row", &ticket, 21.0);
+        assert_eq!(
+            fit_verdict_warns(&capture, "fitwarn-row", "kept the Fit row amber"),
+            1,
+            "the same verdict repeating is silence, not a log flood"
+        );
+        state.witness("fitwarn-row", &ticket, 11.0);
+        assert!(
+            state.snapshot().fit_validated.contains("fitwarn-row"),
+            "a later reading inside tolerance earns the stamp"
+        );
+        assert_eq!(
+            fit_verdict_warns(&capture, "fitwarn-row", "fell back inside"),
+            1,
+            "the reversal is worth one warn"
+        );
+    }
+
+    /// R3's `ForeignDominated` grade runs BEFORE the cross-check: memory that
+    /// moved across the window is someone else's story, so a total-diff reading
+    /// that the fold itself refuses must never stamp a projection green — the
+    /// green would vouch for a number the fold refused to mint.
+    #[tokio::test]
+    async fn a_contaminated_window_never_stamps_a_fit_row_green() {
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("fit-contam");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut state = fit_fold_state(&dir);
+        let entry = fit_booked_entry(&dir, "fitcontam-row");
+        let ticket = fold_ticket(19_303);
+        state.catalog = vec![entry.clone()];
+        seat_spawn(&mut state, &entry, &ticket, 19_303);
+        // own: None keeps this a total-diff (the only reading the grade guards).
+        // At admit 52 GiB of the 72 GiB card was unaccounted; now 58 is: 6 GiB
+        // moved while the engine grew 2 — foreign-dominated, refused outright.
+        state.on_measured(
+            "fitcontam-row",
+            &ticket,
+            super::Reading {
+                total_diff: 2.0,
+                own: None,
+                total_gib: 72.0,
+                used_gib: 60.0,
+            },
+        );
+        assert!(
+            !state.snapshot().fit_validated.contains("fitcontam-row"),
+            "a contaminated window cannot mint a green"
+        );
+        assert_eq!(
+            fit_verdict_warns(&capture, "fitcontam-row", "kept the Fit row amber"),
+            0,
+            "the guard refuses BEFORE any verdict is attempted"
+        );
+    }
+
+    /// An uncalibrated margin is NO defined tolerance: the row stays amber with
+    /// total silence — a display cross-check may not nag about a tolerance that
+    /// was never configured.
+    #[tokio::test]
+    async fn an_uncalibrated_margin_never_validates_and_never_says_so() {
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("fit-quiet");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut state = fold_state(&dir);
+        let entry = fit_booked_entry(&dir, "fitquiet-row");
+        let ticket = fold_ticket(19_304);
+        state.catalog = vec![entry.clone()];
+        seat_spawn(&mut state, &entry, &ticket, 19_304);
+        state.witness("fitquiet-row", &ticket, 11.0);
+        assert!(
+            !state.snapshot().fit_validated.contains("fitquiet-row"),
+            "no calibration, no tolerance, no green"
+        );
+        for needle in ["kept the Fit row amber", "fell back inside"] {
+            assert_eq!(
+                fit_verdict_warns(&capture, "fitquiet-row", needle),
+                0,
+                "silence, not a nag about an absent config key: {needle}"
+            );
+        }
+    }
+
+    /// The stamp's two retirements: a catalog rescan bumps the fit epoch (and
+    /// clears the map), and a calculator swap clears it outright — a green the
+    /// page showed described the superseded catalog or the old tool.
+    #[tokio::test]
+    async fn a_rescan_or_a_calculator_swap_retires_the_session_stamp() {
+        let dir = crate::testutil::temp_dir("fit-retire");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut state = fit_fold_state(&dir);
+        let entry = fit_booked_entry(&dir, "fitretire-row");
+        let ticket = fold_ticket(19_305);
+        state.catalog = vec![entry.clone()];
+        seat_spawn(&mut state, &entry, &ticket, 19_305);
+        state.on_fit_version(state.fit_gen(), Some("b11669".to_string()));
+        state.witness("fitretire-row", &ticket, 11.0);
+        assert!(state.snapshot().fit_validated.contains("fitretire-row"));
+        state.spawn_fit_warm();
+        assert!(
+            state.snapshot().fit_validated.is_empty(),
+            "the rescan's epoch retires every session stamp"
+        );
+        state.witness("fitretire-row", &ticket, 11.0);
+        assert!(
+            state.snapshot().fit_validated.contains("fitretire-row"),
+            "the new epoch can earn a fresh stamp"
+        );
+        state.on_fit_version(state.fit_gen(), Some("b20000".to_string()));
+        assert!(
+            state.snapshot().fit_validated.is_empty(),
+            "a replaced calculator voids verdicts earned under the old one"
         );
     }
 

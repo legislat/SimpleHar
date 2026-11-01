@@ -1270,10 +1270,13 @@ fn loaded_rows(slots: &[crate::scheduler::SlotStatus]) -> BTreeMap<String, Loade
 /// page's table renders (A5: `context`, `serve_model`, `model_ref`) and the loaded
 /// row's server-computed facts (`launched_at`, `stale_config` — absent when the
 /// model is not loaded, never null: not-loaded is a state, not an empty value).
+/// `fit_validated` is the third joined fact: the actor's session cross-check
+/// verdict, present as `true` only while it stands (absent is not false — an
+/// unvalidated row keeps its exact unvalidated shape).
 /// Single builder for `merged_state` and `/har/models` so they cannot drift. The
 /// client-facing listener `/v1/models` is deliberately minimal — local file
 /// paths stay off the LAN-facing surface.
-fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>) -> Value {
+fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>, fit_validated: bool) -> Value {
     let mut body = json!({
         "id": entry.name,
         "object": "model",
@@ -1337,6 +1340,15 @@ fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>) -> Value {
     if let Some(fit) = entry.fit_gb {
         body["fit_gb"] = json!(fit);
     }
+    // R11 session cross-check: `fit_validated` appears ONLY while the verdict
+    // stands — absent, never null, never `false` (an unvalidated row's document
+    // is byte-identical to a never-checkable one, the same absent-is-not-null
+    // rule as `fit_gb`; the fixture-parity pin rides it). The gate answers the
+    // flag: a row the gate no longer books from Fit cannot carry a verdict about
+    // a booking that is not happening.
+    if fit_validated && entry.cost_source() == crate::model::CostSource::Fit {
+        body["fit_validated"] = json!(true);
+    }
     if let Some(loaded) = loaded {
         body["launched_at"] = json!(loaded.launched_at);
         body["stale_config"] = json!(loaded.stale_config);
@@ -1352,7 +1364,13 @@ async fn merged_state(state: &ApiState) -> Result<Value, ApiError> {
     let catalog = state.catalog().await?;
     let models: Vec<Value> = catalog
         .iter()
-        .map(|entry| model_json(entry, loaded.get(&entry.name)))
+        .map(|entry| {
+            model_json(
+                entry,
+                loaded.get(&entry.name),
+                scheduler.fit_validated.contains(&entry.name),
+            )
+        })
         .collect();
     let mut document = render_status_document(state, &scheduler).await;
     document["models"] = Value::Array(models);
@@ -1702,7 +1720,13 @@ async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
     let loaded = loaded_rows(&scheduler.slots);
     let models: Vec<Value> = catalog
         .iter()
-        .map(|entry| model_json(entry, loaded.get(&entry.name)))
+        .map(|entry| {
+            model_json(
+                entry,
+                loaded.get(&entry.name),
+                scheduler.fit_validated.contains(&entry.name),
+            )
+        })
         .collect();
     Ok(Json(json!({ "object": "list", "data": models })))
 }
@@ -2574,17 +2598,20 @@ mod tests {
         };
         for truthy in ["true", "1", "on"] {
             assert_eq!(
-                model_json(&entry(truthy), None)["cpu_offload"],
+                model_json(&entry(truthy), None, false)["cpu_offload"],
                 json!(true),
                 "`{truthy}` is engine-truthy"
             );
         }
-        assert_eq!(model_json(&entry("yes"), None)["cpu_offload"], json!(false));
         assert_eq!(
-            model_json(&entry("false"), None)["cpu_offload"],
+            model_json(&entry("yes"), None, false)["cpu_offload"],
             json!(false)
         );
-        let body = model_json(&entry("true"), None);
+        assert_eq!(
+            model_json(&entry("false"), None, false)["cpu_offload"],
+            json!(false)
+        );
+        let body = model_json(&entry("true"), None, false);
         assert_eq!(body["context"], json!("262144"));
         assert_eq!(body["model_ref"], json!(r"F:\m.gguf"));
         assert_eq!(body["cost"], json!("fixed"));
@@ -2626,10 +2653,10 @@ mod tests {
                 raw: BTreeMap::new(),
             }
         };
-        let books = model_json(&row(Some(31.0)), None);
+        let books = model_json(&row(Some(31.0)), None, false);
         assert_eq!(books["cost_basis"], json!("fit"));
         assert_eq!(books["fit_gb"], json!(31.0));
-        let floored = model_json(&row(Some(20.0)), None);
+        let floored = model_json(&row(Some(20.0)), None, false);
         assert_eq!(
             floored["cost_basis"],
             json!("declared"),
@@ -2639,6 +2666,64 @@ mod tests {
             floored["fit_gb"],
             json!(20.0),
             "the figure itself still rides the payload for the page"
+        );
+    }
+
+    /// R11 session cross-check, wire shape: `fit_validated` appears ONLY as a
+    /// `true` alongside a row the gate books from Fit — never null, never
+    /// `false`, and never beside a row the gate books some other way (the
+    /// verdict is about a Fit booking, so a row with no Fit booking cannot
+    /// carry it even if the set still names the model). Falsifier: emitting
+    /// the flag unconditionally fails the absent legs; dropping the cost-basis
+    /// gate fails the declared leg.
+    #[test]
+    fn the_fit_validated_key_rides_only_a_fit_booked_row_the_session_validated() {
+        let fit_row = |fit: Option<f64>, declared: Option<f64>| ModelEntry {
+            fit_gb: fit,
+            vram_gb: declared,
+            ..ModelEntry {
+                name: "m".to_string(),
+                engine: "llama".to_string(),
+                category: CategoryId::Work,
+                vram_gb: None,
+                gguf_size_gb: None,
+                cost: crate::model::CostClass::Fixed,
+                launch_floor_gb: None,
+                load_timeout_s: None,
+                measured_gb: None,
+                measured_min_gb: None,
+                measured_offload: None,
+                measured_attribution: None,
+                measured_profile: None,
+                fit_gb: None,
+                model_ref: None,
+                serve_model: None,
+                file: None,
+                raw: BTreeMap::new(),
+            }
+        };
+        let validated = model_json(&fit_row(Some(31.0), None), None, true);
+        assert_eq!(validated["cost_basis"], json!("fit"));
+        assert_eq!(
+            validated["fit_validated"],
+            json!(true),
+            "a session-validated Fit row carries the flag"
+        );
+        let unvalidated = model_json(&fit_row(Some(31.0), None), None, false);
+        assert!(
+            unvalidated.get("fit_validated").is_none(),
+            "an unvalidated row keeps the absent key, not null: {unvalidated}"
+        );
+        let declared = model_json(&fit_row(Some(20.0), Some(24.0)), None, true);
+        assert!(
+            declared.get("fit_validated").is_none(),
+            "a row the gate books from its declared floor carries no verdict about a \
+             Fit booking that is not happening: {declared}"
+        );
+        let unprobed = model_json(&fit_row(None, None), None, true);
+        assert!(
+            unprobed.get("fit_validated").is_none() && unprobed.get("fit_gb").is_none(),
+            "a never-probed row is byte-identical to its pre-R11 shape: {unprobed}"
         );
     }
 
@@ -2664,10 +2749,10 @@ mod tests {
             file: None,
             raw: BTreeMap::new(),
         };
-        let body = model_json(&entry, None);
+        let body = model_json(&entry, None, false);
         assert_eq!(body["est_vram_gb"], json!(23.0 * 1.15 + 2.0));
         entry.measured_gb = Some(70.5);
-        let body = model_json(&entry, None);
+        let body = model_json(&entry, None, false);
         assert_eq!(body["measured_gb"], json!(70.5));
         assert!(
             body["est_vram_gb"].is_null(),
@@ -2836,7 +2921,7 @@ mod tests {
             "m",
         )
         .expect("entry");
-        let plain = model_json(&entry, None);
+        let plain = model_json(&entry, None, false);
         assert!(
             plain.get("launched_at").is_none() && plain.get("stale_config").is_none(),
             "an unloaded row carries neither key, not even null: {plain}"
@@ -2845,7 +2930,7 @@ mod tests {
             launched_at: "2026-10-29T03:55:12Z".to_string(),
             stale_config: true,
         };
-        let body = model_json(&entry, Some(&loaded));
+        let body = model_json(&entry, Some(&loaded), false);
         assert_eq!(body["launched_at"], json!("2026-10-29T03:55:12Z"));
         assert_eq!(body["stale_config"], json!(true));
 
@@ -4206,6 +4291,7 @@ mod tests {
                 jobs: Vec::new(),
                 catalog_errors: Vec::new(),
                 stranded_containers: None,
+                fit_validated: Default::default(),
             })
         };
         assert_eq!(document(vec![empty, reported("quiet", None)]), None);
@@ -4247,6 +4333,7 @@ mod tests {
             jobs: Vec::new(),
             catalog_errors: Vec::new(),
             stranded_containers: None,
+            fit_validated: Default::default(),
         };
         let picked = pick_loaded_occupant(&api, &status, CategoryId::Aux)
             .expect("an occupied category must resolve");
@@ -4280,6 +4367,7 @@ mod tests {
             jobs: Vec::new(),
             catalog_errors: Vec::new(),
             stranded_containers: None,
+            fit_validated: Default::default(),
         };
         api.touch("cold");
         let picked = pick_loaded_occupant(&api, &status, CategoryId::Aux)
@@ -4323,6 +4411,7 @@ mod tests {
             jobs: Vec::new(),
             catalog_errors: Vec::new(),
             stranded_containers: None,
+            fit_validated: Default::default(),
         };
         assert!(
             pick_loaded_occupant(&api, &status, CategoryId::Aux).is_none(),

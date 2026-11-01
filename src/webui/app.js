@@ -393,6 +393,16 @@ function renderHeader(status) {
       : anyPending
         ? el("span", { class: "sh-badge", "data-tone": "warn" }, text("listener pending"))
         : null,
+    // R5: reservations the harness counts but no live container renews. The
+    // verdict is the harness's (`status.stranded_containers`, absent when
+    // clean); the page only names who is missing — never a number it invented.
+    (status.stranded_containers || []).length > 0
+      ? el(
+          "span",
+          { class: "sh-badge", "data-tone": "warn" },
+          text(`stranded: ${status.stranded_containers.join(", ")}`),
+        )
+      : null,
   );
   const controls = el("div", { class: "sh-controls" });
   for (const category of CATEGORY_ORDER) controls.append(renderTabItem(status, category));
@@ -436,12 +446,15 @@ function renderHeader(status) {
   );
 }
 
-// What a loaded slot's container admitted it reserves (R9 display chain), or null.
+// The loaded slot whose container reports its reservation (R9 display chain), or
+// null. The slot itself travels, not just its figure: the armed `need_gib` is
+// the gate's side of the same booking, so a cell can name a divergence (F3).
 function slotReportedGb(status, category, modelId) {
-  const slot = status.slots.find(
-    (s) => s.category === category && s.model === modelId && s.container_reported_gb != null,
+  return (
+    status.slots.find(
+      (s) => s.category === category && s.model === modelId && s.container_reported_gb != null,
+    ) ?? null
   );
-  return slot ? slot.container_reported_gb : null;
 }
 
 function modelRow(status, model, category) {
@@ -583,7 +596,8 @@ function modelRow(status, model, category) {
   // floor (the gate books greedy by nominal/estimate, never the floor). Provenance
   // is colour, not prose (operator 2026-11-01); the full sentence lives in the
   // tooltip. A row the page saw loaded keeps that session memory in the tooltip.
-  const slotReported = serving ? slotReportedGb(status, category, model.id) : null;
+  const reportedSlot = serving ? slotReportedGb(status, category, model.id) : null;
+  const slotReported = reportedSlot ? reportedSlot.container_reported_gb : null;
   let costText;
   let costChecked = false;
   let costTitle;
@@ -591,6 +605,20 @@ function modelRow(status, model, category) {
     costText = `${slotReported.toFixed(1)} GiB`;
     costChecked = true;
     costTitle = `engine-reported: this container reserves ${slotReported.toFixed(1)} GiB`;
+  } else if (
+    // The engine calculator's pre-spawn projection: amber until this session's
+    // launch cross-checks the live booking against it (R11), then green — the
+    // same colour-is-provenance rule as every other cell, and the tooltip says
+    // whose number it is because a projection is not a measurement.
+    model.cost_basis === "fit" &&
+    model.fit_gb !== null &&
+    model.fit_gb !== undefined
+  ) {
+    costText = `${model.fit_gb.toFixed(1)} GiB`;
+    costChecked = model.fit_validated === true;
+    costTitle =
+      `engine-projected ${model.fit_gb.toFixed(1)} GiB · engine calculator, pre-spawn, re-verified per launch` +
+      (costChecked ? " · this session's launch confirmed it" : "");
   } else if (
     model.cost_basis === "measured" &&
     model.measured_gb !== null &&
@@ -615,7 +643,7 @@ function modelRow(status, model, category) {
         : "greedy";
     costTitle =
       model.launch_floor_gb !== null && model.launch_floor_gb !== undefined
-        ? `greedy: floor ${model.launch_floor_gb} GiB, unchecked class`
+        ? `greedy: launch floor - dedicated-card intent ${model.launch_floor_gb} GiB, unchecked class`
         : "greedy: no floor declared, unchecked";
   } else if (model.vram_gb !== null) {
     costText = `${model.vram_gb} GiB`;
@@ -626,6 +654,18 @@ function modelRow(status, model, category) {
   } else {
     costText = "—";
     costTitle = "nothing the gate can book yet";
+  }
+  // F3: when the container's self-report and the gate's armed booking disagree,
+  // say both — the cell shows what the container claims while the gate still
+  // books its own figure until a reload re-reads the truth. 0.05 GiB sits under
+  // the 0.1 display quantum, so only real divergence earns the note.
+  if (
+    slotReported !== null &&
+    reportedSlot.need_gib !== null &&
+    reportedSlot.need_gib !== undefined &&
+    Math.abs(reportedSlot.need_gib - slotReported) >= 0.05
+  ) {
+    costTitle += ` · booked ${reportedSlot.need_gib.toFixed(1)} GiB until reload`;
   }
   if (
     !slotReported &&

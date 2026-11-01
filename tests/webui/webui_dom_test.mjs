@@ -347,7 +347,25 @@ const driver = `
     applyState({ ...fixtures["/har/status"], slots: [bookedSlot], models: [bookedModel] });
     check("the loaded row books the slot's live figure, checked",
       rowCost("bookedone").text === "44.0 GiB" &&
-        rowCost("bookedone").cls.includes("sh-cost-checked"), JSON.stringify(rowCost("bookedone")));
+        rowCost("bookedone").cls.includes("sh-cost-checked") &&
+        !rowCost("bookedone").title.includes("until reload"), JSON.stringify(rowCost("bookedone")));
+    // F3: the container says 44 but the gate still books its armed 40 (a config
+    // edit lands after launch) - the cell shows the container's word verbatim
+    // and names the gate's booking in the tooltip, until a reload re-reads.
+    const driftSlot = { ...bookedSlot, need_gib: 40 };
+    applyState({ ...fixtures["/har/status"], slots: [driftSlot], models: [bookedModel] });
+    check("a reported/booked mismatch names both figures",
+      rowCost("bookedone").text === "44.0 GiB" &&
+        rowCost("bookedone").title.includes("booked 40.0 GiB until reload"),
+      JSON.stringify(rowCost("bookedone")));
+    // Under the 0.1 GiB display quantum the two numbers ARE the same figure
+    // on screen - no note for a divergence no cell could show.
+    const nearSlot = { ...bookedSlot, need_gib: 44.04 };
+    applyState({ ...fixtures["/har/status"], slots: [nearSlot], models: [bookedModel] });
+    check("a sub-quantum divergence earns no note",
+      rowCost("bookedone").text === "44.0 GiB" &&
+        !rowCost("bookedone").title.includes("until reload"),
+      JSON.stringify(rowCost("bookedone")));
     const unloadedSlot = { ...bookedSlot, model: null, container_reported_gb: null };
     applyState({ ...fixtures["/har/status"], slots: [unloadedSlot], models: [bookedModel] });
     const after = rowCost("bookedone");
@@ -451,6 +469,24 @@ const driver = `
         cost_basis: "declared",
         launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
         model_ref: "mock://m", serve_model: null, cpu_offload: false },
+      { id: "fitone", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "fit", fit_gb: 31.0,
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "F:/f.gguf", serve_model: null, cpu_offload: false },
+      { id: "fitverified", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "fit", fit_gb: 28.4, fit_validated: true,
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "F:/v.gguf", serve_model: null, cpu_offload: false },
+      { id: "fitfalse", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "fit", fit_gb: 30.0, fit_validated: 1,
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "F:/x.gguf", serve_model: null, cpu_offload: false },
+      // A verdict the server never pairs with this basis (model_json gates it on
+      // cost_source == Fit): the page must still refuse to borrow the green.
+      { id: "declaredfit", engine: "llama", category: "WORK", vram_gb: 24, cost: "fixed",
+        cost_basis: "declared", fit_gb: 20.0, fit_validated: true,
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "F:/d.gguf", serve_model: null, cpu_offload: false },
     ],
   });
   const costs = {};
@@ -471,7 +507,8 @@ const driver = `
   check("greedy row is unchecked floor, number only",
     costs["greedyone"].text === "65 GiB" &&
       costs["greedyone"].cls.includes("sh-cost-unchecked") &&
-      costs["greedyone"].title.includes("floor 65 GiB"), JSON.stringify(costs["greedyone"]));
+      costs["greedyone"].title.includes("launch floor - dedicated-card intent") &&
+      costs["greedyone"].title.includes("65 GiB"), JSON.stringify(costs["greedyone"]));
   check("measured row is checked, number only",
     costs["measuredone"].text === "29.9 GiB" &&
       costs["measuredone"].cls.includes("sh-cost-checked"), JSON.stringify(costs["measuredone"]));
@@ -493,6 +530,36 @@ const driver = `
     costs["ninferone"].text === "26 GiB" &&
       costs["ninferone"].cls.includes("sh-cost-unchecked") &&
       costs["ninferone"].title.includes("declared 26 GiB"), JSON.stringify(costs["ninferone"]));
+  // R11: a Fit booking is the engine calculator's pre-spawn projection - amber
+  // until this session's launch cross-checks it, then green. The gate's basis
+  // alone picks the figure: a declared row that happens to carry a smaller
+  // fit_gb still shows what the gate actually books.
+  check("an unvalidated fit row is amber projection, source named",
+    costs["fitone"].text === "31.0 GiB" &&
+      costs["fitone"].cls.includes("sh-cost-unchecked") &&
+      costs["fitone"].title.includes("engine calculator, pre-spawn") &&
+      !costs["fitone"].title.includes("confirmed"), JSON.stringify(costs["fitone"]));
+  check("a session-validated fit row is green and says so",
+    costs["fitverified"].text === "28.4 GiB" &&
+      costs["fitverified"].cls.includes("sh-cost-checked") &&
+      costs["fitverified"].title.includes("this session's launch confirmed it"),
+    JSON.stringify(costs["fitverified"]));
+  check("a declared row shows the booked declared figure, never the fit one",
+    costs["declaredfit"].text === "24 GiB" &&
+      !costs["declaredfit"].title.includes("engine calculator"),
+    JSON.stringify(costs["declaredfit"]));
+  // Green ONLY on a true session verdict (app.js checks === true): a truthy
+  // non-true flag is not a verdict — 1 is the falsifier that separates the
+  // strict compare from a bare truthiness test. And a verdict cannot ride a
+  // row the gate does not book from Fit.
+  check("a non-true fit verdict never turns the row green",
+    costs["fitfalse"].text === "30.0 GiB" &&
+      costs["fitfalse"].cls.includes("sh-cost-unchecked") &&
+      !costs["fitfalse"].title.includes("confirmed"), JSON.stringify(costs["fitfalse"]));
+  check("a declared row never borrows the fit verdict",
+    costs["declaredfit"].cls.includes("sh-cost-unchecked") &&
+      !costs["declaredfit"].title.includes("confirmed"),
+    JSON.stringify(costs["declaredfit"]));
   // cpu_offload engine scoping: the CPU column (td 3) offers its control only
   // for OFFLOAD_ENGINES rows; a strata row gets a dash and NO checkbox.
   const cpuBoxes = {};
@@ -608,6 +675,31 @@ const driver = `
   check("absent verdicts render no badge (no verdict is not a verdict)",
     listenerBadges().length === 0, listenerBadges().join(" | "));
   applyState(verdictDoc(false, false));
+
+  // ---- R5: stranded reservations ride the same server-verdict badge rule ----
+  // The harness decides which reservations no live container renews; the page
+  // only lists status.stranded_containers verbatim. Absent or empty means the
+  // badge does not exist — an empty list is clean, not a zero-count badge.
+  const strandedBadges = () =>
+    findAll(document.getElementById("sh-header"), "span", "sh-badge")
+      .filter((b) => textOf(b).indexOf("stranded") === 0)
+      .map((b) => b.attrs["data-tone"] + "=" + textOf(b));
+  const strandedDoc = (names) => ({
+    ...fixtures["/har/status"],
+    models: fixtures["/har/models"].data,
+    ...(names === undefined ? {} : { stranded_containers: names }),
+  });
+  applyState(strandedDoc(undefined));
+  check("clean fixture shows no stranded badge", strandedBadges().length === 0,
+    strandedBadges().join(" | "));
+  applyState(strandedDoc(["r5-api-a", "r5-api-b"]));
+  check("stranded containers render the amber badge, named",
+    strandedBadges().join("|") === "warn=stranded: r5-api-a, r5-api-b",
+    strandedBadges().join(" | "));
+  applyState(strandedDoc([]));
+  check("an empty stranded list renders no badge", strandedBadges().length === 0,
+    strandedBadges().join(" | "));
+  applyState(strandedDoc(undefined));
 
   // ---- FINDINGS-16 [3]: a refused config-default write flashes AND re-reads ----
   const flashBox = document.getElementById("sh-flash");
