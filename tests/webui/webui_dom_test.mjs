@@ -79,6 +79,8 @@ globalThis.window = {
   location: { hostname: "127.0.0.1" },
   matchMedia: () => ({ matches: false }),
   localStorage: storage,
+  scrollY: 0,
+  scrollTo: (x, y) => { globalThis.window.scrollY = y; },
   prompt: (message) => {
     globalThis.promptLog.push(message);
     globalThis.promptSawKeys = [...globalThis.store.keys()].join(",");
@@ -702,6 +704,35 @@ const driver = `
   globalThis.requireToken = null;
   globalThis.store.clear();
   quietFlash();
+
+  // Polling noise (operator 2026-11-01): while the operator scrolls or selects,
+  // a tick that only moved the sampled memory numbers must not repaint the page.
+  await refresh();
+  const mainNow = document.getElementById("sh-main");
+  mainNow.children[0].__keeper = "still-mine";
+  globalThis.window.scrollY = 4321;
+  const statusDoc = globalThis.fixtures["/har/status"];
+  const originalEmbDefault = statusDoc.categories[3].default_model;
+  statusDoc.mem.observed_used_gb = 41.5;
+  await refresh();
+  check("volatile-only tick does not repaint the page",
+    mainNow.children.length > 0 && mainNow.children[0].__keeper === "still-mine",
+    "repainted: " + (mainNow.children[0] && mainNow.children[0].__keeper));
+  check("volatile-only tick leaves the scroll alone",
+    globalThis.window.scrollY === 4321, "scrollY=" + globalThis.window.scrollY);
+  check("the bar still shows the new number",
+    textOf(document.getElementById("sh-header")).indexOf("41.5") >= 0,
+    textOf(document.getElementById("sh-header")).slice(0, 90));
+  // A real change repaints - and the operator's scroll comes back to them.
+  const keeper2 = mainNow.children[0];
+  globalThis.window.scrollY = 777;
+  statusDoc.categories[3].default_model = "zzz-emb";
+  await refresh();
+  check("a structural change repaints",
+    mainNow.children[0] !== keeper2 && !mainNow.children[0].__keeper);
+  check("the repaint restores the scroll",
+    globalThis.window.scrollY === 777, "scrollY=" + globalThis.window.scrollY);
+  statusDoc.categories[3].default_model = originalEmbDefault;
 
   for (const [name, ok, extra] of results)
     console.log((ok ? "PASS " : "FAIL ") + name + (ok || !extra ? "" : " :: " + extra));

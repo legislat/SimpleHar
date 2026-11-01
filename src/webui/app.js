@@ -237,59 +237,98 @@ function renderTabItem(status, category) {
   return item;
 }
 
+// Polling quiet (operator 2026-11-01): the NVML and host-RAM samples move every
+// tick, but a memory-only tick is not a page change. Repainting the whole page on
+// it cancelled the operator's scroll and text selection mid-read ("polling noise"),
+// so an unchanged structural document is now PATCHED in place - the bars get their
+// new numbers through the painters registered by the last full render, and no
+// other node is touched. A real change still repaints, with the scroll restored.
+let volatilePainters = [];
+let lastRenderKey = "";
+
+// The render gate's comparison key: the whole document EXCEPT the fields that
+// only ever drift between samples (witness/RAM readings, slot idle seconds).
+function stateKey(status, models) {
+  if (!status) return "";
+  const masked = { ...status, mem: { ...(status.mem || {}) }, models: null };
+  // Mask the drifting values but KEEP their presence: a bar appearing or vanishing
+  // (the card becomes sampleable, RAM stops being) is structural and must repaint.
+  masked.mem.observed_used_gb =
+    status.mem && status.mem.observed_used_gb == null ? null : 1;
+  masked.mem.ram_used_gb = status.mem && status.mem.ram_used_gb ? 1 : null;
+  if (Array.isArray(masked.slots)) {
+    masked.slots = masked.slots.map((slot) => (slot ? { ...slot, idle_s: null } : slot));
+  }
+  return JSON.stringify(masked) + "|" + JSON.stringify(models || []);
+}
+
+// Applies a memory-only tick to the already-painted bars (after a full render
+// registered the painters; before or without them, nothing is painted).
+function patchVolatile(status) {
+  const mem = status && status.mem;
+  if (!mem) return;
+  for (const paint of volatilePainters) paint(mem);
+}
+
 function renderMemory(status) {
   const mem = status.mem;
-  const reservePct = (mem.reserve_gb / mem.total_gb) * 100;
-  const observed = mem.observed_used_gb;
-  const observedPct =
-    observed === null || observed === undefined
-      ? null
-      : Math.min(100, (observed / mem.total_gb) * 100);
   const bars = [];
+  volatilePainters = [];
   // One bar, one truth: what the card itself reports. The ledger bar left with the
   // ledger (operator 2026-10-26) — nothing budgets against it any more, and two
   // bars showing two "VRAM used" numbers is how the 69.7-vs-1.8 GiB lie survived
   // a release. Hatched = the reserve band admission keeps clear; "booked" = loads
   // committed but not yet installed, which the card cannot have accounted for.
-  if (observedPct !== null) {
+  if (mem.observed_used_gb !== null && mem.observed_used_gb !== undefined) {
     // R1: the witness states its own attribution capability; the page prefers that
     // verdict over inferring it from a number happening to be absent (an idle card is
     // capable, a WDDM-degraded card is not — both show no attributed bytes). An
     // token outside the closed set is the UNAVAILABLE sentence, never a crash: the
     // page must degrade one label, not repaint nothing (review 2026-10-31).
-    const attribution =
-      mem.attribution === "unavailable" ||
-      (mem.attribution == null && mem.attributed_gb == null) ||
-      (mem.attribution !== "per_process" && mem.attributed_gb == null)
-        ? "per-process attribution unavailable"
-        : mem.attribution === "per_process" && mem.attributed_gb == null
-          ? "per-process capable (card idle)"
-          : "attributed " + Number(mem.attributed_gb).toFixed(1) + " GiB";
-    const booked =
-      mem.booked_gb > 0 ? "; booked " + mem.booked_gb.toFixed(1) + " GiB in flight" : "";
-    const reported =
-      mem.container_reported_gb != null && mem.container_reported_gb > 0
-        ? "; containers report " + mem.container_reported_gb.toFixed(1) + " GiB reserved"
-        : "";
+    const observedOf = (m) => Math.min(100, (m.observed_used_gb / m.total_gb) * 100);
+    const reservePct = (mem.reserve_gb / mem.total_gb) * 100;
+    const label = el("label", {});
+    const fill = el("i", {});
     // Compaction (operator 2026-11-01): the bar label carries only the number the
     // operator reads; the honesty sentence - source, attribution, booking, reserve
     // hatch - moved to the tooltip, same words, still one VRAM bar and never a
-    // fabricated zero.
+    // fabricated zero. The same paint() words serve the first render and every
+    // memory-only patch, so the two can never disagree.
+    const paint = (m) => {
+      const attribution =
+        m.attribution === "unavailable" ||
+        (m.attribution == null && m.attributed_gb == null) ||
+        (m.attribution !== "per_process" && m.attributed_gb == null)
+          ? "per-process attribution unavailable"
+          : m.attribution === "per_process" && m.attributed_gb == null
+            ? "per-process capable (card idle)"
+            : "attributed " + Number(m.attributed_gb).toFixed(1) + " GiB";
+      const booked =
+        m.booked_gb > 0 ? "; booked " + m.booked_gb.toFixed(1) + " GiB in flight" : "";
+      const reported =
+        m.container_reported_gb != null && m.container_reported_gb > 0
+          ? "; containers report " + m.container_reported_gb.toFixed(1) + " GiB reserved"
+          : "";
+      label.setAttribute(
+        "title",
+        `VRAM ${m.observed_used_gb.toFixed(1)} / ${m.total_gb.toFixed(0)} GiB (${m.source}; ${attribution}${booked}${reported}; hatched = ${m.reserve_gb.toFixed(1)} GiB reserve)`,
+      );
+      label.replaceChildren(
+        text(`VRAM ${m.observed_used_gb.toFixed(1)} / ${m.total_gb.toFixed(0)} GiB`),
+      );
+      fill.setAttribute("style", `width:${observedOf(m)}%`);
+    };
+    paint(mem);
+    volatilePainters.push(paint);
     bars.push(
       el(
         "div",
         {},
-        el(
-          "label",
-          {
-            title: `VRAM ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (${mem.source}; ${attribution}${booked}${reported}; hatched = ${mem.reserve_gb.toFixed(1)} GiB reserve)`,
-          },
-          text(`VRAM ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB`),
-        ),
+        label,
         el(
           "div",
           { class: "sh-bar", "data-tone": "observed" },
-          el("i", { style: `width:${observedPct}%` }),
+          fill,
           el("u", {
             class: "sh-reserve",
             style: `left:${(100 - reservePct).toFixed(2)}%;width:${reservePct.toFixed(2)}%`,
@@ -301,20 +340,25 @@ function renderMemory(status) {
   // A1: host RAM context (informational; admission budgets VRAM, never RAM). Omit
   // the whole bar when the platform cannot sample it, rather than show zeros.
   if (mem.ram_total_gb) {
-    const ramPct = Math.min(100, (mem.ram_used_gb / mem.ram_total_gb) * 100);
+    const ramLabel = el("label", {});
+    const ramFill = el("i", {});
+    const paintRam = (m) => {
+      ramLabel.setAttribute(
+        "title",
+        `RAM ${m.ram_used_gb.toFixed(1)} / ${m.ram_total_gb.toFixed(0)} GiB (host, informational)`,
+      );
+      ramLabel.replaceChildren(
+        text(`RAM ${m.ram_used_gb.toFixed(1)} / ${m.ram_total_gb.toFixed(0)} GiB`),
+      );
+      ramFill.setAttribute(
+        "style",
+        `width:${Math.min(100, (m.ram_used_gb / m.ram_total_gb) * 100)}%`,
+      );
+    };
+    paintRam(mem);
+    volatilePainters.push(paintRam);
     bars.push(
-      el(
-        "div",
-        {},
-        el(
-          "label",
-          {
-            title: `RAM ${mem.ram_used_gb.toFixed(1)} / ${mem.ram_total_gb.toFixed(0)} GiB (host, informational)`,
-          },
-          text(`RAM ${mem.ram_used_gb.toFixed(1)} / ${mem.ram_total_gb.toFixed(0)} GiB`),
-        ),
-        el("div", { class: "sh-bar", "data-tone": "ram" }, el("i", { style: `width:${ramPct}%` })),
-      ),
+      el("div", {}, ramLabel, el("div", { class: "sh-bar", "data-tone": "ram" }, ramFill)),
     );
   }
   return el("div", { class: "sh-mem" }, ...bars);
@@ -739,6 +783,10 @@ function render() {
   paintTokenControl();
   const status = state.status;
   if (!status) return;
+  // A full repaint replaces every node, so the operator's scroll position is
+  // saved across it (text selection cannot survive a real content change and
+  // does not need to; memory-only ticks never reach this function at all).
+  const savedScroll = window.scrollY || 0;
   const headerHost = document.getElementById("sh-header");
   headerHost.replaceChildren(renderHeader(status));
   const mainHost = document.getElementById("sh-main");
@@ -784,6 +832,8 @@ function render() {
       text("SimpleHar SE — slots, jobs and refusals straight from /har/*"),
     ),
   );
+  window.scrollTo(0, savedScroll);
+  lastRenderKey = stateKey(status, state.models);
 }
 
 // ---------- event stream with polling fallback (Step 14) ----------
@@ -809,7 +859,8 @@ function applyState(doc) {
   state.status = doc;
   state.models = doc.models || [];
   recordReportedFootprints(doc);
-  render();
+  if (stateKey(state.status, state.models) === lastRenderKey) patchVolatile(state.status);
+  else render();
 }
 
 async function refresh() {
@@ -836,7 +887,8 @@ async function refresh() {
   state.models = catalog.data;
   recordReportedFootprints(status);
   try {
-    render();
+    if (stateKey(state.status, state.models) === lastRenderKey) patchVolatile(state.status);
+    else render();
   } catch (error) {
     flashError(error);
   }
