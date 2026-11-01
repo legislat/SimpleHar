@@ -51,6 +51,16 @@ pub struct BudgetFacts {
     pub budget: Option<Gibibytes>,
     /// Physical free the witness saw at decision time; `None` when it was down.
     pub observed_free: Option<Gibibytes>,
+    /// R3 (operator GO 2026-11-01): the share of the card that no eviction the
+    /// harness may perform can reclaim — foreign holders, non-evictable occupants
+    /// and the driver's own baseline. `None` when the witness was down.
+    pub unreleasable: Option<Gibibytes>,
+    /// R3: what the card physically held at decision time (the witness's own
+    /// `used_gib`), quoted beside `unreleasable` so the split is checkable.
+    pub used_gib: Option<Gibibytes>,
+    /// R3: the harness's whole ledger (Σ occupant bookings) beside the physical
+    /// reading, so a paper deficit between the two is visible in the refusal.
+    pub booked_total: Option<Gibibytes>,
 }
 
 impl BudgetFacts {
@@ -72,11 +82,71 @@ impl BudgetFacts {
         {
             parts.push(format!("observed free {observed}"));
         }
-        if parts.is_empty() {
+        let sentence = if parts.is_empty() {
             String::new()
         } else {
             format!(" ({})", parts.join(", "))
+        };
+        // R3: the refusal must name what the operator cannot release, so the
+        // dead end ("free 30, need 40 — but WHO holds the 30?") is diagnosable
+        // from the message alone. Printed only when the number is real.
+        match self.unreleasable {
+            Some(u) if u.0 > DISAGREE_GIB => {
+                let mut names = Vec::new();
+                if let Some(used) = self.used_gib {
+                    names.push(format!("card holds {used}"));
+                }
+                if let Some(booked) = self.booked_total {
+                    names.push(format!("booked {booked}"));
+                }
+                let beside = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", names.join(", "))
+                };
+                format!("{sentence}; {u} unreleasable{beside}")
+            }
+            _ => sentence,
         }
+    }
+}
+
+/// Who holds the card, graded from the **movement** of unaccounted memory across
+/// the sample window (R3, ruling 10). A static foreign holder is not the
+/// problem — the total-diff rides a baseline that already discounts it; the
+/// problem is foreign memory *moving* while the reading is taken, which turns a
+/// free-memory delta into someone else's story. This grades *trust in a
+/// `total_diff` figure* — it never touches the physical gate, which reads the
+/// raw card either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardOccupancy {
+    /// Unaccounted memory did not move: a `total_diff` taken across the window
+    /// is the engine's real footprint.
+    Quiescent,
+    /// Unaccounted memory moved, but less than the engine's own growth could
+    /// explain: the `total_diff` is noisy-but-usable, keep it with its label.
+    OwnDominated,
+    /// Unaccounted memory moved by more than the engine's own growth: the
+    /// window's delta is a foreign story, not a footprint.
+    ForeignDominated,
+}
+
+/// Grades one sample window: `foreign_growth_gib` is how much further the
+/// unaccounted remainder of the card drifted between admit and sample (it may
+/// be negative — shrinking foreign memory is as unaccounted as growing), and
+/// `own_growth_gib` is the footprint the fold itself attributes to the engine.
+#[must_use]
+pub fn grade_card_occupancy(
+    foreign_growth_gib: f64,
+    own_growth_gib: f64,
+    tolerance_gib: f64,
+) -> CardOccupancy {
+    if foreign_growth_gib <= tolerance_gib {
+        CardOccupancy::Quiescent
+    } else if foreign_growth_gib <= own_growth_gib.max(0.0) {
+        CardOccupancy::OwnDominated
+    } else {
+        CardOccupancy::ForeignDominated
     }
 }
 
@@ -134,7 +204,7 @@ pub enum AdmissionError {
         /// Reserve subtracted before the gate.
         reserve: Gibibytes,
         /// The inputs `free` was derived from (ledger / observed).
-        facts: BudgetFacts,
+        facts: Box<BudgetFacts>,
         /// Candidates the planner considered (may be empty when none exist).
         victims_considered: Vec<VictimInfo>,
         /// Models that cannot be evicted, with reasons.
@@ -156,7 +226,7 @@ pub enum AdmissionError {
         /// Reserve subtracted before the gate.
         reserve: Gibibytes,
         /// The inputs `free` was derived from (ledger / observed).
-        facts: BudgetFacts,
+        facts: Box<BudgetFacts>,
         /// Candidates the planner considered (may be empty when none exist).
         victims_considered: Vec<VictimInfo>,
         /// Models that cannot be evicted, with reasons.
@@ -482,7 +552,7 @@ mod tests {
             min_free: Gibibytes(6.0),
             free: Gibibytes(4.0),
             reserve: Gibibytes(2.0),
-            facts: BudgetFacts::default(),
+            facts: Box::default(),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
         }
@@ -515,10 +585,11 @@ mod tests {
             need: Gibibytes(34.0),
             free: Gibibytes(1.8),
             reserve: Gibibytes(2.0),
-            facts: BudgetFacts {
+            facts: Box::new(BudgetFacts {
                 budget: Some(Gibibytes(69.7)),
                 observed_free: Some(Gibibytes(1.8)),
-            },
+                ..Default::default()
+            }),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
         }
@@ -531,10 +602,11 @@ mod tests {
             need: Gibibytes(34.0),
             free: Gibibytes(30.0),
             reserve: Gibibytes(2.0),
-            facts: BudgetFacts {
+            facts: Box::new(BudgetFacts {
                 budget: Some(Gibibytes(30.0)),
                 observed_free: Some(Gibibytes(30.0)),
-            },
+                ..Default::default()
+            }),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
         }
@@ -554,5 +626,85 @@ mod tests {
             free_gb(Gibibytes(72.0), Gibibytes(2.0), Gibibytes(80.0)).0,
             -10.0
         ));
+    }
+
+    /// R3: the refusal names the memory the operator cannot release, beside the
+    /// physical reading and the ledger, so the dead end is diagnosable from the
+    /// message alone. A zero or absent figure stays a clean sentence (the
+    /// `plain`-refusal rule above).
+    #[test]
+    fn refusal_names_the_unreleasable_share_of_the_card() {
+        let foreign_held = AdmissionError::Insufficient {
+            need: Gibibytes(40.0),
+            free: Gibibytes(30.0),
+            reserve: Gibibytes(2.0),
+            facts: Box::new(BudgetFacts {
+                budget: Some(Gibibytes(30.0)),
+                observed_free: Some(Gibibytes(30.0)),
+                unreleasable: Some(Gibibytes(18.4)),
+                used_gib: Some(Gibibytes(40.0)),
+                booked_total: Some(Gibibytes(21.6)),
+            }),
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            foreign_held.contains("18.4 GiB unreleasable (card holds 40.0 GiB, booked 21.6 GiB)"),
+            "{foreign_held}"
+        );
+        // A quiet card must not grow a tail about unreleasable memory: no
+        // figure, and a zero figure, both stay a clean sentence.
+        let quiet = AdmissionError::Insufficient {
+            need: Gibibytes(40.0),
+            free: Gibibytes(30.0),
+            reserve: Gibibytes(2.0),
+            facts: Box::default(),
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
+        }
+        .to_string();
+        assert!(!quiet.contains("unreleasable"), "{quiet}");
+        let zero = BudgetFacts {
+            unreleasable: Some(Gibibytes(0.0)),
+            ..Default::default()
+        }
+        .detail(Gibibytes(30.0));
+        assert!(zero.is_empty(), "{zero}");
+    }
+
+    /// R3 ruling 10: the fold grades the window by how far UNACCOUNTED memory
+    /// moved, not by how much sits there: a static foreign holder is already
+    /// discounted by the baseline, and refusing those would blank every honest
+    /// co-serve fold. The clamp legs matter: shrinking foreign memory grades
+    /// quiescent, and foreign movement beyond the engine's own growth is a
+    /// foreign story whatever the share.
+    #[test]
+    fn occupancy_grades_foreign_movement_across_the_window() {
+        assert_eq!(
+            grade_card_occupancy(0.1, 10.0, 0.3),
+            CardOccupancy::Quiescent,
+            "unaccounted memory that did not move keeps the fold trusted"
+        );
+        assert_eq!(
+            grade_card_occupancy(-5.0, 10.0, 0.3),
+            CardOccupancy::Quiescent,
+            "shrinking foreign memory moves nothing the fold could blame itself"
+        );
+        assert_eq!(
+            grade_card_occupancy(10.0, 20.0, 0.3),
+            CardOccupancy::OwnDominated,
+            "10 GiB foreign movement against 20 own growth is still own-explainable"
+        );
+        assert_eq!(
+            grade_card_occupancy(30.0, 20.0, 0.3),
+            CardOccupancy::ForeignDominated,
+            "30 GiB moved that the engine's own growth cannot explain"
+        );
+        assert_eq!(
+            grade_card_occupancy(1.0, 0.0, 0.3),
+            CardOccupancy::ForeignDominated,
+            "movement with nothing of its own to blame it on is foreign"
+        );
     }
 }

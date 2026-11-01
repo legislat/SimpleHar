@@ -599,6 +599,7 @@ enum ActorMsg {
         total_diff: f64,
         own: Option<f64>,
         total_gib: f64,
+        used_gib: f64,
     },
     /// The container's own startup `MemorySummary` figure (R9): one shot per launch,
     /// fetched from `docker logs` at readiness. The reserved footprint is static for
@@ -657,6 +658,7 @@ struct Reading {
     total_diff: f64,
     own: Option<f64>,
     total_gib: f64,
+    used_gib: f64,
 }
 
 /// One figure handed to [`ActorState::fold`], bundled with the launch it belongs to
@@ -1167,6 +1169,7 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 total_diff,
                 own,
                 total_gib,
+                used_gib,
             } => state.on_measured(
                 &model,
                 &ticket,
@@ -1174,6 +1177,7 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                     total_diff,
                     own,
                     total_gib,
+                    used_gib,
                 },
             ),
             ActorMsg::MeasuredEngineReport {
@@ -2325,17 +2329,24 @@ impl ActorState {
             total_diff,
             own,
             total_gib,
+            used_gib,
         } = reading;
         // One lookup for the spawn this reading belongs to, by the `(model, ticket)`
         // the sampler carries: the same row answers for the tenant subtraction below
         // (`other_need_at_admit`) and for the measured anchor. A reading whose spawn
         // row cannot be found — or was never anchored at spawn — is not folded: the
         // harness cannot say what a launch it cannot identify ran under.
-        let Some((at_admit, anchor)) = self
+        let Some((at_admit, observed_at_admit, anchor)) = self
             .jobs
             .iter()
             .find(|(_, job)| job.model == model && job.spawned.as_ref() == Some(ticket))
-            .map(|(_, job)| (job.other_need_at_admit, job.measured.clone()))
+            .map(|(_, job)| {
+                (
+                    job.other_need_at_admit,
+                    job.observed_at_admit,
+                    job.measured.clone(),
+                )
+            })
         else {
             return;
         };
@@ -2367,6 +2378,38 @@ impl ActorState {
             (true, false) => crate::model::MeasuredAttribution::PerProcess,
             _ => crate::model::MeasuredAttribution::TotalDiff,
         };
+        // R3 ruling 10 (operator GO 2026-11-01): a total-diff is a footprint only
+        // while the unaccounted remainder of the card stands still. A static
+        // foreign holder is already discounted by the admit baseline; memory that
+        // MOVES inside the window is what turned qwen-turbo's range into the
+        // 23.8–59.3 noise (blanked by the operator's ruling 2026-11-01). When the
+        // unaccounted movement exceeds what this engine's own growth explains,
+        // the fold is someone else's story and nothing is minted — a labelled
+        // blank beats a stand-in lie. A witness that never answered at admit has
+        // no baseline to move from, and keeps the pre-R3 behavior.
+        if attribution == crate::model::MeasuredAttribution::TotalDiff {
+            if let Some(free_at_admit) = observed_at_admit {
+                let foreign_at_admit = (total_gib - free_at_admit - at_admit).max(0.0);
+                let foreign_now = (used_gib - (attributed + booked_others).max(0.0)).max(0.0);
+                let grade = crate::budget::grade_card_occupancy(
+                    foreign_now - foreign_at_admit,
+                    attributed,
+                    self.cfg.witness_tolerance_gb,
+                );
+                if grade == crate::budget::CardOccupancy::ForeignDominated {
+                    tracing::warn!(
+                        model,
+                        used_gib,
+                        attributed,
+                        booked_others,
+                        foreign_at_admit,
+                        foreign_now,
+                        "measured total-diff skipped: unaccounted memory moved more than the engine grew; no range minted from someone else's story"
+                    );
+                    return;
+                }
+            }
+        }
         self.fold(&FoldPlan {
             model: model.to_string(),
             ticket: ticket.clone(),
@@ -2702,6 +2745,9 @@ impl ActorState {
                 self.ledger_sum(),
             )),
             observed_free: observed_free.map(Gibibytes),
+            // R3: filled in the refusal arm from the planner's candidate set;
+            // a passing admission never prints them.
+            ..Default::default()
         };
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.free_at_admit = Some(free);
@@ -2784,6 +2830,19 @@ impl ActorState {
                 Err((considered, blockers)) => {
                     self.step(job_id, SwapState::AdmitFail);
                     let reserve = Gibibytes(self.cfg.vram_reserve_gb);
+                    // R3 (operator GO 2026-11-01): the refusal must name the
+                    // memory no eviction can reclaim — the card minus the
+                    // same-slot replacement and every evictable candidate.
+                    // Blockers ride inside it (they are exactly the part the
+                    // harness may not release) and are named beside it.
+                    let mut facts = facts;
+                    if observed_free.is_some() {
+                        let releasable =
+                            victim_need + considered.iter().map(|v| v.need_gib).sum::<f64>();
+                        facts.unreleasable = Some(Gibibytes((occupied - releasable).max(0.0)));
+                        facts.used_gib = Some(Gibibytes(occupied));
+                        facts.booked_total = Some(self.ledger_sum());
+                    }
                     let error =
                         if floor_deficit > 0.0 && floor_deficit >= need_deficit {
                             AdmissionError::BelowLaunchFloor {
@@ -2793,7 +2852,7 @@ impl ActorState {
                                 // G13: the figure the gate actually compared.
                                 free,
                                 reserve,
-                                facts,
+                                facts: Box::new(facts),
                                 victims_considered: considered,
                                 blockers,
                             }
@@ -2803,7 +2862,7 @@ impl ActorState {
                                 // G13: the compared figure, never the flattering one.
                                 free,
                                 reserve,
-                                facts,
+                                facts: Box::new(facts),
                                 victims_considered: considered,
                                 blockers,
                             }
@@ -3743,6 +3802,7 @@ impl ActorState {
                                     total_diff,
                                     own: sample.own_gib(&ctx.own_pids),
                                     total_gib: sample.total_gib,
+                                    used_gib: sample.used_gib,
                                 })
                                 .is_err()
                             {
@@ -4566,6 +4626,7 @@ mod tests {
                     total_diff: attributed,
                     own: Some(attributed),
                     total_gib: 24.0,
+                    used_gib: attributed + 0.1,
                 },
             );
         }
@@ -5482,6 +5543,7 @@ mod tests {
                 total_diff: 12.0,
                 own: None,
                 total_gib: 72.0,
+                used_gib: 13.0,
             },
         );
         assert_eq!(
@@ -5542,6 +5604,7 @@ mod tests {
                 total_diff: 12.0,
                 own: None,
                 total_gib: 24.0,
+                used_gib: 13.0,
             },
         );
         let entry = &state.catalog[0];
@@ -5572,6 +5635,57 @@ mod tests {
             Some(crate::model::MeasuredAttribution::EngineReport)
         );
         assert_eq!(entry.cost_source(), crate::model::CostSource::Measured);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3 ruling 10: a total-diff read on a foreign-dominated card mints nothing.
+    /// The card holds far more than this engine plus the other occupants can
+    /// account for, so the delta is someone else's story — absence, labelled by
+    /// the warn, never a 23.8–59.3 stand-in. Falsifier: deleting the
+    /// `ForeignDominated` guard persists the 12.0 GiB reading to the yaml.
+    #[tokio::test]
+    async fn a_foreign_dominated_card_mints_no_total_diff() {
+        let dir = crate::testutil::temp_dir("fold-foreign-dominated");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("fd.yaml");
+        std::fs::write(&yaml, "engine: ninfer\nvram_gb: 20\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "fd");
+        let ticket = fold_ticket(19_021);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_021);
+        // The admit baseline: the card was near-empty when this load was admitted,
+        // so everything it holds beyond this engine at sample time is memory that
+        // MOVED during the window — 26 GiB of foreign story against a 12 GiB delta.
+        if let Some((_, job)) = state
+            .jobs
+            .iter_mut()
+            .find(|(_, j)| j.spawned.as_ref() == Some(&ticket))
+        {
+            job.observed_at_admit = Some(50.0);
+        }
+
+        state.on_measured(
+            "fd",
+            &ticket,
+            super::Reading {
+                total_diff: 12.0,
+                own: None,
+                total_gib: 72.0,
+                used_gib: 60.0,
+            },
+        );
+        assert_eq!(
+            state.catalog[0].measured_gb, spawned.measured_gb,
+            "a foreign-dominated reading must not mint a range"
+        );
+        assert_eq!(state.catalog[0].measured_attribution, None);
+        let written = std::fs::read_to_string(&yaml).expect("file readable");
+        assert!(
+            !written.contains("measured_gb"),
+            "nothing reaches the yaml: {written}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5722,6 +5836,7 @@ mod tests {
                 total_diff: 18.0,
                 own: None,
                 total_gib: 24.0,
+                used_gib: 19.0,
             },
         );
         assert_eq!(

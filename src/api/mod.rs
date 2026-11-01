@@ -2686,10 +2686,11 @@ mod tests {
             need: crate::budget::Gibibytes(50.0),
             free: crate::budget::Gibibytes(20.0),
             reserve: crate::budget::Gibibytes(2.0),
-            facts: crate::budget::BudgetFacts {
+            facts: Box::new(crate::budget::BudgetFacts {
                 budget: Some(crate::budget::Gibibytes(20.0)),
                 observed_free: None,
-            },
+                ..Default::default()
+            }),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
         });
