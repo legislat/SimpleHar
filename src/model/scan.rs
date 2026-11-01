@@ -61,6 +61,13 @@ pub enum ScanKind {
     /// and ninfer key families — is scoped the same data-driven way, so a new
     /// row knob needs no new scan code.
     InertKey,
+    /// The row still rides the verbatim legacy `ninfer_autostart` launch path:
+    /// deprecated by ruling 18b (2026-11-01) and removed after a green Wave C.
+    /// Warn-only across the whole compat window: the row keeps publishing and
+    /// loading exactly as before — the scan only names it, so the operator
+    /// converges every card on the harness-rendered `ninfer_image` template
+    /// before the gated removal item lands.
+    Deprecated,
     /// A yaml file the scan refuses to publish (Fork C doctrine): it carried at
     /// least one problem line — then the `reason` names every offending line — or it
     /// parsed clean but yielded **no keys at all**, which the `reason` says outright
@@ -651,6 +658,34 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 // warns and the entry publishes (ruling D stands).
                 for key in map.keys() {
                     if SILENT_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
+                    // Ruling 18b interim: a ninfer row still riding the verbatim
+                    // `ninfer_autostart` launch path is deprecated, not refused —
+                    // the compat window keeps it loadable until a green Wave C
+                    // lands the removal. A row that also declares `ninfer_image`
+                    // does not ride this path (spawn refuses the pair as an
+                    // ambiguous launch source), so only the verbatim shape earns
+                    // the deprecation notice.
+                    if key == "ninfer_autostart"
+                        && entry.engine == crate::ownership::NINFER_ENGINE
+                        && map
+                            .get("ninfer_autostart")
+                            .is_some_and(|value| !value.trim().is_empty())
+                        && !map
+                            .get("ninfer_image")
+                            .is_some_and(|value| !value.trim().is_empty())
+                    {
+                        catalog.errors.push(ScanError {
+                            kind: ScanKind::Deprecated,
+                            file: file_name.clone(),
+                            reason: format!(
+                                "model `{}` uses legacy `ninfer_autostart`: deprecated, will \
+                                 be removed after the next verification window; adopt the \
+                                 harness-rendered `ninfer_image` template",
+                                entry.name
+                            ),
+                        });
                         continue;
                     }
                     // `ninfer_profile_<name>` is the family of custom-profile
@@ -2066,6 +2101,67 @@ mod tests {
         );
     }
 
+    /// Ruling 18b interim: a verbatim legacy `ninfer_autostart` row is deprecated
+    /// but stays loadable across the compat window — the scan warns exactly one
+    /// `Deprecated` naming the row and the field, points at the template path, and
+    /// still publishes the entry; a modern `ninfer_image` row gets no such report.
+    /// Falsifier: making it a refusal shrinks `models.len()`; firing on the
+    /// template row or on both rows breaks the one-warn / silence pair.
+    #[test]
+    fn a_legacy_autostart_row_warns_deprecated_and_still_publishes() {
+        let dir = crate::testutil::temp_dir("scan-deprecated");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("legacy-row.yaml"),
+            "engine: ninfer\nvram_gb: 20\nninfer_autostart: /opt/legacy.sh\nninfer_container: legacy-box\n",
+        )
+        .expect("write legacy");
+        std::fs::write(
+            dir.join("modern-row.yaml"),
+            "engine: ninfer\nvram_gb: 20\nninfer_image: ninfer:local\nninfer_container: modern-box\n",
+        )
+        .expect("write modern");
+        let catalog = scan_dir(&dir);
+        assert_eq!(
+            catalog.models.len(),
+            2,
+            "warn not refuse: both rows scan into the catalog during the compat window: {:?}",
+            catalog.errors
+        );
+        let deprecated: Vec<&ScanError> = catalog
+            .errors
+            .iter()
+            .filter(|e| e.kind == ScanKind::Deprecated)
+            .collect();
+        assert_eq!(
+            deprecated.len(),
+            1,
+            "exactly one deprecation warn, for the one legacy row: {:?}",
+            catalog.errors
+        );
+        let warn = deprecated[0];
+        assert!(
+            warn.file.contains("legacy-row"),
+            "the warn carries the offending file: {warn:?}"
+        );
+        assert!(
+            warn.reason.contains("`legacy-row`")
+                && warn.reason.contains("legacy `ninfer_autostart`")
+                && warn.reason.contains("`ninfer_image`"),
+            "the warn names the row and the field and points at the template: {}",
+            warn.reason
+        );
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .all(|e| !e.file.contains("modern-row")),
+            "the template row must stay completely silent: {:?}",
+            catalog.errors
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Slice 10c (full `extra_args` enforcement): a hostile extra word refuses
     /// the FILE at rescan — never published, never reaching a spawn that could
     /// evict a resident for the doomed launch — and the refusal names both the
@@ -2633,6 +2729,7 @@ mod tests {
             (ScanKind::EngineUnavailable, "engine_unavailable"),
             (ScanKind::UnknownKey, "unknown_key"),
             (ScanKind::InertKey, "inert_key"),
+            (ScanKind::Deprecated, "deprecated"),
             (ScanKind::InvalidYaml, "invalid_yaml"),
             (ScanKind::DuplicateName, "duplicate_name"),
             (ScanKind::PolicyRefused, "policy_refused"),

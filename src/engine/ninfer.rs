@@ -7,8 +7,9 @@
 //! [`crate::process`], and launched from the staged copy — so every ninfer start
 //! complies with what the harness can check and expect (`--restart no`,
 //! loopback-only publish, bounded logs, pre-reap). `ninfer_autostart` remains as the
-//! compatibility path for pre-template yamls: the operator's script runs verbatim
-//! under the same positional contract (`$1` profile, `$2` key|nokey, `$3`
+//! compatibility path for pre-template yamls (deprecated by ruling 18b: the scan
+//! warns every such row, removal rides a green Wave C): the operator's script runs
+//! verbatim under the same positional contract (`$1` profile, `$2` key|nokey, `$3`
 //! host-publish port). Because the container outlives the short-lived `wsl.exe`
 //! client, the spec carries the container name so the runtime reaps it with
 //! `docker rm -f` on release (v3.3 `Proc::Container` parity), and readiness chains
