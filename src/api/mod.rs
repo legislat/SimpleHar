@@ -1283,6 +1283,30 @@ fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>) -> Value {
         "measured_gb": entry.measured_gb,
         "measured_min_gb": entry.measured_min_gb,
         "measured_offload": entry.measured_offload,
+        // Which figure admission actually books, stated by the gate's own decision
+        // (one derivation; the page renders this and never re-computes the
+        // precedence — the duplication-review rule made visible for R9).
+        "cost_basis": match entry.cost_source() {
+            crate::model::CostSource::Declared => "declared",
+            crate::model::CostSource::Measured => "measured",
+            crate::model::CostSource::Estimate => "estimate",
+            crate::model::CostSource::Undeclared => "undeclared",
+        },
+        // R9/R1: whose number the measured pair is. The page shows it and admits
+        // nothing from it — only a `cost_basis: "measured"` row ever renders a
+        // provenance tag, which a `total_diff` can never become (it never books),
+        // so the token alone is display context, never a booking claim.
+        "measured_attribution": entry
+            .measured_attribution
+            .map(crate::model::MeasuredAttribution::as_str),
+        // The displayed number == what admission must have free, shown only when the
+        // provenance actually books (the K-round page-must-not-derive rule: the gate's
+        // answer is computed here, never reconstructed in the browser). The page's
+        // Cost cell renders `measured_gb` under the same condition, so this field is
+        // the cross-check the operator's forensic log reads against the gate.
+        "required_to_free_gb": (entry.cost_source() == crate::model::CostSource::Measured)
+            .then_some(entry.measured_gb)
+            .flatten(),
         "cost": entry.cost,
         "launch_floor_gb": entry.launch_floor_gb,
         "load_timeout_s": entry.load_timeout_s,
@@ -1314,6 +1338,29 @@ async fn merged_state(state: &ApiState) -> Result<Value, ApiError> {
     let mut document = render_status_document(state, &scheduler).await;
     document["models"] = Value::Array(models);
     Ok(document)
+}
+
+/// The R9 sum for the memory bar: what the running containers said they reserve,
+/// summed over the loaded occupants' per-slot `engine_report` figures only (the
+/// scheduler snapshot carries each container's own report, so `/har/status` and the
+/// SSE push derive the identical number — review 2026-10-31: threading it only
+/// through the SSE build made the annotation unreachable on the poll path, which is
+/// the ONLY path a token-gated page has). `None` when no loaded container has
+/// reported — a container that never spoke must not render as "reserved 0 GiB"
+/// next to a card that disagrees. Same-name occupants on two slots are one
+/// container: the sum takes the model's figure once.
+fn container_reported_gb(scheduler: &SchedulerStatus) -> Option<f64> {
+    let mut per_model: BTreeMap<&str, f64> = BTreeMap::new();
+    for slot in &scheduler.slots {
+        if let (Some(model), Some(gib)) = (&slot.model, slot.container_reported_gb) {
+            per_model
+                .entry(model.as_str())
+                .and_modify(|held| *held = held.max(gib))
+                .or_insert(gib);
+        }
+    }
+    let sum: f64 = per_model.values().sum();
+    (sum > 0.0).then_some(sum)
 }
 
 /// `GET /har/events` — one SSE stream: the current state immediately, then a push
@@ -1887,6 +1934,7 @@ async fn mem_section(state: &ApiState, scheduler: &crate::scheduler::SchedulerSt
     // (review, 2026-10-26). The caller already holds this snapshot — asking the
     // actor for a second one per poll was a duplicated round-trip.
     let booked_gb = crate::scheduler::booking_gibs(&scheduler.jobs);
+    let container_reported_gb = container_reported_gb(scheduler);
     let ram = crate::witness::ram_sample();
     let mut section = match state.witness.sample().await {
         Ok(sample) => {
@@ -1900,6 +1948,17 @@ async fn mem_section(state: &ApiState, scheduler: &crate::scheduler::SchedulerSt
                 // answered with no usable per-process figures at all (WDDM
                 // degradation): absence, never a fake 0.0 GiB (review 2026-10-26).
                 "attributed_gb": (attributed > 0.0).then_some(attributed),
+                // R1: the witness's own answer to "could per-process bytes be
+                // obtained" — the page's label must come from the witness, never
+                // inferred from whether a number happened to be present (an idle
+                // card legitimately has `attributed_gb: null` and `per_process`
+                // capability at the same time).
+                "attribution": sample.attribution.as_str(),
+                // R9: what the loaded containers said they reserved, summed over
+                // the currently loaded models' `engine_report` figures only —
+                // `null` when no loaded model has a self-report. Display and
+                // cross-check against `observed_used_gb`; never a gate input.
+                "container_reported_gb": container_reported_gb,
                 "source": state.witness.source(),
             })
         }
@@ -1909,6 +1968,10 @@ async fn mem_section(state: &ApiState, scheduler: &crate::scheduler::SchedulerSt
             "booked_gb": booked_gb,
             "observed_used_gb": null,
             "attributed_gb": null,
+            // No sample, no claim: a witness that cannot answer cannot grade its
+            // own attribution — absence, never a fake `unavailable`.
+            "attribution": null,
+            "container_reported_gb": container_reported_gb,
             "source": format!("unavailable ({reason})"),
         }),
     };
@@ -2484,6 +2547,8 @@ mod tests {
             measured_gb: None,
             measured_min_gb: None,
             measured_offload: None,
+            measured_attribution: None,
+            measured_profile: None,
             model_ref: Some(r"F:\m.gguf".to_string()),
             serve_model: None,
             file: None,
@@ -2527,6 +2592,8 @@ mod tests {
             measured_gb: None,
             measured_min_gb: None,
             measured_offload: None,
+            measured_attribution: None,
+            measured_profile: None,
             model_ref: Some(r"F:\m.gguf".to_string()),
             serve_model: None,
             file: None,
@@ -2728,6 +2795,7 @@ mod tests {
             loading_job: None,
             launched_at: Some(launched.to_string()),
             stale_config: Some(stale),
+            container_reported_gb: None,
             loaded_at: Instant::now(),
         };
         let rows = loaded_rows(&[
@@ -4013,8 +4081,49 @@ mod tests {
             loading_job: None,
             launched_at: None,
             stale_config: None,
+            container_reported_gb: None,
             loaded_at,
         }
+    }
+
+    /// The R9 memory-bar sum (server side, where the honesty rule lives): it sums
+    /// the per-slot `engine_report` figures the scheduler anchored — one figure per
+    /// model even when the same container occupies two slots — and answers `None`
+    /// (never `0.0`) when nobody reported, so a silent container cannot render as
+    /// "reserved 0 GiB" next to a busy card. The engine/attribution gates themselves
+    /// are pinned at their source (`only_an_engine_report_anchor_reaches_the_snapshot_slot`,
+    /// scheduler); this pins the fold-over-slots above them.
+    #[test]
+    fn the_container_reported_sum_dedupes_models_and_never_fakes_zero() {
+        let now = Instant::now();
+        let reported = |model: &str, gib: Option<f64>| SlotStatus {
+            container_reported_gb: gib,
+            ..occupied_slot(model, 9_100, now)
+        };
+        let empty = SlotStatus {
+            model: None,
+            ..occupied_slot("empty", 9_101, now)
+        };
+        let document = |slots: Vec<SlotStatus>| {
+            container_reported_gb(&SchedulerStatus {
+                slots,
+                jobs: Vec::new(),
+                catalog_errors: Vec::new(),
+            })
+        };
+        assert_eq!(document(vec![empty, reported("quiet", None)]), None);
+        assert_eq!(
+            document(vec![reported("a", Some(20.0)), reported("b", Some(11.25))]),
+            Some(31.25)
+        );
+        assert_eq!(
+            document(vec![
+                reported("twin", Some(30.0)),
+                reported("twin", Some(30.0))
+            ]),
+            Some(30.0),
+            "one container on two slots is one reservation"
+        );
     }
 
     #[test]
@@ -4107,6 +4216,7 @@ mod tests {
             loading_job: None,
             launched_at: None,
             stale_config: None,
+            container_reported_gb: None,
             loaded_at: now,
         };
         let status = SchedulerStatus {

@@ -213,6 +213,37 @@ const driver = `
       ? vramLabel.indexOf("per-process attribution unavailable") >= 0
       : vramLabel.indexOf("attributed " + mem.attributed_gb.toFixed(1) + " GiB") >= 0,
     vramLabel);
+  // R1/R9: the bar reads the witness's own attribution verdict and the sum of what
+  // the loaded containers reported reserving — both server-computed, never inferred.
+  check("vram bar uses the server attribution verdict",
+    vramLabel.indexOf("(" + mem.source + "; attributed " + mem.attributed_gb.toFixed(1) + " GiB") >= 0,
+    vramLabel);
+  check("vram bar names the container-reported reservation",
+    vramLabel.indexOf("containers report " + mem.container_reported_gb.toFixed(1) + " GiB reserved") >= 0,
+    vramLabel);
+  {
+    const degraded = JSON.parse(JSON.stringify(fixtures["/har/status"]));
+    degraded.mem.attributed_gb = null;
+    degraded.mem.attribution = "unavailable";
+    degraded.mem.container_reported_gb = null;
+    applyState({ ...degraded, models: fixtures["/har/models"].data });
+    const dl = findAll(document.getElementById("sh-header"), "label").filter(function (t) {
+      return textOf(t).indexOf("VRAM ") === 0;
+    })[0];
+    check("unavailable attribution is stated, not inferred from absence",
+      textOf(dl).indexOf("per-process attribution unavailable") >= 0, textOf(dl));
+    check("a container that never reported says nothing, not zero",
+      textOf(dl).indexOf("containers report") < 0, textOf(dl));
+    const idle = JSON.parse(JSON.stringify(degraded));
+    idle.mem.attribution = "per_process";
+    applyState({ ...idle, models: fixtures["/har/models"].data });
+    const il = findAll(document.getElementById("sh-header"), "label").filter(function (t) {
+      return textOf(t).indexOf("VRAM ") === 0;
+    })[0];
+    check("a capable but idle card is not called unavailable",
+      textOf(il).indexOf("per-process capable (card idle)") >= 0, textOf(il));
+    applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+  }
   check("vram bar never claims external", vramLabel.indexOf("external") < 0, vramLabel);
   check("vram bar shows the in-flight booking",
     mem.booked_gb > 0
@@ -290,18 +321,31 @@ const driver = `
     ...fixtures["/har/status"],
     models: [
       { id: "greedyone", engine: "strata", category: "WORK", vram_gb: 55, cost: "greedy",
+        cost_basis: "declared",
         launch_floor_gb: 65, measured_gb: null, measured_min_gb: null, context: null,
         model_ref: "strata://g", serve_model: null, cpu_offload: false },
       { id: "measuredone", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "measured", measured_attribution: "per_process",
         launch_floor_gb: null, measured_gb: 29.9, measured_min_gb: null, est_vram_gb: 29.4,
         context: null, model_ref: "F:/x.gguf", serve_model: null, cpu_offload: false },
       { id: "rangeone", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "measured", measured_attribution: "per_process",
         launch_floor_gb: null, measured_gb: 41.7, measured_min_gb: 24.3, est_vram_gb: null,
         context: null, model_ref: "F:/y.gguf", serve_model: null, cpu_offload: false },
+      { id: "totaldiffone", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "estimate", measured_attribution: "total_diff",
+        launch_floor_gb: null, measured_gb: 2.4, measured_min_gb: null, est_vram_gb: 27.4,
+        context: null, model_ref: "F:/t.gguf", serve_model: null, cpu_offload: false },
+      { id: "engineone", engine: "ninfer", category: "WORK", vram_gb: null, cost: "exact",
+        cost_basis: "measured", measured_attribution: "engine_report",
+        launch_floor_gb: null, measured_gb: 31.2, measured_min_gb: 31.2, est_vram_gb: null,
+        context: null, model_ref: "ninfer://box:8004/served", serve_model: null, cpu_offload: false },
       { id: "ninferone", engine: "ninfer", category: "WORK", vram_gb: 26, cost: "fixed",
+        cost_basis: "declared",
         launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
         model_ref: "ninfer://box:8004/served", serve_model: null, cpu_offload: false },
       { id: "mockone", engine: "mock", category: "WORK", vram_gb: 4, cost: "fixed",
+        cost_basis: "declared",
         launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
         model_ref: "mock://m", serve_model: null, cpu_offload: false },
     ],
@@ -318,6 +362,14 @@ const driver = `
     costs["measuredone"] === "measured 29.9 GiB", JSON.stringify(costs));
   check("measured row shows the range when a low end exists",
     costs["rangeone"] === "measured 24.3-41.7 GiB", JSON.stringify(costs));
+  // R9: the Cost column shows exactly what the gate books (cost_basis), and says
+  // whose number a measured figure is. A total-diff never books, so its row shows
+  // the estimate the gate really charges; an engine-reported figure is labelled as
+  // the container's own reservation.
+  check("a total-diff never shows as the booking basis",
+    costs["totaldiffone"] === "27.4 GiB (est.)", JSON.stringify(costs));
+  check("an engine-reported figure books and is labelled",
+    costs["engineone"] === "measured 31.2 GiB (engine-reported)", JSON.stringify(costs));
   // cpu_offload engine scoping: the CPU column (td 3) offers its control only
   // for OFFLOAD_ENGINES rows; a strata row gets a dash and NO checkbox.
   const cpuBoxes = {};

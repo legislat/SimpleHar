@@ -323,6 +323,7 @@ async fn a_self_dying_engine_stops_answering_before_the_fake_calls_it_gone() {
             expect_status: 200,
         },
         container: None,
+        script: None,
     };
     for round in 0..8u32 {
         let ticket = SpawnTicket {

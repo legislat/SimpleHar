@@ -178,6 +178,7 @@ impl EngineAdapter for StrataAdapter {
                 }),
             ),
             container: None,
+            script: None,
         })
     }
 }
@@ -207,6 +208,8 @@ mod tests {
             measured_gb: None,
             measured_min_gb: None,
             measured_offload: None,
+            measured_attribution: None,
+            measured_profile: None,
             model_ref: Some("strata://test".to_string()),
             serve_model: Some("qwen3.8-flash-next".to_string()),
             file: None,

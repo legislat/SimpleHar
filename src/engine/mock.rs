@@ -44,6 +44,7 @@ impl EngineAdapter for MockAdapter {
                 expect_status: 200,
             },
             container: None,
+            script: None,
         })
     }
 }
@@ -66,6 +67,8 @@ mod tests {
             measured_gb: None,
             measured_min_gb: None,
             measured_offload: None,
+            measured_attribution: None,
+            measured_profile: None,
             model_ref: None,
             serve_model: None,
             file: None,

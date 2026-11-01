@@ -56,6 +56,7 @@ impl VramWitness for FakeWitness {
                     total_gib: 72.0,
                     used_gib: 0.0,
                     processes: vec![],
+                    attribution: simplehar_se::budget::AttributionQuality::Unavailable,
                 })
             }
         };
@@ -71,6 +72,7 @@ fn sample(total: f64, used: f64) -> MemorySample {
         total_gib: total,
         used_gib: used,
         processes: vec![],
+        attribution: simplehar_se::budget::AttributionQuality::Unavailable,
     }
 }
 

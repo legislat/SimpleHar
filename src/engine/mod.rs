@@ -89,6 +89,15 @@ pub struct LaunchSpec {
     /// only the `wsl.exe` client, so the runtime must additionally `docker rm -f`
     /// this name (Step 8 extension, 2026-10-26). `None` for process engines.
     pub container: Option<String>,
+    /// A shell script the runtime must stage into the distro and run **instead of**
+    /// the script named in argv (template adoption, operator ruling 2026-10-31): the
+    /// harness renders the canonical autostart body itself, so every ninfer launch is
+    /// a script it can check and expect, not an operator file that may drift. The
+    /// runtime stages the bytes content-addressed (replace-atomically, then verify)
+    /// and rewrites the argv script position to the staged path before spawning;
+    /// `Some` demands argv shape `[..., "bash", <script>, ...]`. `None` for process
+    /// engines and for a launch that runs the operator's own script verbatim.
+    pub script: Option<String>,
 }
 
 /// The shared WSL client prefix: `wsl.exe -d <distro> -u <user> --`. Launch
@@ -283,6 +292,21 @@ pub trait EngineRuntime: Send + Sync {
     /// `None` when the engine does not answer or reports nothing: callers fall
     /// back to the harness name.
     async fn discover_model_id(&self, port: u16) -> Option<String>;
+
+    /// The raw `docker logs <container>` text for a container-backed engine (R9), so
+    /// the engine-specific parser can read the startup `MemorySummary` that never
+    /// reaches the harness-captured client log. Generic passthrough (no engine
+    /// knowledge here); `None` when the container cannot be reached or this runtime
+    /// backs nothing with a container. Default `None`: only the process runtime
+    /// answers.
+    async fn container_report(&self, _container: &str) -> Option<String> {
+        None
+    }
+
+    /// Persist a fetched container log to `logs/<model>-<epoch>.container.log` for
+    /// forensic survival of the next `docker rm -f` (R9), pruning that model's
+    /// container logs to the keep-N. No-op by default (mocks, non-container runtimes).
+    async fn save_container_log(&self, _model: &str, _text: &str) {}
 }
 
 /// Production boot's adapter map (FINDINGS-10 [3]): llama + strata + ninfer always,

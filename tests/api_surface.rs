@@ -1116,6 +1116,53 @@ async fn the_webui_fixture_is_a_document_the_endpoint_can_actually_emit() {
         keys(&live_job, "/har/status.jobs[0]"),
         "the fixture's job ledger is not the ledger shape `JobStatus` serializes"
     );
+
+    // Same rule for the models table (review 2026-10-31): the DOM suite renders
+    // `fixtures/models.json` through the Cost cell's provenance ladder, and the
+    // fixture had drifted eight fields behind `model_json` — the page passed against
+    // rows `/har/models` never sends. `launched_at`/`stale_config` exist on a row
+    // ONLY while its model is installed, so they alone are exempt and must be the
+    // entire difference; anything else in that difference is a shape violation.
+    let (_, live_models) = get_json(&control, "/har/models").await;
+    let fixture_models: Value = serde_json::from_str(
+        &std::fs::read_to_string("tests/webui/fixtures/models.json")
+            .expect("the DOM suite's models fixture is committed"),
+    )
+    .expect("the models fixture is JSON");
+    let fixture_keys = keys(
+        &row_of(&fixture_models, "fixture /har/models"),
+        "fixture /har/models",
+    );
+    let live_keys = keys(&row_of(&live_models, "/har/models"), "live /har/models");
+    let installed_only = |keys: &[String]| {
+        keys.iter()
+            .filter(|key| *key != "launched_at" && *key != "stale_config")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        installed_only(&fixture_keys),
+        installed_only(&live_keys),
+        "the models fixture rows are not the rows the endpoint sends"
+    );
+    let installed: Vec<&String> = live_keys
+        .iter()
+        .filter(|key| !fixture_keys.contains(key))
+        .collect();
+    assert!(
+        installed
+            .iter()
+            .all(|key| *key == "launched_at" || *key == "stale_config"),
+        "the live row carries fields the fixture never has: {installed:?}"
+    );
+
+    fn row_of(doc: &Value, what: &str) -> Value {
+        doc["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .unwrap_or_else(|| panic!("{what} carries no rows"))
+    }
 }
 
 #[tokio::test]

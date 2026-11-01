@@ -140,6 +140,8 @@ const CONSUMED_KEYS: &[&str] = &[
     "measured_gb",
     "measured_gb_min",
     "measured_offload",
+    "measured_attribution",
+    "measured_profile",
     "strata_config",
     "strata_python",
     "strata_cwd",
@@ -147,6 +149,16 @@ const CONSUMED_KEYS: &[&str] = &[
     "ninfer_container",
     "ninfer_profile",
     "ninfer_key",
+    "ninfer_image",
+    "ninfer_model_name",
+    "ninfer_artifact",
+    "ninfer_internal_port",
+    "ninfer_model_roots",
+    "ninfer_serve_args",
+    "ninfer_gpu_device",
+    "ninfer_model_id",
+    "ninfer_key_file",
+    "ninfer_serve_cmd",
     "external",
 ];
 
@@ -637,6 +649,35 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 // warned nor logged nor surfaced.
                 for key in map.keys() {
                     if SILENT_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
+                    // `ninfer_profile_<name>` is the family of custom-profile
+                    // override keys (template adoption, 2026-10-31): the suffix is
+                    // operator-chosen, so the const cannot enumerate it. The exact
+                    // name `ninfer_profile` stays a const member; this prefix is the
+                    // one read-side exception, and the adapter still refuses a
+                    // selected custom profile whose override line is absent. A
+                    // suffix the adapter could never name as a profile is dead
+                    // config, so it stays an unknown key rather than passing on
+                    // prefix alone (the shape mirrors `valid_profile_name` in
+                    // engine/ninfer.rs — including its first-byte-lowercase rule,
+                    // which keeps `ninfer_profile_9x` reportable — and that module
+                    // remains the launch-time authority).
+                    let profile_override_key = key
+                        .strip_prefix("ninfer_profile_")
+                        .is_some_and(|suffix| !suffix.is_empty() && suffix.len() <= 16)
+                        && key
+                            .strip_prefix("ninfer_profile_")
+                            .unwrap_or_default()
+                            .bytes()
+                            .next()
+                            .is_some_and(|b| b.is_ascii_lowercase())
+                        && key
+                            .strip_prefix("ninfer_profile_")
+                            .unwrap_or_default()
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                    if profile_override_key {
                         continue;
                     }
                     if !CONSUMED_KEYS.contains(&key.as_str()) {
@@ -2060,6 +2101,8 @@ mod tests {
              measured_gb: 20.0\n\
              measured_gb_min: 10.0\n\
              measured_offload: false\n\
+             measured_attribution: total_diff\n\
+             measured_profile: b\n\
              strata_config: C:/Strata/profile.json\n\
              strata_python: C:/Strata/.venv/Scripts/python.exe\n\
              strata_cwd: C:/Strata\n\
@@ -2067,6 +2110,16 @@ mod tests {
              ninfer_container: golden-box\n\
              ninfer_profile: b\n\
              ninfer_key: true\n\
+             ninfer_image: ninfer:local\n\
+             ninfer_model_name: Golden-Artifact-Dir\n\
+             ninfer_artifact: golden.ninfer\n\
+             ninfer_internal_port: 8004\n\
+             ninfer_model_roots: /mnt/d/Models,/home/ops/ai/models\n\
+             ninfer_serve_args: --spec=dflash2 --draft-tokens=7\n\
+             ninfer_gpu_device: \"0\"\n\
+             ninfer_model_id: golden-id\n\
+             ninfer_key_file: $HOME/.simplehar/keys/golden-box.key\n\
+             ninfer_serve_cmd: ninfer-serve\n\
              external: false\n",
         )
         .expect("write golden");
@@ -2108,6 +2161,35 @@ mod tests {
         }
     }
 
+    /// Review 2026-10-31 (H1): the fold's persist→rescan round trip. The writer
+    /// (`MeasuredData::edits` in the scheduler) stamps every serving model with the
+    /// measured quartet; the scanner must read those keys back silently — a
+    /// harness-written key reported as "not read by the harness" is a false
+    /// statement to the operator and trips the live-ModelConf-clean gate. The
+    /// const-coverage pin missed this class because it checks the const against a
+    /// hand-listed literal set, not against what the WRITER emits.
+    #[test]
+    fn a_fold_written_yaml_rescans_without_unknown_key_reports() {
+        let written = "engine: ninfer\n\
+                       name: served\n\
+                       ninfer_autostart: /opt/served.sh\n\
+                       ninfer_container: ninfer-served\n\
+                       vram_gb: 20\n\
+                       measured_gb: 31.2\n\
+                       measured_gb_min: 31.2\n\
+                       measured_attribution: engine_report\n\
+                       measured_profile: b\n";
+        let (map, problems) = parse_flat_yaml(written);
+        assert!(
+            problems.is_empty(),
+            "the fold's own write-back must rescan clean: {problems:?}"
+        );
+        assert_eq!(
+            map.get("measured_attribution").map(String::as_str),
+            Some("engine_report")
+        );
+    }
+
     /// The const pinned from the other side: the code's key literals are members.
     /// `FLAG_TABLE` is the llama flag map read straight into argv; the manual list
     /// mirrors the remaining `.get("<key>")` reads across the adapters and the
@@ -2145,6 +2227,16 @@ mod tests {
             "ninfer_container",
             "ninfer_profile",
             "ninfer_key",
+            "ninfer_image",
+            "ninfer_model_name",
+            "ninfer_artifact",
+            "ninfer_internal_port",
+            "ninfer_model_roots",
+            "ninfer_serve_args",
+            "ninfer_gpu_device",
+            "ninfer_model_id",
+            "ninfer_key_file",
+            "ninfer_serve_cmd",
             "external",
         ] {
             assert!(
@@ -2152,6 +2244,51 @@ mod tests {
                 "`{key}` must be a consumed key"
             );
         }
+        // The one key family the const cannot enumerate: the operator-chosen
+        // custom-profile override is consumed by prefix rule (the adapter refuses a
+        // selected custom profile whose line is absent, so the read is real).
+        let pdir = crate::testutil::temp_dir("scan-profile-prefix");
+        let _ = std::fs::remove_dir_all(&pdir);
+        std::fs::create_dir_all(&pdir).expect("temp dir");
+        std::fs::write(
+            pdir.join("custom.yaml"),
+            "engine: ninfer\nninfer_container: box\nninfer_profile: lt\nninfer_profile_lt: ctx=16384 kv=32768 conc=2\n",
+        )
+        .expect("write");
+        std::fs::write(
+            pdir.join("bad.yaml"),
+            "engine: ninfer\nninfer_container: bx2\nninfer_profile_BAD-NAME: ctx=1 kv=1 conc=1\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&pdir);
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .all(|e| e.kind != ScanKind::UnknownKey
+                    || e.reason.contains("ninfer_profile_BAD-NAME")),
+            "only the unsuffixable key may raise unknown-key: {:?}",
+            catalog.errors
+        );
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .any(|e| e.kind == ScanKind::UnknownKey
+                    && e.reason.contains("ninfer_profile_BAD-NAME")),
+            "a profile-override suffix the adapter could never name is dead config: {:?}",
+            catalog.errors
+        );
+        let custom = catalog
+            .models
+            .iter()
+            .find(|m| m.name == "custom")
+            .expect("the valid-override entry publishes");
+        assert!(
+            custom.raw.contains_key("ninfer_profile_lt"),
+            "the override line must survive into raw for the adapter to read"
+        );
+        let _ = std::fs::remove_dir_all(&pdir);
     }
 
     /// The machine check the sweep left behind: the operator's live ModelConf must

@@ -132,6 +132,8 @@ mod tests {
             measured_gb: None,
             measured_min_gb: None,
             measured_offload: None,
+            measured_attribution: None,
+            measured_profile: None,
             model_ref: Some(model_ref.to_string()),
             serve_model: None,
             file: file.map(PathBuf::from),

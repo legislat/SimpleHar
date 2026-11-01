@@ -247,12 +247,25 @@ function renderMemory(status) {
   // a release. Hatched = the reserve band admission keeps clear; "booked" = loads
   // committed but not yet installed, which the card cannot have accounted for.
   if (observedPct !== null) {
+    // R1: the witness states its own attribution capability; the page prefers that
+    // verdict over inferring it from a number happening to be absent (an idle card is
+    // capable, a WDDM-degraded card is not — both show no attributed bytes). An
+    // token outside the closed set is the UNAVAILABLE sentence, never a crash: the
+    // page must degrade one label, not repaint nothing (review 2026-10-31).
     const attribution =
-      mem.attributed_gb == null
+      mem.attribution === "unavailable" ||
+      (mem.attribution == null && mem.attributed_gb == null) ||
+      (mem.attribution !== "per_process" && mem.attributed_gb == null)
         ? "per-process attribution unavailable"
-        : "attributed " + mem.attributed_gb.toFixed(1) + " GiB";
+        : mem.attribution === "per_process" && mem.attributed_gb == null
+          ? "per-process capable (card idle)"
+          : "attributed " + Number(mem.attributed_gb).toFixed(1) + " GiB";
     const booked =
       mem.booked_gb > 0 ? "; booked " + mem.booked_gb.toFixed(1) + " GiB in flight" : "";
+    const reported =
+      mem.container_reported_gb != null && mem.container_reported_gb > 0
+        ? "; containers report " + mem.container_reported_gb.toFixed(1) + " GiB reserved"
+        : "";
     bars.push(
       el(
         "div",
@@ -261,7 +274,7 @@ function renderMemory(status) {
           "label",
           {},
           text(
-            `VRAM ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (${mem.source}; ${attribution}${booked}; hatched = ${mem.reserve_gb.toFixed(1)} GiB reserve)`,
+            `VRAM ${observed.toFixed(1)} / ${mem.total_gb.toFixed(0)} GiB (${mem.source}; ${attribution}${booked}${reported}; hatched = ${mem.reserve_gb.toFixed(1)} GiB reserve)`,
           ),
         ),
         el(
@@ -517,19 +530,27 @@ function modelRow(status, model, category) {
       "td",
       {},
       text(
-        // Cost honesty (operator 2026-10-26): a greedy model's nominal size is a
-        // model-size claim, not a VRAM footprint — measured or floor, never 55.
-        // The measured figure is a range (§0.4): the low end is where the session
-        // started, the high end is what admission books, so showing only one of
-        // them would hide how much of the card the KV cache can take.
-        model.measured_gb !== null && model.measured_gb !== undefined
+        // Cost honesty, server-decided (R9): the gate says which figure it books via
+        // `cost_basis`, and the page shows exactly that number — a measured pair only
+        // when it really is the booking basis, never a stand-in over a declared
+        // number. The range's low end is where the session started, the high end is
+        // what admission books; the provenance token says whose number it is.
+        model.cost_basis === "measured" &&
+          model.measured_gb !== null &&
+          model.measured_gb !== undefined
           ? `measured ${
               model.measured_min_gb !== null &&
               model.measured_min_gb !== undefined &&
               model.measured_min_gb < model.measured_gb
                 ? model.measured_min_gb.toFixed(1) + "-" + model.measured_gb.toFixed(1)
                 : model.measured_gb.toFixed(1)
-            } GiB${model.cost === "greedy" ? " (greedy)" : ""}`
+            } GiB${
+              model.measured_attribution === "total_diff"
+                ? " (total-diff)"
+                : model.measured_attribution === "engine_report"
+                  ? " (engine-reported)"
+                  : ""
+            }${model.cost === "greedy" ? " (greedy)" : ""}`
           : model.cost === "greedy"
             ? model.launch_floor_gb !== null && model.launch_floor_gb !== undefined
               ? `greedy · floor ${model.launch_floor_gb} GiB`

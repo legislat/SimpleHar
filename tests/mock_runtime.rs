@@ -163,6 +163,12 @@ pub struct MockRuntime {
     /// assert this SET (which kills the product really issued and left unproven)
     /// instead of trusting the fake's budget arithmetic (FINDINGS-19 [4]).
     parked: Arc<Mutex<Vec<(u16, u64)>>>,
+    /// R9 fake seam: canned `docker logs` text per container name, returned by
+    /// [`EngineRuntime::container_report`] (tests seed the startup `MemorySummary`).
+    container_reports: Arc<Mutex<HashMap<String, String>>>,
+    /// R9 fake seam: every `(model, text)` handed to `save_container_log`, for
+    /// asserting a failed launch snapshotted its container log.
+    saved_container_logs: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Default for MockRuntime {
@@ -188,7 +194,28 @@ impl MockRuntime {
             kill_holds: Arc::new(AtomicUsize::new(usize::MAX)),
             hold_ports: Arc::new(Mutex::new(BTreeSet::new())),
             parked: Arc::new(Mutex::new(Vec::new())),
+            container_reports: Arc::new(Mutex::new(HashMap::new())),
+            saved_container_logs: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Seeds the canned `docker logs` text [`EngineRuntime::container_report`] returns
+    /// for `name` (R9). Call before driving the scheduler.
+    #[allow(dead_code)]
+    pub fn set_container_report(&self, name: &str, text: &str) {
+        self.container_reports
+            .lock()
+            .expect("container report lock")
+            .insert(name.to_string(), text.to_string());
+    }
+
+    /// Every `(model, text)` the scheduler asked to snapshot, in order (R9).
+    #[allow(dead_code)]
+    pub fn saved_container_logs(&self) -> Vec<(String, String)> {
+        self.saved_container_logs
+            .lock()
+            .expect("saved container lock")
+            .clone()
     }
 
     /// Lets every `HoldKill` engine parked inside `kill` actually die, so a test can
@@ -475,6 +502,21 @@ impl EngineRuntime for MockRuntime {
         let response = self.client.get(&url).send().await.ok()?;
         let body: serde_json::Value = response.json().await.ok()?;
         body["data"][0]["id"].as_str().map(str::to_string)
+    }
+
+    async fn container_report(&self, container: &str) -> Option<String> {
+        self.container_reports
+            .lock()
+            .expect("container report lock")
+            .get(container)
+            .cloned()
+    }
+
+    async fn save_container_log(&self, model: &str, text: &str) {
+        self.saved_container_logs
+            .lock()
+            .expect("saved container lock")
+            .push((model.to_string(), text.to_string()));
     }
 }
 

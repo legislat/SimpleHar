@@ -43,6 +43,11 @@ windows = { version = "0.62", features = [
 tokio-stream = "0.1"
 # NVML in-process witness with a graceful `nvidia-smi` fallback (Step 4, item 5).
 nvml-wrapper = "0.10"
+# Base64 for staging a harness-rendered autostart script into the distro: the script
+# body rides a quoted heredoc inside a driver fed to `wsl … -- bash -s` on stdin
+# (template adoption, 2026-10-31), so it never touches a shell-tokenized command
+# line, only this alphabet.
+base64 = "0.22"
 
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` drives the router in tests without binding a port.

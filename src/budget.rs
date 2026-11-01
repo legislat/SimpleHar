@@ -217,6 +217,43 @@ pub fn free_gb(total: Gibibytes, reserve: Gibibytes, occupied: Gibibytes) -> Gib
     Gibibytes(total.0 - reserve.0 - occupied.0)
 }
 
+/// Whether the per-process figures on a sample are usable for attribution (R1).
+///
+/// A pure, witness-local fact: `PerProcess` iff at least one entry reported a
+/// concrete non-zero byte count; `Unavailable` covers the driver returning no list,
+/// an empty list, or all-zero `UsedGpuMemory` (the WDDM degradation seen box-wide).
+/// An **idle** card is `Unavailable` deliberately — attribution asks "could per-process
+/// bytes be obtained", never "is anything running" (idleness is `used_gib`'s question).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributionQuality {
+    /// At least one compute process reported a concrete `used > 0`.
+    PerProcess,
+    /// No usable per-process byte figure came back.
+    Unavailable,
+}
+
+impl AttributionQuality {
+    /// The payload token for `/har/status` (R1): the witness's own answer to "could
+    /// per-process bytes be obtained", spelled for the page and the operator.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttributionQuality::PerProcess => "per_process",
+            AttributionQuality::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// The card-global attribution quality for a per-process list.
+#[must_use]
+pub fn attribution_from_processes(processes: &[(u32, f64)]) -> AttributionQuality {
+    if processes.iter().any(|(_, used)| *used > 0.0) {
+        AttributionQuality::PerProcess
+    } else {
+        AttributionQuality::Unavailable
+    }
+}
+
 /// One witness observation of the card (Step 4 rules 2-4).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemorySample {
@@ -226,6 +263,8 @@ pub struct MemorySample {
     pub used_gib: f64,
     /// Per-process usage in GiB: `(pid, used)`.
     pub processes: Vec<(u32, f64)>,
+    /// Whether `processes` can be trusted to attribute a footprint (R1).
+    pub attribution: AttributionQuality,
 }
 
 impl MemorySample {
@@ -353,10 +392,12 @@ pub fn parse_smi_sample(gpu_csv: &str, apps_csv: &str) -> Result<MemorySample, S
         };
         processes.push((pid, used));
     }
+    let attribution = attribution_from_processes(&processes);
     Ok(MemorySample {
         total_gib,
         used_gib,
         processes,
+        attribution,
     })
 }
 
@@ -370,11 +411,30 @@ mod tests {
 
     #[test]
     fn own_gib_reports_attribution_or_none() {
-        let s = |procs: Vec<(u32, f64)>| MemorySample {
-            total_gib: 72.0,
-            used_gib: 40.0,
-            processes: procs,
+        let s = |procs: Vec<(u32, f64)>| {
+            let attribution = attribution_from_processes(&procs);
+            MemorySample {
+                total_gib: 72.0,
+                used_gib: 40.0,
+                processes: procs,
+                attribution,
+            }
         };
+        assert_eq!(
+            s(vec![]).attribution,
+            AttributionQuality::Unavailable,
+            "no entries: nothing to attribute"
+        );
+        assert_eq!(
+            s(vec![(7, 0.0), (8, 0.0)]).attribution,
+            AttributionQuality::Unavailable,
+            "all-zero WDDM is not a measurement"
+        );
+        assert_eq!(
+            s(vec![(7, 30.0), (8, 10.0)]).attribution,
+            AttributionQuality::PerProcess,
+            "a concrete byte count is attributable"
+        );
         assert_eq!(s(vec![]).own_gib(&[7]), None, "no attribution is not zero");
         assert_eq!(
             s(vec![(7, 0.0), (8, 0.0)]).own_gib(&[7]),

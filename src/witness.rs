@@ -7,7 +7,7 @@
 //! caller **refuses** rather than deciding on a stale guess or a bookkeeping fallback
 //! (F-3/F-7 lesson); only `LedgerOnlyWitness` budgets from the ledger instead.
 
-use crate::budget::{parse_smi_sample, MemorySample, VramWitness};
+use crate::budget::{attribution_from_processes, parse_smi_sample, MemorySample, VramWitness};
 use async_trait::async_trait;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -132,10 +132,12 @@ impl NvmlWitness {
                 tracing::warn!(error = %error, "per-process VRAM figures unavailable");
             }
         }
+        let attribution = attribution_from_processes(&processes);
         Ok(MemorySample {
             total_gib: gib(info.total),
             used_gib: gib(info.used),
             processes,
+            attribution,
         })
     }
 

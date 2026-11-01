@@ -175,6 +175,14 @@ pub struct SlotStatus {
     /// reload turn, and on harness write-backs; reading it performs no stat.
     /// Empty slot: absent.
     pub stale_config: Option<bool>,
+    /// What this container occupant's own startup `MemorySummary` said it reserves
+    /// (R9), straight from its spawn anchor — `None` for a child-process spawn, a
+    /// container that never reported, or a report the anchor refused. Carried on
+    /// the snapshot so BOTH `/har/status` and SSE quote the same number (review
+    /// 2026-10-31: threading it only through the SSE build made the memory-bar
+    /// annotation unreachable for a token-gated, poll-only page); display only,
+    /// never a gate input.
+    pub container_reported_gb: Option<f64>,
     /// When the occupant was loaded (copy of the actor's `Occupant::loaded_at`).
     /// Empty slots carry the snapshot time, mirroring the `map_or(Instant::now(),
     /// |o| o.loaded_at)` policy of the scheduler's own LRU picks. Not serialized:
@@ -536,6 +544,22 @@ impl Scheduler {
     }
 }
 
+/// Releases a detached failed-launch snapshot's in-flight mark on drop (R9 C1):
+/// constructed inside the spawned fetch, dropped by every exit path (normal end,
+/// early return, panic unwind), so a wedged mark can never permanently blind the
+/// next failure of the same container name (review 2026-10-31, L9).
+struct SnapshotRelease {
+    tx: mpsc::UnboundedSender<ActorMsg>,
+    container: String,
+}
+
+impl Drop for SnapshotRelease {
+    fn drop(&mut self) {
+        let _ = self.tx.send(ActorMsg::SnapshotDone(self.container.clone()));
+    }
+}
+
+#[derive(Debug)]
 enum ActorMsg {
     Command {
         cmd: Command,
@@ -576,19 +600,28 @@ enum ActorMsg {
         own: Option<f64>,
         total_gib: f64,
     },
-    /// The blocking write-back of a measured triple was refused by the disk
+    /// The container's own startup `MemorySummary` figure (R9): one shot per launch,
+    /// fetched from `docker logs` at readiness. The reserved footprint is static for
+    /// the life of the engine, so it fixes the range outright instead of folding.
+    MeasuredEngineReport {
+        model: String,
+        ticket: SpawnTicket,
+        required_to_free_gb: f64,
+        total_gib: f64,
+    },
+    /// A detached failed-launch log snapshot (R9 C1) has finished; release its
+    /// in-flight mark so a later failure of the same container name re-snapshots.
+    SnapshotDone(String),
+    /// The blocking write-back of a measured figure was refused by the disk
     /// (Fork C, FINDINGS-13 [4] follow-through): the actor must stop booking in
-    /// memory what disk rejected. Carries the exact triple the failed write
-    /// attempted, so a reading that has since been superseded never drains the
-    /// newer (possibly persisted) values. `offload` is `None` for engines outside
-    /// `OFFLOAD_ENGINES` — their persist carried only the pair, and their memory
-    /// never held a stamp to drain. `file` is the spawn-era row the write targeted:
-    /// the drain may only land on it, never on a same-name twin.
+    /// memory what disk rejected. Carries the exact figure — pair **and provenance
+    /// stamps** — the failed write attempted, so a reading that has since been
+    /// superseded never drains the newer (possibly persisted) values. `file` is the
+    /// spawn-era row the write targeted: the drain may only land on it, never on a
+    /// same-name twin.
     MeasuredPersistFailed {
         model: String,
-        high: f64,
-        low: f64,
-        offload: Option<bool>,
+        data: MeasuredData,
         file: Option<PathBuf>,
     },
     /// A harness-owned writer just rewrote a resident model's own yaml (the measured
@@ -613,6 +646,96 @@ enum ActorMsg {
     Catalog {
         reply: oneshot::Sender<crate::model::scan::Catalog>,
     },
+}
+
+/// The two witness numbers for one fold: what the card grew by since this spawn's
+/// baseline, and what the driver attributed to the engine's own pids (R1: `None`
+/// means per-process attribution was unavailable, so the fold may only ever be
+/// stamped `total_diff` — which displays but never books).
+#[derive(Debug, Clone, Copy)]
+struct Reading {
+    total_diff: f64,
+    own: Option<f64>,
+    total_gib: f64,
+}
+
+/// One figure handed to [`ActorState::fold`], bundled with the launch it belongs to
+/// so the fold reads as "this spawn says this number" rather than seven positional
+/// arguments. `fold_range` is the second half of the provenance contract: a witness
+/// point is averaged into this launch's history, while the container's own reserved
+/// figure is static for the life of the process and is never averaged.
+#[derive(Debug, Clone)]
+struct FoldPlan {
+    model: String,
+    ticket: SpawnTicket,
+    high: f64,
+    low: f64,
+    attribution: crate::model::MeasuredAttribution,
+    profile: Option<String>,
+    fold_range: bool,
+}
+
+/// Everything one fold wrote to the catalog row: the pair and the provenance
+/// stamps, kept together so a refused persist drains exactly what it wrote
+/// (Fork C extended to the R9 stamps — a drain that forgot `measured_attribution`
+/// would leave the file and the memory disagreeing about who owns the number).
+#[derive(Debug, Clone, PartialEq)]
+struct MeasuredData {
+    high: f64,
+    low: f64,
+    offload: Option<bool>,
+    attribution: Option<crate::model::MeasuredAttribution>,
+    profile: Option<String>,
+}
+
+impl MeasuredData {
+    /// The `(key, value)` edits for one persist: a `None` value removes the key, so
+    /// a total-diff fold cleans up the stamps a superseded `engine_report` wrote.
+    /// All keys ride in ONE rewrite: split across writes, a failure in between could
+    /// leave an orphan pair or a range booked under the wrong provenance (the
+    /// scanner rejects the orphan outright — dropping the whole model).
+    fn edits(&self) -> Vec<(&'static str, Option<String>)> {
+        vec![
+            ("measured_gb", Some(format!("{:.1}", self.high))),
+            ("measured_gb_min", Some(format!("{:.1}", self.low))),
+            ("measured_offload", self.offload.map(|on| on.to_string())),
+            (
+                "measured_attribution",
+                self.attribution.map(|a| a.as_str().to_string()),
+            ),
+            ("measured_profile", self.profile.clone()),
+        ]
+    }
+}
+
+impl Clone for ActorMsg {
+    /// Only the persist-fail reconcile is ever cloned: it must leave the blocking
+    /// write with the bytes it wrote, while a reply channel cannot be cloned and the
+    /// rest of the variants never cross a thread boundary twice.
+    fn clone(&self) -> Self {
+        match self {
+            Self::MeasuredPersistFailed { model, data, file } => Self::MeasuredPersistFailed {
+                model: model.clone(),
+                data: data.clone(),
+                file: file.clone(),
+            },
+            _ => unreachable!("only the persist-fail reconcile is cloned"),
+        }
+    }
+}
+
+/// Everything the serving-window sampler needs, captured at install so the task
+/// never reaches back into actor state: the `(model, ticket)` pair a reading is
+/// stamped with, the pids the witness may attribute (empty for a container spawn —
+/// its ticket pid is the dead `wsl.exe` client), and the container whose own
+/// startup report the sampler fetches once before falling back to the witness (R9).
+#[derive(Debug, Clone)]
+struct SamplerCtx {
+    model: String,
+    ticket: SpawnTicket,
+    own_pids: Vec<u32>,
+    container: Option<String>,
+    engine: String,
 }
 
 /// Result of an async step, sent back to the actor by the spawned step task.
@@ -697,6 +820,22 @@ struct MeasuredAnchor {
     /// inside the cold-start window must not manufacture or erase the warning, and a
     /// same-name twin must not lend this one its id.
     serve_model: Option<String>,
+    /// How the figure this spawn has folded was obtained (R9). `None` until the first
+    /// fold lands: a reload's `read_measured` drops the in-memory stamp together with
+    /// the range it describes, and the next fold re-mints both from this spawn — the
+    /// stamp is never a leftover from a process that is gone.
+    attribution: Option<crate::model::MeasuredAttribution>,
+    /// The ninfer profile identity this engine was launched under: the profile name
+    /// plus the `--kv-capacity` a custom override line stands for
+    /// (`crate::engine::ninfer::profile_stamp`) — the argument the autostart script
+    /// effectively received, default `b` — the same derivation `read_measured`
+    /// compares the persisted stamp against. Captured at spawn, never re-read at
+    /// sample time, like every other anchor field.
+    profile: Option<String>,
+    /// Whether this spawn is backed by a detached WSL container (ninfer). A container
+    /// spawn never claims per-process attribution — its ticket pid is the dead
+    /// `wsl.exe` client — so witness readings can only ever be `total_diff` there.
+    container: bool,
 }
 
 impl MeasuredAnchor {
@@ -722,6 +861,11 @@ impl MeasuredAnchor {
                 (None, _) => None,
             },
             serve_model: entry.serve_model.clone(),
+            attribution: None,
+            profile: (entry.engine == crate::ownership::NINFER_ENGINE)
+                .then(|| crate::engine::ninfer::profile_stamp(&entry.raw))
+                .flatten(),
+            container: entry.engine == crate::ownership::NINFER_ENGINE,
         }
     }
 }
@@ -858,6 +1002,12 @@ struct ActorState {
     witness: Arc<dyn crate::budget::VramWitness>,
     events: tokio::sync::broadcast::Sender<SchedulerStatus>,
     tx: mpsc::UnboundedSender<ActorMsg>,
+    /// Containers with a detached failed-launch log snapshot in flight (R9 C1).
+    /// The task must survive `finish`'s `job.tasks` abort to land the evidence the
+    /// next launch's pre-reap destroys, so its bound is this set — one fetch per
+    /// container, never a pile of concurrent `docker logs` clients from a
+    /// crash-looping load — rather than a job-scoped handle.
+    snapshot_in_flight: HashSet<String>,
     slots: Vec<Slot>,
     jobs: BTreeMap<JobId, Job>,
     /// Last proxy-side use per model (idle sweep input, Step 5).
@@ -1017,14 +1167,27 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 total_diff,
                 own,
                 total_gib,
-            } => state.on_measured(&model, &ticket, total_diff, own, total_gib),
-            ActorMsg::MeasuredPersistFailed {
+            } => state.on_measured(
+                &model,
+                &ticket,
+                Reading {
+                    total_diff,
+                    own,
+                    total_gib,
+                },
+            ),
+            ActorMsg::MeasuredEngineReport {
                 model,
-                high,
-                low,
-                offload,
-                file,
-            } => state.on_measured_persist_failed(&model, high, low, offload, file),
+                ticket,
+                required_to_free_gb,
+                total_gib,
+            } => state.on_engine_report(&model, &ticket, required_to_free_gb, total_gib),
+            ActorMsg::SnapshotDone(container) => {
+                state.snapshot_in_flight.remove(&container);
+            }
+            ActorMsg::MeasuredPersistFailed { model, data, file } => {
+                state.on_measured_persist_failed(&model, &data, file);
+            }
             ActorMsg::ModelFileWritten {
                 model,
                 path,
@@ -1099,6 +1262,7 @@ impl ActorState {
             witness,
             events: tokio::sync::broadcast::channel(64).0,
             tx,
+            snapshot_in_flight: HashSet::new(),
             slots,
             jobs: BTreeMap::new(),
             last_used: HashMap::new(),
@@ -1808,30 +1972,10 @@ impl ActorState {
         }
     }
 
-    /// Folds one serving-window reading into the model's measured range and writes it
-    /// back to the yaml (§0.4): `measured_gb` keeps the high end — what `fixed`
-    /// admission consults — and `measured_gb_min` the low end the page shows, plus —
-    /// for `OFFLOAD_ENGINES` owners only — the `cpu_offload` setting they were taken
-    /// under, so a later flip voids them at scan (the pair is engine-agnostic
-    /// witness truth; the stamp is a knob the engine must actually read).
-    /// Everything it says comes from the spawn's [`MeasuredAnchor`], never from the
-    /// live catalog: `reload()` replaces the catalog while the process keeps its argv,
-    /// so a stamp read at sample time would describe a launch that never happened and
-    /// — because the void rule compares that same stamp with the yaml — disarm the rule
-    /// that catches it, and a range read at sample time would be re-seeded from the
-    /// one live process. Six guards keep the number honest: the sampled engine must
-    /// still be the one in the slot; no other job may be in flight; a tenant that
-    /// appeared after admit is subtracted, or the driver's own per-process attribution
-    /// is used when the card reports it; a figure outside the card is refused, not
-    /// persisted (measurement verifies, it never guesses); the spawn must carry an
-    /// anchor at all; and the row that owns the reading must still be the file this
-    /// engine was launched from — if it has gone, nothing is booked, the reason is
-    /// named once and the sampler is retired. A persist the disk refuses
-    /// reconciles: the triple drains from memory (Fork C — see
-    /// [`ActorState::on_measured_persist_failed`]).
     /// Takes and aborts the sampler of the serving occupant identified by
     /// `model`+`ticket`, so a reading with nowhere to go stops being produced rather
-    /// than being discarded for 24 h. Both anchor classes that cannot persist call this
+    /// than being discarded for 24 h (the fold's own guard list lives on
+    /// [`ActorState::on_measured`]). Both anchor classes that cannot persist call this
     /// (FINDINGS2-04 [3]); it is idempotent, and the ticket keeps a re-minted twin's
     /// sampler untouched.
     fn retire_sampler(&mut self, model: &str, ticket: &SpawnTicket) {
@@ -1849,68 +1993,117 @@ impl ActorState {
         }
     }
 
-    fn on_measured(
-        &mut self,
-        model: &str,
-        ticket: &SpawnTicket,
-        total_diff: f64,
-        own: Option<f64>,
-        total_gib: f64,
-    ) {
-        let serving = self.slots.iter().any(|slot| {
-            slot.occupant
-                .as_ref()
-                .is_some_and(|o| o.model == model && &o.ticket == ticket)
-        });
-        if !serving {
-            return;
+    /// The R9 one-shot: fetch `docker logs <container>` at readiness, snapshot it for
+    /// forensics, and hand the engine's own startup `MemorySummary` figure to the
+    /// actor. `Some(())` means the sampler is finished for the footprint (the reserved
+    /// figure is static per launch); `None` means fall back to the witness loop —
+    /// whose readings a container spawn can only ever earn as `total_diff`
+    /// (displayed, never booked; §5.2: an old build without the memory record, a
+    /// container that will not answer, or a figure the actor would refuse all land
+    /// here, after the snapshot is kept for forensics). The fetch rides the
+    /// ownership-scoped WSL control-command path; the engine-specific parse lives in
+    /// [`crate::engine::ninfer::parse_startup_memory`].
+    async fn report_container(
+        runtime: &Arc<dyn EngineRuntime>,
+        tx: &mpsc::UnboundedSender<ActorMsg>,
+        ctx: &SamplerCtx,
+    ) -> Option<()> {
+        let container = ctx.container.as_deref()?;
+        if ctx.engine != crate::ownership::NINFER_ENGINE {
+            return None;
         }
-        let swapping = self
-            .jobs
-            .values()
-            .any(|job| !job.terminal && job.model != model);
-        if swapping {
-            return;
+        let text = runtime.container_report(container).await?;
+        runtime.save_container_log(&ctx.model, &text).await;
+        let report = crate::engine::ninfer::parse_startup_memory(&text)?;
+        let total_gib = report.total_device_memory_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        // Decide HERE whether the actor could ever book this figure: the one-shot
+        // does not retry after it sends, so consuming the sampler on a figure the
+        // actor would drop would silently skip the witness stand-in too (review
+        // 2026-10-31, M1). A refused figure falls back; the actor still logs the
+        // race-loss drop that cannot be predicted here.
+        Self::measurable_figure(report.required_to_free_gb, total_gib)?;
+        if tx
+            .send(ActorMsg::MeasuredEngineReport {
+                model: ctx.model.clone(),
+                ticket: ctx.ticket.clone(),
+                required_to_free_gb: report.required_to_free_gb,
+                total_gib,
+            })
+            .is_err()
+        {
+            return Some(()); // actor gone
         }
-        let booked_others: f64 = self
-            .slots
-            .iter()
-            .filter_map(|slot| slot.occupant.as_ref())
-            .filter(|o| o.model != model)
-            .map(|o| o.need.0)
-            .sum();
-        // One lookup for the spawn this reading belongs to, by the `(model, ticket)`
-        // the sampler carries: the same row answers for the tenant subtraction above
-        // (`other_need_at_admit`) and for the measured anchor below. A reading whose
-        // spawn row cannot be found — or was never anchored at spawn — is not folded:
-        // the harness cannot say what a launch it cannot identify ran under.
-        let Some((spawned_job, at_admit, anchor)) = self
+        tracing::info!(
+            model = %ctx.model,
+            container,
+            required_to_free_gb = report.required_to_free_gb,
+            "engine reported its reserved VRAM footprint"
+        );
+        Some(())
+    }
+
+    /// Snapshots a failed launch's container log (R9, C1): the autostart pre-reap the
+    /// NEXT launch runs is `docker rm -f`, un-interceptable, so the engine evidence of
+    /// a failed start must be on the Windows side before this job's reap completes —
+    /// never on graceful unload, where there is nothing left to forensicate. Best
+    /// effort: a container that never came up simply yields no log. The task is
+    /// deliberately NOT parked on `job.tasks`: `finish` aborts those the moment the
+    /// release lands, which is routinely before a 10 s `docker logs` returns — the
+    /// one piece of evidence the pre-reap destroys would be the one thing the harness
+    /// cancelled. It is bounded by the control-command timeout instead.
+    fn snapshot_failed_container(&mut self, job_id: JobId) {
+        let Some((container, model)) = self
             .jobs
-            .iter()
-            .find(|(_, job)| job.model == model && job.spawned.as_ref() == Some(ticket))
-            .map(|(id, job)| (*id, job.other_need_at_admit, job.measured.clone()))
+            .get(&job_id)
+            .and_then(|job| job.container.clone().map(|c| (c, job.model.clone())))
         else {
             return;
         };
-        let Some(anchor) = anchor else { return };
-        let attributed = own.unwrap_or(total_diff - (booked_others - at_admit).max(0.0));
-        if !attributed.is_finite() || attributed < 0.0 || attributed > total_gib {
-            // No footprint this engine could have — a wedged driver, or a subtraction
-            // that overshot. Absence, never a fake number.
-            return;
+        if !self.snapshot_in_flight.insert(container.clone()) {
+            return; // a fetch for this container is already running
         }
-        let rounded = (attributed * 10.0).round() / 10.0;
-        if rounded < 0.05 {
-            // Sub-quantum attribution is absence, not a measurement: persisting it
-            // would write the exact token the scanner's reader rule rejects.
-            return;
-        }
-        let mut persist: Option<(std::path::PathBuf, f64, f64, Option<bool>)> = None;
-        let mut changed = false;
+        let runtime = Arc::clone(&self.runtime);
+        let tx = self.tx.clone();
+        let released = container.clone();
+        tokio::spawn(async move {
+            // RAII release: the in-flight mark clears on EVERY exit of this task —
+            // normal end, early return, or panic — so a wedged mark can never
+            // silently blind every later failure of this container name (review
+            // 2026-10-31, L9).
+            let _guard = SnapshotRelease {
+                tx,
+                container: released,
+            };
+            if let Some(text) = runtime.container_report(&container).await {
+                runtime.save_container_log(&model, &text).await;
+            }
+        });
+    }
+
+    fn fold(&mut self, plan: &FoldPlan) {
+        let FoldPlan {
+            model,
+            ticket,
+            high,
+            low,
+            attribution,
+            profile,
+            fold_range,
+        } = plan;
+        let (model, high, low) = (model.as_str(), *high, *low);
         // The row that owns this reading is the spawn-era FILE, never whichever entry
         // answers to the name now: a reload that renames the yaml keeps the bytes and
         // moves the name, and a re-minted twin steals it, so only the file the engine
         // was launched from may receive the write (FINDINGS-13 [3]).
+        let Some((spawned_job, anchor)) = self
+            .jobs
+            .iter()
+            .find(|(_, job)| job.model == model && job.spawned.as_ref() == Some(ticket))
+            .map(|(id, job)| (*id, job.measured.clone()))
+        else {
+            return;
+        };
+        let Some(anchor) = anchor else { return };
         let Some(path) = anchor.file.clone() else {
             // Synthetic row at spawn: no operator file exists, so nothing may be
             // written and nothing may be booked against a name nobody owns. The sampler
@@ -1947,112 +2140,302 @@ impl ActorState {
         // Folded against the SPAWN's range, not the entry's live pair: `read_measured`
         // drops the in-memory copy the moment a stamp stops matching, and a reload
         // that voids it must not silently re-seed an accumulated range from the one
-        // process still on the card.
-        let high = anchor.range.map_or(rounded, |(high, _)| high.max(rounded));
-        let low = anchor
-            .range
-            .map_or(rounded, |(_, low)| low.min(rounded))
-            .min(high);
-        if entry.measured_gb != Some(high)
-            || entry.measured_min_gb != Some(low)
-            || entry.measured_offload != anchor.offload
+        // process still on the card. An `engine_report` skips the fold: the reserved
+        // figure is the engine's whole claim for this launch, static, and not a point
+        // to be averaged into noisy witness history.
+        let (high, low) = if *fold_range {
+            let high = anchor.range.map_or(high, |(h, _)| h.max(high));
+            let low = anchor.range.map_or(low, |(_, l)| l.min(low)).min(high);
+            (high, low)
+        } else {
+            (high, low)
+        };
+        let data = MeasuredData {
+            high,
+            low,
+            offload: anchor.offload,
+            attribution: Some(*attribution),
+            profile: profile.clone(),
+        };
+        if entry.measured_gb == Some(high)
+            && entry.measured_min_gb == Some(low)
+            && entry.measured_offload == data.offload
+            && entry.measured_attribution == data.attribution
+            && entry.measured_profile == data.profile
         {
-            if let Some(declared) = entry.vram_gb {
-                let drift = (high - declared).abs();
-                if drift > (declared * 0.25).max(2.0) {
-                    tracing::warn!(
-                        model,
-                        declared,
-                        measured = high,
-                        "measured footprint diverges from the declared vram_gb"
-                    );
-                }
-            }
-            entry.measured_gb = Some(high);
-            entry.measured_min_gb = Some(low);
-            // The stamp is what this launch actually ran under — minted at spawn
-            // through `offload_live` + the engine's truth set, so the flip-void rule
-            // keeps a stamp that describes the process rather than one rewritten to
-            // agree with the yaml that arrived after it.
-            entry.measured_offload = anchor.offload;
-            persist = Some((path, high, low, anchor.offload));
-            changed = true;
+            return;
         }
-        if changed {
-            // The spawn's own accumulator, so the next sample (and any reload in
-            // between) still folds against the range this process produced.
-            if let Some(job) = self.jobs.get_mut(&spawned_job) {
-                job.measured = Some(MeasuredAnchor {
-                    range: Some((high, low)),
-                    ..anchor.clone()
-                });
+        if let Some(declared) = entry.vram_gb {
+            let drift = (high - declared).abs();
+            if drift > (declared * 0.25).max(2.0) {
+                tracing::warn!(
+                    model,
+                    declared,
+                    measured = high,
+                    "measured footprint diverges from the declared vram_gb"
+                );
             }
-            self.publish();
         }
-        if let Some((path, high, low, offload)) = persist {
-            let name = model.to_string();
-            let tx = self.tx.clone();
-            let anchor_file = path.clone();
-            tokio::task::spawn_blocking(move || {
-                // Every measured key in ONE rewrite: written separately, a failure
-                // between them could leave an orphan or inverted pair, and the
-                // scanner rejects that pair outright — dropping the whole model
-                // (review, 2026-10-27). The stamp rides only when the engine reads
-                // `cpu_offload`: a non-offload yaml never gains a meaningless key.
-                let high_text = format!("{high:.1}");
-                let low_text = format!("{low:.1}");
-                let stamp_text = offload.map(|on| on.to_string());
-                let mut edits: Vec<(&str, Option<&str>)> = vec![
-                    ("measured_gb", Some(high_text.as_str())),
-                    ("measured_gb_min", Some(low_text.as_str())),
-                ];
-                if let Some(stamp) = stamp_text.as_deref() {
-                    edits.push(("measured_offload", Some(stamp)));
-                }
-                match crate::model::writeback::set_flags_on_file(&path, &edits) {
-                    Ok(()) => {
-                        // Axis-2 interlock 5: the fold's own bytes are not a config
-                        // change since launch. The fingerprint rides from here —
-                        // off-thread, directly after the atomic rename — so the
-                        // resident's cached verdict never amber-self over a measurement.
-                        if let Some(fingerprint) = crate::model::fingerprint(&path) {
-                            let _ = tx.send(ActorMsg::ModelFileWritten {
-                                model: name,
-                                path,
-                                fingerprint,
-                            });
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            model = %name,
-                            "cannot persist the measured range"
-                        );
-                        // Warn alone left memory booking a range the file never got
-                        // (FINDINGS-13 [4]'s degraded tail): hand the exact refused
-                        // triple back to the actor, which drains it from the catalog.
-                        // The file rides with it so the drain can only land on the row
-                        // this write targeted — never on a same-name twin.
-                        let _ = tx.send(ActorMsg::MeasuredPersistFailed {
+        entry.measured_gb = Some(high);
+        entry.measured_min_gb = Some(low);
+        // The stamps are what this launch actually ran under — minted at spawn
+        // through `offload_live` + the engine's truth set, so the void rules keep
+        // stamps that describe the process rather than ones rewritten to agree with
+        // the yaml that arrived after it.
+        entry.measured_offload = data.offload;
+        entry.measured_attribution = data.attribution;
+        entry.measured_profile = data.profile.clone();
+        // The spawn's own accumulator, so the next sample (and any reload in between)
+        // still folds against the range and provenance this process produced. A
+        // witness fold that follows the container's own report is refused upstream by
+        // the anchor's `EngineReport` stamp, so the reserved figure can never be
+        // clobbered by a noisy total-diff.
+        if let Some(job) = self.jobs.get_mut(&spawned_job) {
+            job.measured = Some(MeasuredAnchor {
+                range: Some((high, low)),
+                attribution: data.attribution,
+                ..anchor.clone()
+            });
+        }
+        self.publish();
+        let name = model.to_string();
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            // Every measured key in ONE rewrite: written separately, a failure
+            // between them could leave an orphan or inverted pair, or a range booked
+            // under the wrong provenance, and the scanner rejects the orphan outright
+            // — dropping the whole model (review, 2026-10-27).
+            let edits = data.edits();
+            let edits: Vec<(&'static str, Option<&str>)> =
+                edits.iter().map(|(k, v)| (*k, v.as_deref())).collect();
+            match crate::model::writeback::set_flags_on_file(&path, &edits) {
+                Ok(()) => {
+                    // Axis-2 interlock 5: the fold's own bytes are not a config
+                    // change since launch. The fingerprint rides from here —
+                    // off-thread, directly after the atomic rename — so the
+                    // resident's cached verdict never amber-self over a measurement.
+                    if let Some(fingerprint) = crate::model::fingerprint(&path) {
+                        let _ = tx.send(ActorMsg::ModelFileWritten {
                             model: name,
-                            high,
-                            low,
-                            offload,
-                            file: Some(anchor_file),
+                            path,
+                            fingerprint,
                         });
                     }
                 }
-            });
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        model = %name,
+                        "cannot persist the measured range"
+                    );
+                    // Warn alone left memory booking a range the file never got
+                    // (FINDINGS-13 [4]'s degraded tail): hand the exact refused
+                    // figure back to the actor, which drains it from the catalog.
+                    // The file rides with it so the drain can only land on the row
+                    // this write targeted — never on a same-name twin.
+                    let _ = tx.send(ActorMsg::MeasuredPersistFailed {
+                        model: name,
+                        data,
+                        file: Some(path),
+                    });
+                }
+            }
+        });
+    }
+
+    /// The guards every fold must clear before it can touch the catalog: the engine
+    /// this reading claims to describe must still be the one in the slot, and no other
+    /// job may be in flight (a swap mid-window would attribute the card's movement to
+    /// the wrong model). Shared by the witness and the `engine_report` paths so the two
+    /// can never drift apart on who may be believed.
+    fn serving_uncontested(&self, model: &str, ticket: &SpawnTicket) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.occupant
+                .as_ref()
+                .is_some_and(|o| o.model == model && &o.ticket == ticket)
+        }) && !self
+            .jobs
+            .values()
+            .any(|job| !job.terminal && job.model != model)
+    }
+
+    /// One fold's figure at the catalog's 0.1 GiB quantum. `None` means the number is
+    /// not a measurement at all — nonsense or a sub-quantum wobble, both of which are
+    /// absence, and persisting either would write a token the scanner's reader rule
+    /// rejects or book a footprint the card never carried.
+    fn measurable_figure(value: f64, total_gib: f64) -> Option<f64> {
+        if !value.is_finite() || value < 0.0 || value > total_gib {
+            return None;
         }
+        let rounded = (value * 10.0).round() / 10.0;
+        (rounded >= 0.05).then_some(rounded)
+    }
+
+    /// Folds one serving-window witness reading into the model's measured range and
+    /// writes it back to the yaml (§0.4): `measured_gb` keeps the high end — what
+    /// admission consults when the provenance lets it book — and `measured_gb_min` the
+    /// low end the page shows, plus the stamps that make the figure comparable to a
+    /// future launch: the `cpu_offload` setting (`OFFLOAD_ENGINES` owners only), and
+    /// the `measured_attribution:` provenance this reading really earned (R1/R9).
+    /// `own` carrying bytes is the only route to `per_process`; everything the card
+    /// could not attribute is stamped `total_diff` — displayed, never booked. A
+    /// container spawn can never claim `per_process`: its ticket pid is the dead
+    /// `wsl.exe` client (`ninfer.rs`).
+    /// Everything it says comes from the spawn's [`MeasuredAnchor`], never from the
+    /// live catalog: `reload()` replaces the catalog while the process keeps its argv,
+    /// so a stamp read at sample time would describe a launch that never happened and
+    /// — because the void rule compares that same stamp with the yaml — disarm the rule
+    /// that catches it, and a range read at sample time would be re-seeded from the
+    /// one live process. Guards keep the number honest: the sampled engine must still
+    /// be the one in the slot; no other job may be in flight; a tenant that appeared
+    /// after admit is subtracted, or the driver's own per-process attribution is used
+    /// when the card reports it; a figure outside the card is refused, not persisted
+    /// (measurement verifies, it never guesses); the spawn must carry an anchor at
+    /// all; a spawn whose engine already self-reported refuses witness folds outright;
+    /// and the row that owns the reading must still be the file this engine was
+    /// launched from — if it has gone, nothing is booked, the reason is named once and
+    /// the sampler is retired. A persist the disk refuses reconciles: the figure
+    /// drains from memory (Fork C — see [`ActorState::on_measured_persist_failed`]).
+    fn on_measured(&mut self, model: &str, ticket: &SpawnTicket, reading: Reading) {
+        if !self.serving_uncontested(model, ticket) {
+            return;
+        }
+        let Reading {
+            total_diff,
+            own,
+            total_gib,
+        } = reading;
+        // One lookup for the spawn this reading belongs to, by the `(model, ticket)`
+        // the sampler carries: the same row answers for the tenant subtraction below
+        // (`other_need_at_admit`) and for the measured anchor. A reading whose spawn
+        // row cannot be found — or was never anchored at spawn — is not folded: the
+        // harness cannot say what a launch it cannot identify ran under.
+        let Some((at_admit, anchor)) = self
+            .jobs
+            .iter()
+            .find(|(_, job)| job.model == model && job.spawned.as_ref() == Some(ticket))
+            .map(|(_, job)| (job.other_need_at_admit, job.measured.clone()))
+        else {
+            return;
+        };
+        let Some(anchor) = anchor else { return };
+        // The spawn's own verdict on provenance, decided before any arithmetic: a
+        // spawn that already folded the container's `engine_report` never takes a
+        // witness reading into its range again (the reserved figure is static — the
+        // total-diff could only corrupt it).
+        if anchor.attribution == Some(crate::model::MeasuredAttribution::EngineReport) {
+            return;
+        }
+        let booked_others: f64 = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.occupant.as_ref())
+            .filter(|o| o.model != model)
+            .map(|o| o.need.0)
+            .sum();
+        let attributed = own.unwrap_or(total_diff - (booked_others - at_admit).max(0.0));
+        let Some(rounded) = Self::measurable_figure(attributed, total_gib) else {
+            // No footprint this engine could have — a wedged driver, or a subtraction
+            // that overshot — or a sub-quantum wobble. Absence, never a fake number.
+            return;
+        };
+        // The provenance a witness reading may claim (R1 doctrine: metadata only —
+        // this never touches the physical gate). Concrete bytes for the engine's own
+        // pids are the only route to `per_process`.
+        let attribution = match (own.is_some(), anchor.container) {
+            (true, false) => crate::model::MeasuredAttribution::PerProcess,
+            _ => crate::model::MeasuredAttribution::TotalDiff,
+        };
+        self.fold(&FoldPlan {
+            model: model.to_string(),
+            ticket: ticket.clone(),
+            high: rounded,
+            low: rounded,
+            attribution,
+            // The profile stamp belongs to the `engine_report` figure alone (its KV
+            // is what the profile's --kv-capacity bound); a witness range carries
+            // none, so the void rule never misjudges a total-diff on a profile move.
+            profile: (attribution == crate::model::MeasuredAttribution::EngineReport)
+                .then(|| anchor.profile.clone())
+                .flatten(),
+            fold_range: true,
+        });
+    }
+
+    /// Folds the container's one-shot startup `MemorySummary` figure (R9): the
+    /// engine's own reserved footprint — weights + KV at *declared* capacity +
+    /// graphs + reservations + slack — as computed by the engine from its own
+    /// `cudaMemGetInfo`, with no cross-tenant noise. It books (ruling 15 (ii)),
+    /// bounded: declared `vram_gb` still wins, the physical gate stays `used_gib`,
+    /// and `exact` rows are verified against it rather than estimated. Both ends of
+    /// the pair are the reserved figure: `measured_gb_min` never understates the
+    /// declared KV, and the figure is static for the life of the launch.
+    fn on_engine_report(
+        &mut self,
+        model: &str,
+        ticket: &SpawnTicket,
+        required_to_free_gb: f64,
+        total_gib: f64,
+    ) {
+        if !self.serving_uncontested(model, ticket) {
+            // The one-shot does not retry — the sampler ends when it sends — so a
+            // drop here must be visible (review 2026-10-31, M1: the last silent
+            // consumption of this figure rode the witness baseline).
+            tracing::warn!(
+                model,
+                "engine report dropped: another spawn is in flight and this reading lost its uncontested window"
+            );
+            return;
+        }
+        // The parser already clamped to `[0, total]`; a claimed reservation of zero is
+        // nonsense, refused by the same rule the witness path applies — nonsense never
+        // books, and never persists.
+        let Some(rounded) = Self::measurable_figure(required_to_free_gb, total_gib) else {
+            tracing::warn!(
+                model,
+                required_to_free_gb,
+                total_gib,
+                "engine report refused: the figure is nonsense or sub-quantum for this card"
+            );
+            return;
+        };
+        let anchor = self
+            .jobs
+            .iter()
+            .find(|(_, job)| job.model == model && job.spawned.as_ref() == Some(ticket))
+            .and_then(|(_, job)| job.measured.clone());
+        let profile = anchor.as_ref().and_then(|a| a.profile.clone());
+        if profile.is_none() {
+            // Ruling 15 demands every booked `engine_report` be launch-verifiable
+            // against a resolved profile. A legacy-autostart spawn never ran the
+            // override validation, so there is no certifying identity: the figure
+            // still persists (it is the engine's own bytes — the page should show
+            // them) but `read_measured`'s void now refuses to book it.
+            tracing::warn!(
+                model,
+                "engine report has no resolved profile stamp (legacy autostart?): it displays but will not book"
+            );
+        }
+        self.fold(&FoldPlan {
+            model: model.to_string(),
+            ticket: ticket.clone(),
+            high: rounded,
+            low: rounded,
+            attribution: crate::model::MeasuredAttribution::EngineReport,
+            profile,
+            // Static for the life of the launch: never averaged into witness history.
+            fold_range: false,
+        });
     }
 
     /// Reconciles a refused measured persist (Fork C): the in-memory measured pair
-    /// (and, for offload engines, the stamp) is drained to its none state so the
-    /// page and `fixed` admission never charge a footprint the disk refused. The
-    /// drain only lands when the entry still holds the exact values that failed —
-    /// a superseding reading (whose own persist will carry its own reconcile if it
-    /// too fails) is left untouched.
+    /// and the provenance stamps written with it are drained to their none state so
+    /// the page and admission never charge a footprint the disk refused. The drain
+    /// only lands when the entry still holds the exact values that failed — a
+    /// superseding reading (whose own persist will carry its own reconcile if it too
+    /// fails) is left untouched. Draining the stamps with the pair is what keeps the
+    /// grandfathering rule honest: a `measured_gb` with no stamp books, so a row the
+    /// disk refused must not keep a stamp claiming a provenance it never got.
     ///
     /// The row is found by the same key the fold used, the spawn-era FILE
     /// (FINDINGS2-04 [1]): keying this leg `name && file` while the fold is keyed
@@ -2066,9 +2449,7 @@ impl ActorState {
     fn on_measured_persist_failed(
         &mut self,
         model: &str,
-        high: f64,
-        low: f64,
-        offload: Option<bool>,
+        data: &MeasuredData,
         file: Option<PathBuf>,
     ) {
         let Some(entry) = self.catalog.iter_mut().find(|m| {
@@ -2077,13 +2458,17 @@ impl ActorState {
         }) else {
             return;
         };
-        if entry.measured_gb == Some(high)
-            && entry.measured_min_gb == Some(low)
-            && entry.measured_offload == offload
+        if entry.measured_gb == Some(data.high)
+            && entry.measured_min_gb == Some(data.low)
+            && entry.measured_offload == data.offload
+            && entry.measured_attribution == data.attribution
+            && entry.measured_profile == data.profile
         {
             entry.measured_gb = None;
             entry.measured_min_gb = None;
             entry.measured_offload = None;
+            entry.measured_attribution = None;
+            entry.measured_profile = None;
             self.publish();
         }
     }
@@ -3091,6 +3476,11 @@ impl ActorState {
                 self.spawn_probe_task(job_id, spawned.port);
             }
             (SwapState::Spawn, Event::Spawned(Err(error))) => {
+                // R9 (C1): a failed client leaves the container it did start (or a
+                // half-created one) reachable for exactly one more moment — snapshot
+                // its log before this job's reap and the next launch's pre-reap erase
+                // the engine's own account of the failure.
+                self.snapshot_failed_container(job_id);
                 self.fail_job(
                     job_id,
                     SchedulerError::Spawn(error.to_string()),
@@ -3101,6 +3491,7 @@ impl ActorState {
                 self.install(job_id, discovered);
             }
             (SwapState::Ready, Event::Probed(Probe::Failed { reason }, _)) => {
+                self.snapshot_failed_container(job_id);
                 self.fail_job(
                     job_id,
                     SchedulerError::EngineFailed(reason),
@@ -3236,25 +3627,48 @@ impl ActorState {
         // victim's whole footprint. The card's per-process attribution is preferred
         // when the driver reports it; the total-diff stands in otherwise, which is what
         // makes a container-backed engine measurable at all (its ticket pid is a
-        // short-lived `wsl.exe` client). What to charge is the actor's call alone: it
-        // knows who else is booked and which engine actually holds the slot.
-        let ticket = self.jobs.get(&job_id).and_then(|job| job.spawned.clone());
-        let own_pids: Vec<u32> = match (
-            ticket.as_ref(),
-            self.jobs
-                .get(&job_id)
-                .is_some_and(|job| job.container.is_none()),
-        ) {
-            (Some(ticket), true) => vec![ticket.pid],
-            _ => Vec::new(),
-        };
+        // short-lived `wsl.exe` client) — and from R9 the container's own startup
+        // `MemorySummary` stands in ahead of even that, so the sampler fetches it
+        // first. What to charge is the actor's call alone: it knows who else is booked
+        // and which engine actually holds the slot.
+        let sampler_ctx = self.jobs.get(&job_id).map(|job| {
+            let ticket = job
+                .spawned
+                .clone()
+                .expect("invariant: install only happens after a spawn");
+            SamplerCtx {
+                model: job.model.clone(),
+                own_pids: if job.container.is_none() {
+                    vec![ticket.pid]
+                } else {
+                    Vec::new()
+                },
+                ticket,
+                container: job.container.clone(),
+                engine: job.engine.clone(),
+            }
+        });
         let baseline_free = self.post_release_free(job_id);
-        if let (Some(slot), Some(baseline_free), Some(ticket)) = (slot, baseline_free, ticket) {
+        if let (Some(slot), Some(ctx)) = (slot, sampler_ctx) {
             let witness = Arc::clone(&self.witness);
+            let runtime = Arc::clone(&self.runtime);
             let tx = self.tx.clone();
-            let measured_model = model.clone();
             let every = std::time::Duration::from_secs(self.cfg.measured_sample_s.max(1));
             let handle = tokio::spawn(async move {
+                // The container's own startup report is demanded whenever a container
+                // is installed — it is a property of the engine, not of the witness,
+                // and a card the witness cannot observe (ledger-only, wedged driver)
+                // must not also blind the harness to what the engine itself said.
+                if Self::report_container(&runtime, &tx, &ctx).await.is_some() {
+                    return;
+                }
+                // The total-diff stand-in needs the admit reading as its baseline;
+                // with no observation to subtract from, there is no honest
+                // difference to take, so the stand-in — and only the stand-in —
+                // stays home.
+                let Some(baseline_free) = baseline_free else {
+                    return;
+                };
                 let mut tick = tokio::time::interval(every);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 // The first interval tick completes at once; consume it, because a
@@ -3287,10 +3701,10 @@ impl ActorState {
                             }
                             if tx
                                 .send(ActorMsg::Measured {
-                                    model: measured_model.clone(),
-                                    ticket: ticket.clone(),
+                                    model: ctx.model.clone(),
+                                    ticket: ctx.ticket.clone(),
                                     total_diff,
-                                    own: sample.own_gib(&own_pids),
+                                    own: sample.own_gib(&ctx.own_pids),
                                     total_gib: sample.total_gib,
                                 })
                                 .is_err()
@@ -3575,6 +3989,28 @@ impl ActorState {
         *field(&mut job.timings) = Some(elapsed);
     }
 
+    /// What the occupant's own container reported it reserves (R9), read off the
+    /// spawn anchor of the job that produced this exact occupant (`model` + `ticket`
+    /// — never the model name alone, which a re-minted twin can steal): Some only
+    /// for a ninfer container spawn whose anchor folded an `engine_report` figure.
+    /// The API's memory-bar sum derives from this so `/har/status` and the SSE push
+    /// quote ONE source (review 2026-10-31: threading the sum only through the SSE
+    /// build left the poll path — the only path a token-gated page has — forever
+    /// null, and a fixture carrying the value hid it).
+    fn container_reported_gb(&self, slot: &Slot) -> Option<f64> {
+        let occupant = slot.occupant.as_ref()?;
+        let job = self.jobs.iter().find_map(|(_, job)| {
+            (job.model == occupant.model && job.spawned.as_ref() == Some(&occupant.ticket))
+                .then_some(job)
+        })?;
+        let anchor = job.measured.as_ref()?;
+        (job.engine == crate::ownership::NINFER_ENGINE
+            && anchor.container
+            && anchor.attribution == Some(crate::model::MeasuredAttribution::EngineReport))
+        .then(|| anchor.range.map(|(high, _)| high))
+        .flatten()
+    }
+
     fn snapshot(&self) -> SchedulerStatus {
         let now = Instant::now();
         SchedulerStatus {
@@ -3600,6 +4036,7 @@ impl ActorState {
                         .as_ref()
                         .map(|o| crate::model::iso8601_utc(o.launched_at_wall)),
                     stale_config: s.occupant.as_ref().map(|o| o.stale_config),
+                    container_reported_gb: self.container_reported_gb(s),
                     loaded_at: s.occupant.as_ref().map_or(now, |o| o.loaded_at),
                 })
                 .collect(),
@@ -4081,6 +4518,44 @@ mod tests {
         }];
     }
 
+    impl ActorState {
+        /// The pin seam for one witness reading, exactly as the serving-window sampler
+        /// sends it (`ActorMsg::Measured`).
+        fn witness(&mut self, model: &str, ticket: &SpawnTicket, attributed: f64) {
+            self.on_measured(
+                model,
+                ticket,
+                super::Reading {
+                    total_diff: attributed,
+                    own: Some(attributed),
+                    total_gib: 24.0,
+                },
+            );
+        }
+
+        /// The pin seam for the container's one-shot startup `MemorySummary` figure
+        /// (`ActorMsg::MeasuredEngineReport`). The card is the operator's 72 GiB: a
+        /// reserved figure may legitimately exceed the 24 GiB the witness fold pins
+        /// use, because it counts KV reserved at *declared* capacity, not bytes the
+        /// card was observed carrying.
+        fn engine_report(&mut self, model: &str, ticket: &SpawnTicket, required_gb: f64) {
+            self.on_engine_report(model, ticket, required_gb, 72.0);
+        }
+
+        /// The pin seam for the persist-failed reconcile: the disk refused exactly this
+        /// figure, so the drain must land on exactly these values. Pair-only rows pass
+        /// `attribution: None, profile: None` — the legacy shape a pre-provenance
+        /// persist carried.
+        fn fail_persist(
+            &mut self,
+            model: &str,
+            data: super::MeasuredData,
+            file: Option<std::path::PathBuf>,
+        ) {
+            self.on_measured_persist_failed(model, &data, file);
+        }
+    }
+
     /// A persist the disk refuses must not leave memory booking what disk denied
     /// (Fork C, closing FINDINGS-13 [4]'s warn-only tail): the warn fires AND the
     /// catalog entry's measured triple drains to its none state. The entry is a
@@ -4139,7 +4614,7 @@ mod tests {
         state.catalog = vec![entry.clone()];
         seat_spawn(&mut state, &entry, &ticket, 18_991);
 
-        state.on_measured("drift", &ticket, 3.7, Some(3.7), 24.0);
+        state.witness("drift", &ticket, 3.7);
         assert_eq!(
             state.catalog[0].measured_gb,
             Some(3.7),
@@ -4150,29 +4625,31 @@ mod tests {
             .await
             .expect("the persist failure reaches the actor")
             .expect("channel open");
-        let ActorMsg::MeasuredPersistFailed {
-            model,
-            high,
-            low,
-            offload,
-            file,
-        } = msg
-        else {
+        let ActorMsg::MeasuredPersistFailed { model, data, file } = msg else {
             panic!("expected the persist-failed reconcile message");
         };
         assert_eq!(model, "drift");
-        assert_eq!((high, low, offload), (3.7, 3.7, Some(false)));
+        assert_eq!((data.high, data.low, data.offload), (3.7, 3.7, Some(false)));
+        assert_eq!(
+            data.attribution,
+            Some(crate::model::MeasuredAttribution::PerProcess),
+            "concrete bytes for the engine's own pid stamp the reading per_process"
+        );
         assert_eq!(
             file.as_deref(),
             Some(yaml.as_path()),
             "the reconcile names the spawn-era row it refused to write"
         );
 
-        state.on_measured_persist_failed(&model, high, low, offload, file);
+        state.fail_persist(&model, data, file);
         let entry = &state.catalog[0];
         assert_eq!(entry.measured_gb, None);
         assert_eq!(entry.measured_min_gb, None);
         assert_eq!(entry.measured_offload, None);
+        assert_eq!(
+            entry.measured_attribution, None,
+            "a range the disk refused must not keep the provenance that would book it"
+        );
 
         let warns = capture.lock().expect("capture lock");
         assert!(
@@ -4257,7 +4734,7 @@ mod tests {
             ..spawn_era.clone()
         }];
 
-        state.on_measured("renamed", &ticket, 3.7, Some(3.7), 24.0);
+        state.witness("renamed", &ticket, 3.7);
         assert_eq!(
             state.catalog[0].measured_gb,
             Some(3.7),
@@ -4268,14 +4745,7 @@ mod tests {
             .await
             .expect("the persist failure reaches the actor")
             .expect("channel open");
-        let ActorMsg::MeasuredPersistFailed {
-            model,
-            high,
-            low,
-            offload,
-            file,
-        } = msg
-        else {
+        let ActorMsg::MeasuredPersistFailed { model, data, file } = msg else {
             panic!("expected the persist-failed reconcile message");
         };
         assert_eq!(
@@ -4284,7 +4754,7 @@ mod tests {
         );
         assert_eq!(file.as_deref(), Some(yaml.as_path()));
 
-        state.on_measured_persist_failed(&model, high, low, offload, file);
+        state.fail_persist(&model, data, file);
         let entry = &state.catalog[0];
         assert_eq!(
             entry.measured_gb, None,
@@ -4342,7 +4812,7 @@ mod tests {
             .expect("a seated occupant")
             .measure = Some(sampler);
 
-        state.on_measured("synthetic", &ticket, 3.7, Some(3.7), 24.0);
+        state.witness("synthetic", &ticket, 3.7);
 
         let measure = &state
             .slots
@@ -4533,13 +5003,33 @@ mod tests {
         entry.file = Some(fresh_yaml.clone());
         state.catalog = vec![entry];
 
-        state.on_measured_persist_failed("fresh", 5.0, 5.0, Some(false), Some(fresh_yaml.clone()));
+        state.fail_persist(
+            "fresh",
+            super::MeasuredData {
+                high: 5.0,
+                low: 5.0,
+                offload: Some(false),
+                attribution: None,
+                profile: None,
+            },
+            Some(fresh_yaml.clone()),
+        );
         assert_eq!(
             state.catalog[0].measured_gb,
             Some(6.0),
             "the newer (possibly persisted) triple survives a stale failure"
         );
-        state.on_measured_persist_failed("fresh", 6.0, 4.0, None, Some(fresh_yaml.clone()));
+        state.fail_persist(
+            "fresh",
+            super::MeasuredData {
+                high: 6.0,
+                low: 4.0,
+                offload: None,
+                attribution: None,
+                profile: None,
+            },
+            Some(fresh_yaml.clone()),
+        );
         assert_eq!(
             state.catalog[0].measured_gb,
             Some(6.0),
@@ -4547,7 +5037,17 @@ mod tests {
              (llama-style) triple: equal pair values with the wrong stamp shape are \
              not the triple that failed"
         );
-        state.on_measured_persist_failed("fresh", 6.0, 4.0, Some(false), Some(fresh_yaml.clone()));
+        state.fail_persist(
+            "fresh",
+            super::MeasuredData {
+                high: 6.0,
+                low: 4.0,
+                offload: Some(false),
+                attribution: None,
+                profile: None,
+            },
+            Some(fresh_yaml.clone()),
+        );
         assert_eq!(
             state.catalog[0].measured_gb, None,
             "the matching triple drains"
@@ -4561,11 +5061,15 @@ mod tests {
         let paironly_yaml = dir.join("paironly.yaml");
         paironly.file = Some(paironly_yaml.clone());
         state.catalog.push(paironly);
-        state.on_measured_persist_failed(
+        state.fail_persist(
             "paironly",
-            6.0,
-            4.0,
-            Some(false),
+            super::MeasuredData {
+                high: 6.0,
+                low: 4.0,
+                offload: Some(false),
+                attribution: None,
+                profile: None,
+            },
             Some(paironly_yaml.clone()),
         );
         assert_eq!(
@@ -4574,7 +5078,17 @@ mod tests {
             "the reverse leg: a Some-shaped (llama-style) failure must not drain a \
              pair-only (strata-style) triple"
         );
-        state.on_measured_persist_failed("paironly", 6.0, 4.0, None, Some(paironly_yaml.clone()));
+        state.fail_persist(
+            "paironly",
+            super::MeasuredData {
+                high: 6.0,
+                low: 4.0,
+                offload: None,
+                attribution: None,
+                profile: None,
+            },
+            Some(paironly_yaml.clone()),
+        );
         assert_eq!(
             state.catalog[1].measured_gb, None,
             "the shape-matching failure drains the pair"
@@ -4664,7 +5178,7 @@ mod tests {
         state.catalog = vec![stampy.clone(), nostamp.clone()];
 
         seat_spawn(&mut state, &stampy, &ticket, 18_992);
-        state.on_measured("stampy", &ticket, 4.2, Some(4.2), 24.0);
+        state.witness("stampy", &ticket, 4.2);
         assert_eq!(
             (
                 state.catalog[0].measured_gb,
@@ -4694,7 +5208,7 @@ mod tests {
         );
 
         seat_spawn(&mut state, &nostamp, &ticket, 18_992);
-        state.on_measured("nostamp", &ticket, 4.3, Some(4.3), 24.0);
+        state.witness("nostamp", &ticket, 4.3);
         assert_eq!(
             (
                 state.catalog[1].measured_gb,
@@ -4783,7 +5297,7 @@ mod tests {
         state.catalog = vec![spawned.clone()];
         seat_spawn(&mut state, &spawned, &ticket, 19_001);
 
-        state.on_measured("flip", &ticket, 5.0, Some(5.0), 24.0);
+        state.witness("flip", &ticket, 5.0);
         await_yaml_keys(&yaml, &["measured_gb: 5.0", "measured_offload: false"]).await;
 
         // The operator flips the knob (one line, the measured keys stay) and the
@@ -4798,7 +5312,7 @@ mod tests {
             "the rescan's void rule must have fired, or the leg below proves nothing"
         );
 
-        state.on_measured("flip", &ticket, 6.0, Some(6.0), 24.0);
+        state.witness("flip", &ticket, 6.0);
         let entry = &state.catalog[0];
         assert_eq!(
             entry.measured_offload,
@@ -4835,6 +5349,352 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// R9 (ruling 15 (ii)): the container's own reserved-footprint report books for an
+    /// `exact` row that declared nothing — the one class the GGUF fallback must never
+    /// guess for — fixes BOTH ends of the pair (`measured_gb_min` never understates the
+    /// declared KV), carries the launch's profile stamp, and outranks every later
+    /// witness reading: the reserved figure is static, so a noisy total-diff could only
+    /// corrupt it. Falsifiers: dropping the anchor's `EngineReport` guard lets the
+    /// witness clobber the range; stamping without the profile leaves the scan's
+    /// profile-void rule without an anchor to compare.
+    #[tokio::test]
+    async fn an_engine_report_books_an_exact_row_and_the_witness_never_clobbers_it() {
+        let dir = crate::testutil::temp_dir("fold-engine-report");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("er.yaml");
+        std::fs::write(&yaml, "engine: ninfer\ncost: exact\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "er");
+        assert_eq!(
+            spawned.cost_source(),
+            crate::model::CostSource::Undeclared,
+            "exact without its declared precision claim starts refused, never estimated"
+        );
+        let ticket = fold_ticket(19_010);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_010);
+
+        state.engine_report("er", &ticket, 31.0);
+        let entry = &state.catalog[0];
+        assert_eq!(entry.measured_gb, Some(31.0));
+        assert_eq!(
+            entry.measured_min_gb,
+            Some(31.0),
+            "the reserved figure is static: both ends are the reservation"
+        );
+        assert_eq!(
+            entry.measured_attribution,
+            Some(crate::model::MeasuredAttribution::EngineReport)
+        );
+        assert_eq!(entry.measured_profile.as_deref(), Some("b"));
+        assert_eq!(
+            entry.cost_source(),
+            crate::model::CostSource::Measured,
+            "the engine's own reserved budget is a source: exact may book it"
+        );
+
+        state.witness("er", &ticket, 9.0);
+        let entry = &state.catalog[0];
+        assert_eq!(
+            (entry.measured_gb, entry.measured_min_gb),
+            (Some(31.0), Some(31.0)),
+            "the total-diff cannot widen what the engine itself reported"
+        );
+        await_yaml_keys(
+            &yaml,
+            &[
+                "measured_gb: 31.0",
+                "measured_attribution: engine_report",
+                "measured_profile: b",
+            ],
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-slot carrier behind the API's R9 memory-bar sum: the figure reaches
+    /// the snapshot ONLY through the spawn anchor of the very job that produced this
+    /// occupant — engine ninfer, container-backed, attribution `engine_report` — so
+    /// `/har/status` and the SSE push quote the identical number (review
+    /// 2026-10-31: threading the sum only through the SSE build made the annotation
+    /// dead on the poll path). Falsifier: loosening any one of the three anchor
+    /// gates (the engine check, `anchor.container`, the attribution filter — the
+    /// very filter with zero coverage before this pin) makes a total-diff free-memory
+    /// delta or a child-process figure reach the line the operator reads as
+    /// container-reserved.
+    #[tokio::test]
+    async fn only_an_engine_report_anchor_reaches_the_snapshot_slot() {
+        let dir = crate::testutil::temp_dir("fold-slot-report");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir_all(dir.join("logs")).expect("logs dir");
+        let yaml = dir.join("sb.yaml");
+        std::fs::write(&yaml, "engine: ninfer\ncost: exact\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "sb");
+        let ticket = fold_ticket(19_015);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_015);
+
+        // Witness first: a container total-diff must NOT populate the slot carrier.
+        state.on_measured(
+            "sb",
+            &ticket,
+            super::Reading {
+                total_diff: 12.0,
+                own: None,
+                total_gib: 72.0,
+            },
+        );
+        assert_eq!(
+            state.snapshot().slots[0].container_reported_gb,
+            None,
+            "a free-memory delta is not a container reservation"
+        );
+
+        // The engine's own record: the same fold that books is what the slot carries.
+        state.engine_report("sb", &ticket, 31.0);
+        assert_eq!(
+            state.snapshot().slots[0].container_reported_gb,
+            Some(31.0),
+            "the engine_report fold is the ONLY route to the bar's reserved line"
+        );
+
+        // A twin under a non-ninfer engine, anchored like a report but with the
+        // engine gate's answer changed: the engine check must keep it out.
+        let twin = ModelEntry {
+            engine: "llama".to_string(),
+            ..spawned.clone()
+        };
+        let twin_ticket = fold_ticket(19_016);
+        state.catalog = vec![twin.clone()];
+        seat_spawn(&mut state, &twin, &twin_ticket, 19_016);
+        state.engine_report("sb", &twin_ticket, 31.0);
+        assert_eq!(
+            state.snapshot().slots[0].container_reported_gb,
+            None,
+            "a child-process spawn never reserves container memory, whoever reported it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R9 (§5.2) + F1(b): a container that never yielded a parsable memory record
+    /// still gets measured — but the reading is stamped `total_diff`, and a
+    /// `total_diff` displays without ever booking. When the report does land (a later
+    /// startup), it supersedes the witness figure outright. Falsifier: minting the
+    /// witness stamp as `None` (the pre-R9 shape) books the 12.0 GiB total-diff as if
+    /// it were a footprint.
+    #[tokio::test]
+    async fn a_total_diff_fold_displays_but_never_books_until_the_report_lands() {
+        let dir = crate::testutil::temp_dir("fold-total-diff");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("td.yaml");
+        std::fs::write(&yaml, "engine: ninfer\ncost: exact\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "td");
+        let ticket = fold_ticket(19_011);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_011);
+
+        state.on_measured(
+            "td",
+            &ticket,
+            super::Reading {
+                total_diff: 12.0,
+                own: None,
+                total_gib: 24.0,
+            },
+        );
+        let entry = &state.catalog[0];
+        assert_eq!(
+            entry.measured_gb,
+            Some(12.0),
+            "the page still shows the reading"
+        );
+        assert_eq!(
+            entry.measured_attribution,
+            Some(crate::model::MeasuredAttribution::TotalDiff)
+        );
+        assert_eq!(
+            entry.cost_source(),
+            crate::model::CostSource::Undeclared,
+            "exact never books a total-diff: absence of a source is still absence"
+        );
+
+        state.engine_report("td", &ticket, 31.0);
+        let entry = &state.catalog[0];
+        assert_eq!(
+            (entry.measured_gb, entry.measured_min_gb),
+            (Some(31.0), Some(31.0)),
+            "the engine's own figure replaces the noisy stand-in rather than widening it"
+        );
+        assert_eq!(
+            entry.measured_attribution,
+            Some(crate::model::MeasuredAttribution::EngineReport)
+        );
+        assert_eq!(entry.cost_source(), crate::model::CostSource::Measured);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 + R9: a detached container's ticket pid is the dead `wsl.exe` client, so a
+    /// container spawn may NEVER claim `per_process` — even a witness reading that
+    /// carries concrete bytes for that pid is a lie waiting to be stamped. The
+    /// falsifier is minting the stamp from `own` alone: the container row would book
+    /// 12.0 GiB as its own from a number the card never attributed to the engine.
+    #[tokio::test]
+    async fn a_container_reading_may_never_claim_per_process_attribution() {
+        let dir = crate::testutil::temp_dir("fold-container-own");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir_all(dir.join("logs")).expect("logs dir");
+        let yaml = dir.join("cn.yaml");
+        std::fs::write(&yaml, "engine: ninfer\nvram_gb: 20\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "cn");
+        let ticket = fold_ticket(19_012);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_012);
+
+        state.witness("cn", &ticket, 12.0);
+        let entry = &state.catalog[0];
+        assert_eq!(
+            entry.measured_attribution,
+            Some(crate::model::MeasuredAttribution::TotalDiff),
+            "a container's pid is the dead client: concrete bytes for it attribute nothing"
+        );
+        assert_eq!(
+            entry.cost_source(),
+            crate::model::CostSource::Declared,
+            "the declared number still books; the total-diff never competes"
+        );
+        // The persist must carry the honest stamp: a file left with a bare
+        // `measured_gb` would grandfather the stand-in back into booking on the next
+        // scan, which is exactly the lie this pin exists to keep out.
+        let written = await_yaml_keys(&yaml, &["measured_attribution: total_diff"]).await;
+        assert!(
+            !written.contains("measured_profile"),
+            "a witness range carries no profile stamp: {written}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The counterpart leg: a child-process engine whose card DID report concrete
+    /// bytes for the engine's own pid earns `per_process` — a provenance that books,
+    /// written to the file alongside the pair. Falsifier: stamping every witnessed
+    /// fold `total_diff` breaks the booking leg here while the container leg above
+    /// stays green.
+    #[tokio::test]
+    async fn a_per_process_fold_books_and_stamps_the_file() {
+        let dir = crate::testutil::temp_dir("fold-per-process");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir_all(dir.join("logs")).expect("logs dir");
+        let yaml = dir.join("pp.yaml");
+        std::fs::write(&yaml, "engine: llama\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "pp");
+        let ticket = fold_ticket(19_013);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_013);
+
+        state.witness("pp", &ticket, 7.4);
+        let entry = &state.catalog[0];
+        assert_eq!(
+            entry.measured_attribution,
+            Some(crate::model::MeasuredAttribution::PerProcess)
+        );
+        assert_eq!(
+            entry.cost_source(),
+            crate::model::CostSource::Measured,
+            "a driver-attributed footprint is a real booking source for a fixed row"
+        );
+        await_yaml_keys(
+            &yaml,
+            &["measured_gb: 7.4", "measured_attribution: per_process"],
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fork C extended to the provenance stamps: a range the disk refused must not
+    /// keep the stamp that would book it. With the grandfathering rule (an UNSTAMPED
+    /// measured pair books), a drain that cleared only the pair and left
+    /// `measured_attribution` behind would resurrect the refused figure as bookable on
+    /// the next rescan — this pin is the falsifier for exactly that half-drain.
+    #[test]
+    fn a_refused_persist_drains_the_provenance_stamps_with_the_pair() {
+        let dir = crate::testutil::temp_dir("fold-drain-stamps");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("ds.yaml");
+        std::fs::write(&yaml, "engine: ninfer\nvram_gb: 20\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let mut entry = rescan_entry(&yaml, "ds");
+        entry.measured_gb = Some(30.0);
+        entry.measured_min_gb = Some(30.0);
+        entry.measured_attribution = Some(crate::model::MeasuredAttribution::EngineReport);
+        entry.measured_profile = Some("b".to_string());
+        state.catalog = vec![entry];
+
+        state.fail_persist(
+            "ds",
+            super::MeasuredData {
+                high: 30.0,
+                low: 30.0,
+                offload: None,
+                attribution: Some(crate::model::MeasuredAttribution::EngineReport),
+                profile: Some("b".to_string()),
+            },
+            Some(yaml.clone()),
+        );
+        let entry = &state.catalog[0];
+        assert_eq!(entry.measured_gb, None);
+        assert_eq!(
+            entry.measured_attribution, None,
+            "an orphaned provenance stamp would grandfather the refused pair back to bookable"
+        );
+        assert_eq!(entry.measured_profile, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sampler's fallback shape (R9 §5.2): with no container report seeded, the
+    /// one-shot finds nothing, the witness loop still runs, and what lands is stamped
+    /// `total_diff` — displayed, never booked. A regression that swallows the report
+    /// path entirely looks exactly like this pin from the outside, which is why the
+    /// report-present legs live in `tests/r9_container_report.rs` against the faked
+    /// runtime seam rather than being asserted only here.
+    #[tokio::test]
+    async fn a_container_without_a_report_falls_back_to_the_witness_loop() {
+        let dir = crate::testutil::temp_dir("fold-report-fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("fb.yaml");
+        std::fs::write(&yaml, "engine: ninfer\nvram_gb: 20\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "fb");
+        let ticket = fold_ticket(19_014);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_014);
+
+        state.on_measured(
+            "fb",
+            &ticket,
+            super::Reading {
+                total_diff: 18.0,
+                own: None,
+                total_gib: 24.0,
+            },
+        );
+        assert_eq!(
+            state.catalog[0].measured_attribution,
+            Some(crate::model::MeasuredAttribution::TotalDiff),
+            "the stand-in keeps its honest provenance"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FINDINGS-13 [3]'s fold half: two rows answering to one identity. The reading
     /// belongs to the file the engine was spawned from, and the reconcile of a refused
     /// persist may only drain that same row — never the twin whose bytes the refused
@@ -4858,7 +5718,7 @@ mod tests {
         state.catalog = vec![rescan_entry(&twin, "twin"), spawned.clone()];
         seat_spawn(&mut state, &spawned, &ticket, 19_002);
 
-        state.on_measured("twin", &ticket, 4.4, Some(4.4), 24.0);
+        state.witness("twin", &ticket, 4.4);
         let folded = await_yaml_keys(&mine, &["measured_gb: 4.4"]).await;
         assert!(
             folded.contains("measured_gb_min: 4.4"),
@@ -4880,13 +5740,27 @@ mod tests {
         );
 
         // The refused-persist reconcile is held to the same target: equal values on
-        // both rows may not make the twin drainable.
+        // both rows may not make the twin drainable. Both rows wear exactly what the
+        // resident's own fold wrote — only the row whose FILE the refused write
+        // targeted may drain.
         for index in 0..2 {
             state.catalog[index].measured_gb = Some(4.4);
             state.catalog[index].measured_min_gb = Some(4.4);
             state.catalog[index].measured_offload = Some(false);
+            state.catalog[index].measured_attribution =
+                Some(crate::model::MeasuredAttribution::PerProcess);
         }
-        state.on_measured_persist_failed("twin", 4.4, 4.4, Some(false), Some(mine.clone()));
+        state.fail_persist(
+            "twin",
+            super::MeasuredData {
+                high: 4.4,
+                low: 4.4,
+                offload: Some(false),
+                attribution: Some(crate::model::MeasuredAttribution::PerProcess),
+                profile: None,
+            },
+            Some(mine.clone()),
+        );
         assert_eq!(
             state.catalog[1].measured_gb, None,
             "the row the refused write targeted drains"
@@ -4936,7 +5810,7 @@ mod tests {
         std::fs::write(&yaml, "engine: llama\nbad key: x\n").expect("break the row");
         state.catalog = Vec::new();
 
-        state.on_measured("gone", &ticket, 9.0, Some(9.0), 24.0);
+        state.witness("gone", &ticket, 9.0);
         assert!(
             state.catalog.is_empty(),
             "no row may be booked, created or extended for a vanished launch"
@@ -5005,7 +5879,7 @@ mod tests {
             }),
             job: None,
         }];
-        bare.on_measured("gone", &unanchored, 9.0, Some(9.0), 24.0);
+        bare.witness("gone", &unanchored, 9.0);
         assert_eq!(
             bare.catalog[0].measured_gb, None,
             "an unanchored spawn has no stamp to mint and no file to write"

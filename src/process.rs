@@ -36,17 +36,31 @@ use crate::ownership::{
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
 /// `CREATE_NO_WINDOW`: hidden children (Step 8).
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Poll pause between release-evidence checks inside the deadline.
 const RELEASE_POLL: Duration = Duration::from_millis(100);
-/// Log hygiene (Step 16): at most this many engine log files survive; the oldest
-/// are deleted at spawn time (T14's `logs/` budget).
-const LOG_FILE_CAP: usize = 50;
+/// Per-model forensic retention (R9, operator 2026-10-31): the newest this many
+/// launches' client captures **and** this many container snapshots survive, per model.
+/// Replaces the old global-50 budget, which let a swap-heavy model evict another
+/// model's forensic log — a failed launch's log must survive the second launch.
+const ENGINE_LOG_KEEP: usize = 5;
+/// Defensive ceiling on the `docker logs` text we retain (bytes, tail). A second
+/// belt behind docker's own `--tail` ([`CONTAINER_LOG_TAIL_LINES`]): pathological
+/// multi-megabyte single lines still cannot blow up the harness. Bounded upstream by
+/// `--log-opt max-file` for containers the harness itself started.
+const CONTAINER_LOG_FETCH_CAP: usize = 8 * 1024 * 1024;
+/// The line bound handed to `docker logs --tail`, so the daemon — not the harness's
+/// memory — enforces the fetch bound (see [`container_logs`]). Comfortably above any
+/// plausible post-startup chatter while the startup `MemorySummary` record (written
+/// at startup, re-read only for a container this harness claimed) stays in view.
+const CONTAINER_LOG_TAIL_LINES: usize = 20_000;
 
 /// Windows env var names (case-insensitive) an engine child may keep (§5 locked
 /// decision, E3): external engines obey only harness-owned configuration, so a
@@ -188,18 +202,52 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// asymmetry between engine children and control commands possible in the first
 /// place.
 async fn run_control_command(program: &str, args: &[String]) -> ControlOutcome {
+    run_control_command_with_stdin(program, args, &[]).await
+}
+
+/// [`run_control_command`] with a stdin payload. The ONLY legitimate use is the
+/// staging driver: a program that must reach the distro shell *as data*, never as
+/// argv — the login-shell re-tokenization GOTCHAS `[ps]` warns about cannot touch
+/// bytes that ride a pipe, and no path (Windows or otherwise) ever appears in the
+/// command line. Writing the payload to the child's stdin to EOF precedes waiting,
+/// so a child that never reads cannot wedge the control timeout into `TimedOut`
+/// without also being reaped by `kill_on_drop`.
+async fn run_control_command_with_stdin(
+    program: &str,
+    args: &[String],
+    stdin: &[u8],
+) -> ControlOutcome {
     let mut command = Command::new(program);
     command
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .kill_on_drop(true)
-        .env_clear();
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (key, value) in control_child_env() {
         command.env(key, value);
     }
-    match tokio::time::timeout(CONTROL_TIMEOUT, command.output()).await {
+    let run = async {
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let mut pipe = child
+            .stdin
+            .take()
+            .unwrap_or_else(|| unreachable!("invariant: stdin is piped above"));
+        // A stdin write that fails because the child already died (a `bash` that
+        // rejects the invocation outright) is not the failure to report: the exit
+        // status and stderr below name the real one.
+        let _ = pipe.write_all(stdin).await;
+        drop(pipe);
+        child
+            .wait_with_output()
+            .await
+            .map_err(|error| error.to_string())
+    };
+    match tokio::time::timeout(CONTROL_TIMEOUT, run).await {
         Ok(Ok(output)) => ControlOutcome::Ran(output),
-        Ok(Err(error)) => ControlOutcome::Failed(error.to_string()),
+        Ok(Err(error)) => ControlOutcome::Failed(error),
         Err(_) => ControlOutcome::TimedOut,
     }
 }
@@ -264,15 +312,46 @@ fn prune_matching(
     }
 }
 
-/// Deletes the oldest `*.log` engine captures beyond `keep` in `dir`.
-///
-/// Harness boot logs are deliberately excluded: a swap-heavy session burns the engine
-/// budget, and the log that explains a refusal must never be evicted by the next 50
-/// spawns — least of all by the first spawn of the boot that follows the crash the
-/// operator is about to investigate. Its own budget is
-/// [`prune_harness_log_files`].
-fn prune_log_files(dir: &std::path::Path, keep: usize) {
-    prune_matching(dir, keep, "engine", is_engine_log);
+/// Whether a path is one of the R9 container-log snapshots (`<model>-<epoch>.container.log`),
+/// as opposed to a client capture (`<model>-<epoch>.log`).
+fn is_container_log(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".container.log"))
+        && !is_harness_log(path)
+}
+
+/// Per-model forensic retention (R9): keep the newest `keep` client captures **and**
+/// the newest `keep` container snapshots for one model, deleting the older ones of
+/// each class. Scoped to one model so a swap-heavy model can never evict another
+/// model's forensic log — the defect of the old global budget. The scope is the exact
+/// minted shape `{model}-{epoch}[.container].log` — epoch all digits — NOT a bare
+/// `{model}-` prefix: model names legally contain `-`, so a prefix match let model
+/// `swift`'s keep-N claim (and delete) `swift-7b`'s files. Harness boot logs are
+/// excluded from both classes by [`is_harness_log`].
+fn prune_model_logs(dir: &std::path::Path, prefix: &str, keep: usize) {
+    let owned_prefix = format!("{prefix}-");
+    let matches_model = |path: &std::path::Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                let Some(rest) = name.strip_prefix(owned_prefix.as_str()) else {
+                    return false;
+                };
+                // `{epoch}.log` or `{epoch}.container.log`, epoch all digits.
+                let epoch = rest
+                    .strip_suffix(".container.log")
+                    .or_else(|| rest.strip_suffix(".log"))
+                    .unwrap_or(rest);
+                !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit())
+            })
+    };
+    prune_matching(dir, keep, "engine", |path| {
+        is_engine_log(path) && !is_container_log(path) && matches_model(path)
+    });
+    prune_matching(dir, keep, "container", |path| {
+        is_container_log(path) && matches_model(path)
+    });
 }
 
 /// Keeps the newest `keep` harness boot logs (rotations included). Called by
@@ -490,6 +569,266 @@ async fn reap_container(distro: &str, user: &str, name: &str) -> bool {
     }
 }
 
+/// The in-distro directory a harness-rendered autostart script is staged into.
+/// Deliberately outside every model directory and outside the operator's script
+/// tree: a staged file can never shadow or be confused with a hand-written one
+/// (template adoption, operator ruling 2026-10-31).
+const STAGED_AUTOSTART_DIR: &str = ".simplehar/autostart";
+
+/// How many staged renders of one model's slug survive in the staging directory
+/// (the staging driver prunes older `<slug>-<hash>.sh` files past this many). A
+/// model under active editing re-renders on every yaml change; the cap keeps the
+/// directory bounded while retaining enough history to re-launch what the ledger
+/// still names.
+const STAGED_SCRIPT_KEEP: usize = 10;
+
+/// The `tail -n +N` bound that realizes [`STAGED_SCRIPT_KEEP`]: the first
+/// `KEEP`-newest files are kept, everything from `KEEP+1` on is pruned.
+const STAGED_SCRIPT_KEEP_PLUS_ONE: usize = STAGED_SCRIPT_KEEP + 1;
+
+/// FNV-1a over the script bytes: a content address, not a security primitive. Two
+/// renders of one model collide only when their bytes are equal, which is exactly
+/// the dedup the staging path wants; a hostile yaml cannot engineer a collision
+/// against another model because every render names its own container, and the
+/// script's *content* is validated at render time regardless.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// The content address a staged script carries in its name. Public so the adapter's
+/// argv placeholder names exactly the file [`stage_script`] will have verified —
+/// one hash, one naming rule, no drift between what the ledger shows and what runs.
+#[must_use]
+pub fn script_content_hash(script: &str) -> u64 {
+    fnv1a64(script.as_bytes())
+}
+
+/// The in-distro path a script's bytes stage to: `~/.simplehar/autostart/<slug>-<fnv>.sh`.
+/// The slug comes from an already-validated container name and the hash is hex, so the
+/// whole path stays inside the `valid_word` charset the WSL argv demands. Pure, so the
+/// shape is pinned without a distro. The leading `~` is a *bare word* in every position
+/// it is used at inside the staging command, so the login shell expands it to the
+/// `-u <user>` account's home — the same coordinate rule `valid_word` exists to enforce
+/// elsewhere; here it is the deliberate, single exception, spelled as `$HOME`-parented
+/// by the command itself rather than by shell luck.
+fn staged_script_path(slug: &str, script: &str) -> String {
+    let slug: String = slug
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!(
+        "~/{STAGED_AUTOSTART_DIR}/{slug}-{:016x}.sh",
+        fnv1a64(script.as_bytes())
+    )
+}
+
+/// Escape every POSIX ERE metacharacter so `find -regextype posix-extended -regex`
+/// matches `literal` byte-for-byte. `staged_script_path` confines the slug it feeds
+/// the prune regex to `[A-Za-z0-9._-]`, where only `.` is ERE-significant — but the
+/// escape is total, so widening that charset upstream cannot silently hand a `.`- or
+/// `[`-bearing slug the prune wildcard (review 2026-10-31: raw `har.a` pruned
+/// `har-a`'s and `harxa`'s pools, measured on the distro's findutils).
+///
+/// # Arguments
+///
+/// * `literal` - text to be matched literally inside a POSIX ERE.
+///
+/// # Returns
+///
+/// The text with every metacharacter backslash-prefixed.
+fn escape_posix_regex(literal: &str) -> String {
+    let mut out = String::with_capacity(literal.len() + 8);
+    for c in literal.chars() {
+        if matches!(
+            c,
+            '.' | '\\' | '[' | ']' | '{' | '}' | '(' | ')' | '*' | '+' | '?' | '|' | '^' | '$'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Point the script slot of a staged-script argv at `path`, or refuse. The slot is
+/// the word after `bash`, and `bash` must be the word after the *last* `--` that
+/// closes `wsl.exe`'s own options — anchoring on the first `bash` anywhere would
+/// let a config whose distro or user is literally `bash` move the rewrite onto the
+/// wrong slot, leaving the unwritten placeholder for `bash` to open relative to
+/// cwd (review 2026-10-31, LOW; fail-closed today, pinned so it stays so). Pure,
+/// so the anchor is testable without a distro.
+///
+/// # Arguments
+///
+/// * `argv` - the adapter's launch argv, placeholder in the script slot.
+/// * `path` - the staged path (from [`staged_script_path`]) to install.
+///
+/// # Returns
+///
+/// The rewritten argv, or `None` when argv is not `… -- bash <slot> …`.
+fn rewrite_script_slot(mut argv: Vec<String>, path: String) -> Option<Vec<String>> {
+    let dashes = argv.iter().rposition(|arg| arg == "--")?;
+    argv.get(dashes + 1).filter(|word| *word == "bash")?;
+    let slot = argv.get_mut(dashes + 2)?;
+    *slot = path;
+    Some(argv)
+}
+
+/// The POSIX `cksum` value of `bytes` — CRC-32 with polynomial `0x04C11DB7`
+/// (MSB-first, unreflected), zero init, then the message length folded in the same
+/// way, then the complement — exactly what every POSIX `cksum` prints as its first
+/// two fields. The staging driver re-computes this *in the distro* (`cksum < file`,
+/// the two-field stdin form) and compares, so the staging evidence is the bytes,
+/// not "some non-empty file exists". Chosen over awk arithmetic (a review measured
+/// gawk and mawk disagreeing with each other and with any 64-bit hash) and over
+/// zlib-style reflected CRC-32 (which is NOT what `cksum` computes — a review
+/// caught the first cut confusing them): these are the algorithm's defining
+/// constants, and the pin below is the operator's own coreutils 9.4 binary, whose
+/// vectors this function reproduces byte-for-byte.
+fn cksum_expectation(bytes: &[u8]) -> (u32, usize) {
+    fn fold(mut crc: u32, byte: u8) -> u32 {
+        crc ^= u32::from(byte) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+        crc
+    }
+    let mut crc = 0u32;
+    for byte in bytes {
+        crc = fold(crc, *byte);
+    }
+    let mut len = bytes.len();
+    loop {
+        crc = fold(crc, (len & 0xFF) as u8);
+        len /= 256;
+        if len == 0 {
+            break;
+        }
+    }
+    (!crc, bytes.len())
+}
+
+/// The stdin staging program: base64 heredoc in, hash-named temp, double `cksum`
+/// gate (before and after the atomic `mv -f`), and a bounded per-slug keep-N prune.
+/// Pure — every interpolation is harness-internal (the hash, the blob, the cksum
+/// expectation, the path-safe slug escaped for the prune regex), so the driver's
+/// shape is pinned without a distro. `file_name` is the argv word `bash -s` binds
+/// to `$1`; its `<slug>-<16hex>.sh` shape names the same content address the temp
+/// and the prune carry.
+fn staging_driver(script: &str, file_name: &str, blob: &str) -> String {
+    let hash = fnv1a64(script.as_bytes());
+    let slug = file_name
+        .strip_suffix(&format!("-{:016x}.sh", hash))
+        .unwrap_or(file_name);
+    let (expected_crc, expected_len) = cksum_expectation(script.as_bytes());
+    // `valid_container_name` admits `.`, which is the ERE any-character operator:
+    // interpolated raw, a dot-bearing slug (`har.a`) would prune `har-a`'s and
+    // `harxa`'s keep-N pool (review 2026-10-31, measured on the distro's findutils).
+    // Escaping every metacharacter makes the regex match the slug LITERALLY.
+    let slug_re = escape_posix_regex(slug);
+    // The temp names the slug AND the hash, and both temp paths are `rm -f`-ed
+    // before the redirects: shell `>` PRESERVES a pre-existing file's mode (umask
+    // is creation-only), so a planted loose-mode temp must not propagate to the
+    // published target, and two concurrent stagings of identical bytes must not
+    // share one temp (review 2026-10-31, LOW; fail-closed either way — content is
+    // cksum-gated — but a flake and a mode leak are both what staging must not do).
+    format!(
+        "#!/usr/bin/env bash\n\
+         set -euo pipefail\n\
+         umask 077\n\
+         dir=\"$HOME/{STAGED_AUTOSTART_DIR}\"\n\
+         mkdir -p \"$dir\"\n\
+         target=\"$dir/$1\"\n\
+         tmp=\"$dir/.staging.{slug}-{hash:x}.tmp\"\n\
+         trap 'rm -f -- \"$tmp\" \"$tmp.b64\"' EXIT\n\
+         rm -f -- \"$tmp\" \"$tmp.b64\"\n\
+         cat > \"$tmp.b64\" <<'SIMPLEHAR_B64'\n{blob}\nSIMPLEHAR_B64\n\
+         base64 -d \"$tmp.b64\" > \"$tmp\"\n\
+         rm -f -- \"$tmp.b64\"\n\
+         test \"$(cksum < \"$tmp\")\" = \"{expected_crc} {expected_len}\" \\\n\
+             || {{ echo \"staging: content mismatch before publish\" >&2; exit 3; }}\n\
+         mv -f -- \"$tmp\" \"$target\"\n\
+         test \"$(cksum < \"$target\")\" = \"{expected_crc} {expected_len}\" \\\n\
+             || {{ echo \"staging: content mismatch after publish\" >&2; exit 4; }}\n\
+         trap - EXIT\n\
+         find \"$dir\" -maxdepth 1 -regextype posix-extended \\\n\
+             -regex '.*/{slug_re}-[0-9a-f]{{16}}\\.sh' -printf '%T@\\t%p\\n' 2>/dev/null \\\n\
+             | sort -rn | tail -n +{STAGED_SCRIPT_KEEP_PLUS_ONE} \\\n\
+             | while IFS=$'\\t' read -r _ stale; do case \"$stale\" in \"$dir/\"*) rm -f -- \"$stale\";; esac; done\n",
+    )
+}
+
+/// Stage `script`'s bytes at `path` (a `~/.simplehar/autostart/` path the wsl_user
+/// owns) and prove the *content* landed. The distro rules (GOTCHAS `[ps]`) are "never
+/// `wsl bash -c <string>` — the login shell re-tokenizes and expands the payload
+/// before the inner shell sees it" and (same reason) never hand the inner shell a
+/// Windows path: so the staging program arrives on **stdin** (`bash -s`), which the
+/// login shell never sees at all, with only plain harness-minted words after it. The
+/// script body never enters any command line — it rides a base64 blob inside the
+/// driver's quoted heredoc, the one alphabet with no shell metacharacters — and
+/// `$HOME` is resolved by the driver, inside the distro. Write is atomic
+/// (slug-and-hash-named temp + `mv -f`; the temp is `rm -f`-ed up front because a
+/// shell redirect preserves a pre-existing file's mode, while the *target* is
+/// never pre-deleted, so a concurrent staging's published file is only ever
+/// replaced by `mv` itself), a `trap` removes the temp on every exit path, and the
+/// driver checks `cksum` of the staged bytes twice — before publish and after —
+/// against the expectation computed here: a staging the distro did not confirm
+/// byte-for-byte is reported, never spawned against.
+///
+/// # Returns
+///
+/// `Ok(())` only when the distro confirmed the staged file checksums to `script`'s
+/// exact bytes.
+async fn stage_script(distro: &str, user: &str, path: &str, script: &str) -> Result<(), String> {
+    use base64::Engine as _;
+    if distro.trim().is_empty() || user.trim().is_empty() {
+        return Err(
+            "WSL coordinates missing from the config: cannot stage an autostart script".to_string(),
+        );
+    }
+    let blob = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let driver = staging_driver(script, file_name, &blob);
+    // The driver rides stdin; the argv words after `bash -s` are plain words
+    // (`<slug>-<16hex>.sh` re-sanitized by `staged_script_path`; the prune regex
+    // carries the slug ERE-escaped — literal, never a wildcard — AND demands the
+    // 16-hex content address, so no container name, prefix-related or dot-bearing,
+    // can aim the keep-N pool at another model's renders). The
+    // cksum expectation is NOT an argument: the login shell would re-split a
+    // space-bearing value, so it rides as a literal inside the stdin script, and
+    // `cksum < file` takes the two-field stdin form (the file-argument form prints
+    // a third path field a `test =` can never match).
+    let mut argv = wsl_prefix(distro, user);
+    argv.extend(["bash".to_string(), "-s".to_string(), file_name.to_string()]);
+    let (program, rest) = argv
+        .split_first()
+        .unwrap_or_else(|| unreachable!("invariant: wsl_prefix is never empty"));
+    match run_control_command_with_stdin(program, rest, driver.as_bytes()).await {
+        ControlOutcome::Ran(output) if output.status.success() => Ok(()),
+        ControlOutcome::Ran(output) => Err(format!(
+            "distro rejected the staging driver: {}",
+            excerpt(&output.stderr)
+        )),
+        ControlOutcome::Failed(error) => Err(format!("cannot run the staging driver: {error}")),
+        ControlOutcome::TimedOut => Err("the staging driver timed out".to_string()),
+    }
+}
+
 /// One catalog-declared container candidate for the boot reclaim: the declaring
 /// model's `engine:` plus its `ninfer_container:` value. Both travel together so
 /// [`boot_reap_decision`] can apply the engine gate and the name gate at boot,
@@ -576,6 +915,71 @@ async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
             .map(ToString::to_string)
             .collect(),
     )
+}
+
+/// `wsl.exe … docker logs --tail <n> <name>` (R9): the raw container stdout. The
+/// line bound is imposed by **docker** (`--tail`), not by truncating a fully
+/// buffered fetch after the fact — a container the operator never rotated (e.g. one
+/// left from a manual run under a harness-shaped name) has an unbounded log, and a
+/// cap that only applies after `output()` has buffered it is a cap on the file we
+/// keep, not on the memory we spend. The byte ceiling stays as a belt for pathological
+/// single lines. The engine-specific parser (ninfer) reads the startup `MemorySummary`
+/// from this; `ProcessRuntime` stays engine-agnostic. A control command, so it runs
+/// through [`run_control_command`] with only the scrubbed OS baseline (no token into
+/// WSL).
+async fn container_logs(distro: &str, user: &str, name: &str) -> Option<String> {
+    let mut argv = wsl_prefix(distro, user);
+    argv.extend([
+        "docker".to_string(),
+        "logs".to_string(),
+        format!("--tail={}", CONTAINER_LOG_TAIL_LINES),
+        name.to_string(),
+    ]);
+    let (program, args) = argv
+        .split_first()
+        .unwrap_or_else(|| unreachable!("invariant: wsl_prefix is never empty"));
+    match run_control_command(program, args).await {
+        ControlOutcome::Ran(output) if output.status.success() => {
+            // `docker logs` routes the container's stdout to the client's stdout and
+            // the container's stderr to the client's stderr; the startup record is
+            // the engine's, and an engine that logs it to stderr must not silently
+            // cost the booking (the same reason the engine-child capture merges both
+            // streams). A docker-side error line is inert to the parsers.
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !output.stderr.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            let bytes = text.as_bytes();
+            if bytes.len() <= CONTAINER_LOG_FETCH_CAP {
+                Some(text)
+            } else {
+                let mut start = bytes.len() - CONTAINER_LOG_FETCH_CAP;
+                while start < bytes.len() && !text.is_char_boundary(start) {
+                    start += 1;
+                }
+                Some(text[start..].to_string())
+            }
+        }
+        ControlOutcome::Ran(output) => {
+            tracing::warn!(
+                container = name,
+                stderr = %excerpt(&output.stderr),
+                "docker logs reported failure"
+            );
+            None
+        }
+        ControlOutcome::Failed(error) => {
+            tracing::warn!(container = name, error = %error, "docker logs cannot run");
+            None
+        }
+        ControlOutcome::TimedOut => {
+            tracing::warn!(container = name, "docker logs timed out");
+            None
+        }
+    }
 }
 
 impl ProcessRuntime {
@@ -758,6 +1162,43 @@ impl Default for ProcessRuntime {
 #[async_trait]
 impl EngineRuntime for ProcessRuntime {
     async fn spawn(&self, spec: &LaunchSpec, ticket: SpawnTicket) -> Result<Spawned, SpawnError> {
+        // Template adoption (operator ruling 2026-10-31): a spec carrying a rendered
+        // script runs THAT, never whatever file argv names — the bytes are staged
+        // content-addressed, verified on disk, and the script position in argv is
+        // rewritten to the staged path before anything spawns. A failed staging is a
+        // spawn failure, not a fallback to an uncontrolled script.
+        let spec = match spec.script.as_deref() {
+            None => std::borrow::Cow::Borrowed(spec),
+            Some(script) => {
+                let slug = match &ticket.kind {
+                    ResourceKind::Container { name } => name.clone(),
+                    ResourceKind::ChildProcess => spec.log_name.clone(),
+                };
+                let path = staged_script_path(&slug, script);
+                if let Err(reason) =
+                    stage_script(&self.wsl_distro, &self.wsl_user, &path, script).await
+                {
+                    return Err(SpawnError::SpawnFailed {
+                        reason: format!(
+                            "cannot stage the harness-rendered autostart script: {reason}"
+                        ),
+                    });
+                }
+                let argv =
+                    match rewrite_script_slot(spec.argv.clone(), path) {
+                        Some(rewritten) => rewritten,
+                        None => return Err(SpawnError::SpawnFailed {
+                            reason:
+                                "a staged-script spec must run bash: no script position to rewrite"
+                                    .to_string(),
+                        }),
+                    };
+                std::borrow::Cow::Owned(LaunchSpec {
+                    argv,
+                    ..spec.clone()
+                })
+            }
+        };
         let Some((program, rest)) = spec.argv.split_first() else {
             return Err(SpawnError::SpawnFailed {
                 reason: "empty argv in launch spec".to_string(),
@@ -799,7 +1240,7 @@ impl EngineRuntime for ProcessRuntime {
                 reason: format!("cannot create {}: {error}", self.logs_dir.display()),
             });
         }
-        prune_log_files(&self.logs_dir, LOG_FILE_CAP);
+        prune_model_logs(&self.logs_dir, &spec.log_name, ENGINE_LOG_KEEP);
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1025,6 +1466,66 @@ impl EngineRuntime for ProcessRuntime {
         body["data"][0]["id"].as_str().map(str::to_string)
     }
 
+    async fn container_report(&self, container: &str) -> Option<String> {
+        if self.wsl_distro.trim().is_empty() || self.wsl_user.trim().is_empty() {
+            return None;
+        }
+        // Ownership gate, same rule as the reap: never address a name this harness
+        // could not have spawned (an ID-shaped or hostile name is refused).
+        if !valid_container_name(container) {
+            tracing::warn!(
+                container,
+                "not a name this harness may address: container_report skipped"
+            );
+            return None;
+        }
+        container_logs(&self.wsl_distro, &self.wsl_user, container).await
+    }
+
+    async fn save_container_log(&self, model: &str, text: &str) {
+        // A snapshot with no bytes is forensic noise, not evidence: a container
+        // that never exec'd yields an empty `docker logs`, and rotating a model's
+        // genuine snapshots against such a file would destroy history to record
+        // nothing.
+        if text.trim().is_empty() {
+            return;
+        }
+        // Same sanitization the adapters give `log_name`, so the snapshot shares the
+        // model's prefix and both classes fall under one per-model keep-N.
+        let prefix: String = model
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let path = self
+            .logs_dir
+            .join(format!("{prefix}-{epoch}.container.log"));
+        if let Err(error) = tokio::fs::create_dir_all(&self.logs_dir).await {
+            tracing::warn!(error = %error, "cannot create logs dir for a container snapshot");
+            return;
+        }
+        match tokio::fs::write(&path, text.as_bytes()).await {
+            Ok(()) => {
+                prune_model_logs(&self.logs_dir, &prefix, ENGINE_LOG_KEEP);
+                tracing::debug!(path = %path.display(), "container log snapshot written");
+            }
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "cannot write container log snapshot"
+            ),
+        }
+    }
+
     async fn probe(&self, port: u16, readiness: &crate::engine::ReadinessSpec) -> Probe {
         // Fast-fail (Step 3 cancel/dead-engine lesson): a child that already exited
         // must not eat the whole readiness deadline — readiness is unreachable.
@@ -1220,6 +1721,142 @@ mod tests {
         );
     }
 
+    /// Template adoption (2026-10-31): the staged path is content-addressed, lives
+    /// only under `~/.simplehar/autostart/`, and is a single unquoted word to the
+    /// distro shell — so a hostile slug or a re-render can neither escape the
+    /// directory nor collide with another model's staged file.
+    #[test]
+    fn a_staged_script_path_is_content_addressed_and_shell_bare() {
+        let first = staged_script_path("ninfer-x", "echo a");
+        let second = staged_script_path("ninfer-x", "echo b");
+        assert!(
+            first.starts_with("~/.simplehar/autostart/ninfer-x-"),
+            "{first}"
+        );
+        assert!(first.ends_with(".sh"), "{first}");
+        assert_ne!(
+            first, second,
+            "different bytes must not overwrite each other"
+        );
+        assert_eq!(
+            first,
+            staged_script_path("ninfer-x", "echo a"),
+            "same bytes, same name"
+        );
+        for c in first.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || matches!(c, '~' | '/' | '.' | '_' | '-'),
+                "the path must be one bare word for the distro shell: {c}"
+            );
+        }
+        let slugged = staged_script_path("bad name;rm", "x");
+        assert!(slugged.contains("bad_name_rm"), "{slugged}");
+        assert!(
+            !slugged.contains(' ') && !slugged.contains(';'),
+            "{slugged}"
+        );
+        // The staging driver carries the body base64-only: a script full of shell
+        // metal must not be able to contribute a single metacharacter anywhere the
+        // login shell could re-tokenize it (the blob lives inside a quoted heredoc
+        // in a file, never on a command line).
+        assert_eq!(script_content_hash(""), script_content_hash(""));
+        assert_ne!(script_content_hash("a"), script_content_hash("b"));
+    }
+
+    /// The keep-N prune matches the slug LITERALLY (review 2026-10-31, MEDIUM):
+    /// `valid_container_name` admits `.`, and raw interpolation made `har.a`'s
+    /// prune hit `har-a-<hex>.sh` and `harxa-<hex>.sh` on the distro's findutils —
+    /// two models sharing one keep-10 pool, the exact class the 16-hex content
+    /// address was added to kill. Falsifier: feed the slug to the regex unescaped
+    /// and the raw-`.` forms appear in the driver.
+    #[test]
+    fn the_prune_regex_escapes_the_slug_so_dots_cannot_wildcard_a_sibling_pool() {
+        assert_eq!(escape_posix_regex("a.b*c[x]"), r"a\.b\*c\[x\]");
+        let script = "echo body";
+        let hash = fnv1a64(script.as_bytes());
+        let build = |slug: &str| {
+            let file_name = format!("{slug}-{:016x}.sh", hash);
+            staging_driver(script, &file_name, "Zm9v")
+        };
+        let dotted = build("har.a");
+        assert!(
+            dotted.contains(r"regex '.*/har\.a-[0-9a-f]{16}\.sh'"),
+            "the slug's dot must reach find as an escaped literal:\n{dotted}"
+        );
+        assert!(
+            !dotted.contains(".*/har.a-"),
+            "an unescaped dot is the any-character operator"
+        );
+        // The temp names slug AND hash, and both temps are removed before the
+        // redirects — a pre-existing loose-mode temp must not propagate its mode
+        // through `>` (which preserves an existing file's mode), and identical
+        // concurrent stagings must collide loudly rather than interleave (LOW).
+        let tmp_line = format!(r#"tmp="$dir/.staging.har.a-{hash:x}.tmp""#);
+        assert!(dotted.contains(&tmp_line), "{dotted}");
+        let pre_rm = dotted
+            .find("rm -f -- \"$tmp\" \"$tmp.b64\"")
+            .unwrap_or_else(|| panic!("no pre-clean in:\n{dotted}"));
+        let first_write = dotted.find("cat >").expect("heredoc present");
+        assert!(pre_rm < first_write, "the pre-clean must precede any write");
+    }
+
+    /// The staged-path rewrite anchors on `bash` AFTER the last `--` (review
+    /// 2026-10-31, LOW): a config distro/user literally `bash` must not move the
+    /// rewrite to the wrong slot, and a spec that does not run `-- bash <slot>` is
+    /// refused, never launched against the unwritten placeholder.
+    #[test]
+    fn the_script_slot_rewrite_anchors_past_the_wsl_separator() {
+        let argv = || {
+            vec![
+                "wsl.exe".to_string(),
+                "-d".to_string(),
+                "bash".to_string(),
+                "-u".to_string(),
+                "ops".to_string(),
+                "--".to_string(),
+                "bash".to_string(),
+                "PLACE".to_string(),
+                "b".to_string(),
+            ]
+        };
+        let rewritten = rewrite_script_slot(argv(), "STAGED".to_string()).expect("anchored");
+        assert_eq!(rewritten[7], "STAGED");
+        assert_eq!(rewritten[2], "bash", "the decoy distro word is untouched");
+
+        let mut no_dashes = argv();
+        no_dashes[5] = "-u".to_string();
+        assert_eq!(
+            rewrite_script_slot(no_dashes, "STAGED".to_string()),
+            None,
+            "no `-- bash` anchor means no rewrite, so the spawn is refused"
+        );
+        let mut trailing = argv();
+        trailing.truncate(7);
+        assert_eq!(
+            rewrite_script_slot(trailing, "STAGED".to_string()),
+            None,
+            "bash with no slot after it must never be rewritten past the end"
+        );
+    }
+
+    /// The staging verifier must be the same function on both sides of the pipe:
+    /// these vectors were captured from the operator distro's own coreutils 9.4
+    /// `cksum` (`printf X | cksum`), not from a re-implementation — the driver
+    /// compares its `cksum < file` output against exactly these pairs.
+    #[test]
+    fn the_staging_checksum_matches_the_distro_cksum() {
+        assert_eq!(cksum_expectation(b""), (4_294_967_295, 0));
+        assert_eq!(cksum_expectation(b"123456789"), (930_766_865, 9));
+        assert_eq!(cksum_expectation(b"a"), (1_220_704_766, 1));
+        assert_eq!(cksum_expectation(b"hello world"), (1_135_714_720, 11));
+        assert_eq!(cksum_expectation("café".as_bytes()), (2_824_353_162, 5));
+        assert_ne!(
+            cksum_expectation(b"echo a").0,
+            cksum_expectation(b"echo b").0,
+            "one flipped byte must move the checksum"
+        );
+    }
+
     #[test]
     fn only_the_first_kill_carries_the_reap_duty() {
         let name = "ninfer-x".to_string();
@@ -1326,27 +1963,49 @@ mod tests {
     }
 
     #[test]
-    fn log_pruning_keeps_the_newest_files() {
+    fn log_pruning_keeps_the_newest_per_model_and_spares_other_models() {
         let dir = crate::testutil::temp_dir("logprune");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp logs dir");
+        // Six captures for model `m`, oldest first (lowest index = oldest mtime).
         for i in 0..6 {
-            let path = dir.join(format!("engine-{i}.log"));
-            std::fs::write(&path, b"x").expect("seed log");
-            // Distinct mtimes: force aging by touching the metadata via sleep is
-            // flaky; instead write times backwards is not portable - use file
-            // order by setting modified times explicitly on unix only. Here we
-            // rely on the prune test using names as a proxy: oldest = lowest i.
-            let _ = i;
+            std::fs::write(dir.join(format!("m-{i}.log")), b"x").expect("seed client log");
+            std::fs::write(dir.join(format!("m-{i}.container.log")), b"x")
+                .expect("seed container log");
             std::thread::sleep(Duration::from_millis(10));
         }
-        prune_log_files(&dir, 3);
-        let remaining: Vec<String> = std::fs::read_dir(&dir)
+        // A different model's logs must survive untouched (the global-cap defect).
+        std::fs::write(dir.join("other-0.log"), b"x").expect("seed foreign log");
+        prune_model_logs(&dir, "m", 3);
+        let names: Vec<String> = std::fs::read_dir(&dir)
             .expect("read dir")
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(remaining.len(), 3, "cap enforced: {remaining:?}");
+        let m_clients: Vec<_> = names
+            .iter()
+            .filter(|n| {
+                n.starts_with("m-") && n.ends_with(".log") && !n.ends_with(".container.log")
+            })
+            .collect();
+        let m_containers: Vec<_> = names
+            .iter()
+            .filter(|n| n.ends_with(".container.log"))
+            .collect();
+        assert_eq!(
+            m_clients.len(),
+            3,
+            "client captures capped per model: {m_clients:?}"
+        );
+        assert_eq!(
+            m_containers.len(),
+            3,
+            "container snapshots capped per model: {m_containers:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "other-0.log"),
+            "another model's forensic log is never evicted: {names:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1374,11 +2033,13 @@ mod tests {
         assert!(!is_harness_log(std::path::Path::new("logs/notes.txt")));
     }
 
-    /// The trap this split exists to close: the boot log that explains a refusal must
-    /// not be deleted by the engine spawns that follow it — least of all by the first
-    /// spawn of the boot after the crash the operator is about to investigate.
-    /// Falsifier: drop the `!is_harness_log` guard from `is_engine_log` and the boot
-    /// log disappears with `keep = 3`.
+    /// The per-model engine budget never evicts the harness boot log nor another
+    /// model's logs. The `is_engine_log`/`is_container_log` `!is_harness_log` guard is
+    /// pinned directly by `harness_logs_are_never_engine_logs`; this pins that the
+    /// prefix-scoped prune leaves the boot log and foreign models alone while capping
+    /// its own model to `keep`.
+    /// Falsifier: widen `matches_prefix` to ignore the separator (or drop the prefix
+    /// entirely) and the boot log disappears with `keep = 3`.
     #[test]
     fn the_engine_budget_never_prunes_the_harness_boot_log() {
         let dir = crate::testutil::temp_dir("logprune-h");
@@ -1388,7 +2049,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         std::fs::write(dir.join("harness-1793.log"), b"the refusal").expect("seed boot log");
-        prune_log_files(&dir, 3);
+        prune_model_logs(&dir, "engine", 3);
         let remaining: Vec<String> = std::fs::read_dir(&dir)
             .expect("read dir")
             .filter_map(Result::ok)
@@ -1590,6 +2251,7 @@ mod tests {
                 expect_status: 200,
             },
             container: None,
+            script: None,
         }
     }
 
@@ -2010,6 +2672,7 @@ mod tests {
                 expect_status: 200,
             },
             container: None,
+            script: None,
         };
         let tk = SpawnTicket {
             generation: 7,

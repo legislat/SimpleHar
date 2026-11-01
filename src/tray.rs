@@ -933,6 +933,7 @@ mod tests {
             loading_job: None,
             launched_at: None,
             stale_config: None,
+            container_reported_gb: None,
             loaded_at: std::time::Instant::now(),
         }
     }

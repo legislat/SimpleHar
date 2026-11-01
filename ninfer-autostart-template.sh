@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# autostart.sh вЂ” start one NInfer service with a VRAM profile: a|b|c|d (default b)
+# REFERENCE ONLY — not on the launch path. The authoritative template is
+# CANONICAL_NINFER_SCRIPT in src/engine/ninfer.rs, which the harness renders from
+# the model yaml, stages into the distro, and launches. Keep the two in sync.
+# autostart.sh — start one NInfer service with a VRAM profile: a|b|c|d|e (default b)
 set -euo pipefail
 
 NAME="SE-nin-mymodel"                 # == ninfer_container in the model yaml
@@ -27,7 +30,8 @@ case "$CFG" in
   b) MAX_CTX=262144; KV_CAP=262144; CONC=1 ;;  # default: large single agent context
   c) MAX_CTX=131072; KV_CAP=131072; CONC=1 ;;  # most VRAM-conserving
   d) MAX_CTX=16384;  KV_CAP=32768;  CONC=2 ;;  # short context, 2 concurrent
-  *) echo "usage: $0 <a|b|c|d> [key]" >&2; exit 1 ;;
+  e) MAX_CTX=65536;  KV_CAP=65536;  CONC=1 ;;  # mid context, single agent
+  *) echo "usage: $0 <a|b|c|d|e> [key]" >&2; exit 1 ;;
 esac
 
 if [[ "$WITH_KEY" == "key" ]]; then
@@ -44,9 +48,10 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 docker run -d --name "$NAME" \
   --gpus '"device=0"' \
-  --restart unless-stopped \
+  --restart no \
   --publish "127.0.0.1:${PUBLISH}:${INTERNAL_PORT}" \
   --volume "$MODEL_DIR:/models:ro" \
+  --log-driver json-file --log-opt max-size=25m --log-opt max-file=5 \
   "$IMAGE" \
   serve "/models/$ARTIFACT" \
   --host 0.0.0.0 \

@@ -1214,6 +1214,8 @@ Start Port    End Port
             measured_gb: None,
             measured_min_gb: None,
             measured_offload: None,
+            measured_attribution: None,
+            measured_profile: None,
             model_ref: model_ref.map(str::to_string),
             serve_model: None,
             file: None,

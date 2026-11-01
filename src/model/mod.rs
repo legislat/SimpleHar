@@ -45,6 +45,14 @@ pub enum ModelError {
         /// Raw value.
         value: String,
     },
+    /// The `measured_attribution:` provenance token is not one this harness wrote.
+    #[error("field `{field}` is not one of engine_report|per_process|total_diff: `{value}`")]
+    BadAttribution {
+        /// Field name.
+        field: String,
+        /// Raw value.
+        value: String,
+    },
     /// `cost:` is not one of fixed|greedy|exact.
     #[error("bad `cost` value `{value}` (fixed|greedy|exact)")]
     BadCost {
@@ -72,6 +80,57 @@ pub enum CostClass {
     /// `measured_gb` logs a warning) instead of overriding it as it does for
     /// `fixed`.
     Exact,
+}
+
+/// How a measured footprint figure was obtained, and therefore whether it may book
+/// (R1, DECISIONS LOCKED 2026-10-30). Written by `on_measured` as the
+/// `measured_attribution:` stamp and read back at scan; never upgraded post-hoc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasuredAttribution {
+    /// The engine's own reserved-footprint self-report (ninfer startup
+    /// `MemorySummary`): the authoritative over-reserved figure, books.
+    EngineReport,
+    /// Per-process attribution from the witness (`own_gib` returned bytes): books.
+    PerProcess,
+    /// A free-memory total-diff (per-process unavailable): displays, **never books**.
+    TotalDiff,
+}
+
+impl MeasuredAttribution {
+    /// Whether a figure stamped with this provenance may be booked for admission.
+    /// A `TotalDiff` never books; an absent stamp (a legacy `measured_gb` written
+    /// before provenance existed) is grandfathered bookable and is corrected the
+    /// next time the model serves (the sampler always stamps from R9 on).
+    #[must_use]
+    pub fn bookable(self) -> bool {
+        !matches!(self, MeasuredAttribution::TotalDiff)
+    }
+
+    /// Whether this provenance comes from the engine speaking about itself — its own
+    /// reserved budget, or concrete bytes the driver named as its pids. `exact` rows
+    /// accept only these (ruling 15 (ii)): a grandfathered stamp-less pair is not a
+    /// source for a class that forbids guessing, even though `fixed` may still charge
+    /// it.
+    #[must_use]
+    pub fn self_reported(self) -> bool {
+        matches!(
+            self,
+            MeasuredAttribution::EngineReport | MeasuredAttribution::PerProcess
+        )
+    }
+
+    /// The yaml/payload token for this provenance — the exact form
+    /// [`parse_measured_attribution`] accepts back, so writer and reader share one
+    /// spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MeasuredAttribution::EngineReport => "engine_report",
+            MeasuredAttribution::PerProcess => "per_process",
+            MeasuredAttribution::TotalDiff => "total_diff",
+        }
+    }
 }
 
 /// One model from `ModelConf/`, typed (Step 10: the harness name is canonical, and
@@ -106,9 +165,10 @@ pub struct ModelEntry {
     /// High end of the engine footprint measured by the harness while this model
     /// served (`measured_gb:`, written back after Install; see
     /// [`ModelEntry::measured_min_gb`] for the low end). The page shows the range as
-    /// truth for every cost class; admission consults the high end only for `fixed`
-    /// models with no declared `vram_gb` (greedy keeps nominal semantics; exact
-    /// refuses without its declared precision claim).
+    /// truth for every cost class; admission consults it when the provenance stamp
+    /// says it may book (`fixed` without a declared `vram_gb`, or `exact` on an
+    /// `engine_report` figure — ruling 15 (ii)); a `total_diff` displays but never
+    /// books (greedy keeps nominal semantics; exact refuses without a source).
     pub measured_gb: Option<f64>,
     /// Low end of the measured range (`measured_gb_min:`): the smallest witness
     /// total-diff seen while the model served. The spread is what the model actually
@@ -122,6 +182,15 @@ pub struct ModelEntry {
     /// engines that never read the key the flip cannot describe the launch, so it
     /// voids nothing.
     pub measured_offload: Option<bool>,
+    /// How the measured range was obtained (`measured_attribution:`): gates whether it
+    /// books. `TotalDiff` never books; absent is grandfathered (see
+    /// [`MeasuredAttribution::bookable`]).
+    pub measured_attribution: Option<MeasuredAttribution>,
+    /// The `ninfer_profile` an `engine_report` figure was taken under
+    /// (`measured_profile:`): the reserved KV is bound to the profile's `--kv-capacity`,
+    /// so a profile change voids the pair at scan (the ninfer analog of
+    /// `measured_offload`). Absent for non-ninfer engines and total-diff figures.
+    pub measured_profile: Option<String>,
     /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
     /// Informational for managed models; used for stem/path aliases (Step 10).
     pub model_ref: Option<String>,
@@ -227,41 +296,106 @@ fn parse_gib(field: &str, raw: &str) -> Result<f64, ModelError> {
     Ok(v)
 }
 
-/// The measured footprint pair and the `cpu_offload` setting it was taken under
-/// (high end, low end, stamp).
-type MeasuredPair = (Option<f64>, Option<f64>, Option<bool>);
+/// The measured footprint pair plus the launch-describing stamps it is only
+/// meaningful alongside: the `cpu_offload` setting and (for an `engine_report` figure)
+/// the `ninfer_profile` whose `--kv-capacity` bound the reserved KV.
+struct Measured {
+    max: Option<f64>,
+    min: Option<f64>,
+    offload: Option<bool>,
+    attribution: Option<MeasuredAttribution>,
+    profile: Option<String>,
+}
 
-/// Reads the measured footprint pair and its `cpu_offload` stamp together, because
-/// they are only meaningful as a unit: if the model is now launched differently than
-/// when it was measured, the range describes a different run and is dropped. The
-/// stamp itself survives in the entry and the `/har/*` payload (the page renders the
-/// range only). A flip voids the pair solely for engines
-/// [`crate::engine::llama::offload_live`] says read `cpu_offload`: on the others the
-/// key cannot describe the launch, so voiding on it would be an inert key deciding
-/// an admission outcome.
+impl Measured {
+    /// Drop the range but keep the stamps, so the payload still shows *how* it was
+    /// taken even once the number is voided (mirrors the offload-flip behavior).
+    fn voided(self) -> Self {
+        Self {
+            max: None,
+            min: None,
+            ..self
+        }
+    }
+}
+
+/// Reads the measured footprint pair together with the stamps that make it comparable
+/// to the current launch. Two void conditions (measured values verify, they never
+/// mislead): a `cpu_offload` flip on an [`crate::engine::llama::offload_live`] engine,
+/// and a `ninfer_profile` change on an `engine_report` figure (its reserved KV is bound
+/// to the profile's `--kv-capacity`). A void drops the range but keeps the stamps in
+/// the entry/payload.
 ///
 /// # Errors
 ///
 /// [`ModelError::BadNumber`] for a non-numeric or sub-quantum size, [`ModelError::BadBool`]
-/// for an unreadable stamp, and a `measured_gb_min` that exceeds its `measured_gb` or
+/// for an unreadable `measured_offload`, [`ModelError::BadAttribution`] for an unreadable
+/// `measured_attribution`, and a `measured_gb_min` that exceeds its `measured_gb` or
 /// appears without one.
-fn read_measured(
-    engine: &str,
-    keys: &BTreeMap<String, String>,
-) -> Result<MeasuredPair, ModelError> {
-    let stamp = keys
+fn read_measured(engine: &str, keys: &BTreeMap<String, String>) -> Result<Measured, ModelError> {
+    let offload = keys
         .get("measured_offload")
         .map(|raw| parse_bool_stamp("measured_offload", raw))
         .transpose()?;
-    // Read the live setting with the engine's own truth set, the same one the page uses
-    // (HANDOFF §6): a flip must not hide behind a third reading of the same token.
+    let attribution = keys
+        .get("measured_attribution")
+        .map(|raw| parse_measured_attribution(raw))
+        .transpose()?;
+    let profile = keys
+        .get("measured_profile")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let mut measured = Measured {
+        max: None,
+        min: None,
+        offload,
+        attribution,
+        profile,
+    };
+    // A flip voids the pair only on engines whose adapters read `cpu_offload`; an
+    // absent `engine:` is llama (the scan default, the one offload engine).
     let offload_now = keys
         .get("cpu_offload")
         .is_some_and(|v| crate::engine::llama::jinja_on(v));
     if crate::engine::llama::offload_live(engine)
-        && stamp.is_some_and(|stamped| stamped != offload_now)
+        && offload.is_some_and(|stamped| stamped != offload_now)
     {
-        return Ok((None, None, stamp));
+        return Ok(measured.voided());
+    }
+    // The engine_report reserved figure is bound to the profile's KV capacity: a
+    // profile change since it was taken makes the reservation incomparable. The
+    // comparison is the profile's RESOLVED IDENTITY (name plus the `--kv-capacity`
+    // a custom override line stands for — `profile_stamp`), not the name alone:
+    // editing `ninfer_profile_<name>`'s `kv=` moves the reservation without moving
+    // the name, and an unresolvable identity (bad or deleted override line) voids —
+    // nothing launch-verified behind it can be trusted to still describe the card.
+    // The gate is on the ATTRIBUTION, not on the presence of a stamp: an
+    // `engine_report` row whose stamp is missing was written behind an unvalidated
+    // (legacy-autostart) profile and has no certifying launch at all, so the
+    // mismatch with the identity now — whatever it resolves to, `None` included —
+    // voids it (review 2026-10-31, H2: gating on `profile.is_some()` let exactly
+    // those unstamped figures survive every comparability change).
+    if measured.attribution == Some(MeasuredAttribution::EngineReport) || measured.profile.is_some()
+    {
+        let identity_now = crate::engine::ninfer::profile_stamp(keys);
+        if measured.profile.as_deref() != identity_now.as_deref() {
+            return Ok(measured.voided());
+        }
+    }
+    // An `engine:` flip in the same file outranks any stamp: an engine_report
+    // reservation describes a container's CUDA reservation and a per_process figure
+    // a driver-attributed child — neither crosses engines, and a stale ninfer
+    // profile on a llama row would otherwise "match" the built-in default silently
+    // (review 2026-10-31, M2). A ninfer row claiming per_process is the same
+    // impossibility seen from the other side (a container has no harness child).
+    let ninfer = engine == crate::ownership::NINFER_ENGINE;
+    let stamp_describes_the_wrong_engine = match measured.attribution {
+        Some(MeasuredAttribution::EngineReport) => !ninfer,
+        Some(MeasuredAttribution::PerProcess) => ninfer,
+        Some(MeasuredAttribution::TotalDiff) | None => false,
+    };
+    if stamp_describes_the_wrong_engine {
+        return Ok(measured.voided());
     }
     let size = |field: &str, raw: &str| -> Result<f64, ModelError> {
         let v = parse_gib(field, raw)?;
@@ -295,7 +429,23 @@ fn read_measured(
             }
         })
         .transpose()?;
-    Ok((max, min, stamp))
+    measured.max = max;
+    measured.min = min;
+    Ok(measured)
+}
+
+/// Strict reading of the `measured_attribution:` provenance token this harness wrote:
+/// only the three forms it emits, so a typo is a scan error rather than a silent false.
+fn parse_measured_attribution(raw: &str) -> Result<MeasuredAttribution, ModelError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "engine_report" => Ok(MeasuredAttribution::EngineReport),
+        "per_process" => Ok(MeasuredAttribution::PerProcess),
+        "total_diff" => Ok(MeasuredAttribution::TotalDiff),
+        _ => Err(ModelError::BadAttribution {
+            field: "measured_attribution".to_string(),
+            value: raw.to_string(),
+        }),
+    }
 }
 
 /// Strict reading of a boolean token this harness wrote itself: the engine's truth set
@@ -327,18 +477,53 @@ pub enum CostSource {
 }
 
 impl ModelEntry {
-    /// The booking precedence: declared → measured (`fixed` only) → GGUF estimate,
-    /// with `exact`-without-`vram_gb` refused.
+    /// Whether the measured pair is present with a provenance that may book: an
+    /// absent stamp is a legacy figure, grandfathered (see
+    /// [`MeasuredAttribution::bookable`]); an explicit `total_diff` never books.
+    /// This is the *witness* question — `exact` demands more, which is why
+    /// [`Self::may_book_measured`] is a separate question from this one.
+    #[must_use]
+    fn measured_bookable(&self) -> bool {
+        self.measured_gb.is_some()
+            && self
+                .measured_attribution
+                .is_none_or(MeasuredAttribution::bookable)
+    }
+
+    /// Whether admission may charge this entry's measured pair, per its cost class.
+    /// `greedy` never books a measurement: a post-spill footprint is not a nominal
+    /// size (the class exists to take the whole card). `exact` is the mirror image —
+    /// it demands a real *source*, so only a figure the engine produced about itself
+    /// qualifies (`engine_report`/`per_process`); a grandfathered stamp-less pair and
+    /// a `total_diff` stand-in are both refused, since the GGUF-size fallback would
+    /// be a precision claim with no source. `fixed` accepts any bookable provenance.
+    #[must_use]
+    fn may_book_measured(&self) -> bool {
+        if !self.measured_bookable() {
+            return false;
+        }
+        match self.cost {
+            CostClass::Greedy => false,
+            CostClass::Exact => self
+                .measured_attribution
+                .is_some_and(MeasuredAttribution::self_reported),
+            CostClass::Fixed => true,
+        }
+    }
+
+    /// The booking precedence: declared → measured (only where the cost class may
+    /// book it, per [`Self::may_book_measured`]) → GGUF estimate, with
+    /// `exact`-without-`vram_gb`-and-without-a-self-reported-measurement refused.
     #[must_use]
     pub fn cost_source(&self) -> CostSource {
         if self.vram_gb.is_some() {
             return CostSource::Declared;
         }
+        if self.may_book_measured() {
+            return CostSource::Measured;
+        }
         if self.cost == CostClass::Exact {
             return CostSource::Undeclared;
-        }
-        if self.cost == CostClass::Fixed && self.measured_gb.is_some() {
-            return CostSource::Measured;
         }
         CostSource::Estimate
     }
@@ -448,7 +633,7 @@ impl ModelEntry {
             .get("engine")
             .cloned()
             .unwrap_or_else(|| "llama".to_string());
-        let (measured_gb, measured_min_gb, measured_offload) = read_measured(&engine, keys)?;
+        let measured = read_measured(&engine, keys)?;
         Ok(ModelEntry {
             name: name.trim().to_string(),
             engine,
@@ -458,9 +643,11 @@ impl ModelEntry {
             cost,
             launch_floor_gb,
             load_timeout_s,
-            measured_gb,
-            measured_min_gb,
-            measured_offload,
+            measured_gb: measured.max,
+            measured_min_gb: measured.min,
+            measured_offload: measured.offload,
+            measured_attribution: measured.attribution,
+            measured_profile: measured.profile,
             model_ref: keys.get("model").cloned(),
             serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
             file: None,
@@ -622,6 +809,213 @@ mod tests {
     }
 
     #[test]
+    fn measured_attribution_parses_each_provenance() {
+        for (raw, want) in [
+            ("engine_report", MeasuredAttribution::EngineReport),
+            ("per_process", MeasuredAttribution::PerProcess),
+            ("total_diff", MeasuredAttribution::TotalDiff),
+            ("ENGINE_REPORT", MeasuredAttribution::EngineReport),
+        ] {
+            let entry = ModelEntry::from_flat(
+                &flat(&[
+                    ("name", "m"),
+                    ("engine", "llama"),
+                    ("measured_gb", "10"),
+                    ("measured_attribution", raw),
+                ]),
+                "m",
+            )
+            .expect("a written provenance token parses");
+            assert_eq!(entry.measured_attribution, Some(want), "raw {raw}");
+            if raw.eq_ignore_ascii_case("engine_report") {
+                // Review M2's other side: the token PARSES on any engine (a scan
+                // error would eat the operator's file), but the pair it stamps is
+                // void-on-sight on the wrong engine kind.
+                assert_eq!(entry.measured_gb, None, "cross-engine pair voids: {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_measured_attribution_is_a_scan_error() {
+        let err = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("measured_gb", "10"),
+                ("measured_attribution", "maybe"),
+            ]),
+            "m",
+        );
+        assert!(
+            matches!(err, Err(ModelError::BadAttribution { ref field, .. }) if field == "measured_attribution"),
+            "a provenance typo is a scan error, never a silent default"
+        );
+    }
+
+    #[test]
+    fn only_total_diff_is_unbookable() {
+        assert!(!MeasuredAttribution::TotalDiff.bookable());
+        assert!(MeasuredAttribution::EngineReport.bookable());
+        assert!(MeasuredAttribution::PerProcess.bookable());
+    }
+
+    #[test]
+    fn a_ninfer_profile_change_voids_the_engine_report_range() {
+        // The reserved KV is bound to the profile's --kv-capacity: a different profile
+        // makes the engine_report figure incomparable, so the range drops (stamp kept).
+        let changed = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("measured_gb", "30"),
+                ("measured_attribution", "engine_report"),
+                ("measured_profile", "b"),
+                ("ninfer_profile", "c"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(changed.measured_gb, None, "profile moved: range voided");
+        assert_eq!(
+            changed.measured_attribution,
+            Some(MeasuredAttribution::EngineReport),
+            "the stamp survives the void"
+        );
+        assert_eq!(changed.measured_profile.as_deref(), Some("b"));
+        let same = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("measured_gb", "30"),
+                ("measured_attribution", "engine_report"),
+                ("measured_profile", "b"),
+                ("ninfer_profile", "b"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            same.measured_gb,
+            Some(30.0),
+            "profile unchanged: range kept"
+        );
+        // The name alone is not the identity: a custom profile whose override line
+        // moved `kv` reserves a different KV pool under the same name, and the
+        // engine_report figure must not survive that.
+        let custom = |kv: &str| {
+            ModelEntry::from_flat(
+                &flat(&[
+                    ("name", "m"),
+                    ("engine", "ninfer"),
+                    ("measured_gb", "30"),
+                    ("measured_attribution", "engine_report"),
+                    ("measured_profile", "lt:kv32768"),
+                    ("ninfer_profile", "lt"),
+                    ("ninfer_profile_lt", &format!("ctx=16384 kv={kv} conc=2")),
+                ]),
+                "m",
+            )
+            .expect("valid")
+        };
+        assert_eq!(
+            custom("32768").measured_gb,
+            Some(30.0),
+            "same resolved capacity: the stamp still matches"
+        );
+        assert_eq!(
+            custom("524288").measured_gb,
+            None,
+            "edited override line: same name, different reservation, voided"
+        );
+        let mut no_line = vec![
+            ("name", "m"),
+            ("engine", "ninfer"),
+            ("measured_gb", "30"),
+            ("measured_attribution", "engine_report"),
+            ("measured_profile", "lt:kv32768"),
+            ("ninfer_profile", "lt"),
+        ];
+        let unresolvable = ModelEntry::from_flat(&flat(&no_line), "m").expect("valid");
+        assert_eq!(
+            unresolvable.measured_gb, None,
+            "a deleted override line cannot leave a figure claiming it"
+        );
+        no_line.push(("ninfer_profile_lt", "ctx=bad kv=bad conc=bad"));
+        assert_eq!(
+            ModelEntry::from_flat(&flat(&no_line), "m")
+                .expect("valid")
+                .measured_gb,
+            None,
+            "an unparseable override line voids, never certifies"
+        );
+    }
+
+    /// Review 2026-10-31 (H2 + M2): the comparability gate keys on the ATTRIBUTION,
+    /// not on the presence of a stamp, and a stamp can never cross engines. The
+    /// first cut let an unstamped `engine_report` (written behind an unvalidated
+    /// legacy-autostart profile) survive every profile change, and let an
+    /// `engine:` flip in the same file carry the figure onto the new engine.
+    #[test]
+    fn an_unstamped_or_cross_engine_report_figure_never_books() {
+        let unstamped = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("measured_gb", "30"),
+                ("measured_attribution", "engine_report"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            unstamped.measured_gb, None,
+            "an engine_report with no resolved profile had no certifying launch"
+        );
+        let flipped = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "llama"),
+                ("measured_gb", "30"),
+                ("measured_attribution", "engine_report"),
+                ("measured_profile", "b"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            flipped.measured_gb, None,
+            "a container reservation cannot describe a llama process"
+        );
+        let wrong_engine = |engine: &str, attribution: &str| {
+            ModelEntry::from_flat(
+                &flat(&[
+                    ("name", "m"),
+                    ("engine", engine),
+                    ("measured_gb", "30"),
+                    ("measured_attribution", attribution),
+                ]),
+                "m",
+            )
+            .expect("valid")
+        };
+        assert_eq!(
+            wrong_engine("ninfer", "per_process").measured_gb,
+            None,
+            "a container has no harness child to attribute"
+        );
+        assert_eq!(
+            wrong_engine("llama", "per_process").measured_gb,
+            Some(30.0),
+            "per_process on its own engine kind survives"
+        );
+        assert_eq!(
+            wrong_engine("ninfer", "total_diff").measured_gb,
+            Some(30.0),
+            "total_diff crosses engines honestly (it never books anyway)"
+        );
+    }
+
+    #[test]
     fn a_cpu_offload_flip_voids_the_range_but_keeps_its_stamp() {
         // The pair describes a different launch: an offloaded run has no comparable
         // footprint, so it must be neither booked nor displayed (§0.4 invalidation).
@@ -727,10 +1121,126 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(greedy.cost_source(), CostSource::Estimate);
+        let greedy_reported = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("cost", "greedy"),
+                ("measured_gb", "7"),
+                ("measured_attribution", "engine_report"),
+                ("measured_profile", "b"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            greedy_reported.measured_gb,
+            Some(7.0),
+            "the pair survives on its honest engine kind — greedy must refuse a LIVE figure"
+        );
+        assert_eq!(
+            greedy_reported.cost_source(),
+            CostSource::Estimate,
+            "a self-report is still a footprint, not a nominal size: greedy never books it"
+        );
+        let legacy_pair = ModelEntry::from_flat(
+            &flat(&[("name", "m"), ("cost", "exact"), ("measured_gb", "7")]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            legacy_pair.cost_source(),
+            CostSource::Undeclared,
+            "a stamp-less legacy pair is grandfathered for `fixed`, but `exact` demands a source"
+        );
         // `exact` without a declared number is refused, never estimated.
         let exact =
             ModelEntry::from_flat(&flat(&[("name", "m"), ("cost", "exact")]), "m").expect("valid");
         assert_eq!(exact.cost_source(), CostSource::Undeclared);
+    }
+
+    /// R1/F1(b) + ruling 15 (ii): the provenance stamp, not the bare presence of a
+    /// measured pair, decides what books. `total_diff` displays but never books —
+    /// neither for `fixed` (no resurrecting the GGUF estimate either: it stays the
+    /// estimate) nor for `exact` (a stand-in is not a source). `engine_report` books
+    /// `exact` too: the engine's own reserved budget is the source the class demands.
+    /// Falsifier: reading `measured_gb` without consulting `measured_attribution`
+    /// books the total-diff rows here.
+    #[test]
+    fn provenance_decides_booking_for_fixed_and_exact() {
+        let fixed_total_diff = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("cost", "fixed"),
+                ("measured_gb", "7"),
+                ("measured_attribution", "total_diff"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            fixed_total_diff.cost_source(),
+            CostSource::Estimate,
+            "a total-diff must not book, and must not replace the estimate with a lie either"
+        );
+        let exact_total_diff = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("cost", "exact"),
+                ("measured_gb", "7"),
+                ("measured_attribution", "total_diff"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            exact_total_diff.cost_source(),
+            CostSource::Undeclared,
+            "exact stays refused on a stand-in figure"
+        );
+        // Each bookable provenance is shown on the engine kind that can honestly
+        // carry it (review 2026-10-31, M2): an `engine_report` on a llama row is
+        // void-on-sight, and a `per_process` on a container row likewise. The
+        // `measured_profile` is the identity a template-path fold really writes —
+        // an UNstamped engine_report has no certifying launch and never books
+        // (the H2 pin below).
+        for (token, engine, profile) in [
+            ("engine_report", "ninfer", Some("b")),
+            ("per_process", "llama", None),
+        ] {
+            let mut keys = vec![
+                ("name", "m"),
+                ("engine", engine),
+                ("cost", "exact"),
+                ("measured_gb", "7"),
+                ("measured_attribution", token),
+            ];
+            if let Some(profile) = profile {
+                keys.push(("measured_profile", profile));
+            }
+            let exact_reported = ModelEntry::from_flat(&flat(&keys), "m").expect("valid");
+            assert_eq!(
+                exact_reported.cost_source(),
+                CostSource::Measured,
+                "{token}: a bookable provenance is a source for exact"
+            );
+        }
+        // Declared still wins unconditionally over any measured figure (DECISIONS
+        // LOCKED: the container number is bounded, never sovereign).
+        let declared_wins = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("cost", "exact"),
+                ("vram_gb", "26"),
+                ("measured_gb", "7"),
+                ("measured_attribution", "engine_report"),
+                ("measured_profile", "b"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(declared_wins.cost_source(), CostSource::Declared);
     }
 
     #[test]
