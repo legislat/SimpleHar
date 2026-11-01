@@ -1457,6 +1457,30 @@ mod tests {
         assert!(script.contains("override:ninfer_profile_lt"), "{script}");
     }
 
+    /// The reference script shipped beside the README must teach exactly the R10
+    /// separation the canonical renders. `ec310a5` corrected it by hand; this pin is
+    /// what makes the next drift fail at the gate instead of in a review (F4).
+    #[test]
+    fn the_shipped_reference_template_teaches_the_separation() {
+        let shipped = include_str!("../../ninfer-autostart-template.sh");
+        assert!(
+            shipped.contains("INTERNAL_PORT=8808"),
+            "the shipped reference must teach the R10 default internal port"
+        );
+        assert!(
+            shipped.contains("${3:?"),
+            "the shipped reference must fail closed when the harness omits arg 3"
+        );
+        assert!(
+            !shipped.contains("${3:-"),
+            "the legacy fallback would host-publish the internal port on a missing arg 3"
+        );
+        assert!(
+            !shipped.contains("8004") && !shipped.contains("8005"),
+            "legacy manual-namespace internal ports must not survive in the reference"
+        );
+    }
+
     /// Fail-closed doctrine for the launch surface: a yaml cannot steer the container
     /// with anything the validators do not name. Each leg is a distinct substitution
     /// site; the falsifier for every one is deleting its check.

@@ -255,7 +255,12 @@ function stateKey(status, models) {
   // (the card becomes sampleable, RAM stops being) is structural and must repaint.
   masked.mem.observed_used_gb =
     status.mem && status.mem.observed_used_gb == null ? null : 1;
-  masked.mem.ram_used_gb = status.mem && status.mem.ram_used_gb ? 1 : null;
+  masked.mem.ram_used_gb =
+    status.mem && status.mem.ram_used_gb == null ? null : 1;
+  // attributed_gb drifts every sample beside observed_used_gb wherever per-process
+  // attribution works (review F1): same volatile class, same presence-masking.
+  masked.mem.attributed_gb =
+    status.mem && status.mem.attributed_gb == null ? null : 1;
   if (Array.isArray(masked.slots)) {
     masked.slots = masked.slots.map((slot) => (slot ? { ...slot, idle_s: null } : slot));
   }
@@ -338,8 +343,9 @@ function renderMemory(status) {
     );
   }
   // A1: host RAM context (informational; admission budgets VRAM, never RAM). Omit
-  // the whole bar when the platform cannot sample it, rather than show zeros.
-  if (mem.ram_total_gb) {
+  // the whole bar when the platform cannot sample it, rather than show zeros. The
+  // used number gates too: a total without a reading is not a bar (review F5).
+  if (mem.ram_total_gb && mem.ram_used_gb != null) {
     const ramLabel = el("label", {});
     const ramFill = el("i", {});
     const paintRam = (m) => {

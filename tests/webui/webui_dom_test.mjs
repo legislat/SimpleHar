@@ -26,7 +26,12 @@ class El {
   setAttribute(k, v) { this.attrs[k] = String(v); }
   getAttribute(k) { return this.attrs[k] ?? null; }
   append(...kids) { this.children.push(...kids); }
-  replaceChildren(...kids) { this.children = kids; }
+  replaceChildren(...kids) {
+    this.children = kids;
+    // A real browser loses the scroll when the whole document body is replaced;
+    // emulate it on the root so a deleted restore line cannot pass both ways (F2).
+    if (this.tag === "#sh-main") globalThis.window.scrollY = 0;
+  }
   addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
   dispatch(type, event) { for (const fn of this.listeners[type] ?? []) fn(event); }
   querySelector(sel) {
@@ -733,6 +738,37 @@ const driver = `
   check("the repaint restores the scroll",
     globalThis.window.scrollY === 777, "scrollY=" + globalThis.window.scrollY);
   statusDoc.categories[3].default_model = originalEmbDefault;
+  // F1: attributed_gb drifts every sample wherever per-process attribution works;
+  // it must be volatile like its siblings, while its presence stays structural.
+  statusDoc.mem.attributed_gb = null;
+  await refresh();
+  const beforeAttr = mainNow.children[0];
+  statusDoc.mem.attributed_gb = 3.2;
+  await refresh();
+  check("attributed bytes appearing repaints",
+    mainNow.children[0] !== beforeAttr,
+    "same node after presence change");
+  const attrKeeper = mainNow.children[0];
+  statusDoc.mem.attributed_gb = 5.6;
+  await refresh();
+  check("a drifting attributed_gb does not repaint",
+    mainNow.children[0] === attrKeeper,
+    "repainted: " + (mainNow.children[0] && mainNow.children[0].__keeper));
+  statusDoc.mem.attributed_gb = 12.3;
+  // F3: sample presence transitions are page changes, not volatile ticks - the
+  // bar must vanish and return through a real repaint, never a silent patch miss.
+  const vanishKeeper = mainNow.children[0];
+  statusDoc.mem.observed_used_gb = null;
+  await refresh();
+  check("losing the sample repaints and drops the bar",
+    mainNow.children[0] !== vanishKeeper && !mainNow.children[0].__keeper &&
+      textOf(document.getElementById("sh-header")).indexOf("VRAM") < 0,
+    "header=" + textOf(document.getElementById("sh-header")).slice(0, 90));
+  statusDoc.mem.observed_used_gb = 41.5;
+  await refresh();
+  check("the bar returns when the sample returns",
+    textOf(document.getElementById("sh-header")).indexOf("41.5") >= 0,
+    "header=" + textOf(document.getElementById("sh-header")).slice(0, 90));
 
   for (const [name, ok, extra] of results)
     console.log((ok ? "PASS " : "FAIL ") + name + (ok || !extra ? "" : " :: " + extra));
