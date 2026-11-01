@@ -185,29 +185,39 @@ const FORBIDDEN_SERVE_FLAGS: [&str; 16] = [
     "--kv-dtype",
 ];
 
-/// One `ninfer_serve_args` token: unlike a WSL argv word, a serve flag is *supposed*
-/// to start with `-` (it goes to `ninfer-serve`, not to the login shell), but the
-/// charset stays shell-bare — no space, quote, `$`, backtick, semicolon, pipe,
-/// redirect, paren, brace, or `~` — and the harness-owned flags above are refused.
-/// `--model-id` has its own key (`ninfer_model_id`), so it is refused here too.
-/// The denylist is checked against the flag *name*, so the `--flag=value` form
-/// cannot smuggle a forbidden flag past a whole-token comparison — and against
-/// every strict *prefix* of one, because argparse-style parsers (the Python
-/// precedent behind this engine) resolve unique abbreviations: `--max-cont` is
-/// `--max-context` to such a parser, and the llama `extra_args` deny-list leak
-/// (FINDINGS2-0910, 8/8 smuggles) is the in-repo precedent for closing the
-/// abbreviation door rather than betting on the parser being strict.
+/// One `ninfer_serve_args` token: an option token is *supposed* to start with `-`
+/// (it goes to `ninfer-serve`, not to the login shell), and a bare value token is
+/// admitted too — the engine's own parsers (the Bonsai fork's `serve` AND the
+/// stock `ninfer-serve`) reject the `--flag=value` form outright (manual test
+/// 2026-11-01: `unknown argument: --spec=dflash2`), so the working space form
+/// `--spec dflash2` must stay spellable; every token is quoted at substitution,
+/// so a value cannot shell out. The charset stays shell-bare — no space, quote,
+/// `$`, backtick, semicolon, pipe, redirect, paren, brace, or `~` — and the
+/// harness-owned flags above are refused. `--model-id` has its own key
+/// (`ninfer_model_id`), so it is refused here too. The denylist is checked
+/// against an option token's *name* (so `--flag=value` cannot smuggle past a
+/// whole-token comparison) and against every strict *prefix* of one, because
+/// argparse-style parsers (the Python precedent behind this engine) resolve
+/// unique abbreviations: `--max-cont` is `--max-context` to such a parser, and
+/// the llama `extra_args` deny-list leak (FINDINGS2-0910, 8/8 smuggles) is the
+/// in-repo precedent for closing the abbreviation door rather than betting on
+/// the parser being strict. A value token that begins with `-` is refused, so a
+/// value can never disguise itself as another flag.
 fn valid_serve_arg(token: &str) -> bool {
+    let name = token.split('=').next().unwrap_or(token);
     !token.is_empty()
-        && token.starts_with('-')
         && token.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':' | '+' | '@' | '=')
         })
-        && {
-            let name = token.split('=').next().unwrap_or(token);
-            !FORBIDDEN_SERVE_FLAGS
-                .iter()
-                .any(|flag| name.starts_with(flag) || flag.starts_with(name))
+        && if name.starts_with('-') {
+            // Long options only: this engine's parsers speak `--flag`, and a
+            // single-dash token is more likely a stray short flag than a value.
+            name.starts_with("--")
+                && !FORBIDDEN_SERVE_FLAGS
+                    .iter()
+                    .any(|flag| name.starts_with(flag) || flag.starts_with(name))
+        } else {
+            true
         }
 }
 
@@ -364,6 +374,22 @@ fn profile_override(
         model: model_name.to_string(),
         reason,
     };
+    // A `ninfer_profile_<built-in-name>` line is dead config by this module's
+    // own precedence: the table answers a built-in profile first, and an
+    // override line is consulted only for a custom name — either way the line
+    // is never read. Silently ignoring it is the silent-drift class (manual
+    // test 2026-11-01: a `ninfer_profile_b` line promising int8/conc 2 launched
+    // fp8/conc 1 with no word), so an override line naming any built-in is a
+    // refusal, whatever `ninfer_profile` selects.
+    for (name, ..) in BUILT_IN_PROFILES {
+        let dead = format!("ninfer_profile_{name}");
+        if raw.contains_key(&dead) {
+            return Err(rejected(format!(
+                "`{dead}` can never be read: `{name}` is a built-in profile and the \
+                 built-in table wins; rename the profile to a custom name"
+            )));
+        }
+    }
     if let Some((_, ctx, kv, conc, dtype)) =
         BUILT_IN_PROFILES.iter().find(|(name, ..)| *name == profile)
     {
@@ -1131,6 +1157,61 @@ mod tests {
         ]
     }
 
+    /// The parsers of BOTH shipped images reject the `--flag=value` form
+    /// (`unknown argument: --spec=dflash2`, manual test 2026-11-01), so the
+    /// space form the operator's verified scripts used must stay spellable:
+    /// an option token plus its bare value token, each quoted at substitution.
+    /// Falsifier: a validation that still demands every token be option-shaped
+    /// refuses `dflash2`, and the working launch line becomes inexpressible.
+    #[test]
+    fn serve_args_carries_the_space_form_the_parsers_actually_parse() {
+        let mut pairs = template_pairs();
+        pairs.retain(|(k, _)| *k != "ninfer_serve_args");
+        pairs.push((
+            "ninfer_serve_args",
+            "--spec dflash2 --draft-tokens 5 --max-pending-requests 64",
+        ));
+        let spec = NinferAdapter::new("Ubuntu", "ops")
+            .spec(&entry(&pairs), 18109)
+            .expect("space-form serve args");
+        let script = spec.script.expect("template renders");
+        assert!(
+            script.contains("\"--spec\" \"dflash2\" \"--draft-tokens\" \"5\""),
+            "{script}"
+        );
+        assert!(script.contains("\"64\""), "{script}");
+        // A value may never masquerade as an option: single-dash tokens and
+        // anything extending a harness-owned name are still refused.
+        for bad in ["-x 5", "--host 0.0.0.0", "--data-dir-permissions /x"] {
+            let mut pairs = template_pairs();
+            pairs.retain(|(k, _)| *k != "ninfer_serve_args");
+            pairs.push(("ninfer_serve_args", bad));
+            let reason = refused(&pairs);
+            assert!(reason.contains("ninfer_serve_args"), "{bad}: {reason}");
+        }
+    }
+
+    /// An override line naming a BUILT-IN profile can never be read (the table
+    /// answers built-ins first; overrides apply only to custom names), and the
+    /// manual test caught what silence did with that: the yaml promised
+    /// int8/conc 2, the launch shipped fp8/conc 1. Falsifier: drop the refusal
+    /// and the dead key parses as success while the numbers it names never
+    /// reach the script.
+    #[test]
+    fn an_override_line_naming_a_built_in_profile_is_refused_not_ignored() {
+        for (selected, dead) in [("b", "ninfer_profile_b"), ("card", "ninfer_profile_b")] {
+            let mut pairs = template_pairs();
+            pairs.push(("ninfer_profile", selected));
+            if selected == "card" {
+                pairs.push(("ninfer_profile_card", "ctx=16384 kv=16384 conc=1"));
+            }
+            pairs.push((dead, "ctx=262144 kv=262144 conc=2 kv_dtype=int8"));
+            let reason = refused(&pairs);
+            assert!(reason.contains(dead), "{selected}/{dead}: {reason}");
+            assert!(reason.contains("built-in"), "{selected}/{dead}: {reason}");
+        }
+    }
+
     /// The `ninfer_env` allow-list is a review gate, not a parse rule: the one
     /// card-verified flag reaches the container quoted and complete, and an
     /// arbitrary `NAME` — `LD_PRELOAD`, `PATH` — is refused by name. Falsifier:
@@ -1310,7 +1391,7 @@ mod tests {
             ("ninfer_serve_args", "--mode", "harness-owned flag"),
             ("ninfer_serve_args", "--spec;rm -f /", "shell-bare"),
             ("ninfer_serve_args", "--spec \"x\"", "shell-bare"),
-            ("ninfer_serve_args", "plainword", "shell-bare"),
+            ("ninfer_serve_args", "-x", "shell-bare"),
             ("ninfer_gpu_device", "0 1", "ninfer_gpu_device"),
             ("ninfer_gpu_device", "0;id", "ninfer_gpu_device"),
             ("ninfer_model_id", "a b", "ninfer_model_id"),
