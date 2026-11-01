@@ -159,6 +159,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "ninfer_model_id",
     "ninfer_key_file",
     "ninfer_serve_cmd",
+    "ninfer_env",
     "external",
 ];
 
@@ -2120,6 +2121,7 @@ mod tests {
              ninfer_model_id: golden-id\n\
              ninfer_key_file: $HOME/.simplehar/keys/golden-box.key\n\
              ninfer_serve_cmd: ninfer-serve\n\
+             ninfer_env: CUDA_MODULE_LOADING=LAZY\n\
              external: false\n",
         )
         .expect("write golden");

@@ -79,8 +79,23 @@ const BUILT_IN_PROFILES: [(&str, &str, &str, &str, &str); 5] = [
 
 /// KV dtypes the harness will encode into a launch. Extending this list is the day
 /// the engine grows a dtype the operator asks for; until then an unknown dtype is a
-/// refusal naming the key, never a surprise the distro discovers.
-const ALLOWED_KV_DTYPES: [&str; 4] = ["fp8", "nvfp4", "fp16", "bf16"];
+/// refusal naming the key, never a surprise the distro discovers. `int8` and
+/// `rk8v4` joined on the operator's demand: the Qwen3.8/Swift FP8 cards' verified
+/// lines run int8 KV (the fast-prefill kernel is silently ignored on fp8) and the
+/// Bonsai fork's card runs rk8v4 — pinning their acceptance is what keeps a future
+/// edit from silently breaking a live yaml's launch.
+const ALLOWED_KV_DTYPES: [&str; 6] = ["fp8", "nvfp4", "fp16", "bf16", "int8", "rk8v4"];
+
+/// The environment variables a yaml may set inside the container, as
+/// `ninfer_env: NAME=VALUE ...`. This is an **allow-list, not a parse rule**: an
+/// arbitrary `NAME=VALUE` would let the yaml inject `LD_PRELOAD` or rewrite
+/// `PATH` inside a root-adjacent container, so every admissible name is a
+/// reviewed constant with its own closed value set. `CUDA_MODULE_LOADING=LAZY`
+/// is the operator's card-verified cold-start flag for the NInfer-all forks
+/// (`--gdn-state-fp16`/`--fast-prefill-kernel` line); extending the list is the
+/// day a card demands another one, and the addition is a code review, not a
+/// yaml edit.
+const ALLOWED_ENV_VARS: [(&str, &[&str]); 1] = [("CUDA_MODULE_LOADING", &["EAGER", "LAZY"])];
 
 /// The identity an `engine_report` figure is comparable to: the selected profile
 /// **plus the `--kv-capacity` it resolves to** — the reserved KV is what binds the
@@ -259,7 +274,7 @@ docker run -d --name "$NAME" \
   --publish "127.0.0.1:${PUBLISH}:${PORT}" \
   --volume "$MODEL_DIR:/models:ro" \
   --log-driver json-file --log-opt max-size=25m --log-opt max-file=5 \
-  "$IMAGE" \
+  {{ENV_ARGS}}"$IMAGE" \
   "$SERVE_CMD" "/models/$ARTIFACT" \
   --host 0.0.0.0 \
   --port "$PORT" \
@@ -294,6 +309,7 @@ struct NinferParams {
     key: String,
     gpu_device: String,
     model_id: Option<String>,
+    env: Vec<String>,
 }
 
 /// Reads one required template key, trimmed and non-empty; the error names the exact
@@ -532,6 +548,26 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
     } else {
         "nokey"
     };
+    let env: Vec<String> = optional_param(model, "ninfer_env")
+        .map(|line| line.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+    for token in &env {
+        let ok = ALLOWED_ENV_VARS.iter().any(|(name, values)| {
+            token
+                .strip_prefix(&format!("{name}="))
+                .is_some_and(|value| values.contains(&value))
+        });
+        if !ok {
+            return Err(rejected(format!(
+                "`ninfer_env` tokens must be an allow-listed NAME=VALUE ({}): {token}",
+                ALLOWED_ENV_VARS
+                    .iter()
+                    .map(|(name, values)| format!("{name}={}", values.join("|")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
     Ok(NinferParams {
         profile,
         profile_source,
@@ -551,6 +587,7 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
         key: key.to_string(),
         gpu_device,
         model_id,
+        env,
     })
 }
 
@@ -575,6 +612,14 @@ fn render_canonical(params: &NinferParams) -> Result<String, EngineError> {
         .model_id
         .as_deref()
         .map_or_else(String::new, |id| format!("--model-id \"{id}\" \\\n  "));
+    // Each token is one reviewed `NAME=VALUE` from `ALLOWED_ENV_VARS`; quoting it
+    // keeps the value literal to `docker run`, and the allow-list is what makes an
+    // arbitrary `NAME` (e.g. `LD_PRELOAD`) unrepresentable in the first place.
+    let env_args = params
+        .env
+        .iter()
+        .map(|pair| format!("--env \"{pair}\" \\\n  "))
+        .collect::<String>();
     let script = CANONICAL_NINFER_SCRIPT
         .replace("{{PROFILE_SOURCE}}", &params.profile_source)
         .replace("{{PROFILE}}", &params.profile)
@@ -593,6 +638,7 @@ fn render_canonical(params: &NinferParams) -> Result<String, EngineError> {
         .replace("{{KEY_FILE}}", &params.key_file)
         .replace("{{KEY}}", &params.key)
         .replace("{{GPU_DEVICE}}", &params.gpu_device)
+        .replace("{{ENV_ARGS}}", &env_args)
         .replace("{{MODEL_ID_ARG}}", &model_id_arg);
     if script.contains("{{") {
         return Err(EngineError::Rejected {
@@ -1085,6 +1131,51 @@ mod tests {
         ]
     }
 
+    /// The `ninfer_env` allow-list is a review gate, not a parse rule: the one
+    /// card-verified flag reaches the container quoted and complete, and an
+    /// arbitrary `NAME` — `LD_PRELOAD`, `PATH` — is refused by name. Falsifier:
+    /// widening the check to any `NAME=VALUE` shape makes the refusals land, and
+    /// dropping the render substitution makes the acceptance leg land.
+    #[test]
+    fn ninfer_env_admits_only_the_allow_listed_pair() {
+        let mut pairs = template_pairs();
+        pairs.push(("ninfer_env", "CUDA_MODULE_LOADING=LAZY"));
+        let spec = NinferAdapter::new("Ubuntu", "ops")
+            .spec(&entry(&pairs), 18109)
+            .expect("allow-listed env");
+        let script = spec.script.expect("template renders");
+        assert!(
+            script.contains("--env \"CUDA_MODULE_LOADING=LAZY\""),
+            "{script}"
+        );
+        assert!(!script.contains("{{"), "no placeholder survives");
+
+        for bad in [
+            "CUDA_MODULE_LOADING",
+            "CUDA_MODULE_LOADING=eager",
+            "CUDA_MODULE_LOADING=LAZY;rm -f /",
+            "LD_PRELOAD=/x.so",
+            "PATH=/tmp/bin",
+            "CUDA_MODULE_LOADING=LAZY CUDA_MODULE_LOADING=EAGER PATH=/tmp",
+        ] {
+            let mut pairs = template_pairs();
+            pairs.push(("ninfer_env", bad));
+            let reason = refused(&pairs);
+            assert!(reason.contains("ninfer_env"), "{bad}: {reason}");
+        }
+
+        // Absent key: the line disappears cleanly, leaving no dangling continuation.
+        let spec = NinferAdapter::new("Ubuntu", "ops")
+            .spec(&entry(&template_pairs()), 18109)
+            .expect("no env");
+        let script = spec.script.expect("template renders");
+        assert!(!script.contains("--env"), "{script}");
+        assert!(
+            script.contains("--log-opt max-file=5 \\\n  \"$IMAGE\""),
+            "the run line stays contiguous without an env pair: {script}"
+        );
+    }
+
     /// Template adoption (operator ruling 2026-10-31): the launch runs the harness's
     /// own rendered script, staged by the runtime — never an operator file. This pins
     /// the three incident-review properties (`--restart no`, loopback-only publish,
@@ -1277,6 +1368,25 @@ mod tests {
             .spec(&entry(&pairs), 18109)
             .expect("kv_dtype defaults to fp8");
         assert!(spec.script.expect("rendered").contains("kvdtype=fp8"));
+
+        // The two dtypes the operator's live cards demand (Qwen3.8/Swift int8
+        // with the fast-prefill kernel, Bonsai rk8v4) must stay admissible —
+        // these lines are transcribed from the legacy scripts' verified launches.
+        for dtype in ["int8", "rk8v4"] {
+            let line = format!("ctx=262144 kv=262144 conc=2 kv_dtype={dtype}");
+            let mut pairs = template_pairs();
+            pairs.push(("ninfer_profile", "card"));
+            pairs.push(("ninfer_profile_card", line.as_str()));
+            let spec = NinferAdapter::new("Ubuntu", "ops")
+                .spec(&entry(&pairs), 18109)
+                .unwrap_or_else(|_| panic!("{dtype} must be admissible: the live yamls ship it"));
+            assert!(
+                spec.script
+                    .expect("rendered")
+                    .contains(&format!("kvdtype={dtype}")),
+                "{dtype}"
+            );
+        }
     }
 
     #[test]
