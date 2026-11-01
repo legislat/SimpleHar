@@ -507,6 +507,8 @@ mod tests {
         out.push_str(spec.container.as_deref().unwrap_or(""));
         out.push('\u{1}');
         out.push_str(spec.script.as_deref().unwrap_or(""));
+        out.push('\u{1}');
+        out.push_str(spec.custody.as_deref().unwrap_or(""));
         out
     }
 
@@ -718,6 +720,35 @@ mod tests {
                 assert!(
                     seen.iter().any(|key| key == knob),
                     "row `{}` claims knob `{knob}` but the serialized config has no such key",
+                    row.id
+                );
+            }
+        }
+    }
+
+    /// Custody (slice 10b): only the strata row's launches ride the harness
+    /// custody sidecar — the runtime records exactly what the spec declares.
+    /// Ninfer's evidence is the container claim ledger; llama and mock ride
+    /// the job object's crash guarantee alone. A row growing `custody`
+    /// without the sweep knowing its engine id would fail here first.
+    #[test]
+    fn custody_record_writes_are_the_strata_launches_alone() {
+        for row in all() {
+            let spec = render(&fixture(row.id));
+            if row.id == "strata" {
+                assert_eq!(
+                    spec.custody.as_deref(),
+                    Some("strata"),
+                    "the strata launch must be custody-tracked"
+                );
+                assert!(
+                    engine_policy("strata").is_some(),
+                    "a custody engine must answer to a compiled-in row"
+                );
+            } else {
+                assert_eq!(
+                    spec.custody, None,
+                    "engine `{}` may not claim custody",
                     row.id
                 );
             }

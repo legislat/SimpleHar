@@ -99,6 +99,15 @@ pub struct LaunchSpec {
     /// `Some` demands argv shape `[..., "bash", <script>, ...]`. `None` for process
     /// engines and for a launch that runs the operator's own script verbatim.
     pub script: Option<String>,
+    /// The engine id when this launch must be recorded in the harness custody
+    /// sidecar (chunk 10 slice 10b): the runtime writes the started child's
+    /// pid + start-time token + slot port + instance name (the model, as
+    /// `log_name`) to [`crate::custody::CustodyLedger`] the moment the client
+    /// really started, and clears the entry on confirmed release. `None` =
+    /// not custodied: container-backed engines own the `ninfer-claims.json`
+    /// ledger instead, and the remaining process engines ride only the job
+    /// object's crash guarantee.
+    pub custody: Option<String>,
 }
 
 /// The shared WSL client prefix: `wsl.exe -d <distro> -u <user> --`. Launch

@@ -323,6 +323,7 @@ impl EngineAdapter for LlamaAdapter {
             },
             container: None,
             script: None,
+            custody: None,
         })
     }
 }

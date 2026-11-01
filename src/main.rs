@@ -873,6 +873,8 @@ async fn run(
     {
         let handle = state.scheduler.clone();
         let reap = state.reap_stamp();
+        let custody_runtime = boot_runtime.clone();
+        let custody_grace = Duration::from_secs(state.config.release_timeout_s);
         tokio::spawn(async move {
             // FINDINGS-14 [5] seam: records what `READY_LOGGED` said when this
             // closure began, which is the post-ready ordering the boot contract
@@ -884,6 +886,23 @@ async fn run(
             // completion, on the wall clock, in the same ms-since-start unit as the
             // other measures — it used to end in silence.
             let dispatched = std::time::Instant::now();
+            // Custody sweep (chunk 10 slice 10b, R8): a strata router left by a
+            // crashed run is reaped only on proof from the harness's OWN
+            // sidecar (pid alive AND start-time token equal); the engine's own
+            // leftover probe is untrusted and is never consulted here. The
+            // sweep is catalog-independent, so it runs before the catalog read
+            // below, which may return early.
+            let custody = custody_runtime.reclaim_custody_at_boot(custody_grace).await;
+            if !(custody.reaped.is_empty() && custody.stale.is_empty() && custody.stuck.is_empty())
+            {
+                tracing::info!(
+                    sweep_ms = dispatched.elapsed().as_millis() as u64,
+                    reaped = ?custody.reaped,
+                    stale = ?custody.stale,
+                    stuck = ?custody.stuck,
+                    "boot strata custody sweep finished (§0.2 step 4 companion)"
+                );
+            }
             let Ok(catalog) = handle.catalog().await else {
                 return;
             };

@@ -178,6 +178,11 @@ impl EngineAdapter for StrataAdapter {
             ),
             container: None,
             script: None,
+            // The strata router outlives nothing but its own job object unless the
+            // harness records it: every strata launch rides the custody sidecar
+            // (chunk 10 slice 10b) so a crashed run's orphan is provably ours to
+            // reap at the next boot, purely from the harness's own record.
+            custody: Some("strata".to_string()),
         })
     }
 }
@@ -255,6 +260,11 @@ mod tests {
         );
         assert_eq!(spec.cwd, PathBuf::from(DEFAULT_CWD));
         assert_eq!(spec.log_name, "strata-test");
+        assert_eq!(
+            spec.custody.as_deref(),
+            Some("strata"),
+            "every strata launch rides the custody sidecar (slice 10b)"
+        );
         assert!(spec.env.is_empty());
         assert_eq!(
             spec.readiness,

@@ -26,6 +26,7 @@
 //! block states its invariant. The single-instance guard (A10, §0.2 step 3) lives
 //! here too: a named mutex refuses a second harness.
 
+use crate::custody::{self, CustodyLedger};
 use crate::engine::{
     http_probe, wsl_prefix, EngineRuntime, LaunchSpec, Probe, SpawnError, Spawned,
 };
@@ -408,6 +409,14 @@ struct EngineProc {
     /// early-exited engine was launched against (FINDINGS-13 [2]'s companion: an
     /// engine that dies on a deleted model must name it, not just its exit code).
     argv: Vec<String>,
+    /// The child's OS pid captured at spawn. `Child::id()` reports `None` once
+    /// the child has been reaped, so the release-time custody bookkeeping cannot
+    /// ask the child again — the value must ride on the entry.
+    pid: u32,
+    /// The custody sidecar token written at spawn for a custodied launch
+    /// (chunk 10 slice 10b); `release_confirmed` may only clear the entry
+    /// bearing this token, never one a later launch wrote under the same pid.
+    custody_token: Option<u64>,
 }
 
 /// Owned Job Object handle. `Send` because the runtime owns it exclusively: it is
@@ -436,6 +445,10 @@ pub struct ProcessRuntime {
     /// Shared so every clone of the runtime reads and writes one claim ledger:
     /// the boot reclaim and the spawn/release paths cannot disagree.
     claims: Arc<Mutex<ContainerClaims>>,
+    /// The custody sidecar (slice 10b): recorded at spawn, cleared on
+    /// confirmed release, swept at boot — one shared record per process
+    /// lifetime, the same single-authority rule as the claim ledger.
+    custody: Arc<Mutex<CustodyLedger>>,
     client: reqwest::Client,
     logs_dir: PathBuf,
     wsl_distro: String,
@@ -572,10 +585,23 @@ async fn reap_container(distro: &str, user: &str, name: &str) -> bool {
 /// The in-distro directory a harness-rendered autostart script is staged into.
 /// Deliberately outside every model directory and outside the operator's script
 /// tree: a staged file can never shadow or be confused with a hand-written one
-/// (template adoption, operator ruling 2026-10-31). The value is the ninfer row's
-/// executed-path custody root in the [`crate::engine::policy`] table (§20-9
-/// Fork C single source).
-const STAGED_AUTOSTART_DIR: &str = crate::engine::policy::NINFER_STAGED_SCRIPTS_ROOT;
+/// (template adoption, operator ruling 2026-10-31). The value is READ from the
+/// ninfer row's `custody_exec_roots` cell of the [`crate::engine::policy`]
+/// table (slice 10b: the table cell is the single home, not a re-aliased
+/// constant), so the compiled-in custody root and the staging path cannot
+/// drift apart (§20-9 Fork C).
+///
+/// # Panics
+///
+/// Never: the compiled-in ninfer row always carries its staged-scripts
+/// custody root (a row without it is a build-time bug).
+#[must_use]
+fn staged_scripts_root() -> &'static str {
+    crate::engine::policy::engine_policy(crate::ownership::NINFER_ENGINE)
+        .and_then(|row| row.custody_exec_roots.first())
+        .copied()
+        .expect("invariant: the compiled-in ninfer row ships its staged-scripts custody root")
+}
 
 /// How many staged renders of one model's slug survive in the staging directory
 /// (the staging driver prunes older `<slug>-<hash>.sh` files past this many). A
@@ -629,10 +655,8 @@ fn staged_script_path(slug: &str, script: &str) -> String {
             }
         })
         .collect();
-    format!(
-        "~/{STAGED_AUTOSTART_DIR}/{slug}-{:016x}.sh",
-        fnv1a64(script.as_bytes())
-    )
+    let root = staged_scripts_root();
+    format!("~/{root}/{slug}-{:016x}.sh", fnv1a64(script.as_bytes()))
 }
 
 /// Escape every POSIX ERE metacharacter so `find -regextype posix-extended -regex`
@@ -743,6 +767,7 @@ fn staging_driver(script: &str, file_name: &str, blob: &str) -> String {
     // `harxa`'s keep-N pool (review 2026-10-31, measured on the distro's findutils).
     // Escaping every metacharacter makes the regex match the slug LITERALLY.
     let slug_re = escape_posix_regex(slug);
+    let root = staged_scripts_root();
     // The temp names the slug AND the hash, and both temp paths are `rm -f`-ed
     // before the redirects: shell `>` PRESERVES a pre-existing file's mode (umask
     // is creation-only), so a planted loose-mode temp must not propagate to the
@@ -753,7 +778,7 @@ fn staging_driver(script: &str, file_name: &str, blob: &str) -> String {
         "#!/usr/bin/env bash\n\
          set -euo pipefail\n\
          umask 077\n\
-         dir=\"$HOME/{STAGED_AUTOSTART_DIR}\"\n\
+         dir=\"$HOME/{root}\"\n\
          mkdir -p \"$dir\"\n\
          target=\"$dir/$1\"\n\
          tmp=\"$dir/.staging.{slug}-{hash:x}.tmp\"\n\
@@ -876,6 +901,17 @@ fn container_claims_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ninfer-claims.json"))
 }
 
+/// The custody sidecar (slice 10b): recorded strata launches, beside the
+/// claim ledger the harness already keeps next to its executable — the same
+/// state home for the same reason: one microsecond of local read at boot,
+/// never a stall on a volume that could delay the bind.
+fn strata_custody_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("strata-custody.json")))
+        .unwrap_or_else(|| PathBuf::from("strata-custody.json"))
+}
+
 /// `wsl.exe … docker ps --format {{.Names}}`; `None` when the call cannot run or
 /// reports failure (the reconcile is advisory, never fatal). A control command like
 /// [`reap_container`], so it goes through [`run_control_command`] and carries only
@@ -993,6 +1029,10 @@ impl ProcessRuntime {
             // One ledger for the whole process lifetime, shared by every clone:
             // claimed at spawn, cleared on confirmed release, consulted at boot.
             claims: Arc::new(Mutex::new(ContainerClaims::load(container_claims_path()))),
+            // One custody sidecar per process lifetime, same single-authority
+            // rule (slice 10b): recorded when a custodied launch really
+            // started, cleared on confirmed release, swept at boot.
+            custody: Arc::new(Mutex::new(CustodyLedger::load(strata_custody_path()))),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
@@ -1025,6 +1065,16 @@ impl ProcessRuntime {
     #[must_use]
     pub fn with_claims_ledger(mut self, path: impl Into<PathBuf>) -> Self {
         self.claims = Arc::new(Mutex::new(ContainerClaims::load(path)));
+        self
+    }
+
+    /// Points this runtime's custody sidecar at `path`. Test-only, the very
+    /// rule [`Self::with_claims_ledger`] states: pins must neither touch the
+    /// real sidecar beside the test exe nor leave entries for the next run.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_custody_ledger(mut self, path: impl Into<PathBuf>) -> Self {
+        self.custody = Arc::new(Mutex::new(CustodyLedger::load(path)));
         self
     }
 
@@ -1066,6 +1116,19 @@ impl ProcessRuntime {
                 .lock()
                 .expect("container claim ledger lock")
                 .unclaim(name);
+        }
+    }
+
+    /// Clears this launch's custody sidecar entry, token-guarded: `None` (the
+    /// launch was never recorded) forgets nothing, and a foreign token can
+    /// never erase a later launch's record (slice 10b, engine `drop_record`
+    /// rule). Used by the spawn-failure retract and the confirmed release.
+    fn forget_custody(&self, pid: u32, token: Option<u64>) {
+        if let Some(token) = token {
+            self.custody
+                .lock()
+                .expect("custody sidecar lock")
+                .forget(pid, token);
         }
     }
 
@@ -1147,6 +1210,38 @@ impl ProcessRuntime {
             .lock()
             .expect("container claim ledger lock")
             .contains(name)
+    }
+
+    /// Boot custody reconcile + orphan sweep (chunk 10 slice 10b, R8): for
+    /// each custody sidecar entry, act only on a process that provably matches
+    /// the recorded identity (pid alive **and** start-time token equal); a
+    /// non-matching entry is dropped as stale and whatever lives at that pid
+    /// now is never touched. The engine's own leftover probe is untrusted —
+    /// the release log's `[strata] could not check for engines left by an
+    /// earlier run: RuntimeError` proves it can fail while saying nothing
+    /// about what still runs — and is never consulted here: the sweep is
+    /// driven purely by this harness's own sidecar, through pid-ops that have
+    /// no engine channel. A matching orphan is terminated once (identity
+    /// re-verified at the instant of the signal) and waited out with the
+    /// normal stop-grace; an unconfirmed reap keeps its claim for the next
+    /// boot. Best-effort: every failure path warns and boot proceeds.
+    pub async fn reclaim_custody_at_boot(&self, grace: Duration) -> custody::ReconcileReport {
+        let ledger = Arc::clone(&self.custody);
+        if ledger.lock().expect("custody sidecar lock").is_empty() {
+            return custody::ReconcileReport::default();
+        }
+        custody::reconcile(&ledger, &custody::WinCustodyOs, grace).await
+    }
+
+    /// Test-only read of the custody sidecar behind slice 10b's pins.
+    #[cfg(test)]
+    fn custody_entries(&self) -> Vec<custody::CustodyEntry> {
+        self.custody
+            .lock()
+            .expect("custody sidecar lock")
+            .entries()
+            .cloned()
+            .collect()
     }
 
     /// Number of tracked engines (test/leak assertion helper).
@@ -1285,7 +1380,43 @@ impl EngineRuntime for ProcessRuntime {
                 .claim(name);
         }
         // From here the client exists but is not yet recorded: these two paths report
-        // a failed spawn, so the claim just minted has to go back with the report.
+        // a failed spawn, so anything this call wrote as ownership evidence has to go
+        // back with the report.
+        let pid = child.id().unwrap_or(0);
+        // Custody (slice 10b): a custodied launch's identity enters the sidecar
+        // only on the success path — after every spawn-failure return — so a
+        // load the harness reports as failed never leaves evidence for the
+        // boot sweep to act on. A child whose start time cannot be read records
+        // nothing (warn): an identity that cannot be proven must never
+        // authorize a future kill, and a record that cannot be written never
+        // stops a launch (the engine-side rule, ported).
+        let custody_token = match (spec.custody.as_deref(), pid) {
+            (Some(engine), pid) if pid != 0 => child
+                .raw_handle()
+                .and_then(|raw| custody::start_token_of(windows::Win32::Foundation::HANDLE(raw)))
+                .inspect(|&token| {
+                    self.custody.lock().expect("custody sidecar lock").record(
+                        custody::CustodyEntry {
+                            pid,
+                            start_token: token,
+                            port: ticket.port,
+                            instance: spec.log_name.clone(),
+                            engine: engine.to_string(),
+                            claimed_at_ms: custody::now_ms(),
+                        },
+                    );
+                }),
+            (Some(_), _) => {
+                tracing::warn!(
+                    port = ticket.port,
+                    instance = %spec.log_name,
+                    "a custodied launch reported no pid: nothing recorded, this engine \
+                     will not be reclaimed if this harness dies"
+                );
+                None
+            }
+            (None, _) => None,
+        };
         // Safety: the job handle is created and assigned here, on this task, before
         // the child is stored; `raw_handle` is valid while the child is alive, and the
         // job is closed exactly once, by `JobHandle::drop`.
@@ -1293,6 +1424,7 @@ impl EngineRuntime for ProcessRuntime {
             Ok(handle) => JobHandle(handle),
             Err(reason) => {
                 self.retract_claim(container.as_deref());
+                self.forget_custody(pid, custody_token);
                 return Err(SpawnError::SpawnFailed { reason });
             }
         };
@@ -1301,10 +1433,10 @@ impl EngineRuntime for ProcessRuntime {
             if let Err(reason) = assigned {
                 let _ = child.kill().await;
                 self.retract_claim(container.as_deref());
+                self.forget_custody(pid, custody_token);
                 return Err(SpawnError::SpawnFailed { reason });
             }
         }
-        let pid = child.id().unwrap_or(0);
         tracing::info!(port = ticket.port, pid, log = %log_path.display(),
             "engine spawned under a kill-on-close job object");
         {
@@ -1330,6 +1462,8 @@ impl EngineRuntime for ProcessRuntime {
                     container,
                     generation: ticket.generation,
                     argv: spec.argv.clone(),
+                    pid,
+                    custody_token,
                 },
             );
         }
@@ -1434,22 +1568,27 @@ impl EngineRuntime for ProcessRuntime {
             .await
             .is_err();
         if release_ready(is_container, exited, port_closed) {
-            let reaped_name = self
+            let removed = self
                 .engines
                 .lock()
                 .expect("engine table lock")
-                .remove(&ticket.port)
-                .and_then(|engine| engine.container); // `engine` drops here:
-                                                      // `JobHandle::drop` closes the
-                                                      // handle exactly once.
-            if let (true, Some(name)) = (is_container, reaped_name) {
-                // G12 evidence held: the container is gone, so its ownership claim
-                // ends — a later hand-started container reusing the name can never
-                // inherit a claim this harness no longer needs.
-                self.claims
-                    .lock()
-                    .expect("container claim ledger lock")
-                    .unclaim(&name);
+                .remove(&ticket.port);
+            if let Some(engine) = removed {
+                if let (true, Some(name)) = (is_container, engine.container.as_ref()) {
+                    // G12 evidence held: the container is gone, so its ownership claim
+                    // ends — a later hand-started container reusing the name can never
+                    // inherit a claim this harness no longer needs.
+                    self.claims
+                        .lock()
+                        .expect("container claim ledger lock")
+                        .unclaim(name);
+                }
+                // The custody entry ends with the same evidence: token-guarded, so
+                // a release can never erase a later launch's record written under
+                // the same pid (slice 10b).
+                self.forget_custody(engine.pid, engine.custody_token);
+                // `engine` drops here: `JobHandle::drop` closes the
+                // handle exactly once.
             }
             tracing::info!(
                 port = ticket.port,
@@ -2252,6 +2391,26 @@ mod tests {
             },
             container: None,
             script: None,
+            custody: None,
+        }
+    }
+
+    fn child_ticket(port: u16) -> SpawnTicket {
+        SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 0,
+            port,
+        }
+    }
+
+    /// [`client_spec`] marked for custody recording — exactly what the strata
+    /// adapter puts on every launch (slice 10b): the engine id says record,
+    /// the instance name is the model, `log_name` rides through.
+    fn custodied_spec(program: &str, args: &[&str], log_name: &str) -> LaunchSpec {
+        LaunchSpec {
+            custody: Some("strata".to_string()),
+            ..client_spec(program, args, log_name)
         }
     }
 
@@ -2349,6 +2508,150 @@ mod tests {
             "and persists for the next boot to read"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slice 10b, the live-side pins: a custodied launch records its identity
+    /// the moment the client really started (and the sidecar file sees it),
+    /// and a confirmed release clears the entry. `cmd.exe /c ping` stands in
+    /// for the strata router so the child is still live at kill time.
+    #[tokio::test]
+    async fn a_custodied_launch_records_then_a_release_clears_the_sidecar() {
+        let dir = crate::testutil::temp_dir("custody-spawn");
+        let sidecar = dir.join("strata-custody.json");
+        let runtime = ProcessRuntime::new().with_custody_ledger(&sidecar);
+        let ticket = child_ticket(18_291);
+        let spawned = runtime
+            .spawn(
+                &custodied_spec(
+                    "cmd.exe",
+                    &["/c", "ping", "-n", "30", "127.0.0.1"],
+                    "se-custody",
+                ),
+                ticket.clone(),
+            )
+            .await
+            .expect("cmd.exe starts as a strata-router stand-in");
+        let recorded = runtime.custody_entries();
+        assert_eq!(recorded.len(), 1, "one launch, one entry");
+        assert_eq!(
+            recorded[0],
+            crate::custody::CustodyEntry {
+                pid: spawned.pid,
+                start_token: recorded[0].start_token,
+                port: 18_291,
+                instance: "se-custody".to_string(),
+                engine: "strata".to_string(),
+                claimed_at_ms: recorded[0].claimed_at_ms,
+            },
+            "pid, port, instance and engine id all ride the entry, with a real start token"
+        );
+        assert!(recorded[0].start_token > 0, "the token must be a real time");
+        let on_disk = crate::custody::CustodyLedger::load(&sidecar);
+        assert_eq!(
+            on_disk.entries().cloned().collect::<Vec<_>>(),
+            recorded,
+            "the boot sweep reads exactly what the launch path wrote"
+        );
+        runtime
+            .kill(&ticket)
+            .await
+            .expect("kill of a tracked engine");
+        let mut confirmed = false;
+        for _ in 0..50 {
+            if runtime
+                .release_confirmed(&ticket)
+                .await
+                .expect("release evidence check")
+            {
+                confirmed = true;
+                break;
+            }
+        }
+        assert!(
+            confirmed,
+            "the stand-in must release within the poll budget"
+        );
+        assert!(
+            runtime.custody_entries().is_empty(),
+            "a confirmed release ends the custody claim"
+        );
+        assert!(
+            crate::custody::CustodyLedger::load(&sidecar).is_empty(),
+            "including on disk: the next boot must not see a released engine"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slice 10b's failure-side twin of the claim pins: a spawn that never
+    /// started a client records no custody evidence (the entry is written
+    /// only after every spawn-failure return), and a client that started but
+    /// whose spawn is nevertheless reported failed (injected job failure)
+    /// retracts what it wrote — a launch the harness calls failed never
+    /// leaves a record the boot sweep could act on.
+    #[tokio::test]
+    async fn a_failed_custodied_spawn_leaves_no_sidecar_entry() {
+        let dir = crate::testutil::temp_dir("custody-failed");
+        let sidecar = dir.join("strata-custody.json");
+        let runtime = ProcessRuntime::new().with_custody_ledger(&sidecar);
+        let error = runtime
+            .spawn(
+                &custodied_spec("no-such-engine-program-se.exe", &[], "se-custody-1"),
+                child_ticket(18_292),
+            )
+            .await
+            .expect_err("a program that does not exist cannot spawn");
+        assert!(
+            matches!(&error, SpawnError::SpawnFailed { reason }
+                if reason.contains("no-such-engine-program-se.exe")),
+            "{error}"
+        );
+        assert!(runtime.custody_entries().is_empty());
+        assert!(crate::custody::CustodyLedger::load(&sidecar).is_empty());
+
+        let runtime = ProcessRuntime::new()
+            .with_custody_ledger(&sidecar)
+            .with_injected_job_failure();
+        let error = runtime
+            .spawn(
+                &custodied_spec("cmd.exe", &["/c", "exit 0"], "se-custody-2"),
+                child_ticket(18_293),
+            )
+            .await
+            .expect_err("the injected job failure must fail the spawn");
+        assert!(
+            matches!(&error, SpawnError::SpawnFailed { reason }
+                if reason.contains("injected job-object failure")),
+            "{error}"
+        );
+        assert!(
+            runtime.custody_entries().is_empty(),
+            "the custody entry this call recorded must go back with the failure report"
+        );
+        assert!(
+            crate::custody::CustodyLedger::load(&sidecar).is_empty(),
+            "including on disk, where the boot sweep reads it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slice 10b: the staging path reads its root from the compiled ninfer
+    /// row's `custody_exec_roots` cell — the cell 10a left readerless gains
+    /// its reader here, so the staging location is single-homed in the policy
+    /// table and cannot drift from the compiled custody root (§20-9 Fork C).
+    #[test]
+    fn the_staged_scripts_root_is_read_from_the_policy_cell() {
+        let row = crate::engine::policy::engine_policy(crate::ownership::NINFER_ENGINE)
+            .expect("the compiled-in table ships a ninfer row");
+        assert_eq!(
+            row.custody_exec_roots.first().copied(),
+            Some(staged_scripts_root()),
+            "the cell is the value's single home, not a re-aliased constant"
+        );
+        let path = staged_script_path("nin-x", "echo body");
+        assert!(
+            path.starts_with(&format!("~/{}/", staged_scripts_root())),
+            "the staged script lives under the compiled custody root: {path}"
+        );
     }
 
     /// [3]'s other half: the ticket carries the reap *duty*, the ledger carries the
@@ -2673,6 +2976,7 @@ mod tests {
             },
             container: None,
             script: None,
+            custody: None,
         };
         let tk = SpawnTicket {
             generation: 7,

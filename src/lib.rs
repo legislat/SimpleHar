@@ -9,6 +9,7 @@ pub mod api;
 pub mod budget;
 pub mod catalog;
 pub mod config;
+pub mod custody;
 pub mod engine;
 pub mod listeners;
 pub mod model;

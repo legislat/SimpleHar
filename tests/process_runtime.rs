@@ -56,6 +56,7 @@ fn spec(port: u16, log_name: &str) -> LaunchSpec {
         },
         container: None,
         script: None,
+        custody: None,
     }
 }
 
@@ -423,6 +424,7 @@ async fn probe_fails_fast_when_the_child_already_exited() {
         },
         container: None,
         script: None,
+        custody: None,
     };
     let ticket = ticket(TEST_PORT + 1);
     if let Err(error) = runtime.spawn(&spec, ticket.clone()).await {
@@ -720,6 +722,7 @@ async fn probe_names_the_missing_model_file_when_a_child_exits_early() {
         },
         container: None,
         script: None,
+        custody: None,
     };
     let t = ticket(port);
     if let Err(error) = runtime.spawn(&spec, t.clone()).await {

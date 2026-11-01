@@ -797,6 +797,7 @@ impl EngineAdapter for NinferAdapter {
             ),
             container: Some(container.to_string()),
             script,
+            custody: None,
         })
     }
 }
