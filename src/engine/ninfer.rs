@@ -1551,13 +1551,54 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// detached container (the harness client log holds just the dead `wsl.exe` client).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineReport {
-    /// GiB that must be free to run this model safely (weights + KV at *declared*
-    /// capacity + graphs + reservations + slack): the engine's own reserved budget.
+    /// GiB that must be free to run this model safely: the larger of the
+    /// startup-record reserve (pools + graphs + slack) and the post-ready
+    /// resident footprint (`weights ready` + `runtime`, ruling 2026-11-01 —
+    /// the engine's own word, read after the weight stream landed).
     pub required_to_free_gb: f64,
     /// Raw `total_device_memory_bytes` the engine saw (`totalGlobalMem`).
     pub total_device_memory_bytes: u64,
     /// Raw `available_after_startup_bytes` (free device after the engine reserved).
     pub available_after_startup_bytes: u64,
+}
+
+/// The engine's own post-ready resident footprint: the `weights ready | W GiB`
+/// line plus the `runtime R GiB` figure on the `capacity` line, both from the
+/// same `docker logs` stream as [`parse_startup_memory`]. The startup record
+/// predates the weight stream, so this is the same container speaking *after*
+/// it installed — per-engine and unaffected by other card residents (live
+/// proof 2026-11-01: 27.5 + 16.5 = 44.0 against a witness-observed 44.1).
+///
+/// Returns `None` unless BOTH figures are present; host-side lines (`host KV
+/// pinned | 8.00 GiB`, `host cache budget`) are deliberately never scanned, so
+/// host RAM can never enter a VRAM booking. Each figure is the LAST occurrence,
+/// so a container that restarted in place speaks with its newest voice.
+#[must_use]
+pub fn parse_resident_footprint(log: &str) -> Option<f64> {
+    let weights = last_gib_after(log, "weights ready")?;
+    let runtime = last_gib_after(log, "runtime")?;
+    if weights > 0.0 && runtime > 0.0 && weights.is_finite() && runtime.is_finite() {
+        Some(weights + runtime)
+    } else {
+        None
+    }
+}
+
+/// The GiB amount in the LAST line with a usable figure under `label` — the
+/// number immediately followed by `GiB` after that label (e.g. `weights ready
+/// | 27.5 GiB`). Lines carrying the label without a parseable figure are
+/// skipped, not fatal: the newest *readable* voice wins.
+fn last_gib_after(log: &str, label: &str) -> Option<f64> {
+    log.lines()
+        .rev()
+        .filter_map(|line| {
+            let at = line.rfind(label)? + label.len();
+            let rest = &line[at..];
+            let gib = rest.find("GiB")?;
+            let number = rest[..gib].split_whitespace().last()?.replace(',', "");
+            number.parse::<f64>().ok().filter(|v| *v > 0.0)
+        })
+        .next()
 }
 
 /// Pull the engine's startup device-memory accounting out of `docker logs` output.
@@ -1588,6 +1629,17 @@ pub fn parse_startup_memory(log: &str) -> Option<EngineReport> {
         if required <= 0.0 || !required.is_finite() {
             continue;
         }
+        // The startup record is written BEFORE the weight stream lands (live proof
+        // 2026-11-01: qwen-fp8 reserved 32.0 GiB at startup and installed 44.1).
+        // The engine's own post-ready lines are per-engine, post-load and immune
+        // to whatever else occupies the card, so the booking takes the larger
+        // figure (ruling 2026-11-01: the engine's word, read at ready).
+        let required = match parse_resident_footprint(log) {
+            Some(resident) if resident.is_finite() && resident > 0.0 && resident <= total_gib => {
+                required.max(resident)
+            }
+            _ => required,
+        };
         found = Some(EngineReport {
             required_to_free_gb: required,
             total_device_memory_bytes: total,
@@ -1711,5 +1763,56 @@ mod startup_tests {
         let log = "{\"msg\":\"weird { } braces here\",\"environment\":{\"total_device_memory_bytes\":77309411328},\"memory\":{\"available_after_startup_bytes\":47244640256}}";
         let report = parse_startup_memory(log).expect("the braces-in-string do not break the scan");
         assert!(report.required_to_free_gb > 0.0);
+    }
+
+    /// Ruling 2026-11-01: the startup record is spoken before the weight stream
+    /// (live: qwen-fp8 reserved 32.0 at startup, installed 44.1 — witness), so
+    /// the engine's own post-ready `weights ready`+`runtime` figures raise the
+    /// booking. The host-KV lines (8.00 GiB) in the same vector must never join:
+    /// host RAM is not VRAM.
+    #[test]
+    fn post_ready_lines_raise_the_booking_to_the_installed_footprint() {
+        let log = "{\"environment\":{\"total_device_memory_bytes\":75161927680},\
+            \"memory\":{\"available_after_startup_bytes\":40802189312}}\n\
+            2026-11-01 03:40:32.909 [warning] ninfer-serve: ECC is ENABLED\n\
+            2026-11-01 03:41:00.000  INFO  pinning host KV | 8.00 GiB\n\
+            2026-11-01 03:43:54.192  INFO  weights ready | 27.5 GiB | 2m 17.6s | 204.6 MiB/s\n\
+            2026-11-01 03:44:07.842  INFO  host KV pinned | 8.00 GiB | 8.5s\n\
+            2026-11-01 03:44:07.842  INFO  engine ready | qwen3.8-27b-fp8 | total 3m 34.9s | weights 27.5 GiB\n\
+            2026-11-01 03:44:07.842  INFO  capacity | KV 262,144 tokens, int8, explicit | pages 4,096/33,554,431 | runtime 16.5 GiB | free 27.4 GiB\n";
+        let report = parse_startup_memory(log).expect("parses");
+        // startup 70-38 = 32; resident 27.5+16.5 = 44.0 -> the larger books,
+        // and the host 8.00 GiB lines never join the sum.
+        assert!(
+            (report.required_to_free_gb - 44.0).abs() < 1e-6,
+            "was {}",
+            report.required_to_free_gb
+        );
+        assert!(parse_resident_footprint(log).is_some_and(|r| (r - 44.0).abs() < 1e-6));
+    }
+
+    /// Falsifiers for the raise: an old build that only wrote the JSON record
+    /// must book exactly the startup figure; half a pair must not raise it; and
+    /// a resident claiming more than the card holds is nonsense, never booked.
+    #[test]
+    fn the_startup_figure_survives_alone_half_pairs_and_nonsense() {
+        // Old build: JSON only (the existing 72-44=28 vector).
+        let old = "{\"environment\":{\"total_device_memory_bytes\":77309411328},\
+            \"memory\":{\"available_after_startup_bytes\":47244640256}}";
+        let report = parse_startup_memory(old).expect("parses");
+        assert!((report.required_to_free_gb - 28.0).abs() < 1e-6);
+
+        // Weights without a capacity/runtime line: no pair, no raise.
+        let half =
+            format!("{old}\n2026-11-01 03:43:54.192  INFO  weights ready | 27.5 GiB | 2m 17.6s\n");
+        let report = parse_startup_memory(&half).expect("parses");
+        assert!((report.required_to_free_gb - 28.0).abs() < 1e-6);
+        assert_eq!(parse_resident_footprint(&half), None);
+
+        // A 66+66 pair on a 70 GiB card exceeds the device: ignored outright.
+        let huge =
+            format!("{old}\nINFO weights ready | 66.0 GiB\nINFO capacity | runtime 66.0 GiB\n");
+        let report = parse_startup_memory(&huge).expect("parses");
+        assert!((report.required_to_free_gb - 28.0).abs() < 1e-6);
     }
 }
