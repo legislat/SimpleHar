@@ -98,14 +98,16 @@ const ALLOWED_KV_DTYPES: [&str; 6] = ["fp8", "nvfp4", "fp16", "bf16", "int8", "r
 const ALLOWED_ENV_VARS: [(&str, &[&str]); 1] = [("CUDA_MODULE_LOADING", &["EAGER", "LAZY"])];
 
 /// The port a ninfer container binds when its yaml names no `ninfer_internal_port`:
-/// the documented `EXPOSE 8080` both ninfer images carry. R10 (operator
-/// 2026-11-01: "8003-8005 are manual only"): the container inside is a third
-/// namespace disjoint from both the manual ports and the harness plan, so the
-/// harness defaults to the engine's own number and refuses to borrow a manual or
-/// harness one for it — reusing 8004 internally was what misdirected the whole
-/// 8004 post-mortem, and `PUBLISH="${3:?…}"` removed the last path where a
+/// the SE container-internal number, 8808 — the harness's own 87xx family at a
+/// +100 offset, owned by nobody else (not the manual 80xx world, not the 87xx
+/// listeners, not the 181xx engine plan; a later hand must keep it clear of all
+/// three, which `AppConfig::port_claim` enforces for declared values). R10
+/// (operator 2026-11-01: "8003-8005 are manual only", default amended the same
+/// day: "8080 — bad", closer to the harness ports): the container inside is a
+/// third namespace, and reusing 8004 internally was what misdirected the whole
+/// 8004 post-mortem, while `PUBLISH="${3:?…}"` removed the last path where a
 /// missing publish argument could host-publish the internal number itself.
-pub const DEFAULT_INTERNAL_PORT: &str = "8080";
+pub const DEFAULT_INTERNAL_PORT: &str = "8808";
 
 /// The internal port a ninfer row will bind, resolved exactly as
 /// [`template_params`] resolves it (yaml key, else [`DEFAULT_INTERNAL_PORT`]),
@@ -523,9 +525,9 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
         )));
     }
     // Optional since R10 (operator 2026-11-01: "8003-8005 are manual only"):
-    // the container's inside is its own namespace, so the default is the
-    // images' documented `EXPOSE 8080` rather than any borrowed manual number,
-    // and `AppConfig::port_claim` refuses manual/harness numbers at the gate.
+    // the container's inside is its own namespace, so the default is the SE
+    // internal number rather than any borrowed manual one, and
+    // `AppConfig::port_claim` refuses manual/harness numbers at the gate.
     let port = optional_param(model, "ninfer_internal_port")
         .unwrap_or_else(|| DEFAULT_INTERNAL_PORT.to_string());
     if !valid_number(&port, 1, 65_535) {
@@ -1403,11 +1405,12 @@ mod tests {
     }
 
     /// R10 (operator 2026-11-01): the container's inside is a third namespace. A
-    /// row without `ninfer_internal_port` renders the images' `EXPOSE 8080`, and
-    /// the gate's namespace helper reports exactly the number the template would
-    /// bind — never inventing one for a row the adapter will refuse.
+    /// row without `ninfer_internal_port` renders the SE internal number (8808,
+    /// the harness's 87xx family at +100), and the gate's namespace helper
+    /// reports exactly the number the template would bind — never inventing one
+    /// for a row the adapter will refuse.
     #[test]
-    fn an_internal_port_defaults_to_the_exposed_number_and_the_helper_follows_the_yaml() {
+    fn an_internal_port_defaults_to_the_internal_number_and_the_helper_follows_the_yaml() {
         let without = {
             let mut pairs = template_pairs();
             pairs.retain(|(key, _)| *key != "ninfer_internal_port");
@@ -1417,8 +1420,8 @@ mod tests {
             .spec(&without, 18109)
             .expect("the key is optional");
         let script = spec.script.expect("template renders");
-        assert!(script.contains("PORT=\"8080\""), "{script}");
-        assert_eq!(declared_internal_port(&without), Some(8080));
+        assert!(script.contains("PORT=\"8808\""), "{script}");
+        assert_eq!(declared_internal_port(&without), Some(8808));
         assert_eq!(
             declared_internal_port(&entry(&template_pairs())),
             Some(8090),

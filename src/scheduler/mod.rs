@@ -6506,7 +6506,7 @@ mod tests {
 
     /// R10 (operator 2026-11-01: "8003-8005 are manual only"): a ninfer row
     /// borrowing a manual number as its container-internal port is refused before
-    /// spawn, the default (8080, the images' EXPOSE) arms like any ordinary row,
+    /// spawn, the SE internal default (8808) arms like any ordinary row,
     /// and the rescan twin names the key on the page before any load tries.
     #[tokio::test]
     async fn a_borrowed_internal_port_is_refused_at_the_gate_and_reported_at_rescan() {
@@ -6565,7 +6565,7 @@ mod tests {
         state.start_queued_load(id, 0, ordinary);
         assert!(
             !state.jobs[&id].terminal,
-            "8080 is no namespace's to refuse: {:?}",
+            "8808 is no namespace's to refuse: {:?}",
             state.jobs[&id].error
         );
         // The page twin: the rescan names the key before any load tries.

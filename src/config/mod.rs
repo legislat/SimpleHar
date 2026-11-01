@@ -1148,8 +1148,8 @@ mod tests {
 
     /// R10 (operator 2026-11-01: "8003-8005 are manual only"): the claim helper the
     /// container-internal check consults names each host-side namespace it owns —
-    /// the manual protected set, a category listener, the engine plan — and leaves
-    /// the engines' own `EXPOSE` numbers free.
+    /// the manual protected set, a category listener, the engine plan — and keeps
+    /// the SE internal default (8808) clear of all three.
     #[test]
     fn a_port_claim_names_the_namespace_that_owns_the_number() {
         let cfg = AppConfig::default();
@@ -1161,7 +1161,15 @@ mod tests {
             .port_claim(18109)
             .expect("18109 is the first engine port");
         assert!(engine.contains("engine port"), "{engine}");
-        assert_eq!(cfg.port_claim(8080), None, "the images' EXPOSE stays free");
+        assert_eq!(
+            cfg.port_claim(
+                crate::engine::ninfer::DEFAULT_INTERNAL_PORT
+                    .parse()
+                    .expect("the default is a port")
+            ),
+            None,
+            "the SE internal default must stay free of every host namespace"
+        );
     }
 
     /// FINDINGS-15 [9] pin (b): the exposure the finding named is the ring, so this
