@@ -666,10 +666,10 @@ static STRATA_ROW: EnginePolicy = EnginePolicy {
     custody_data_roots: &[],
     serve_template: None,
     profile_field: Some("strata_config"),
-    // `strata_python`/`strata_cwd` defaults are adapter constants today and
-    // move to the config `engines:` section with the custody slice; when they
-    // do, the knob-parity test starts requiring them here.
-    config_knobs: &[],
+    // The harness-side strata defaults live in the config `engines:` section
+    // (slice 10d); the dotted claims are the knob-parity test's pointers into
+    // that section, which the test walks in a populated serialization.
+    config_knobs: &["engines.strata.python", "engines.strata.cwd"],
 };
 
 static NINFER_ROW: EnginePolicy = EnginePolicy {
@@ -746,6 +746,106 @@ pub(crate) fn render_forced(
         out.push(value);
     }
     out
+}
+
+/// Which custody root class a path is admitted against (slice 10d): executed
+/// paths are programs and working directories the harness itself launches into;
+/// data paths are files the engine only reads at launch. The two classes are
+/// deliberately separate cells — a root admitted for one says nothing about the
+/// other (chunk 10 custody ruling 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustodyClass {
+    /// Class (a): the executed-path roots.
+    Executed,
+    /// Class (b): the data roots.
+    Data,
+}
+
+impl CustodyClass {
+    /// The operator-facing noun naming the class inside a refusal.
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::Executed => "executed-path",
+            Self::Data => "data",
+        }
+    }
+
+    /// The row's roots of this class.
+    const fn roots(self, row: &EnginePolicy) -> &'static [&'static str] {
+        match self {
+            Self::Executed => row.custody_exec_roots,
+            Self::Data => row.custody_data_roots,
+        }
+    }
+}
+
+/// Lexical custody membership: is `path` at or under one of the row's roots for
+/// `class`. An empty cell is OPEN (ruling 5): nothing is refused, because no row
+/// populates an exec root the later copy-in migration will fill and a closed
+/// empty cell would refuse every legitimate config today.
+///
+/// The comparison is lexical (`\` → `/`, trailing `/` trimmed, ASCII
+/// case-insensitive, component-boundary prefix), not filesystem resolution:
+/// these paths are config text judged at spec time, and a `..` component matches
+/// no root — the same conservative direction as the ninfer key-file shape check.
+#[must_use]
+pub(crate) fn admits_under_root(row: &EnginePolicy, class: CustodyClass, path: &str) -> bool {
+    let roots = class.roots(row);
+    if roots.is_empty() {
+        return true;
+    }
+    let path = normalize_custody_path(path);
+    if path.split('/').any(|component| component == "..") {
+        // A traversal component proves no containment lexically (its answer
+        // depends on resolution the harness does not do): refuse, same
+        // conservative direction as the ninfer key-file shape check.
+        return false;
+    }
+    roots.iter().any(|root| {
+        let root = normalize_custody_path(root);
+        path == root
+            || path
+                .strip_prefix(&*root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+fn normalize_custody_path(text: &str) -> String {
+    text.replace('\\', "/")
+        .to_ascii_lowercase()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// [`admits_under_root`] with its refusal: `Ok(())` or a rejection naming the
+/// key, the path and the row's roots, so the operator sees which mechanism owns
+/// the location rather than only that it was denied.
+///
+/// # Errors
+///
+/// [`super::EngineError::Rejected`] when the path lies outside every populated
+/// root of that class (an empty cell refuses nothing, ruling 5).
+pub(crate) fn admit_custody_path(
+    row: &EnginePolicy,
+    class: CustodyClass,
+    model: &str,
+    key: &str,
+    path: &str,
+) -> Result<(), super::EngineError> {
+    if admits_under_root(row, class, path) {
+        return Ok(());
+    }
+    Err(super::EngineError::Rejected {
+        engine: row.id.to_string(),
+        model: model.to_string(),
+        reason: format!(
+            "`{key}` names `{path}`, outside the {} custody roots of the `{}` EnginePolicy \
+             row (harness-owned locations only): {}",
+            class.noun(),
+            row.id,
+            class.roots(row).join(", ")
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -973,54 +1073,210 @@ mod tests {
 
     /// Knob parity (sub-decisions 1+2): every engine-scoped key the harness
     /// config exposes answers to a policy-table row's `config_knobs` or to the
-    /// config-only list. The scanned side is the real serialized config (a new
-    /// `strata_python_default` or `engines:`-section sibling alarms here), and
-    /// the engine-name side is the table itself — no hand-copied list either
-    /// way (the drift class `GOTCHAS` records).
+    /// config-only list — either as a top-level key or as a dotted claim into a
+    /// section (`engines.strata.python`). The scanned side is the real
+    /// serialized config TWICE, the unset default and a fully populated one, so
+    /// a new `strata_python_default` or a new `engines:`-section sibling alarms
+    /// here in both directions; the engine-name side is the table itself — no
+    /// hand-copied list either way (the drift class `GOTCHAS` records).
     #[test]
     fn every_engine_scoped_config_knob_has_a_policy_home() {
         // Config-only knobs: engine-adjacent by name, deliberately not policy
         // data. Additions must say why the table must not own them.
         const CONFIG_ONLY_KNOBS: &[&str] = &[];
-        // Serialize-side completeness: the None-optional engine key is skipped
-        // when absent, so the default doc carries a value for the scan.
-        let config = crate::config::AppConfig {
-            wsl_user: Some("ops".to_string()),
-            ..crate::config::AppConfig::default()
-        };
-        let value = serde_json::to_value(&config).expect("config serializes");
-        let engine_names: Vec<String> = all().iter().map(|row| row.id.to_string()).collect();
         let mut covered: Vec<&str> = CONFIG_ONLY_KNOBS.to_vec();
         for row in all() {
             covered.extend(row.config_knobs);
         }
-        let top = value.as_object().expect("config is a JSON object");
-        let mut seen: Vec<&String> = Vec::new();
-        for key in top.keys() {
-            let lower = key.to_lowercase();
-            let engine_scoped = lower.contains("engine")
-                || lower.contains("wsl")
-                || engine_names.iter().any(|name| lower.contains(name));
-            if !engine_scoped {
-                continue;
+        let engine_names: Vec<String> = all().iter().map(|row| row.id.to_string()).collect();
+        // Serialize-side completeness: the None-optional engine keys are skipped
+        // when absent, so the populated doc carries every value for the scan.
+        // The full struct literals are the forcing function: a new
+        // `EnginesConfig`/`StrataEngineConfig` field fails to compile here until
+        // this test (and the row's claims) know it.
+        let unset = serde_json::to_value(crate::config::AppConfig {
+            wsl_user: Some("ops".to_string()),
+            ..crate::config::AppConfig::default()
+        })
+        .expect("config serializes");
+        let populated = serde_json::to_value(crate::config::AppConfig {
+            wsl_user: Some("ops".to_string()),
+            engines: Some(crate::config::EnginesConfig {
+                strata: Some(crate::config::StrataEngineConfig {
+                    python: Some(std::path::PathBuf::from(
+                        "C:/Strata/.venv/Scripts/python.exe",
+                    )),
+                    cwd: Some(std::path::PathBuf::from("C:/Strata")),
+                }),
+            }),
+            ..crate::config::AppConfig::default()
+        })
+        .expect("a populated engines section serializes");
+        for config in [&unset, &populated] {
+            let top = config.as_object().expect("config is a JSON object");
+            for key in top.keys() {
+                let lower = key.to_lowercase();
+                let engine_scoped = lower.contains("engine")
+                    || lower.contains("wsl")
+                    || engine_names.iter().any(|name| lower.contains(name));
+                if !engine_scoped {
+                    continue;
+                }
+                assert!(
+                    covered
+                        .iter()
+                        .any(|knob| knob == key || knob.starts_with(&format!("{key}."))),
+                    "config key `{key}` is engine-scoped but has no `EnginePolicy` \
+                     `config_knobs` cell, no dotted claim into it, and no config-only \
+                     registration"
+                );
             }
-            seen.push(key);
-            assert!(
-                covered.iter().any(|knob| knob == key),
-                "config key `{key}` is engine-scoped but has no `EnginePolicy` \
-                 `config_knobs` cell and no config-only registration"
-            );
         }
-        // The scan must see the knobs the rows claim — a renamed config field
-        // fails here rather than leaving a stale row.
+        // The scan must see the knobs the rows claim, in the shape each claim
+        // names: plain claims in the unset serialization, dotted claims in the
+        // populated one — a renamed config field fails here, not in production.
         for row in all() {
             for knob in row.config_knobs {
+                let (doc, label) = match knob.split_once('.') {
+                    None => (&unset, "key"),
+                    Some((_, rest)) => {
+                        let claimed_engine = rest
+                            .split('.')
+                            .next()
+                            .expect("dotted claim names an engine");
+                        assert_eq!(
+                            claimed_engine, row.id,
+                            "dotted claim `{knob}` must name its own row"
+                        );
+                        (&populated, "section path")
+                    }
+                };
+                let pointer = format!("/{}", knob.replace('.', "/"));
                 assert!(
-                    seen.iter().any(|key| key == knob),
-                    "row `{}` claims knob `{knob}` but the serialized config has no such key",
+                    doc.pointer(&pointer).is_some(),
+                    "row `{}` claims knob `{knob}` but the serialized config has no such \
+                     {label}",
                     row.id
                 );
             }
+        }
+        // And the other direction: a populated section may carry no sub-key the
+        // rows have not claimed (a silently growing `engines:` object is exactly
+        // the un-owned knob this test exists to catch).
+        if let Some(engines) = populated.get("engines").and_then(|e| e.as_object()) {
+            for (engine, sub) in engines {
+                for sub_key in sub.as_object().expect("engine section is an object").keys() {
+                    let claim = format!("engines.{engine}.{sub_key}");
+                    assert!(
+                        covered.iter().any(|knob| *knob == claim),
+                        "`engines.{engine}.{sub_key}` is serialized but no row claims it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Admission helper (slice 10d): an empty cell is open (ruling 5); a
+    /// populated root admits at-or-under and refuses outside, at the component
+    /// boundary, and the two classes stay separate (ruling 4) — an exec root
+    /// never lets a data path through, or the other way.
+    #[test]
+    fn custody_admission_is_open_when_empty_and_per_class_when_populated() {
+        let open = custody_row(&[], &[]);
+        assert!(admits_under_root(
+            &open,
+            CustodyClass::Executed,
+            r"C:\anywhere\python.exe"
+        ));
+        assert!(admits_under_root(&open, CustodyClass::Data, "/etc/shadow"));
+
+        let row = custody_row(&[r"C:\Strata"], &[NINFER_KEYS_ROOT]);
+        assert!(admits_under_root(
+            &row,
+            CustodyClass::Executed,
+            r"C:\Strata\.venv\Scripts\python.exe"
+        ));
+        assert!(admits_under_root(&row, CustodyClass::Executed, "c:/strata"));
+        assert!(
+            !admits_under_root(&row, CustodyClass::Executed, r"C:\Strata-nvfp4\x.exe"),
+            "a sibling directory sharing the prefix is not under the root"
+        );
+        assert!(!admits_under_root(
+            &row,
+            CustodyClass::Executed,
+            "/etc/passwd"
+        ));
+        assert!(admits_under_root(
+            &row,
+            CustodyClass::Data,
+            "$HOME/.simplehar/keys/x.key"
+        ));
+        assert!(
+            !admits_under_root(
+                &row,
+                CustodyClass::Data,
+                "$HOME/.simplehar/keys/../../x.key"
+            ),
+            "a traversal component matches no root"
+        );
+        // Exec and data are different custody (ruling 4), never one shared list.
+        assert!(!admits_under_root(
+            &row,
+            CustodyClass::Data,
+            r"C:\Strata\.venv\Scripts\python.exe"
+        ));
+        assert!(!admits_under_root(
+            &row,
+            CustodyClass::Executed,
+            "$HOME/.simplehar/keys/x.key"
+        ));
+    }
+
+    /// A refusal must teach (slice 10c doctrine applied to custody): the key,
+    /// the offending path and the row's roots are all in the sentence; an open
+    /// cell refuses nothing.
+    #[test]
+    fn an_outside_root_path_is_refused_naming_key_path_and_roots() {
+        let row = custody_row(&[r"C:\Strata"], &[]);
+        let err = admit_custody_path(
+            &row,
+            CustodyClass::Executed,
+            "m",
+            "strata_python",
+            r"D:\evil\python.exe",
+        )
+        .expect_err("outside the populated exec roots");
+        let text = err.to_string();
+        for needle in [
+            "`strata_python`",
+            r"`D:\evil\python.exe`",
+            "executed-path custody roots",
+            r"C:\Strata",
+        ] {
+            assert!(text.contains(needle), "{needle} missing from: {text}");
+        }
+        assert!(
+            admit_custody_path(
+                &row,
+                CustodyClass::Data,
+                "m",
+                "strata_config",
+                r"D:\a\b.json"
+            )
+            .is_ok(),
+            "an empty data cell denies nothing (ruling 5)"
+        );
+    }
+
+    /// A table row with only the custody cells varied, for the admission pins.
+    fn custody_row(exec: &'static [&'static str], data: &'static [&'static str]) -> EnginePolicy {
+        EnginePolicy {
+            id: "custody-test",
+            custody_exec_roots: exec,
+            custody_data_roots: data,
+            ..engine_policy("mock")
+                .expect("the table ships a mock row")
+                .clone()
         }
     }
 

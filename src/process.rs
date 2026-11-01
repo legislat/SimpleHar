@@ -477,6 +477,53 @@ fn container_rm(distro: &str, user: &str, name: &str) -> (String, Vec<String>) {
     (program.clone(), rest.to_vec())
 }
 
+/// `wsl.exe -d <distro> -u <user> -- docker port <name>`: the read-only
+/// publish-evidence query of ruling 1(b), through the same [`wsl_prefix`] as
+/// launch and teardown so the diagnosis can never address different WSL
+/// coordinates than the spawn it explains.
+fn container_port(distro: &str, user: &str, name: &str) -> (String, Vec<String>) {
+    let mut argv = wsl_prefix(distro, user);
+    argv.extend(["docker".to_string(), "port".to_string(), name.to_string()]);
+    let (program, rest) = argv
+        .split_first()
+        .unwrap_or_else(|| unreachable!("invariant: wsl_prefix is never empty"));
+    (program.clone(), rest.to_vec())
+}
+
+/// Parse of `docker port` stdout for [`EngineRuntime::published_elsewhere`]
+/// (ruling 1(b)): lines `<internal>/<proto> -> <bind>:<host-port>` (the IPv6
+/// bind spells `[::]:18112`). `None` when the harness-offered port is among the
+/// host mappings — the rendered script honored the `$3` contract, so there is
+/// nothing to report — and `None` when no usable mapping is present: a diagnosis
+/// may annotate a failure, never invent evidence from docker's error text.
+fn published_elsewhere_evidence(container: &str, offered: u16, text: &str) -> Option<String> {
+    let mut others: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Some((internal, target)) = line.split_once("->") else {
+            continue;
+        };
+        let target = target.trim();
+        let Some((_, host_port)) = target.rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = host_port.trim().parse::<u16>() else {
+            continue;
+        };
+        if port == offered {
+            return None;
+        }
+        others.push(format!("{} -> {target}", internal.trim()));
+    }
+    if others.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "published-port evidence: docker publishes {container} as {} \
+         (not the harness-offered port {offered})",
+        others.join(", ")
+    ))
+}
+
 /// Whether this kill must reap a container: only a not-yet-terminated engine
 /// carries the reap duty; re-kills (cancel/retry paths) must not re-run
 /// `docker rm` for someone else's container (review, 2026-10-26).
@@ -1623,6 +1670,50 @@ impl EngineRuntime for ProcessRuntime {
         container_logs(&self.wsl_distro, &self.wsl_user, container).await
     }
 
+    async fn published_elsewhere(&self, container: &str, offered: u16) -> Option<String> {
+        if self.wsl_distro.trim().is_empty() || self.wsl_user.trim().is_empty() {
+            return None;
+        }
+        // Ownership gate ruling 1(b) applies strictly: the readiness report only
+        // needs a well-shaped name, but this query reads the claim ledger too —
+        // a container this harness never claimed is never even asked.
+        let claimed = self
+            .claims
+            .lock()
+            .expect("container claim ledger lock")
+            .contains(container);
+        if !valid_container_name(container) || !claimed {
+            return None;
+        }
+        let (program, args) = container_port(&self.wsl_distro, &self.wsl_user, container);
+        match run_control_command(&program, &args).await {
+            // Only docker's own success line is evidence; a not-running,
+            // wedged, or refused `docker port` keeps the original refusal
+            // exactly as the probe wrote it.
+            ControlOutcome::Ran(output) if output.status.success() => published_elsewhere_evidence(
+                container,
+                offered,
+                &String::from_utf8_lossy(&output.stdout),
+            ),
+            ControlOutcome::Ran(output) => {
+                tracing::debug!(
+                    container,
+                    stderr = %excerpt(&output.stderr),
+                    "docker port refused publish evidence"
+                );
+                None
+            }
+            ControlOutcome::Failed(error) => {
+                tracing::debug!(container, error = %error, "docker port cannot run for evidence");
+                None
+            }
+            ControlOutcome::TimedOut => {
+                tracing::debug!(container, "docker port timed out; no publish evidence");
+                None
+            }
+        }
+    }
+
     async fn save_container_log(&self, model: &str, text: &str) {
         // A snapshot with no bytes is forensic noise, not evidence: a container
         // that never exec'd yields an empty `docker logs`, and rotating a model's
@@ -1858,6 +1949,67 @@ mod tests {
             [vec![program], args].concat(),
             vec!["wsl.exe", "-d", "Ubuntu", "-u", "ops", "--", "docker", "rm", "-f", "ninfer-x",]
         );
+    }
+
+    #[test]
+    fn container_port_uses_the_shared_wsl_prefix() {
+        let (program, args) = container_port("Ubuntu", "ops", "ninfer-x");
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(
+            [vec![program], args].concat(),
+            vec!["wsl.exe", "-d", "Ubuntu", "-u", "ops", "--", "docker", "port", "ninfer-x",]
+        );
+    }
+
+    /// Ruling 1(b) parse: a mapping off the offered port becomes evidence, the
+    /// offered port itself stays silent (the `$3` contract held), and docker's
+    /// error text never becomes invented evidence.
+    #[test]
+    fn publish_evidence_names_a_foreign_mapping_and_stays_silent_otherwise() {
+        let text = "8808/tcp -> 127.0.0.1:18112\n8808/tcp -> [::]:18112\n";
+        let evidence = published_elsewhere_evidence("ninfer-x", 18109, text)
+            .expect("a mapping off the offered port is evidence");
+        assert!(evidence.contains("docker publishes ninfer-x"), "{evidence}");
+        assert!(evidence.contains("127.0.0.1:18112"), "{evidence}");
+        assert!(
+            evidence.contains("not the harness-offered port 18109"),
+            "{evidence}"
+        );
+        assert!(
+            published_elsewhere_evidence("ninfer-x", 18112, text).is_none(),
+            "the offered port IS published: nothing to report"
+        );
+        assert!(published_elsewhere_evidence("ninfer-x", 18109, "").is_none());
+        assert!(
+            published_elsewhere_evidence("ninfer-x", 18109, "Error: No such container: ninfer-x\n")
+                .is_none(),
+            "docker's error text must never become invented evidence"
+        );
+    }
+
+    /// Ownership scope of ruling 1(b): the publish query is claim-ledger-strict,
+    /// so a name this harness never claimed is never even addressed, and blank
+    /// WSL coordinates close the door exactly as they close the launch.
+    #[tokio::test]
+    async fn a_container_the_harness_never_claimed_is_never_queried_for_evidence() {
+        let dir = crate::testutil::temp_dir("publish-gate");
+        let ledger = dir.join("ninfer-claims.json");
+        let runtime = ProcessRuntime::new()
+            .with_wsl("Ubuntu", "ops")
+            .with_claims_ledger(&ledger);
+        assert!(
+            runtime
+                .published_elsewhere("ninfer-x", 18109)
+                .await
+                .is_none(),
+            "an unclaimed name must not be queried"
+        );
+        let blank = ProcessRuntime::new().with_claims_ledger(&ledger);
+        assert!(
+            blank.published_elsewhere("ninfer-x", 18109).await.is_none(),
+            "blank coordinates must not reach wsl.exe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Template adoption (2026-10-31): the staged path is content-addressed, lives

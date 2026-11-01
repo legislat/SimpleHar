@@ -29,10 +29,13 @@ use crate::model::ModelEntry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Fallback interpreter when a yaml omits `strata_python:` (v3.3 default).
-const DEFAULT_PYTHON: &str = r"C:\Strata\.venv\Scripts\python.exe";
+/// Fallback interpreter when a yaml omits `strata_python:` (v3.3 default). The
+/// single home of the harness-side defaults is the config `engines:` section
+/// (slice 10d), resolved through [`crate::config::AppConfig::strata_python`]
+/// into the adapter at `default_adapters` boot time.
+const DEFAULT_PYTHON: &str = crate::config::STRATA_PYTHON_DEFAULT;
 /// Fallback working directory when a yaml omits `strata_cwd:` (v3.3 default).
-const DEFAULT_CWD: &str = r"C:\Strata";
+const DEFAULT_CWD: &str = crate::config::STRATA_CWD_DEFAULT;
 
 /// The top-level profile fields that claim a harness-owned decision —
 /// FINDINGS-22 [1] / `DECISIONS` LOCKED "external engines obey only
@@ -233,9 +236,13 @@ impl StrataAdapter {
     /// rendered from the `strata` row of the [`crate::engine::policy`] table
     /// (module, engine tag, profile position, harness-assigned port). Nothing
     /// else reaches the child.
-    fn argv(&self, python: &str, config: &str, port: u16) -> Vec<String> {
-        let row = super::policy::engine_policy("strata")
-            .expect("the compiled-in table ships a strata row");
+    fn argv(
+        &self,
+        row: &super::policy::EnginePolicy,
+        python: &str,
+        config: &str,
+        port: u16,
+    ) -> Vec<String> {
         let mut argv = vec![python.to_string()];
         argv.extend(super::policy::render_forced(row, port, Some(config)));
         argv
@@ -253,6 +260,8 @@ impl EngineAdapter for StrataAdapter {
             model: model.name.clone(),
             reason,
         };
+        let row = super::policy::engine_policy("strata")
+            .expect("the compiled-in table ships a strata row");
         // Required profile JSON, existence-checked before spawn (v3.3 parity:
         // the child would otherwise die minutes into a model load). It must also be
         // a FILE: a directory named `x.json` is the same doomed spawn one step
@@ -269,6 +278,18 @@ impl EngineAdapter for StrataAdapter {
                 field: "strata_config".to_string(),
             });
         };
+        // Custody admission (slice 10d): the profile is a data-custody input.
+        // The strata data cells stay open until the copy-in slice populates them
+        // (ruling 5), so admission passes today — the mechanism stands in front
+        // of the disk work so the later slice enforces without touching this
+        // call site.
+        super::policy::admit_custody_path(
+            row,
+            super::policy::CustodyClass::Data,
+            &model.name,
+            "strata_config",
+            config,
+        )?;
         let config_path = Path::new(config);
         if !config_path.is_file() {
             return Err(rejected(if config_path.exists() {
@@ -289,14 +310,13 @@ impl EngineAdapter for StrataAdapter {
         // The interpreter is `argv[0]`, so it is the one yaml string that chooses
         // which program CreateProcessW starts. Refuse garbage early rather than
         // start whatever path happens to exist: an existing FILE whose name ends in
-        // `.exe`, matching how the llama adapter refuses a missing binary. The
-        // rest of this cell — an interpreter under a config-declared root, the
-        // profile under a declared profile root, policy keys inside the profile
-        // itself — is the two custody-root columns (exec vs data) of chunk 10's
-        // `EnginePolicy` row
-        // and the `engines:` config section (`DECISIONS` §20-9 Fork C), not here;
-        // a batch shim renamed to `.exe` therefore still needs that ruling, which
-        // is why this is called a floor and not a control.
+        // `.exe`, matching how the llama adapter refuses a missing binary.
+        // Location custody (the row's executed-path roots, §20-9 Fork C) rides on
+        // top of this shape floor in the `admit_custody_path` call below: while
+        // the cells are open it admits everything (ruling 5), and it will enforce
+        // unchanged once a later copy-in slice populates them. The shape rule
+        // stays load-bearing — a batch shim renamed to `.exe` is refused here,
+        // which is why this is called a floor and not a control.
         let python = model
             .raw
             .get("strata_python")
@@ -306,6 +326,13 @@ impl EngineAdapter for StrataAdapter {
                 || self.python.to_string_lossy().into_owned(),
                 |v| v.trim().to_string(),
             );
+        super::policy::admit_custody_path(
+            row,
+            super::policy::CustodyClass::Executed,
+            &model.name,
+            "strata_python",
+            &python,
+        )?;
         let python_path = Path::new(&python);
         if !python_path.exists() {
             return Err(rejected(format!("strata_python not found: {python}")));
@@ -334,6 +361,13 @@ impl EngineAdapter for StrataAdapter {
             .map(String::as_str)
             .filter(|v| !v.trim().is_empty())
             .map_or_else(|| self.default_cwd.clone(), |v| PathBuf::from(v.trim()));
+        super::policy::admit_custody_path(
+            row,
+            super::policy::CustodyClass::Executed,
+            &model.name,
+            "strata_cwd",
+            &cwd.to_string_lossy(),
+        )?;
         if !cwd.is_dir() {
             return Err(rejected(format!(
                 "strata_cwd is not an existing directory: {}",
@@ -341,7 +375,7 @@ impl EngineAdapter for StrataAdapter {
             )));
         }
         Ok(LaunchSpec {
-            argv: self.argv(&python, config, port),
+            argv: self.argv(row, &python, config, port),
             cwd,
             env: BTreeMap::new(),
             log_name: model.name.clone(),

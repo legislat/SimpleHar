@@ -3383,6 +3383,7 @@ impl ActorState {
             .expect("invariant: readiness is set when a spawn exists");
         let tx = self.tx.clone();
         let runtime = Arc::clone(&self.runtime);
+        let container = self.jobs[&job_id].container.clone();
         let deadline = Duration::from_secs(
             self.jobs[&job_id]
                 .load_timeout_s
@@ -3410,6 +3411,25 @@ impl ActorState {
                     }
                 }
                 tokio::time::sleep(PROBE_INTERVAL).await;
+            };
+            // Ruling 1(b): evidence-only annotation on a decided failure. A
+            // container-backed spawn gets one look at `docker port`, because
+            // "the container is up but published on another port" is precisely
+            // what a port probe cannot see; the verdict is not touched — the
+            // ready path never reaches here, and the annotation only ever
+            // rides an already-Failed `reason`.
+            let terminal = match terminal {
+                Probe::Failed { reason } => {
+                    let reason = match container.as_deref() {
+                        Some(name) => match runtime.published_elsewhere(name, port).await {
+                            Some(evidence) => format!("{reason}; {evidence}"),
+                            None => reason,
+                        },
+                        None => reason,
+                    };
+                    Probe::Failed { reason }
+                }
+                ready => ready,
             };
             let _ = tx.send(ActorMsg::Event {
                 job: job_id,

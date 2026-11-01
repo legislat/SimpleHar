@@ -313,6 +313,18 @@ pub trait EngineRuntime: Send + Sync {
         None
     }
 
+    /// Ruling 1(b) evidence-only diagnosis: when readiness of a container-backed
+    /// engine failed, where does `docker` actually publish the container? The
+    /// "up but published on another port" leg the port-probing probe cannot see
+    /// for itself. `None` means nothing to report: this runtime backs nothing
+    /// with a container, the container is not this harness's to address, docker
+    /// did not answer, or the offered port is among the mappings (the script
+    /// honored the `$3` contract). Never a gate — the verdict stays the probe's
+    /// (chunk 10 ruling: evidence, not enforcement).
+    async fn published_elsewhere(&self, _container: &str, _offered: u16) -> Option<String> {
+        None
+    }
+
     /// Persist a fetched container log to `logs/<model>-<epoch>.container.log` for
     /// forensic survival of the next `docker rm -f` (R9), pruning that model's
     /// container logs to the keep-N. No-op by default (mocks, non-container runtimes).
@@ -349,7 +361,10 @@ pub fn default_adapters(
     );
     adapters.insert(
         "strata".to_string(),
-        Arc::new(strata::StrataAdapter::default()),
+        Arc::new(strata::StrataAdapter::new(
+            config.strata_python(),
+            config.strata_cwd(),
+        )),
     );
     adapters.insert(
         "ninfer".to_string(),

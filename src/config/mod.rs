@@ -300,6 +300,44 @@ pub fn default_config_path() -> Option<std::path::PathBuf> {
         .and_then(|exe| exe.parent().map(|dir| dir.join(CONFIG_FILE)))
 }
 
+/// Fallback strata interpreter when neither `engines.strata.python` nor a model
+/// yaml's `strata_python` names one (v3.3 default; single home since slice 10d —
+/// the strata adapter's `DEFAULT_PYTHON` is this constant).
+pub const STRATA_PYTHON_DEFAULT: &str = r"C:\Strata\.venv\Scripts\python.exe";
+
+/// Fallback strata working directory when neither `engines.strata.cwd` nor a
+/// model yaml's `strata_cwd` names one (v3.3 default; single home since slice
+/// 10d).
+pub const STRATA_CWD_DEFAULT: &str = r"C:\Strata";
+
+/// Harness-side per-engine defaults (slice 10d). Doctrine (`DECISIONS` LOCKED):
+/// *"external engines obey only harness-owned configuration"* — the interpreter
+/// and working directory a strata launch runs with are configured here, not in
+/// an operator-side engine file. Every key is optional and an unset one stays
+/// out of the serialized file (existing configs keep their exact shape, the
+/// GOTCHAS serialization discipline), while an unknown key is refused
+/// (`deny_unknown_fields`) rather than silently ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnginesConfig {
+    /// strata engine defaults; absent means the documented v3.3 fallbacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strata: Option<StrataEngineConfig>,
+}
+
+/// strata harness-side defaults. The per-model yaml knobs `strata_python` and
+/// `strata_cwd` still override these values for a single model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StrataEngineConfig {
+    /// Interpreter binary (`argv[0]`) the strata launch starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<std::path::PathBuf>,
+    /// Working directory handed to the child process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
+}
+
 /// Root of [`CONFIG_FILE`].
 ///
 /// `Debug` is hand-written, not derived: [`AppConfig::control_token`] renders as a
@@ -401,6 +439,13 @@ pub struct AppConfig {
     /// builds its own adapter map. Always serialized, like [`CategoryConfig::control`].
     #[serde(default)]
     pub allow_mock_engine: bool,
+    /// Harness-side per-engine defaults (slice 10d: the strata interpreter and
+    /// working directory, §20-9 "engines obey only harness-owned configuration").
+    /// Unset serializes nothing — existing config files keep their exact shape —
+    /// and the resolved values are read through [`AppConfig::strata_python`] and
+    /// [`AppConfig::strata_cwd`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engines: Option<EnginesConfig>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -439,6 +484,7 @@ impl fmt::Debug for AppConfig {
             source_path,
             control_token,
             allow_mock_engine,
+            engines,
         } = self;
         let presence = if control_token.is_some() {
             "present"
@@ -465,6 +511,7 @@ impl fmt::Debug for AppConfig {
             .field("source_path", source_path)
             .field("control_token", &format_args!("REDACTED({presence})"))
             .field("allow_mock_engine", allow_mock_engine)
+            .field("engines", engines)
             .finish()
     }
 }
@@ -490,6 +537,7 @@ impl Default for AppConfig {
             wsl_user: None,
             control_token: None,
             allow_mock_engine: false,
+            engines: None,
             source_path: None,
         }
     }
@@ -613,6 +661,31 @@ impl AppConfig {
             .filter(|user| !user.is_empty())
     }
 
+    /// The interpreter a strata launch uses when the model yaml omits
+    /// `strata_python`: `engines.strata.python` when present, else
+    /// [`STRATA_PYTHON_DEFAULT`]. The yaml knob is the per-model override the
+    /// adapter applies on top of this resolved default.
+    #[must_use]
+    pub fn strata_python(&self) -> std::path::PathBuf {
+        self.engines
+            .as_ref()
+            .and_then(|engines| engines.strata.as_ref())
+            .and_then(|strata| strata.python.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from(STRATA_PYTHON_DEFAULT))
+    }
+
+    /// The working directory a strata launch uses when the model yaml omits
+    /// `strata_cwd`: `engines.strata.cwd` when present, else
+    /// [`STRATA_CWD_DEFAULT`].
+    #[must_use]
+    pub fn strata_cwd(&self) -> std::path::PathBuf {
+        self.engines
+            .as_ref()
+            .and_then(|engines| engines.strata.as_ref())
+            .and_then(|strata| strata.cwd.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from(STRATA_CWD_DEFAULT))
+    }
+
     /// Cross-field validation (§0.2 step 2 namespace check). Returns every problem.
     ///
     /// # Errors
@@ -635,6 +708,28 @@ impl AppConfig {
                 reason: "must not be blank; omit the key for an open (loopback-only) control plane"
                     .to_string(),
             });
+        }
+        // Same discipline for the engines section (slice 10d): present-but-blank
+        // is a mistake that must refuse boot, not silently fall back to the
+        // documented default the operator did not choose.
+        if let Some(strata) = self
+            .engines
+            .as_ref()
+            .and_then(|engines| engines.strata.as_ref())
+        {
+            for (field, value) in [
+                ("engines.strata.python", strata.python.as_deref()),
+                ("engines.strata.cwd", strata.cwd.as_deref()),
+            ] {
+                if value.is_some_and(|path| path.as_os_str().to_string_lossy().trim().is_empty()) {
+                    errors.push(ConfigError::Invalid {
+                        field: field.to_string(),
+                        reason: "must name a non-blank path; omit the key to keep the \
+                                 documented default"
+                            .to_string(),
+                    });
+                }
+            }
         }
         let mut seen = BTreeSet::new();
         for cat in &self.categories {
@@ -1384,6 +1479,94 @@ mod tests {
         let reloaded = AppConfig::parse(&text).expect("persisted denial parses");
         assert!(!reloaded.allow_mock_engine);
         assert!(reloaded.validate().is_empty());
+    }
+
+    /// Slice 10d discipline (the inverted-`skip_serializing_if` GOTCHAS class):
+    /// the new `engines:` section must survive serialize→parse→validate, and the
+    /// unset default must not change the serialized file shape at all.
+    #[test]
+    fn the_engines_section_survives_the_config_round_trip() {
+        let pinned = AppConfig {
+            engines: Some(EnginesConfig {
+                strata: Some(StrataEngineConfig {
+                    python: Some(std::path::PathBuf::from(
+                        "C:/Strata/.venv/Scripts/python.exe",
+                    )),
+                    cwd: Some(std::path::PathBuf::from("C:/Strata")),
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        let text = write_back_text(&pinned);
+        let reloaded = AppConfig::parse(&text).expect("a pinned section parses back");
+        assert!(
+            reloaded.validate().is_empty(),
+            "a pinned section must validate: {:?}",
+            reloaded.validate()
+        );
+        assert_eq!(reloaded, pinned, "the section must round-trip unchanged");
+        let unset: serde_json::Value =
+            serde_json::from_str(&write_back_text(&AppConfig::default())).expect("stamped json");
+        assert!(
+            unset.get("engines").is_none(),
+            "an unset section stays out of the file: existing shape must not change"
+        );
+    }
+
+    /// The defaults the `engines:` section resolves to are exactly the values
+    /// every strata launch carried before the section existed — the move of the
+    /// adapter constants must be invisible to an operator who edits nothing.
+    #[test]
+    fn the_engines_section_defaults_are_the_documented_fallbacks() {
+        let default = AppConfig::default();
+        assert_eq!(
+            default.strata_python(),
+            std::path::PathBuf::from(STRATA_PYTHON_DEFAULT)
+        );
+        assert_eq!(
+            default.strata_cwd(),
+            std::path::PathBuf::from(STRATA_CWD_DEFAULT)
+        );
+        let half = AppConfig {
+            engines: Some(EnginesConfig {
+                strata: Some(StrataEngineConfig {
+                    python: Some(std::path::PathBuf::from("D:/other/python.exe")),
+                    cwd: None,
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            half.strata_python(),
+            std::path::PathBuf::from("D:/other/python.exe")
+        );
+        assert_eq!(
+            half.strata_cwd(),
+            std::path::PathBuf::from(STRATA_CWD_DEFAULT),
+            "a half-pinned section keeps the documented default for the absent key"
+        );
+    }
+
+    /// A blank engines path is a mistake that must refuse boot (the
+    /// `control_token` doctrine), and a typo — a section for an engine with no
+    /// harness-side defaults at all — is refused, not ignored.
+    #[test]
+    fn a_blank_or_unknown_engines_entry_is_refused() {
+        let blank =
+            AppConfig::parse(r#"{"engines": {"strata": {"python": "   "}}}"#).expect("parses");
+        assert!(
+            fails_with(&blank, "engines.strata.python"),
+            "{:?}",
+            blank.validate()
+        );
+        assert!(
+            AppConfig::parse(r#"{"engines": {"strata": {"pyton": "x"}}}"#).is_err(),
+            "a misspelled engines subkey must not be silently ignored"
+        );
+        assert!(
+            AppConfig::parse(r#"{"engines": {"llama": {}}}"#).is_err(),
+            "the harness owns no llama-side defaults section to accept"
+        );
     }
 
     /// True when `validate()` reports at least one problem naming `field`.

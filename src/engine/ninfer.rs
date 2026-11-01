@@ -549,9 +549,16 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
     // (chunk-10 custody doctrine: engines obey only harness-owned locations).
     let key_file = optional_param(model, "ninfer_key_file")
         .unwrap_or_else(|| format!("{keys_root}/{container}.key"));
-    let key_file_ok = key_file
-        .strip_prefix(&format!("{keys_root}/"))
-        .is_some_and(|file| file.ends_with(".key") && valid_path_word(file) && !file.contains('/'));
+    // Membership flows through the shared custody admission mechanism (slice
+    // 10d: one admission code path); the shape rules are ninfer's own contract
+    // on top of it — one bare `.key` word, no subdirectories.
+    let key_file_ok =
+        super::policy::admits_under_root(row, super::policy::CustodyClass::Data, &key_file)
+            && key_file
+                .strip_prefix(&format!("{keys_root}/"))
+                .is_some_and(|file| {
+                    file.ends_with(".key") && valid_path_word(file) && !file.contains('/')
+                });
     if !key_file_ok {
         return Err(rejected(format!(
             "`ninfer_key_file` must be a plain file inside `{keys_root}/` ending in \

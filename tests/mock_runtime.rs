@@ -169,6 +169,12 @@ pub struct MockRuntime {
     /// R9 fake seam: every `(model, text)` handed to `save_container_log`, for
     /// asserting a failed launch snapshotted its container log.
     saved_container_logs: Arc<Mutex<Vec<(String, String)>>>,
+    /// Ruling 1(b) fake seam: canned publish evidence returned by
+    /// [`EngineRuntime::published_elsewhere`], keyed by container name.
+    publish_evidence: Arc<Mutex<HashMap<String, String>>>,
+    /// Every `(container, offered)` the scheduler asked about, in order: the
+    /// pins assert the happy path and the container-less failure never ask.
+    publish_calls: Arc<Mutex<Vec<(String, u16)>>>,
 }
 
 impl Default for MockRuntime {
@@ -196,6 +202,8 @@ impl MockRuntime {
             parked: Arc::new(Mutex::new(Vec::new())),
             container_reports: Arc::new(Mutex::new(HashMap::new())),
             saved_container_logs: Arc::new(Mutex::new(Vec::new())),
+            publish_evidence: Arc::new(Mutex::new(HashMap::new())),
+            publish_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -215,6 +223,26 @@ impl MockRuntime {
         self.saved_container_logs
             .lock()
             .expect("saved container lock")
+            .clone()
+    }
+
+    /// Seeds the canned publish evidence [`EngineRuntime::published_elsewhere`]
+    /// returns for `name` (ruling 1(b)). Call before driving the scheduler.
+    #[allow(dead_code)]
+    pub fn set_publish_evidence(&self, name: &str, evidence: &str) {
+        self.publish_evidence
+            .lock()
+            .expect("publish evidence lock")
+            .insert(name.to_string(), evidence.to_string());
+    }
+
+    /// Every `(container, offered)` publish diagnosis the scheduler asked for,
+    /// in order (ruling 1(b)).
+    #[allow(dead_code)]
+    pub fn publish_diagnoses(&self) -> Vec<(String, u16)> {
+        self.publish_calls
+            .lock()
+            .expect("publish calls lock")
             .clone()
     }
 
@@ -508,6 +536,18 @@ impl EngineRuntime for MockRuntime {
         self.container_reports
             .lock()
             .expect("container report lock")
+            .get(container)
+            .cloned()
+    }
+
+    async fn published_elsewhere(&self, container: &str, offered: u16) -> Option<String> {
+        self.publish_calls
+            .lock()
+            .expect("publish calls lock")
+            .push((container.to_string(), offered));
+        self.publish_evidence
+            .lock()
+            .expect("publish evidence lock")
             .get(container)
             .cloned()
     }
