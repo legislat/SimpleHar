@@ -458,6 +458,25 @@ pub struct ProcessRuntime {
     /// minted (FINDINGS2-0910 [3]) — is reachable without a wedged Win32 API.
     #[cfg(test)]
     fail_job_after_spawn: bool,
+    /// Test seam (R5): the R5 reconcile probe goes through this docker door
+    /// instead of `wsl.exe`, so pins can script `docker ps` and read back the
+    /// docker verbs the reconcile actually asked for — the vocabulary bound the
+    /// report-only doctrine promises.
+    #[cfg(test)]
+    docker_probe: Option<DockerProbeSeam>,
+}
+
+/// Recorded docker-probe seam for the R5 pins (test-only): a canned `docker ps`
+/// answer plus the log of docker verbs it was asked to run.
+#[cfg(test)]
+#[derive(Clone)]
+struct DockerProbeSeam {
+    /// `Some` = docker answered with these running names; `None` = the command
+    /// could not run (the silent path).
+    outcome: Option<Vec<String>>,
+    /// One entry per probe, in order. The reconcile reaching `docker rm` or any
+    /// other verb would leave its mark here.
+    calls: Arc<Mutex<Vec<String>>>,
 }
 
 /// `wsl.exe -d <distro> -u <user> -- docker rm -f <name>` (v3.3 kill_container
@@ -959,11 +978,11 @@ fn strata_custody_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("strata-custody.json"))
 }
 
-/// `wsl.exe … docker ps --format {{.Names}}`; `None` when the call cannot run or
-/// reports failure (the reconcile is advisory, never fatal). A control command like
-/// [`reap_container`], so it goes through [`run_control_command`] and carries only
-/// the OS baseline.
-async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
+/// `wsl.exe -d <distro> -u <user> -- docker ps --format {{.Names}}` as pure data:
+/// the one bounded command every container reconcile lists running names with,
+/// through the shared [`wsl_prefix`] so the two reconciles can never address
+/// docker with different commands.
+fn container_ps_command(distro: &str, user: &str) -> (String, Vec<String>) {
     let mut argv = wsl_prefix(distro, user);
     argv.extend([
         "docker".to_string(),
@@ -971,10 +990,30 @@ async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
         "--format".to_string(),
         "{{.Names}}".to_string(),
     ]);
-    let (program, args) = argv
+    let (program, rest) = argv
         .split_first()
         .unwrap_or_else(|| unreachable!("invariant: wsl_prefix is never empty"));
-    let output = match run_control_command(program, args).await {
+    (program.clone(), rest.to_vec())
+}
+
+/// One `docker ps` stdout into its container names (the parse shared by both
+/// reconciles, so neither can invent a name the other would not see).
+fn ps_names(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// `wsl.exe … docker ps --format {{.Names}}`; `None` when the call cannot run or
+/// reports failure (the reconcile is advisory, never fatal). A control command like
+/// [`reap_container`], so it goes through [`run_control_command`] and carries only
+/// the OS baseline.
+async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
+    let (program, args) = container_ps_command(distro, user);
+    let output = match run_control_command(&program, &args).await {
         ControlOutcome::Ran(output) if output.status.success() => output,
         ControlOutcome::Ran(output) => {
             tracing::warn!(
@@ -992,14 +1031,40 @@ async fn docker_ps(distro: &str, user: &str) -> Option<Vec<String>> {
             return None;
         }
     };
-    Some(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToString::to_string)
-            .collect(),
-    )
+    Some(ps_names(&output.stdout))
+}
+
+/// The R5 reconcile's probe: the very command of [`docker_ps`], but every
+/// failure path is SILENT. Report-only doctrine: a probe that could not run is
+/// not a warning — docker being off is the normal state of a machine the
+/// harness never uses, and a rescan must never spam the operator for it.
+async fn docker_ps_quiet(distro: &str, user: &str) -> Option<Vec<String>> {
+    let (program, args) = container_ps_command(distro, user);
+    match run_control_command(&program, &args).await {
+        ControlOutcome::Ran(output) if output.status.success() => Some(ps_names(&output.stdout)),
+        ControlOutcome::Ran(_) | ControlOutcome::Failed(_) | ControlOutcome::TimedOut => None,
+    }
+}
+
+/// The pure core of the R5 report-only reconcile: the running containers whose
+/// exact name a catalog row declares as `ninfer_container` while the claim
+/// ledger holds **no** claim — the stranded VRAM the ownership-scoped reaping
+/// may never address (ruling 9: report it, never touch it). A claimed match is
+/// a running engine this harness started and never appears; a running container
+/// no catalog row names is foreign and equally out of report. Presence in
+/// `docker ps` is re-checked, never assumed.
+fn stranded_plan(
+    present: &[String],
+    declared: &[String],
+    claims: &ContainerClaims,
+) -> BTreeSet<String> {
+    present
+        .iter()
+        .filter(|name| {
+            declared.iter().any(|candidate| candidate == *name) && !claims.contains(name)
+        })
+        .cloned()
+        .collect()
 }
 
 /// `wsl.exe … docker logs --tail <n> <name>` (R9): the raw container stdout. The
@@ -1093,6 +1158,8 @@ impl ProcessRuntime {
             wsl_user: String::new(),
             #[cfg(test)]
             fail_job_after_spawn: false,
+            #[cfg(test)]
+            docker_probe: None,
         }
     }
 
@@ -1131,6 +1198,25 @@ impl ProcessRuntime {
     #[must_use]
     pub fn with_injected_job_failure(mut self) -> Self {
         self.fail_job_after_spawn = true;
+        self
+    }
+
+    /// Routes this runtime's R5 reconcile probe through a recorded docker seam
+    /// answering with `outcome` (`None` = docker cannot run). Test-only, the
+    /// rule [`Self::with_claims_ledger`] states: pins must neither touch the
+    /// operator's WSL nor their docker. The calls handle is shared, so the test
+    /// reads back the docker verbs the reconcile asked for.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_docker_probe(
+        mut self,
+        outcome: Option<Vec<String>>,
+        calls: &Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        self.docker_probe = Some(DockerProbeSeam {
+            outcome,
+            calls: Arc::clone(calls),
+        });
         self
     }
 
@@ -1714,6 +1800,28 @@ impl EngineRuntime for ProcessRuntime {
         }
     }
 
+    async fn unclaimed_container_names(&self, declared: &[String]) -> Option<BTreeSet<String>> {
+        #[cfg(test)]
+        if let Some(seam) = &self.docker_probe {
+            seam.calls
+                .lock()
+                .expect("docker probe lock")
+                .push("ps".to_string());
+            let present = seam.outcome.clone()?;
+            let claims = self.claims.lock().expect("container claim ledger lock");
+            return Some(stranded_plan(&present, declared, &claims));
+        }
+        // Blank coordinates never reach `wsl.exe` — and the R5 probe answers
+        // them SILENTLY, unlike the boot reclaim's pointer line: report-only
+        // doctrine, a failed probe is not a warning.
+        if self.wsl_distro.trim().is_empty() || self.wsl_user.trim().is_empty() {
+            return None;
+        }
+        let present = docker_ps_quiet(&self.wsl_distro, &self.wsl_user).await?;
+        let claims = self.claims.lock().expect("container claim ledger lock");
+        Some(stranded_plan(&present, declared, &claims))
+    }
+
     async fn save_container_log(&self, model: &str, text: &str) {
         // A snapshot with no bytes is forensic noise, not evidence: a container
         // that never exec'd yields an empty `docker logs`, and rotating a model's
@@ -1958,6 +2066,33 @@ mod tests {
         assert_eq!(
             [vec![program], args].concat(),
             vec!["wsl.exe", "-d", "Ubuntu", "-u", "ops", "--", "docker", "port", "ninfer-x",]
+        );
+    }
+
+    /// R5 pin of the real-path command shape: both reconciles (boot reclaim and
+    /// the silent R5 probe) build their docker command through
+    /// [`container_ps_command`] alone, so this exact argv IS the reconcile's
+    /// entire docker reach. The seam pin records the verbs the probe asked the
+    /// seam for; this one pins the argv the probe can actually build — the
+    /// never-kill guarantee's other half.
+    #[test]
+    fn container_ps_is_the_reconciles_entire_docker_vocabulary() {
+        let (program, args) = container_ps_command("Ubuntu", "ops");
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(
+            [vec![program], args].concat(),
+            vec![
+                "wsl.exe",
+                "-d",
+                "Ubuntu",
+                "-u",
+                "ops",
+                "--",
+                "docker",
+                "ps",
+                "--format",
+                "{{.Names}}",
+            ]
         );
     }
 
@@ -2514,6 +2649,142 @@ mod tests {
         let claims = claims_with(&["ninfer-a"]);
         let plan = reclaim_plan(&[], &[candidate("ninfer", "ninfer-a")], &claims);
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn stranded_plan_reports_only_an_unclaimed_catalog_match() {
+        // R5: a claimed match is a running harness engine (normal, silent); a
+        // running container no catalog row names is foreign (out of report);
+        // only the declared-but-unclaimed match strands VRAM.
+        let present: Vec<String> = ["ninfer-kept", "ninfer-stranded", "foreign-x"]
+            .map(String::from)
+            .to_vec();
+        let declared: Vec<String> =
+            ["ninfer-kept".to_string(), "ninfer-stranded".to_string()].to_vec();
+        let claims = claims_with(&["ninfer-kept"]);
+        assert_eq!(
+            stranded_plan(&present, &declared, &claims),
+            ["ninfer-stranded".to_string()].into_iter().collect(),
+            "the claimed name is an engine running normally; the foreign one is not ours"
+        );
+    }
+
+    #[test]
+    fn stranded_plan_stands_down_when_nothing_is_declared_or_running() {
+        // Empty ledger (no claim file) + no running containers = silence: the
+        // plan is empty for every combination of the two empty sides.
+        let empty_claims = claims_with(&[]);
+        let declared = vec!["ninfer-a".to_string()];
+        assert!(stranded_plan(&[], &declared, &empty_claims).is_empty());
+        assert!(
+            stranded_plan(&["ninfer-a".to_string()], &[], &empty_claims).is_empty(),
+            "a running name no row declares is foreign, never reported"
+        );
+        assert!(stranded_plan(&[], &[], &empty_claims).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_probe_names_the_stranded_container_and_asks_docker_only_for_ps() {
+        // The G4 pin: the report-only reconcile's entire docker vocabulary is
+        // `ps`. Every verb it asked the seam for is recorded — a `rm`, `kill`
+        // or `stop` sneaking into the reconcile would surface here.
+        let dir = crate::testutil::temp_dir("r5-probe");
+        let ledger = dir.join("ninfer-claims.json");
+        {
+            let mut claims = ContainerClaims::load(&ledger);
+            assert!(claims.claim("ninfer-kept"));
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = ProcessRuntime::new()
+            .with_wsl("Ubuntu", "ops")
+            .with_claims_ledger(&ledger)
+            .with_docker_probe(
+                Some(
+                    ["ninfer-kept", "ninfer-stranded", "foreign-x"]
+                        .map(String::from)
+                        .to_vec(),
+                ),
+                &calls,
+            );
+        let declared: Vec<String> =
+            ["ninfer-kept".to_string(), "ninfer-stranded".to_string()].to_vec();
+        let stranded = runtime
+            .unclaimed_container_names(&declared)
+            .await
+            .expect("the probe ran");
+        assert_eq!(
+            stranded,
+            ["ninfer-stranded".to_string()].into_iter().collect(),
+            "claimed match silent, foreign name out of report"
+        );
+        let recorded = calls.lock().expect("probe calls lock").clone();
+        assert_eq!(
+            recorded,
+            vec!["ps".to_string()],
+            "the reconcile never reaches beyond `docker ps`"
+        );
+        assert!(
+            recorded.iter().all(|verb| !verb.contains("rm")
+                && !verb.contains("kill")
+                && !verb.contains("stop")),
+            "no destructive verb may ever ride the reconcile: {recorded:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_probe_is_silent_when_docker_cannot_answer() {
+        // A failed probe is not a warning: `None` (not an empty set) is the
+        // actor-side signal to stay silent AND to keep the last-reported set.
+        let dir = crate::testutil::temp_dir("r5-probe-err");
+        let ledger = dir.join("ninfer-claims.json");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = ProcessRuntime::new()
+            .with_wsl("Ubuntu", "ops")
+            .with_claims_ledger(&ledger)
+            .with_docker_probe(None, &calls);
+        assert_eq!(
+            runtime
+                .unclaimed_container_names(&["ninfer-a".to_string()])
+                .await,
+            None,
+            "a docker that cannot answer yields no report, not an empty one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_stands_down_silently_without_wsl_coordinates() {
+        // Cardless-safe: no coordinates means no `wsl.exe`, no warn, `None`.
+        // (Contrast the boot reclaim, which may name the orphan it cannot
+        // reach — the R5 reconcile is the silent path by ruling.)
+        let runtime = ProcessRuntime::new();
+        assert_eq!(
+            runtime
+                .unclaimed_container_names(&["ninfer-a".to_string()])
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_ledger_with_no_running_containers_reports_nothing() {
+        // Missing claim file (empty ledger) + no containers: the probe SUCCEEDS
+        // with an empty set — nothing is stranded, and the actor stays quiet.
+        let dir = crate::testutil::temp_dir("r5-empty");
+        let ledger = dir.join("ninfer-claims.json");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = ProcessRuntime::new()
+            .with_wsl("Ubuntu", "ops")
+            .with_claims_ledger(&ledger)
+            .with_docker_probe(Some(Vec::new()), &calls);
+        assert_eq!(
+            runtime
+                .unclaimed_container_names(&["ninfer-a".to_string()])
+                .await,
+            Some(BTreeSet::new())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn container_ticket(port: u16, name: &str) -> SpawnTicket {

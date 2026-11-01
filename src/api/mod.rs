@@ -1031,7 +1031,7 @@ async fn render_status_document(state: &ApiState, scheduler: &SchedulerStatus) -
     // three fields are now three reads of ONE clone, through the registry's own
     // predicates (`is_down`/`is_pending`), never a re-derived match.
     let verdicts = state.listeners.snapshot();
-    json!({
+    let mut document = json!({
         "version": env!("CARGO_PKG_VERSION"),
         "control_addr": state.control_addr,
         "extended_logging": crate::observability::extended_logging(),
@@ -1057,7 +1057,19 @@ async fn render_status_document(state: &ApiState, scheduler: &SchedulerStatus) -
         "last_error": last_error,
         "catalog_errors": &scheduler.catalog_errors,
         "config_errors": [],
-    })
+    });
+    // R5 report-only reconcile (ruling 9): the stranded-container names the
+    // reconcile warned about ride the SAME snapshot, so the page and the log can
+    // never disagree. Absent — not empty, not null — whenever nothing is
+    // reported: the snapshot already normalizes an empty set to `None`.
+    if let Some(names) = scheduler
+        .stranded_containers
+        .as_ref()
+        .filter(|names| !names.is_empty())
+    {
+        document["stranded_containers"] = json!(names);
+    }
+    document
 }
 
 /// The `409` for a catalog that claims one identity twice (FINDINGS-11 [4]).
@@ -2981,6 +2993,36 @@ mod tests {
         );
     }
 
+    /// The R5 rider on `/har/status` (ruling 9): the warned names appear when the
+    /// snapshot reports them and the key is ABSENT otherwise — absent, not null,
+    /// not `[]` — so a harness with nothing stranded sends the exact old document
+    /// (the fixture-parity pin keeps the DOM suite honest about that shape).
+    #[tokio::test]
+    async fn status_document_carries_stranded_containers_only_when_reported() {
+        let api = live_state(BootTimings::default());
+        let base = api.scheduler.status().await.expect("actor alive");
+        let doc = render_status_document(&api, &base).await;
+        assert!(
+            doc.get("stranded_containers").is_none(),
+            "no report: the key is absent, not null: {doc}"
+        );
+        let mut reported = base.clone();
+        reported.stranded_containers = Some(["r5-api-a".to_string()].into_iter().collect());
+        let doc = render_status_document(&api, &reported).await;
+        assert_eq!(
+            doc["stranded_containers"],
+            json!(["r5-api-a"]),
+            "the reconcile's warned names ride /har/status"
+        );
+        let mut emptied = base.clone();
+        emptied.stranded_containers = Some(std::collections::BTreeSet::new());
+        let doc = render_status_document(&api, &emptied).await;
+        assert!(
+            doc.get("stranded_containers").is_none(),
+            "an empty set never reaches the page as []: {doc}"
+        );
+    }
+
     /// FINDINGS-14 [7] + the 2026-10-28 "A + amber" ruling: a category whose
     /// supervisor never spoke must be PRESENT in the `listeners` object and LABELED
     /// `Pending`, so the page can never read "no verdict" as "no such category" (the
@@ -4105,6 +4147,7 @@ mod tests {
                 slots,
                 jobs: Vec::new(),
                 catalog_errors: Vec::new(),
+                stranded_containers: None,
             })
         };
         assert_eq!(document(vec![empty, reported("quiet", None)]), None);
@@ -4145,6 +4188,7 @@ mod tests {
             ],
             jobs: Vec::new(),
             catalog_errors: Vec::new(),
+            stranded_containers: None,
         };
         let picked = pick_loaded_occupant(&api, &status, CategoryId::Aux)
             .expect("an occupied category must resolve");
@@ -4177,6 +4221,7 @@ mod tests {
             ],
             jobs: Vec::new(),
             catalog_errors: Vec::new(),
+            stranded_containers: None,
         };
         api.touch("cold");
         let picked = pick_loaded_occupant(&api, &status, CategoryId::Aux)
@@ -4219,6 +4264,7 @@ mod tests {
             slots: vec![foreign, portless, zero, empty],
             jobs: Vec::new(),
             catalog_errors: Vec::new(),
+            stranded_containers: None,
         };
         assert!(
             pick_loaded_occupant(&api, &status, CategoryId::Aux).is_none(),

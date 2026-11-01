@@ -27,7 +27,7 @@ use crate::model::scan::{Catalog, ScanError, ScanKind};
 use crate::model::ModelEntry;
 use crate::ownership::{ResourceKind, SpawnTicket};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -141,6 +141,16 @@ pub struct SchedulerStatus {
     pub jobs: Vec<JobStatus>,
     /// Catalog problems from the last scan (bad files, unresolved defaults).
     pub catalog_errors: Vec<crate::model::scan::ScanError>,
+    /// R5 report-only reconcile (ruling 9): running containers matching a catalog
+    /// `ninfer_container` row while the claim ledger holds no claim — the SAME set
+    /// the reconcile warned about, carried on this one snapshot so the page and the
+    /// log can never disagree. Absent from `/har/status` until a probe reports a
+    /// non-empty set (an empty last-reported set normalizes to `None` at the single
+    /// snapshot accessor — the skip predicate's polarity stays `is_none`, the
+    /// GOTCHAS inverted-predicate class); a failed probe keeps the last-reported
+    /// set, exactly like the warn dedupe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stranded_containers: Option<BTreeSet<String>>,
 }
 
 /// One slot as seen by `/har/status` (Step 12).
@@ -559,6 +569,22 @@ impl Drop for SnapshotRelease {
     }
 }
 
+/// R5 reconcile release: every exit of the probe task — normal end, panic,
+/// cancellation — lands exactly one [`ActorMsg::ReconcileDone`], so the
+/// in-flight mark can never wedge. An outcome the probe never filled reports
+/// as a failed probe (silence), never as an empty set.
+struct ReconcileRelease {
+    tx: mpsc::UnboundedSender<ActorMsg>,
+    outcome: Option<Option<BTreeSet<String>>>,
+}
+
+impl Drop for ReconcileRelease {
+    fn drop(&mut self) {
+        let outcome = self.outcome.take().unwrap_or(None);
+        let _ = self.tx.send(ActorMsg::ReconcileDone(outcome));
+    }
+}
+
 #[derive(Debug)]
 enum ActorMsg {
     Command {
@@ -613,6 +639,10 @@ enum ActorMsg {
     /// A detached failed-launch log snapshot (R9 C1) has finished; release its
     /// in-flight mark so a later failure of the same container name re-snapshots.
     SnapshotDone(String),
+    /// An R5 report-only reconcile probe has finished. `Some` = docker answered
+    /// with the stranded set (possibly empty); `None` = the probe could not run
+    /// — silence, and the last-reported set stands untouched.
+    ReconcileDone(Option<BTreeSet<String>>),
     /// The blocking write-back of a measured figure was refused by the disk
     /// (Fork C, FINDINGS-13 [4] follow-through): the actor must stop booking in
     /// memory what disk rejected. Carries the exact figure — pair **and provenance
@@ -1031,6 +1061,15 @@ struct ActorState {
     /// container, never a pile of concurrent `docker logs` clients from a
     /// crash-looping load — rather than a job-scoped handle.
     snapshot_in_flight: HashSet<String>,
+    /// R5 report-only reconcile: a probe per catalog application, never two at
+    /// once (the R9 in-flight bound) — a rescan landing mid-probe is answered
+    /// by the next application, never by a pile of concurrent `docker ps`.
+    reconcile_in_flight: bool,
+    /// The stranded-container set the reconcile last warned about (R5 dedupe).
+    /// `None` = no successful probe yet — absence of a report is not an empty
+    /// report. Warn fires only when the set CHANGES, so repeated rescans of the
+    /// same stranded container never spam the ring.
+    last_reported_stranded: Option<BTreeSet<String>>,
     slots: Vec<Slot>,
     jobs: BTreeMap<JobId, Job>,
     /// Last proxy-side use per model (idle sweep input, Step 5).
@@ -1210,6 +1249,10 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
             ActorMsg::SnapshotDone(container) => {
                 state.snapshot_in_flight.remove(&container);
             }
+            ActorMsg::ReconcileDone(outcome) => {
+                state.reconcile_in_flight = false;
+                state.on_reconcile_done(outcome);
+            }
             ActorMsg::MeasuredPersistFailed { model, data, file } => {
                 state.on_measured_persist_failed(&model, &data, file);
             }
@@ -1288,6 +1331,8 @@ impl ActorState {
             events: tokio::sync::broadcast::channel(64).0,
             tx,
             snapshot_in_flight: HashSet::new(),
+            reconcile_in_flight: false,
+            last_reported_stranded: None,
             slots,
             jobs: BTreeMap::new(),
             last_used: HashMap::new(),
@@ -1412,6 +1457,11 @@ impl ActorState {
         self.catalog_errors = errors;
         self.invalidate_queued_loads();
         self.refresh_stale_markers();
+        // R5 report-only reconcile (ruling 9, 2026-11-01): every catalog
+        // application — the boot scan and every rescan alike — re-checks which
+        // declared container names are running with no claim. Off-thread like
+        // every other engine touch; report-only by construction.
+        self.spawn_unclaimed_reconcile();
     }
 
     /// The resident half of reload (Axis 2 = B, operator ruling 2026-10-29): on the
@@ -2139,6 +2189,70 @@ impl ActorState {
                 runtime.save_container_log(&model, &text).await;
             }
         });
+    }
+
+    /// R5 report-only reconcile trigger (boot scan and every rescan alike): name
+    /// the running containers whose exact name a catalog row declares as
+    /// `ninfer_container` while the claim ledger holds no claim — the stranded
+    /// VRAM the ownership-scoped reaping may never address. The probe runs
+    /// off-thread (no I/O in the actor loop), one at a time, and its result is
+    /// a warning through [`ActorState::on_reconcile_done`] and nothing else:
+    /// never a kill, never an eviction, never a gate (G4; ruling 9 — foreign
+    /// VRAM is never the harness's own and never a gate guess).
+    fn spawn_unclaimed_reconcile(&mut self) {
+        let declared: Vec<String> = self
+            .catalog
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .raw
+                    .get("ninfer_container")
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+            })
+            .collect();
+        if declared.is_empty() || self.reconcile_in_flight {
+            return;
+        }
+        // The sync constructor pins drive `apply_catalog` without a reactor;
+        // the reconcile is live-actor work and simply has nothing to do there.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.reconcile_in_flight = true;
+        let runtime = Arc::clone(&self.runtime);
+        let tx = self.tx.clone();
+        handle.spawn(async move {
+            // RAII release (the R9 C1 rule): the in-flight mark clears on EVERY
+            // exit — a panic in the probe reports as a failed probe (silence),
+            // never as a mark wedged for the process lifetime.
+            let mut release = ReconcileRelease { tx, outcome: None };
+            release.outcome = Some(runtime.unclaimed_container_names(&declared).await);
+        });
+    }
+
+    /// The R5 report itself: one `warn` per stranded name — and only when the
+    /// stranded SET changed, so repeated rescans of the same stranded container
+    /// never spam the ring (the warn IS the ring event: the observability ring
+    /// layer captures every tracing event for the UI log panel). A failed probe
+    /// (`None`) is silence and leaves the last-reported set standing — a docker
+    /// that was momentarily off must not re-warn what a later probe re-confirms.
+    fn on_reconcile_done(&mut self, outcome: Option<BTreeSet<String>>) {
+        let Some(stranded) = outcome else {
+            return;
+        };
+        if self.last_reported_stranded.as_ref() == Some(&stranded) {
+            return;
+        }
+        self.last_reported_stranded = Some(stranded.clone());
+        for name in &stranded {
+            tracing::warn!(
+                container = %name,
+                "unclaimed running container matches a catalog `ninfer_container` row with no \
+                 claim in the ledger: its VRAM stays occupied and the harness will never reap it \
+                 (report only)"
+            );
+        }
     }
 
     fn fold(&mut self, plan: &FoldPlan) {
@@ -4204,6 +4318,13 @@ impl ActorState {
         let now = Instant::now();
         SchedulerStatus {
             catalog_errors: self.catalog_errors.clone(),
+            // One accessor derives the payload from the dedupe state (empty means
+            // absent, never an empty list that would keep the key alive).
+            stranded_containers: self
+                .last_reported_stranded
+                .as_ref()
+                .filter(|names| !names.is_empty())
+                .cloned(),
             slots: self
                 .slots
                 .iter()
@@ -4280,7 +4401,7 @@ mod tests {
     use crate::engine::mock::MockAdapter;
     use crate::engine::EngineAdapter;
     use crate::model::ModelEntry;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -4405,6 +4526,301 @@ mod tests {
             format!("name: {name}\nengine: mock\ncategory: work\n"),
         )
         .expect("model yaml");
+    }
+
+    /// Test double for the R5 reconcile probe (ruling 9): canned `docker ps`
+    /// answers consumed one per probe (`None` = docker could not answer) and
+    /// the declared-name lists it was asked about. Everything else keeps the
+    /// NeverRuntime posture: a load reaching this runtime is a test bug.
+    struct ReconcileRuntime {
+        answers: Mutex<std::collections::VecDeque<Option<BTreeSet<String>>>>,
+        asked: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ReconcileRuntime {
+        fn new(answers: Vec<Option<BTreeSet<String>>>) -> Self {
+            ReconcileRuntime {
+                answers: Mutex::new(answers.into()),
+                asked: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::EngineRuntime for ReconcileRuntime {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: crate::ownership::SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            panic!("the R5 reconcile pin must never load");
+        }
+        async fn kill(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<(), crate::engine::SpawnError> {
+            panic!("the R5 reconcile pin must never load");
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            panic!("the R5 reconcile pin must never load");
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            panic!("the R5 reconcile pin must never load");
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("the R5 reconcile pin must never load");
+        }
+        async fn unclaimed_container_names(&self, declared: &[String]) -> Option<BTreeSet<String>> {
+            self.asked
+                .lock()
+                .expect("asked lock")
+                .push(declared.to_vec());
+            self.answers
+                .lock()
+                .expect("answers lock")
+                .pop_front()
+                .unwrap_or(None)
+        }
+    }
+
+    /// State shaped for the R5 pins: `on_reconcile_done` is called directly, so
+    /// the runtime is never reached and the actor channel never read.
+    fn reconcile_state() -> ActorState {
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        ActorState::empty(
+            crate::config::AppConfig::default(),
+            crate::testutil::temp_dir("r5-state"),
+            adapters,
+            Arc::new(ReconcileRuntime::new(Vec::new())) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        )
+    }
+
+    /// Stranded-container warns captured for one container name: the message
+    /// half pins the report-only wording, the field half the named container.
+    fn stranded_warns(capture: &Arc<Mutex<Vec<CapturedWarn>>>, container: &str) -> usize {
+        capture
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(message, fields)| {
+                message.contains("unclaimed running container")
+                    && message.contains("no claim in the ledger")
+                    && fields
+                        .get("container")
+                        .is_some_and(|name| name.contains(container))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_warns_once_and_an_unchanged_set_never_re_warns() {
+        let capture = install_warn_capture();
+        // Warm the reporting callsite and PROVE delivery before the measured
+        // window (the D9 rule): a sentinel name no assertion below reads about.
+        let mut warm = reconcile_state();
+        warm.on_reconcile_done(Some(["r5-warmup".to_string()].into_iter().collect()));
+        assert!(
+            stranded_warns(&capture, "r5-warmup") == 1,
+            "the reporting callsite was warmed but never delivered"
+        );
+
+        let mut state = reconcile_state();
+        let stranded: BTreeSet<String> = ["r5-unit-a".to_string()].into_iter().collect();
+        state.on_reconcile_done(Some(stranded.clone()));
+        assert_eq!(
+            stranded_warns(&capture, "r5-unit-a"),
+            1,
+            "the first report names the stranded container once"
+        );
+        state.on_reconcile_done(Some(stranded.clone()));
+        assert_eq!(
+            stranded_warns(&capture, "r5-unit-a"),
+            1,
+            "repeated rescans of the same stranded set must not spam the ring"
+        );
+        state.on_reconcile_done(None);
+        state.on_reconcile_done(Some(stranded));
+        assert_eq!(
+            stranded_warns(&capture, "r5-unit-a"),
+            1,
+            "a docker that briefly could not answer must not re-warn what the next probe re-confirms"
+        );
+    }
+
+    /// The `/har/status` rider of the R5 report: the SAME dedupe state backs the
+    /// payload, so page and log can never disagree. Polarity pinned both ways
+    /// (the inverted-`skip_serializing_if` GOTCHAS class): an empty last-reported
+    /// set normalizes to `None` and the key is ABSENT from the serialized
+    /// status, never `null` or `[]`; a failed probe keeps the last-reported set
+    /// exactly like the warn dedupe.
+    #[tokio::test]
+    async fn the_status_snapshot_carries_the_stranded_set_and_drops_it_when_empty() {
+        let mut state = reconcile_state();
+        assert!(
+            state.snapshot().stranded_containers.is_none(),
+            "no probe yet: the key has no shape to leak"
+        );
+        state.on_reconcile_done(None);
+        assert!(
+            state.snapshot().stranded_containers.is_none(),
+            "a failed probe invents nothing for the page either"
+        );
+        let stranded: BTreeSet<String> = ["r5-payload".to_string()].into_iter().collect();
+        state.on_reconcile_done(Some(stranded.clone()));
+        let reported = state.snapshot();
+        assert_eq!(reported.stranded_containers, Some(stranded));
+        assert_eq!(
+            serde_json::to_value(&reported).expect("status serializes")["stranded_containers"],
+            serde_json::json!(["r5-payload"]),
+            "the warned names ride /har/status verbatim"
+        );
+        state.on_reconcile_done(None);
+        assert!(
+            state.snapshot().stranded_containers.is_some(),
+            "a docker that briefly could not answer keeps the last-reported set (same rule as the warn)"
+        );
+        state.on_reconcile_done(Some(BTreeSet::new()));
+        let cleared = state.snapshot();
+        assert!(cleared.stranded_containers.is_none());
+        assert!(
+            serde_json::to_value(&cleared)
+                .expect("status serializes")
+                .get("stranded_containers")
+                .is_none(),
+            "empty means ABSENT, not null or []: the skip predicate must not invert"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_empty_reconcile_never_warns() {
+        let capture = install_warn_capture();
+        let mut state = reconcile_state();
+        state.on_reconcile_done(None);
+        state.on_reconcile_done(Some(BTreeSet::new()));
+        assert_eq!(
+            stranded_warns(&capture, "r5-quiet"),
+            0,
+            "a failed probe and an empty stranded set are both silence"
+        );
+        let stranded: BTreeSet<String> = ["r5-quiet".to_string()].into_iter().collect();
+        state.on_reconcile_done(Some(stranded.clone()));
+        assert_eq!(stranded_warns(&capture, "r5-quiet"), 1);
+        state.on_reconcile_done(Some(BTreeSet::new()));
+        assert_eq!(
+            stranded_warns(&capture, "r5-quiet"),
+            1,
+            "the stranded container dying is a changed set with nothing left to name"
+        );
+        state.on_reconcile_done(Some(stranded));
+        assert_eq!(
+            stranded_warns(&capture, "r5-quiet"),
+            2,
+            "reappearing is a changed set again: one fresh warn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rescan_reports_a_stranded_container_once_across_the_actor() {
+        // End-to-end: the boot scan and every rescan trigger the reconcile; the
+        // warn lands once for the first sighting, the unchanged rescan is quiet,
+        // and a CHANGED set warns again — through the live actor loop, not a
+        // hand-called handler.
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("r5-e2e");
+        std::fs::write(
+            dir.join("r5-model.yaml"),
+            "name: r5-model\nengine: ninfer\ncategory: work\nvram_gb: 2\nninfer_autostart: /opt/r5.sh\nninfer_container: r5-e2e-a\n",
+        )
+        .expect("seed ninfer yaml");
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        adapters.insert(
+            "ninfer".to_string(),
+            Arc::new(crate::engine::ninfer::NinferAdapter::new("Ubuntu", "ops"))
+                as Arc<dyn EngineAdapter>,
+        );
+        let stranded_a: BTreeSet<String> = ["r5-e2e-a".to_string()].into_iter().collect();
+        let stranded_b: BTreeSet<String> = ["r5-e2e-b".to_string()].into_iter().collect();
+        let probe = Arc::new(ReconcileRuntime::new(vec![
+            Some(stranded_a.clone()),
+            Some(stranded_a.clone()),
+            Some(stranded_b.clone()),
+        ]));
+        let handle = Scheduler::start(
+            crate::config::AppConfig::default(),
+            dir.clone(),
+            adapters,
+            probe.clone() as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stranded_warns(&capture, "r5-e2e-a") < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the boot-scan reconcile never reported the stranded container"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            probe
+                .asked
+                .lock()
+                .expect("asked lock")
+                .iter()
+                .any(|names| names.iter().any(|name| name == "r5-e2e-a")),
+            "the probe must be asked with the catalog's declared `ninfer_container` names"
+        );
+        let status = handle.status().await.expect("actor alive");
+        assert_eq!(status.stranded_containers, Some(stranded_a));
+        handle.reload().await.expect("actor alive");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            stranded_warns(&capture, "r5-e2e-a"),
+            1,
+            "a rescan of an unchanged stranded set must not re-warn"
+        );
+        std::fs::write(
+            dir.join("r5-model.yaml"),
+            "name: r5-model\nengine: ninfer\ncategory: work\nvram_gb: 2\nninfer_autostart: /opt/r5.sh\nninfer_container: r5-e2e-b\n",
+        )
+        .expect("edit container name");
+        handle.reload().await.expect("actor alive");
+        while stranded_warns(&capture, "r5-e2e-b") < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the changed stranded set was never reported"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            stranded_warns(&capture, "r5-e2e-a"),
+            1,
+            "the departed name is not re-warned by the changed set"
+        );
+        let status = handle.status().await.expect("actor alive");
+        assert_eq!(
+            status.stranded_containers,
+            Some(stranded_b),
+            "the page rides the same replaced set the log warned about"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

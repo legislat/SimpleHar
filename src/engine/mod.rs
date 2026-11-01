@@ -13,7 +13,7 @@ pub mod strata;
 
 use crate::model::ModelEntry;
 use crate::ownership::SpawnTicket;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
@@ -322,6 +322,20 @@ pub trait EngineRuntime: Send + Sync {
     /// honored the `$3` contract). Never a gate — the verdict stays the probe's
     /// (chunk 10 ruling: evidence, not enforcement).
     async fn published_elsewhere(&self, _container: &str, _offered: u16) -> Option<String> {
+        None
+    }
+
+    /// R5 report-only reconcile (ruling 9, 2026-11-01): which of the container
+    /// names the catalog declares as `ninfer_container` are *running* in the
+    /// container engine right now while the harness's claim ledger records no
+    /// claim for them? Such a container strands its VRAM — the ownership-scoped
+    /// reaping may never touch it — so the operator gets it named. The answer
+    /// is a report, never an action: the caller warns, and nothing downstream
+    /// kills, evicts, or gates on it. `None` = nothing to report: this runtime
+    /// backs nothing with containers, or the probe could not run (a failed
+    /// probe is silence, never a warning). Default `None`: only the process
+    /// runtime answers.
+    async fn unclaimed_container_names(&self, _declared: &[String]) -> Option<BTreeSet<String>> {
         None
     }
 

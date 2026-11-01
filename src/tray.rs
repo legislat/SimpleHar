@@ -514,6 +514,7 @@ fn tick(
 ///     slots: vec![],
 ///     jobs: vec![],
 ///     catalog_errors: vec![],
+///     stranded_containers: None,
 /// };
 /// assert_eq!(
 ///     tray_state(Some(&status), &TraySignal::default()),
@@ -917,6 +918,7 @@ mod tests {
             slots,
             jobs,
             catalog_errors: Vec::new(),
+            stranded_containers: None,
         }
     }
 
@@ -1241,6 +1243,7 @@ mod tests {
             ],
             jobs: vec![],
             catalog_errors: Vec::new(),
+            stranded_containers: None,
         };
         let text = tooltip(&loaded_status, None);
         assert!(text.contains("WORK: qwen3"), "was: {text}");
