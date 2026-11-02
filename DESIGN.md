@@ -1029,7 +1029,7 @@ BUILT 2026-11-01 (`26e858a` - strata profile policy-field refusal at scan+spawn)
 context, cache) remain
 engine-schema data that SE preserves but does not interpret. **[SUPERSEDED
 2026-11-02 by operator ruling 19: strata template mode plus the import bridge
-replace the copy-in migration below - see `handoff/DECISIONS.md` rows 19/19c.]**
+replace the copy-in migration below - see `docs/architecture/DECISIONS.md` rows 19/19c.]**
 Consequences: strata
   profiles migrate into a harness-owned profile dir (copy-in, not symlink/external path;
   spawn from a `strata_config:` pointing outside the harness root — admission machinery
@@ -1049,5 +1049,5 @@ Consequences: strata
   `host`/`port`/`key`); a row still declaring `strata_config` is refused at scan with
   the migration sentence, and `simplehar-se import strata <profile.json>` (emits the
   yaml block, never applies it) replaces the held copy-in slice. See
-  `handoff/DECISIONS.md` rows 19 and 19c. The 2026-10-27 copy-in/strata-cells text
+  `docs/architecture/DECISIONS.md` rows 19 and 19c. The 2026-10-27 copy-in/strata-cells text
   above stands as history only.

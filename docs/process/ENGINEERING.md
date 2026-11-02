@@ -140,8 +140,9 @@ Verification:
 
 - No secrets, keys, or passwords in code or logs; never log tokens or PII.
 - Secrets come from environment or `.env`; `.env` stays gitignored.
-- Scrub absolute machine paths, hostnames, ports, container names, and model paths from any
-  committed artifact; the checklist is `docs/process/PUBLICATION.md`.
+- Scrub author-specific absolute paths, hostnames, ports, container names, and model
+  paths from any committed artifact; the checklist is `docs/process/PUBLICATION.md`.
+  Documented product defaults in README/reference and exact quoted decisions are allowed.
 - Never log prompts, completions, or key material into a shared artifact.
 
 ## Platform (Windows, PowerShell 5.1)

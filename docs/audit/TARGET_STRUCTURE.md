@@ -436,7 +436,8 @@ Each topic has exactly one authoritative home. Everything else is a link.
 - Decision rationale.
 - Test counts.
 - File line numbers.
-- Machine paths in durable docs.
+- Machine paths in durable docs. Documented product defaults in README/reference and
+  exact quoted decisions are the only exceptions.
 - Current HEAD or branch state in durable docs.
 - Full task narratives in the queue.
 

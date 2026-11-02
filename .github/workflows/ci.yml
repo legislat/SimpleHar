@@ -1,0 +1,41 @@
+# Cardless CI (decision D7): checks only. No card tests, no model loads, and
+# no engine start here; the card gate stays operator-only per
+# docs/process/VERIFICATION.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cardless gate
+        shell: pwsh
+        run: ./scripts/gate.ps1
+
+      - name: Doc check
+        shell: pwsh
+        run: node scripts/check-docs.mjs
+
+      - name: Task check
+        shell: pwsh
+        run: node scripts/check-tasks.mjs
+
+      - name: Instruction check
+        shell: pwsh
+        run: node scripts/check-instructions.mjs

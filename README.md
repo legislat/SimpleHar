@@ -1,3 +1,13 @@
+---
+title: SimpleHar SE user guide
+owner: operator
+status: active
+audience: [user, contributor]
+source_of_truth_for: [user-facing behavior and setup]
+last_reviewed: 2026-11-02
+review_trigger: behavior-change, release
+---
+
 # SimpleHar SE
 
 A Windows tray harness for local LLM inference engines: one app, one GPU, many
