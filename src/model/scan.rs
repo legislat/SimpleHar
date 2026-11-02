@@ -162,6 +162,15 @@ const CONSUMED_KEYS: &[&str] = &[
     "strata_config",
     "strata_python",
     "strata_cwd",
+    "strata_exe",
+    "strata_args",
+    "strata_tokenizer",
+    "strata_lib_dirs",
+    "strata_env",
+    "strata_gpu",
+    "strata_parallel",
+    "strata_gpus_asked",
+    "strata_vision",
     "ninfer_autostart",
     "ninfer_container",
     "ninfer_profile",
@@ -607,41 +616,78 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                     }
                 }
                 entry.gguf_size_gb = stat.map(|meta| meta.len() as f64 / (1024.0_f64).powi(3));
-                // A strata entry is its profile JSON, validated by the strata
-                // row's own check (slice 10c): unreadable JSON is a dead load,
-                // an absolute path the profile names and the disk lacks is the
-                // same doomed spawn one layer deeper, and a policy field
-                // (`host`, `port`, key) claimed inside the file decides nothing
-                // and refuses the entry outright (22[1]). Relative profile
-                // paths are exempt (the engine resolves them against the profile
-                // dir — chunk 10 backlog); the `log` key is exempt entirely (a log
-                // target's existence is not a load precondition).
+                // A strata row is either template mode — the row yaml owns the
+                // profile's fields and the harness renders the JSON, so the
+                // scan renders the same bytes and refuses a referenced path
+                // the disk lacks before any load gesture (row 19) — or still
+                // declares `strata_config`, the mode SUPERSEDED by ruling
+                // 2026-11-02 row 19: such a row is refused outright with the
+                // migration sentence, and the live manual profile it points at
+                // stays the operator's own file, read by nothing on the serve
+                // path. Relative rendered paths are exempt (the engine
+                // resolves them against the profile dir — chunk 10 backlog);
+                // the `log` key is exempt entirely (a log target's existence
+                // is not a load precondition).
                 if entry.engine == "strata" {
                     if let Some(profile) = map
                         .get("strata_config")
                         .map(|v| v.trim())
                         .filter(|v| !v.is_empty())
                     {
-                        if let Err(problem) =
-                            crate::engine::strata::validate_profile(Path::new(profile))
-                        {
-                            let kind = match &problem {
-                                crate::engine::strata::ProfileProblem::Unreadable => {
-                                    ScanKind::ProfileUnreadable
+                        catalog.errors.push(ScanError {
+                            kind: ScanKind::PolicyRefused,
+                            file: file_name.clone(),
+                            reason: crate::engine::strata::superseded_sentence(profile),
+                        });
+                        continue;
+                    }
+                    if crate::engine::strata::template_mode(&entry) {
+                        // The default cwd resolves exactly as the adapter's
+                        // does (the `engines:` default — scan runs before the
+                        // config-wired adapter exists, so the constant is the
+                        // single shared home); the value only joins the
+                        // rendered bytes, and a cwd only the config names is
+                        // re-checked with its true value at spec time.
+                        let cwd = map
+                            .get("strata_cwd")
+                            .map(|v| v.trim())
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or(crate::config::STRATA_CWD_DEFAULT);
+                        let rendered =
+                            crate::engine::strata::render_profile(&entry, Path::new(cwd));
+                        match rendered {
+                            Ok(text) => {
+                                if let Err(problem) =
+                                    crate::engine::strata::validate_profile_text(&text)
+                                {
+                                    let kind = match &problem {
+                                        crate::engine::strata::ProfileProblem::MissingPath {
+                                            ..
+                                        } => ScanKind::ModelPathMissing,
+                                        crate::engine::strata::ProfileProblem::PolicyField {
+                                            ..
+                                        } => ScanKind::PolicyRefused,
+                                    };
+                                    catalog.errors.push(ScanError {
+                                        kind,
+                                        file: file_name.clone(),
+                                        reason: problem
+                                            .describe(&format!("rendered:{}", entry.name)),
+                                    });
+                                    continue;
                                 }
-                                crate::engine::strata::ProfileProblem::MissingPath { .. } => {
-                                    ScanKind::ModelPathMissing
-                                }
-                                crate::engine::strata::ProfileProblem::PolicyField { .. } => {
-                                    ScanKind::PolicyRefused
-                                }
-                            };
-                            catalog.errors.push(ScanError {
-                                kind,
-                                file: file_name.clone(),
-                                reason: problem.describe(profile),
-                            });
-                            continue;
+                            }
+                            Err(error) => {
+                                // A shape refusal (a key that cannot carry its
+                                // value) is a typed reject, not a policy claim:
+                                // the refusal already names the yaml key.
+                                catalog.errors.push(ScanError {
+                                    kind: ScanKind::Other,
+                                    file: file_name.clone(),
+                                    reason: error.to_string(),
+                                });
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1722,57 +1768,62 @@ mod tests {
         assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
     }
 
+    /// A row that still declares `strata_config` is the SUPERSEDED mode
+    /// (ruling 2026-11-02 row 19): refused outright with the migration
+    /// sentence, whatever the profile file itself holds.
     #[test]
-    fn an_unreadable_or_invalid_strata_profile_drops_the_entry() {
-        let dir = crate::testutil::temp_dir("scan-strata-bad");
+    fn a_strata_config_row_is_refused_naming_the_import_command() {
+        let dir = crate::testutil::temp_dir("scan-strata-superseded");
         std::fs::create_dir_all(&dir).expect("temp dir");
-        std::fs::write(
-            dir.join("nofile.yaml"),
-            "engine: strata\nstrata_config: Z:/nope/missing.json\nvram_gb: 8\n",
-        )
-        .expect("write");
         std::fs::write(dir.join("broken.json"), "{ not json").expect("write profile");
-        std::fs::write(
-            dir.join("invalid.yaml"),
-            format!(
-                "engine: strata\nstrata_config: {}\nvram_gb: 8\n",
-                dir.join("broken.json").display()
+        for (file, target) in [
+            ("nofile.yaml", "Z:/nope/missing.json"),
+            (
+                "manual.yaml",
+                &dir.join("broken.json").display().to_string(),
             ),
-        )
-        .expect("write");
+        ] {
+            std::fs::write(
+                dir.join(file),
+                format!("engine: strata\nstrata_config: {target}\nvram_gb: 8\n"),
+            )
+            .expect("write");
+        }
         let catalog = scan_dir(&dir);
-        assert!(catalog.models.is_empty(), "neither entry may publish");
-        for file in ["nofile.yaml", "invalid.yaml"] {
+        assert!(catalog.models.is_empty(), "neither row may publish");
+        for file in ["nofile.yaml", "manual.yaml"] {
             assert!(
                 catalog
                     .errors
                     .iter()
-                    .any(|e| e.kind == ScanKind::ProfileUnreadable
+                    .any(|e| e.kind == ScanKind::PolicyRefused
                         && e.file.contains(file)
-                        && e.reason.starts_with("strata profile not readable: ")),
-                "{file} must be refused as an unreadable profile: {:?}",
+                        && e.reason.contains("superseded")
+                        && e.reason.contains("simplehar-se import strata")),
+                "{file} must be refused with the migration sentence: {:?}",
                 catalog.errors
             );
         }
     }
 
+    /// Template mode moves the path walk onto the RENDERA: a row whose engine
+    /// args name a path the disk lacks drops the entry at rescan, naming the
+    /// key and the path exactly as the old file walk did.
     #[test]
-    fn a_strata_profile_naming_a_missing_path_drops_the_entry_naming_key_and_path() {
+    fn a_template_row_naming_a_missing_path_drops_the_entry_naming_key_and_path() {
         let dir = crate::testutil::temp_dir("scan-strata-missing-path");
         std::fs::create_dir_all(&dir).expect("temp dir");
-        std::fs::write(
-            dir.join("profile.json"),
-            r#"{"exe": "C:\\Strata\\engine\\strata.exe", "args": ["--native", "Z:\\nope\\doomed.gguf"]}"#,
-        )
-        .expect("write profile");
-        std::fs::write(
-            dir.join("ref.yaml"),
-            format!(
-                "engine: strata\nstrata_config: {}\nvram_gb: 8\n",
-                dir.join("profile.json").display()
-            ),
-        )
-        .expect("write");
+        std::fs::write(dir.join("strata.exe"), b"x").expect("write exe");
+        std::fs::write(dir.join("tokenizer.bin"), b"t").expect("write tokenizer");
+        let yaml = format!(
+            "engine: strata\nvram_gb: 8\nserve_model: m\nstrata_exe: {}\n\
+             strata_tokenizer: {}\nstrata_cwd: {}\n\
+             strata_args: --native, Z:\\nope\\doomed.gguf\n",
+            dir.join("strata.exe").display(),
+            dir.join("tokenizer.bin").display(),
+            dir.display(),
+        );
+        std::fs::write(dir.join("ref.yaml"), yaml).expect("write");
         let catalog = scan_dir(&dir);
         assert!(catalog.models.is_empty());
         let error = catalog
@@ -1788,127 +1839,68 @@ mod tests {
             "{}",
             error.reason
         );
-        // The array element reports under its owning key so the operator can find
-        // the line in the profile.
+        // The array element reports under its owning key so the operator can
+        // find the line in the row.
         assert!(error.reason.contains("args"), "{}", error.reason);
     }
 
-    /// The `log` key is exempt entirely: a profile that writes its log beside the
-    /// model publishes even when the log target has never existed.
+    /// The `--control-vector-scaled <path>:1.0` shape: the scale suffix is
+    /// stripped before the stat, so a real file named `x.gguf` referenced as
+    /// `x.gguf:1.0` publishes instead of being falsely dropped.
     #[test]
-    fn a_strata_profile_log_key_is_exempt_from_existence() {
-        let dir = crate::testutil::temp_dir("scan-strata-log");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        std::fs::write(
-            dir.join("profile.json"),
-            r#"{"exe": "Z:\\nope\\strata.exe.log", "log": "Z:\\nope\\never-existed.log", "cwd": "."}"#,
-        )
-        .expect("write profile");
-        std::fs::write(
-            dir.join("log.yaml"),
-            format!(
-                "engine: strata\nstrata_config: {}\nvram_gb: 8\n",
-                dir.join("profile.json").display()
-            ),
-        )
-        .expect("write");
-        let catalog = scan_dir(&dir);
-        // `exe` is checked (and missing) — but with the exe present and only the
-        // log absent the entry must publish. Assert both halves.
-        assert!(catalog.models.is_empty(), "a missing exe still drops");
-        assert!(
-            !catalog
-                .errors
-                .iter()
-                .any(|e| e.reason.contains("never-existed")),
-            "the log key must never be judged: {:?}",
-            catalog.errors
-        );
-        std::fs::write(dir.join("strata.exe"), b"placeholder").expect("write exe");
-        std::fs::write(
-            dir.join("profile.json"),
-            format!(
-                "{{\"exe\": \"{}\", \"log\": \"Z:\\\\nope\\\\never-existed.log\"}}",
-                dir.join("strata.exe")
-                    .display()
-                    .to_string()
-                    .replace('\\', "\\\\")
-            ),
-        )
-        .expect("rewrite profile");
-        let catalog = scan_dir(&dir);
-        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
-        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
-    }
-
-    /// The `--control-vector-scaled <path>:1.0` shape: the scale suffix is stripped
-    /// before the stat, so a real file named `x.gguf` referenced as `x.gguf:1.0`
-    /// publishes instead of being falsely dropped.
-    #[test]
-    fn a_strata_control_vector_scale_suffix_is_stripped_before_the_stat() {
+    fn a_template_row_control_vector_scale_suffix_is_stripped_before_the_stat() {
         let dir = crate::testutil::temp_dir("scan-strata-scaled");
         std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("strata.exe"), b"x").expect("write exe");
+        std::fs::write(dir.join("tokenizer.bin"), b"t").expect("write tokenizer");
         std::fs::write(dir.join("vec.gguf"), b"v").expect("write vector");
-        std::fs::write(
-            dir.join("profile.json"),
-            format!(
-                "{{\"args\": [\"--control-vector-scaled\", \"{}:1.0\"]}}",
-                dir.join("vec.gguf")
-                    .display()
-                    .to_string()
-                    .replace('\\', "\\\\")
-            ),
-        )
-        .expect("write profile");
-        std::fs::write(
-            dir.join("scaled.yaml"),
-            format!(
-                "engine: strata\nstrata_config: {}\nvram_gb: 8\n",
-                dir.join("profile.json").display()
-            ),
-        )
-        .expect("write");
+        let yaml = format!(
+            "engine: strata\nvram_gb: 8\nserve_model: m\nstrata_exe: {}\n\
+             strata_tokenizer: {}\nstrata_cwd: {}\n\
+             strata_args: --control-vector-scaled, {}:1.0\n",
+            dir.join("strata.exe").display(),
+            dir.join("tokenizer.bin").display(),
+            dir.display(),
+            dir.join("vec.gguf").display(),
+        );
+        std::fs::write(dir.join("scaled.yaml"), yaml).expect("write");
         let catalog = scan_dir(&dir);
         assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
         assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
     }
 
+    /// A shape a knob cannot carry (a relative `strata_exe`) is reported as a
+    /// typed reject naming the key — and the row does not publish.
     #[test]
-    fn a_bom_prefixed_strata_profile_is_read_not_refused() {
-        // The live `strata-qwen-gptq-nvfp4.json` is UTF-8 with BOM; the engine
-        // reads it, so the scan must not call it unreadable.
-        let dir = crate::testutil::temp_dir("scan-strata-bom");
+    fn a_template_row_shape_refusal_reports_naming_the_yaml_key() {
+        let dir = crate::testutil::temp_dir("scan-strata-shape");
         std::fs::create_dir_all(&dir).expect("temp dir");
-        std::fs::write(dir.join("x.gguf"), b"m").expect("write model");
-        std::fs::write(
-            dir.join("profile.json"),
-            format!(
-                "\u{feff}{{\"exe\": \"{}\"}}",
-                dir.join("x.gguf")
-                    .display()
-                    .to_string()
-                    .replace('\\', "\\\\")
-            ),
-        )
-        .expect("write profile");
-        std::fs::write(
-            dir.join("bom.yaml"),
-            format!(
-                "engine: strata\nstrata_config: {}\nvram_gb: 8\n",
-                dir.join("profile.json").display()
-            ),
-        )
-        .expect("write");
+        std::fs::write(dir.join("tokenizer.bin"), b"t").expect("write tokenizer");
+        let yaml = format!(
+            "engine: strata\nvram_gb: 8\nserve_model: m\nstrata_exe: relative\\strata.exe\n\
+             strata_tokenizer: {}\n",
+            dir.join("tokenizer.bin").display(),
+        );
+        std::fs::write(dir.join("shape.yaml"), yaml).expect("write");
         let catalog = scan_dir(&dir);
-        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
-        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
+        assert!(catalog.models.is_empty());
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.file.contains("shape.yaml"))
+            .expect("the row must be reported");
+        assert!(
+            error.reason.contains("strata_exe") && error.reason.contains("absolute path"),
+            "{}",
+            error.reason
+        );
     }
 
     #[test]
-    fn a_strata_entry_without_the_config_key_defers_to_the_adapter() {
-        // The chunk 10 [2] preflight pin (`required field strata_config` refuses
-        // before the victim dies) needs this entry published, so an absent key is
-        // the adapter's refusal to name, not the scan's.
+    fn a_strata_entry_without_a_profile_source_defers_to_the_adapter() {
+        // The chunk 10 [2] preflight pin (`required field` refuses before the
+        // victim dies) needs this entry published, so an absent source key is
+        // the adapter's refusal to name (row 19: `strata_exe`), not the scan's.
         let dir = crate::testutil::temp_dir("scan-strata-nokey");
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(dir.join("nocfg.yaml"), "engine: strata\nvram_gb: 8\n").expect("write");
@@ -2237,60 +2229,34 @@ mod tests {
         );
     }
 
-    /// Slice 10c (22[1]): policy fields are harness-forced and never obeyed
-    /// from engine-side files — a strata profile that declares `host`, `port`
-    /// or a key refuses its model at rescan, naming the field and the
-    /// mechanism. A profile that decides nothing (the reviewed shape) still
-    /// publishes; a model that merely points at a clean profile is unaffected.
+    /// Slice 10c (22[1]) doctrine, row 19 shape: policy fields are harness-forced
+    /// and never obeyed from engine-side files — and the render makes claiming
+    /// them structurally impossible: a rendered profile carries no `host`, no
+    /// `port`, no key (the bind and port ride the forced argv), while the
+    /// defense-in-depth leg of `validate_profile_text` still refuses any JSON
+    /// that shows one. The scan-side witness is that every clean template row
+    /// publishes with those fields absent; the leg itself is pinned in the
+    /// adapter's module.
     #[test]
-    fn a_strata_profile_claiming_policy_fields_refuses_its_model() {
+    fn a_template_row_publishes_with_the_policy_fields_absent_by_construction() {
         let dir = crate::testutil::temp_dir("scan-profile-policy");
         std::fs::create_dir_all(&dir).expect("temp dir");
-        for (name, profile) in [
-            ("claims-port", r#"{"port": 8080}"#),
-            ("claims-host", r#"{"host": "0.0.0.0"}"#),
-            ("claims-key", r#"{"api_key": "hunter2"}"#),
-        ] {
-            std::fs::write(
-                dir.join(format!("{name}.yaml")),
-                format!(
-                    "engine: strata\nvram_gb: 8\nstrata_config: {}\n",
-                    dir.join(format!("{name}.json")).display()
-                ),
-            )
-            .expect("write yaml");
-            std::fs::write(dir.join(format!("{name}.json")), profile).expect("write profile");
-        }
+        std::fs::write(dir.join("strata.exe"), b"x").expect("write exe");
+        std::fs::write(dir.join("tokenizer.bin"), b"t").expect("write tokenizer");
         std::fs::write(
             dir.join("clean.yaml"),
             format!(
-                "engine: strata\nvram_gb: 8\nstrata_config: {}\n",
-                dir.join("clean.json").display()
+                "engine: strata\nvram_gb: 8\nserve_model: clean\nstrata_exe: {}\n\
+                 strata_tokenizer: {}\nstrata_cwd: {}\n",
+                dir.join("strata.exe").display(),
+                dir.join("tokenizer.bin").display(),
+                dir.display(),
             ),
         )
         .expect("write clean yaml");
-        std::fs::write(dir.join("clean.json"), r#"{"vision": {"enabled": true}}"#)
-            .expect("write clean profile");
         let catalog = scan_dir(&dir);
         assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
         assert_eq!(catalog.models[0].name, "clean");
-        for (name, field) in [
-            ("claims-port", "port"),
-            ("claims-host", "host"),
-            ("claims-key", "api_key"),
-        ] {
-            let hit = catalog
-                .errors
-                .iter()
-                .find(|e| e.kind == ScanKind::PolicyRefused && e.file.contains(name))
-                .unwrap_or_else(|| panic!("{name} must be refused: {:?}", catalog.errors));
-            assert!(
-                hit.reason.contains(&format!("`{field}`"))
-                    && hit.reason.contains("never obeyed from engine-side files"),
-                "the refusal names the field and the ruling: {}",
-                hit.reason
-            );
-        }
     }
 
     #[test]
@@ -2351,6 +2317,15 @@ mod tests {
              strata_config: C:/Strata/profile.json\n\
              strata_python: C:/Strata/.venv/Scripts/python.exe\n\
              strata_cwd: C:/Strata\n\
+             strata_exe: C:/Strata/engine/strata.exe\n\
+             strata_args: --pack, D:/models/pack\n\
+             strata_tokenizer: C:/Strata/tokenizer.bin\n\
+             strata_lib_dirs: C:/Strata/lib\n\
+             strata_env: STRATA_KVA=0\n\
+             strata_gpu: 0\n\
+             strata_parallel: 1\n\
+             strata_gpus_asked: true\n\
+             strata_vision: exe=C:/Strata/vision.exe mmproj=D:/m/mmproj.gguf model=D:/m/m.gguf\n\
              ninfer_autostart: /opt/a.sh\n\
              ninfer_container: golden-box\n\
              ninfer_profile: b\n\
@@ -2489,6 +2464,15 @@ mod tests {
             "strata_config",
             "strata_python",
             "strata_cwd",
+            "strata_exe",
+            "strata_args",
+            "strata_tokenizer",
+            "strata_lib_dirs",
+            "strata_env",
+            "strata_gpu",
+            "strata_parallel",
+            "strata_gpus_asked",
+            "strata_vision",
             "ninfer_autostart",
             "ninfer_container",
             "ninfer_profile",
@@ -2582,10 +2566,11 @@ mod tests {
     /// Fork C gate: the strict acceptance must not blind-side the live catalog.
     /// Since slice 10c "fully clean" is stated as a closed debt ledger: the
     /// live dir publishes every file whose bytes carry no harness-owned claim,
-    /// and the reports are exactly the ruled ones — the policy-field refusals
-    /// on the strata profiles that still declare `host`/`port` (22[1]: the
-    /// profiles must drop the keys — an in-flight serve is unaffected, the
-    /// refusal lands on the next load gesture). The `context` inert hints that
+    /// and the reports are exactly the ruled ones — since row 19 the three
+    /// strata rows are refused with the SUPERSEDED migration sentence (their
+    /// `strata_config` lines await the operator's `simplehar-se import strata`
+    /// adoption; an in-flight serve is unaffected, the refusal lands on the
+    /// next load gesture). The `context` inert hints that
     /// once sat on the ninfer rows landed their cleanup 2026-11-02: the key is
     /// live llama config and the ninfer context rides its `ninfer_profile`
     /// line, so the rows no longer carry it. Every entry is pinned by file and

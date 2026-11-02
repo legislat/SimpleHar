@@ -2,7 +2,7 @@
 //! self-reported id wins for proxy rewriting with a recorded warning on yaml
 //! mismatch; a dead engine's restart installs a fresh, correctly-identified
 //! engine; a genuine upstream error is never retried. The end-to-end mid-request
-//! retry (proxy send → connect failure → restart → retry) is asserted in
+//! retry (proxy send в†’ connect failure в†’ restart в†’ retry) is asserted in
 //! `tests/api_surface.rs` (`dead_engine_connect_failure_restarts_exactly_once`),
 //! where the request is really made.
 
@@ -138,7 +138,7 @@ async fn restart_after_death_installs_a_new_engine() {
     // T10.1's scheduler half. FINDINGS-20 [13]: this used to be named
     // `dead_engine_mid_request_is_restarted_and_retried_once` while sending NO
     // request — a test named for the retry contract that cannot see a retry. The
-    // end-to-end mid-request retry (send → connect failure → restart → retry) is
+    // end-to-end mid-request retry (send в†’ connect failure в†’ restart в†’ retry) is
     // asserted where the request is really made, in
     // `api_surface::dead_engine_connect_failure_restarts_exactly_once`; the name and
     // header here now say what THIS test proves: the dead engine is replaced by a
@@ -324,6 +324,7 @@ async fn a_self_dying_engine_stops_answering_before_the_fake_calls_it_gone() {
         },
         container: None,
         script: None,
+        rendered_profile: None,
         custody: None,
     };
     for round in 0..8u32 {

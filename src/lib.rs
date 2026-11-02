@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod config;
 pub mod custody;
 pub mod engine;
+pub mod import;
 pub mod listeners;
 pub mod model;
 pub mod observability;

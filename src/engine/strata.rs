@@ -1,28 +1,38 @@
-//! The strata engine adapter (DESIGN Step 7; port of the working v3.3 path).
+//! The strata engine adapter (DESIGN Step 7; strata template mode, operator
+//! ruling 2026-11-02 row 19).
 //!
-//! Strata is a Python server (`serve.server`) driven entirely by a profile JSON:
-//! the harness passes only the interpreter, the module, the `--config` path and
-//! the harness-assigned `--port` — weights, quant, context and cache behavior all
-//! live in the profile. Readiness needs the JSON `loaded` flag because strata's
-//! `/health` answers 200 while the weights are still streaming onto the card
-//! (v3.3 `engine.rs:208-226` parity).
+//! Strata is a Python server (`serve.server`) driven entirely by a profile JSON.
+//! Template mode means the ROW YAML owns the profile's fields and the harness
+//! renders the full JSON at every load: the child receives only the
+//! existence-checked interpreter plus the forced tokens the `strata` row of the
+//! [`crate::engine::policy`] table spells (module, engine tag, loopback bind,
+//! harness-rendered profile position, harness-assigned port). Readiness needs
+//! the JSON `loaded` flag because strata's `/health` answers 200 while the
+//! weights are still streaming onto the card (v3.3 `engine.rs:208-226` parity).
+//!
+//! The rendered profile lives in the harness's own root beside the custody
+//! sidecar (content-addressed name, atomic write, keep-N prune — the runtime
+//! stages it and rewrites `--config` to exactly that path, chunk 10 custody
+//! doctrine: engines obey only harness-owned locations). `host`, `port` and key
+//! fields are absent by construction — the bind is the forced loopback
+//! `--host` argv and the port the forced `--port` (server.py resolves both
+//! flags ahead of any profile key) — so ruling 22[1] holds by rendering, not
+//! by policing. The external `strata_config` mode is SUPERSEDED: a row that
+//! still declares it is refused with the migration sentence, and
+//! `simplehar-se import strata <profile.json>` turns a manual profile into the
+//! row yaml. `C:\Strata` stays the manual-launch home the serve path never
+//! reads.
 //!
 //! There is no preload in this harness (engine work is on-demand only), and the
 //! yamls carry no autostart keys: a strata engine spawns only when an operator
 //! loads the model by name.
 //!
-//! What the adapter validates of the three yaml strings it passes on (FINDINGS2-0910
-//! [5] floor, 2026-10-29): `strata_config` must be an existing file, `strata_python`
-//! an existing `.exe` **file** (it is the launched program), and `strata_cwd` an
-//! existing directory. Since slice 10c the profile's *contents* are checked too —
-//! [`validate_profile`] runs at scan and again at spawn, so a profile that cannot
-//! be parsed, references a path the disk lacks, or claims a harness-forced policy
-//! field (`host`, `port`, key — FINDINGS-22 [1]) is refused before the child
-//! starts, never obeyed. The roots that decide which paths are admissible at
-//! all remain the strata `custody_*` cells of the
-//! [`crate::engine::policy`] `EnginePolicy` table (§20-9 Fork C), still open in
-//! 10a with the root values moving to the config's `engines:` section in a later
-//! custody slice.
+//! What the adapter validates (FINDINGS2-0910 [5] floor, 2026-10-29):
+//! `strata_python` must be an existing `.exe` **file** (it is the launched
+//! program) and `strata_cwd` an existing directory. The rendered profile's
+//! contents are checked too — [`validate_profile_text`] runs at scan and again
+//! at spec, so a value that references a path the disk lacks is refused before
+//! the child starts, never launched on.
 
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
@@ -75,13 +85,11 @@ pub(crate) fn policy_field_claims(profile: &str, claims: &[(&str, &str)]) -> Str
     )
 }
 
-/// Why a strata profile file is not loadable. The scan maps each leg to its
+/// Why a rendered strata profile is not loadable. The scan maps each leg to its
 /// `ScanKind` (and its established sentence), the adapter refuses every leg
 /// the same `EngineError::Rejected` way — one check, both doors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProfileProblem {
-    /// The file cannot be read, or is not valid JSON (BOM permitted).
-    Unreadable,
     /// The JSON references an absolute path the disk lacks (the doomed spawn
     /// one layer deeper; relative paths and the `log` key are exempt).
     MissingPath {
@@ -90,8 +98,10 @@ pub(crate) enum ProfileProblem {
         /// The missing absolute path.
         path: String,
     },
-    /// The JSON declares top-level fields the harness forces (22[1]); every
-    /// claim the file carries is listed at once, each with its owning mechanism.
+    /// The JSON declares top-level fields the harness forces (22[1]). The
+    /// renderer structurally cannot emit one, so reaching this leg means a
+    /// renderer bug — it refuses anyway, because a profile that claims a
+    /// harness-forced field must never launch regardless of who wrote it.
     PolicyField {
         /// `(field, owner)` for each claimed field.
         claims: Vec<(&'static str, &'static str)>,
@@ -99,13 +109,12 @@ pub(crate) enum ProfileProblem {
 }
 
 impl ProfileProblem {
-    /// The operator-facing sentence, with the profile path as the caller
-    /// names it (byte-identical to the established scan text for the two
-    /// pre-existing legs).
+    /// The operator-facing sentence, with the profile as the caller names it
+    /// (the rendered copy is named `rendered:<model>`, never a path — pointing
+    /// at an operator file would suggest one is a launch input).
     #[must_use]
     pub(crate) fn describe(&self, profile: &str) -> String {
         match self {
-            Self::Unreadable => format!("strata profile not readable: {profile}"),
             Self::MissingPath { key, path } => {
                 format!("strata profile references missing path: {key} = {path}")
             }
@@ -114,29 +123,20 @@ impl ProfileProblem {
     }
 }
 
-/// The strata row's profile check, shared by the scan (which reports it) and
-/// the adapter (which refuses the spawn with it — the profile is read by the
-/// child minutes after admission evicted any victim, so an unreadable file, a
-/// missing referenced path, or a policy-field claim all refuse at spec time,
-/// never launch on it). Order: readability, referenced paths, then policy
-/// fields — a profile that cannot even be parsed is reported as unreadable,
-/// exactly as the scan did before this shared helper existed.
+/// The strata profile check, run over the RENDERED JSON text: the scan runs it
+/// on every template row (a doomed spawn refuses at rescan, not at load, after
+/// admission may already have evicted a resident), and the adapter re-runs it
+/// at spec time — a model file deleted between scan and load meets the same
+/// typed refusal. The bytes arrive from [`render_profile`], so an unparseable
+/// shape is structurally impossible; the legs that stay load-bearing are the
+/// referenced paths and (defense in depth) the harness-forced-field claim.
 ///
 /// # Errors
 ///
-/// The first [`ProfileProblem`] the file shows.
-pub(crate) fn validate_profile(path: &Path) -> Result<(), ProfileProblem> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Err(ProfileProblem::Unreadable);
-    };
-    // A UTF-8 BOM is ignored, not refused (same doctrine as
-    // `parse_flat_yaml`; RFC 8259 permits it, and the strata engine reads
-    // BOM'd profiles today — the live `strata-qwen-gptq-nvfp4.json` carries
-    // one).
-    let json = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
-        return Err(ProfileProblem::Unreadable);
-    };
+/// The first [`ProfileProblem`] the JSON shows.
+pub(crate) fn validate_profile_text(json: &str) -> Result<(), ProfileProblem> {
+    let root = serde_json::from_str::<serde_json::Value>(json)
+        .expect("the renderer's own JSON parses; a failure here is a renderer bug");
     if let Some((key, missing)) = missing_profile_path(&root) {
         return Err(ProfileProblem::MissingPath { key, path: missing });
     }
@@ -205,6 +205,360 @@ fn is_absolute_shape(text: &str) -> bool {
         || text.starts_with("\\\\")
 }
 
+/// The migration sentence for a row that still declares `strata_config`
+/// (operator ruling 2026-11-02 row 19: no compat path — the external profile
+/// mode is superseded at once, and the import command is the bridge). One
+/// sentence, two doors: the scan refuses the row with it and the adapter
+/// refuses a hand-built entry the same way.
+pub(crate) fn superseded_sentence(path: &str) -> String {
+    format!(
+        "`strata_config` ({path}) is superseded by the rendered-profile template: run \
+         `simplehar-se import strata \"{path}\"`, merge its output into this row, and delete \
+         the `strata_config` line"
+    )
+}
+
+/// The template-mode selector: a strata row renders its profile when the yaml
+/// carries `strata_exe` — the engine binary the rendered profile will name.
+pub(crate) fn template_mode(model: &ModelEntry) -> bool {
+    knob(model, "strata_exe").is_some()
+}
+
+/// One optional yaml value, trimmed; an empty or whitespace-only value reads
+/// as absent, so clearing a key clears the field.
+fn knob<'a>(model: &'a ModelEntry, key: &str) -> Option<&'a str> {
+    model
+        .raw
+        .get(key)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+}
+
+/// A required single-value key that must carry an absolute-path shape
+/// (drive-letter or UNC): the rendered profile is walked for existence at both
+/// doors, but shape refuses here so the error names the yaml key a hand-shape
+/// check at the walk could only report as a path.
+fn required_path(
+    model: &ModelEntry,
+    key: &str,
+    rejected: &dyn Fn(String) -> EngineError,
+) -> Result<String, EngineError> {
+    let Some(value) = knob(model, key) else {
+        return Err(EngineError::MissingField {
+            model: model.name.clone(),
+            field: key.to_string(),
+        });
+    };
+    if profile_path_candidate(value).is_none() {
+        return Err(rejected(format!(
+            "`{key}` must be an absolute path (drive-letter or UNC): {value}"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+/// A comma-separated path list (`strata_lib_dirs`): the ninfer
+/// `ninfer_model_roots` idiom — the comma is the only separator, so paths may
+/// hold spaces but never commas (measured: no inference path on this box does).
+fn path_list(
+    model: &ModelEntry,
+    key: &str,
+    rejected: &dyn Fn(String) -> EngineError,
+) -> Result<Vec<String>, EngineError> {
+    let Some(line) = knob(model, key) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in line.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(rejected(format!(
+                "`{key}` entries must be non-empty, comma-separated absolute paths: {line}"
+            )));
+        }
+        if profile_path_candidate(entry).is_none() {
+            return Err(rejected(format!(
+                "`{key}` entries must be absolute paths (drive-letter or UNC): {entry}"
+            )));
+        }
+        out.push(entry.to_string());
+    }
+    Ok(out)
+}
+
+/// An optional unsigned integer key (`strata_gpu`, `strata_parallel`).
+fn unsigned(
+    model: &ModelEntry,
+    key: &str,
+    rejected: &dyn Fn(String) -> EngineError,
+) -> Result<Option<u64>, EngineError> {
+    let Some(value) = knob(model, key) else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| rejected(format!("`{key}` must be a non-negative integer: {value}")))
+}
+
+/// The `strata_env` surface: whitespace-separated `NAME=VALUE` tokens where the
+/// name is a `STRATA_`-prefixed engine setting (`STRATA_KVA=0`) — the shape
+/// ninfer enforces by enumerating its vars, enforced here by the engine's own
+/// namespace: no foreign `LD_PRELOAD`-style name can enter the child's profile.
+fn env_map(
+    model: &ModelEntry,
+    rejected: &dyn Fn(String) -> EngineError,
+) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+    let mut map = serde_json::Map::new();
+    let Some(line) = knob(model, "strata_env") else {
+        return Ok(map);
+    };
+    for token in line.split_whitespace() {
+        let bad = |why: &str| {
+            Err(rejected(format!(
+                "`strata_env` tokens must be STRATA_<NAME>=<VALUE> ({why}): {token}"
+            )))
+        };
+        let Some((name, value)) = token.split_once('=') else {
+            return bad("one `=`");
+        };
+        let name_ok = name.strip_prefix("STRATA_").is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        });
+        if !name_ok {
+            return bad("uppercase `STRATA_`-prefixed name");
+        }
+        let value_ok = !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'));
+        if !value_ok {
+            return bad("plain value (letters, digits, `._+-`)");
+        }
+        map.insert(
+            name.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    Ok(map)
+}
+
+/// The `strata_vision` block: whitespace-separated `k=v` tokens over the fixed
+/// key set — `exe`, `mmproj` and `model` are absolute paths (required together,
+/// the vision server cannot start without them), `gpu` is truthy (default on,
+/// as every manual profile has it), `max_tokens` an unsigned count. Rendering
+/// the block also appends the engine's `--vision` switch to `args` (server.py
+/// derives the switch from the block's presence); the canonical row therefore
+/// spells the vision ONCE, in the block.
+fn vision_block(
+    model: &ModelEntry,
+    rejected: &dyn Fn(String) -> EngineError,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, EngineError> {
+    let Some(line) = knob(model, "strata_vision") else {
+        return Ok(None);
+    };
+    let mut taken = serde_json::Map::new();
+    let mut gpu = true;
+    let mut max_tokens: Option<u64> = None;
+    for token in line.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            return Err(rejected(format!(
+                "`strata_vision` tokens must be k=v over exe, mmproj, model, gpu, max_tokens: {token}"
+            )));
+        };
+        match key {
+            "exe" | "mmproj" | "model" => {
+                if profile_path_candidate(value).is_none() {
+                    return Err(rejected(format!(
+                        "`strata_vision` {key} must be an absolute path (drive-letter or UNC): {value}"
+                    )));
+                }
+                taken.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            }
+            "gpu" => gpu = crate::model::truthy(value),
+            "max_tokens" => {
+                max_tokens = Some(value.parse::<u64>().map_err(|_| {
+                    rejected(format!(
+                        "`strata_vision` max_tokens must be a number: {value}"
+                    ))
+                })?);
+            }
+            other => {
+                return Err(rejected(format!(
+                "`strata_vision` key `{other}` is not one of exe, mmproj, model, gpu, max_tokens"
+            )))
+            }
+        }
+    }
+    for required in ["exe", "mmproj", "model"] {
+        if !taken.contains_key(required) {
+            return Err(rejected(format!(
+                "`strata_vision` requires `{required}` when a vision block is declared"
+            )));
+        }
+    }
+    taken.insert("gpu".to_string(), serde_json::Value::Bool(gpu));
+    if let Some(tokens) = max_tokens {
+        taken.insert("max_tokens".to_string(), serde_json::json!(tokens));
+    }
+    Ok(Some(taken))
+}
+
+/// Renders the complete strata profile JSON from the row's yaml (operator
+/// ruling 2026-11-02 row 19 — the L3 render of the ninfer idiom: the harness
+/// writes the artifact, so the launch is exactly what this function checked).
+/// `host`, `port` and key fields are never emitted: the bind and the port ride
+/// the forced argv (the `--host` loopback literal and the slot `--port`), and
+/// server.py resolves both flags ahead of any profile key. `cwd` arrives from
+/// the adapter's already-existence-checked resolution; the engine `log` lands
+/// in the harness's own profile root. Every refusal names the yaml key the
+/// operator has to fix (G6).
+///
+/// # Errors
+///
+/// [`EngineError::MissingField`] for a required key, [`EngineError::Rejected`]
+/// for a shape the key cannot carry.
+pub(crate) fn render_profile(model: &ModelEntry, cwd: &Path) -> Result<String, EngineError> {
+    let rejected = &|reason: String| EngineError::Rejected {
+        engine: "strata".to_string(),
+        model: model.name.clone(),
+        reason,
+    };
+    let exe = required_path(model, "strata_exe", rejected)?;
+    let tokenizer = required_path(model, "strata_tokenizer", rejected)?;
+    let Some(model_name) = model
+        .serve_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Err(EngineError::MissingField {
+            model: model.name.clone(),
+            field: "serve_model".to_string(),
+        });
+    };
+    let mut args: Vec<String> = match knob(model, "strata_args") {
+        Some(line) => {
+            let tokens: Vec<String> = line
+                .split(',')
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty())
+                .collect();
+            let spelled = line.split(',').count();
+            if tokens.len() != spelled {
+                return Err(rejected(format!(
+                    "`strata_args` must be comma-separated non-empty engine tokens: {line}"
+                )));
+            }
+            tokens
+        }
+        None => Vec::new(),
+    };
+    if let Some(banned) = args
+        .iter()
+        .find(|token| *token == "--host" || *token == "--port")
+    {
+        return Err(rejected(format!(
+            "`{banned}` in `strata_args` is harness-forced argv and must not be spelled by the row"
+        )));
+    }
+    let vision = vision_block(model, rejected)?;
+    if vision.is_some() {
+        if args.iter().any(|token| token == "--vision") {
+            return Err(rejected(
+                "the `strata_vision` block already switches vision on; drop the `--vision` \
+                 token from `strata_args`"
+                    .to_string(),
+            ));
+        }
+        args.push("--vision".to_string());
+    }
+    let mut profile = serde_json::Map::new();
+    profile.insert("exe".to_string(), serde_json::Value::String(exe));
+    profile.insert(
+        "args".to_string(),
+        serde_json::Value::Array(
+            args.into_iter()
+                .map(serde_json::Value::String)
+                .collect::<Vec<_>>(),
+        ),
+    );
+    profile.insert(
+        "cwd".to_string(),
+        serde_json::Value::String(cwd.to_string_lossy().into_owned()),
+    );
+    profile.insert(
+        "tokenizer".to_string(),
+        serde_json::Value::String(tokenizer),
+    );
+    profile.insert(
+        "model_name".to_string(),
+        serde_json::Value::String(model_name.to_string()),
+    );
+    profile.insert(
+        "log".to_string(),
+        serde_json::Value::String(
+            crate::process::strata_profiles_dir()
+                .join(format!(
+                    "{}.log",
+                    crate::process::sanitize_slug(&model.name)
+                ))
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    let dirs = path_list(model, "strata_lib_dirs", rejected)?;
+    if !dirs.is_empty() {
+        profile.insert(
+            "lib_dirs".to_string(),
+            serde_json::Value::Array(
+                dirs.into_iter()
+                    .map(serde_json::Value::String)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    let env = env_map(model, rejected)?;
+    if !env.is_empty() {
+        profile.insert("env".to_string(), serde_json::Value::Object(env));
+    }
+    if let Some(gpu) = unsigned(model, "strata_gpu", rejected)? {
+        profile.insert("gpu".to_string(), serde_json::json!(gpu));
+    }
+    if let Some(parallel) = unsigned(model, "strata_parallel", rejected)? {
+        profile.insert("parallel".to_string(), serde_json::json!(parallel));
+    }
+    if knob(model, "strata_gpus_asked").is_some_and(crate::model::truthy) {
+        profile.insert("gpus_asked".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(vision) = vision {
+        profile.insert("vision".to_string(), serde_json::Value::Object(vision));
+    }
+    // The content address is the version: one deterministic render per yaml,
+    // so the pretty form only has to stay stable across harness builds, and
+    // serde_json's BTreeMap order already guarantees that.
+    serde_json::to_string_pretty(&serde_json::Value::Object(profile))
+        .map_err(|e| rejected(format!("the rendered profile would not serialize: {e}")))
+}
+
+/// The staged file name a rendered profile carries: the sanitized model slug
+/// plus the same content address the runtime verifies the bytes against before
+/// it rewrites `--config` (one hash, one naming rule — the ledger, the argv
+/// placeholder and the file on disk name the same bytes).
+pub(crate) fn staged_profile_name(slug: &str, text: &str) -> String {
+    format!(
+        "{}-{:016x}.json",
+        crate::process::sanitize_slug(slug),
+        crate::process::script_content_hash(text)
+    )
+}
+
 /// Strata adapter: argv from data, `/health` 200 **and** `loaded != false`.
 #[derive(Debug, Clone)]
 pub struct StrataAdapter {
@@ -262,56 +616,34 @@ impl EngineAdapter for StrataAdapter {
         };
         let row = super::policy::engine_policy("strata")
             .expect("the compiled-in table ships a strata row");
-        // Required profile JSON, existence-checked before spawn (v3.3 parity:
-        // the child would otherwise die minutes into a model load). It must also be
-        // a FILE: a directory named `x.json` is the same doomed spawn one step
-        // later, and the python child's own error would arrive after admission
-        // already evicted a resident engine (FINDINGS2-0910 [5] floor).
-        let Some(config) = model
-            .raw
-            .get("strata_config")
-            .map(String::as_str)
-            .filter(|v| !v.trim().is_empty())
-        else {
+        // One profile source, gated before anything else (operator ruling
+        // 2026-11-02 row 19): `strata_exe` selects the harness render, and the
+        // external `strata_config` mode is SUPERSEDED — a row still declaring
+        // it meets the migration sentence, not a launch. The argv placeholder
+        // below is a harness-minted file name, and the runtime rewrites it to
+        // exactly the staged bytes, so no operator path ever reaches the child.
+        let legacy = knob(model, "strata_config");
+        if template_mode(model) {
+            if let Some(path) = legacy {
+                return Err(rejected(format!(
+                    "`strata_exe` (harness-rendered profile) and `strata_config` (operator \
+                     file) are mutually exclusive: a launch has exactly one profile source, \
+                     and the row still names the file: {path}"
+                )));
+            }
+        } else if let Some(path) = legacy {
+            return Err(rejected(superseded_sentence(path)));
+        } else {
             return Err(EngineError::MissingField {
                 model: model.name.clone(),
-                field: "strata_config".to_string(),
+                field: "strata_exe".to_string(),
             });
-        };
-        // Custody admission (slice 10d): the profile is a data-custody input.
-        // The strata data cells stay open until the copy-in slice populates them
-        // (ruling 5), so admission passes today — the mechanism stands in front
-        // of the disk work so the later slice enforces without touching this
-        // call site.
-        super::policy::admit_custody_path(
-            row,
-            super::policy::CustodyClass::Data,
-            &model.name,
-            "strata_config",
-            config,
-        )?;
-        let config_path = Path::new(config);
-        if !config_path.is_file() {
-            return Err(rejected(if config_path.exists() {
-                format!("strata_config is not a file: {config}")
-            } else {
-                format!("strata_config not found: {config}")
-            }));
-        }
-        // The file is only the floor (10c): the profile's contents are the
-        // launch the child will actually obey, so the same check the scan ran
-        // is re-run here — a profile edited or swapped after the rescan cannot
-        // silently launch on a mix, and the refusal (unreadable, missing path,
-        // or claimed policy field — 22[1]) names the reason the scan would
-        // have named.
-        if let Err(problem) = validate_profile(config_path) {
-            return Err(rejected(problem.describe(config)));
         }
         // The interpreter is `argv[0]`, so it is the one yaml string that chooses
         // which program CreateProcessW starts. Refuse garbage early rather than
         // start whatever path happens to exist: an existing FILE whose name ends in
         // `.exe`, matching how the llama adapter refuses a missing binary.
-        // Location custody (the row's executed-path roots, §20-9 Fork C) rides on
+        // Location custody (the row's executed-path roots, В§20-9 Fork C) rides on
         // top of this shape floor in the `admit_custody_path` call below: while
         // the cells are open it admits everything (ruling 5), and it will enforce
         // unchanged once a later copy-in slice populates them. The shape rule
@@ -374,8 +706,19 @@ impl EngineAdapter for StrataAdapter {
                 cwd.display()
             )));
         }
+        // The render is the launch (row 19): every shape the profile must keep
+        // is refused naming its yaml key, and the referenced paths get the same
+        // walk the scan ran — a model file deleted between scan and load meets
+        // the typed refusal here, minutes before the child would die on it.
+        let profile_text = render_profile(model, &cwd)?;
+        if let Err(problem) = validate_profile_text(&profile_text) {
+            return Err(rejected(
+                problem.describe(&format!("rendered:{}", model.name)),
+            ));
+        }
+        let staged_name = staged_profile_name(&model.name, &profile_text);
         Ok(LaunchSpec {
-            argv: self.argv(row, &python, config, port),
+            argv: self.argv(row, &python, &staged_name, port),
             cwd,
             env: BTreeMap::new(),
             log_name: model.name.clone(),
@@ -392,6 +735,7 @@ impl EngineAdapter for StrataAdapter {
             ),
             container: None,
             script: None,
+            rendered_profile: Some(profile_text),
             // The strata router outlives nothing but its own job object unless the
             // harness records it: every strata launch rides the custody sidecar
             // (chunk 10 slice 10b) so a crashed run's orphan is provably ours to
@@ -436,44 +780,113 @@ mod tests {
         }
     }
 
-    /// A real file on disk stands in for the profile JSON and the interpreter:
-    /// the adapter existence-checks both before handing a spec to the runtime.
-    fn real_file(tag: &str) -> PathBuf {
-        real_file_with_extension(tag, "json")
-    }
-
-    /// As [`real_file`], with the extension under test: the interpreter rule is an
-    /// extension rule, so a "file that exists" fixture must be able to be a `.cmd`.
+    /// A real file on disk stands in for every referenced path the walk checks
+    /// (engine exe, tokenizer, weights) and, with the right extension, for the
+    /// interpreter: the adapter shape-checks the interpreter and the render
+    /// existence-checks every profile path before handing a spec over.
     fn real_file_with_extension(tag: &str, extension: &str) -> PathBuf {
         let path = crate::testutil::temp_dir("strata").join(format!("{tag}.{extension}"));
         std::fs::write(&path, b"{}").expect("temp file");
         path
     }
 
+    fn path_text(path: &Path) -> &str {
+        path.to_str().expect("utf-8 fixture path")
+    }
+
+    /// The minimal valid template row: existing engine exe + tokenizer, and a
+    /// cwd that does not depend on the machine's engine homes.
+    fn fixture_pairs() -> Vec<(String, String)> {
+        let exe = real_file_with_extension("fixture-exe", "exe");
+        let tokenizer = real_file_with_extension("fixture-tokenizer", "bin");
+        let cwd = crate::testutil::temp_dir("strata-cwd");
+        vec![
+            ("strata_exe".to_string(), path_text(&exe).to_string()),
+            (
+                "strata_tokenizer".to_string(),
+                path_text(&tokenizer).to_string(),
+            ),
+            ("strata_cwd".to_string(), path_text(&cwd).to_string()),
+        ]
+    }
+
+    fn spec_of(base: &[(String, String)], extra: &[(&str, &str)]) -> LaunchSpec {
+        let mut pairs: Vec<(&str, &str)> =
+            base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        pairs.extend_from_slice(extra);
+        StrataAdapter::new(
+            std::env::current_exe().expect("a real .exe stand-in"),
+            std::env::temp_dir(),
+        )
+        .spec(&entry(&pairs), 18109)
+        .expect("valid template spec")
+    }
+
+    /// The full-contract pin (row 19): the harness forces the bind and port as
+    /// argv, the `--config` slot carries ONLY the content-addressed render
+    /// name, and the rendered JSON owns every profile field with no policy
+    /// keys of its own.
     #[test]
-    fn argv_matches_the_v33_contract() {
-        let config = real_file("argv");
-        let spec = StrataAdapter::default()
-            .spec(
-                &entry(&[("strata_config", config.to_str().expect("utf-8 path"))]),
-                18109,
-            )
-            .expect("valid spec");
+    fn the_render_names_its_bytes_and_the_argv_forces_bind_and_port() {
+        let base = fixture_pairs();
+        let weights = real_file_with_extension("weights", "gguf");
+        let spec = spec_of(
+            &base,
+            &[(
+                "strata_args",
+                &format!("--pack, --native, {}", path_text(&weights)),
+            )],
+        );
+        let text = spec.rendered_profile.expect("template render");
+        let name = spec
+            .argv
+            .iter()
+            .skip_while(|arg| *arg != "--config")
+            .nth(1)
+            .expect("the forced --config slot");
         assert_eq!(
-            spec.argv,
-            vec![
-                DEFAULT_PYTHON,
+            name.as_str(),
+            staged_profile_name("strata-test", &text),
+            "the argv placeholder must be the render's own content address"
+        );
+        let mut expected: Vec<String> = vec![std::env::current_exe()
+            .expect("test exe")
+            .to_string_lossy()
+            .into_owned()];
+        expected.extend(
+            [
                 "-m",
                 "serve.server",
                 "--engine",
                 "strata",
+                "--host",
+                "127.0.0.1",
                 "--config",
-                config.to_str().expect("utf-8 path"),
+                name.as_str(),
                 "--port",
                 "18109",
             ]
+            .map(str::to_string),
         );
-        assert_eq!(spec.cwd, PathBuf::from(DEFAULT_CWD));
+        assert_eq!(spec.argv, expected);
+        let profile: serde_json::Value = serde_json::from_str(&text).expect("rendered JSON");
+        let top: Vec<&str> = profile
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for banned in ["host", "port", "key", "api_key"] {
+            assert!(
+                !top.contains(&banned),
+                "the render owns no {banned}: {text}"
+            );
+        }
+        assert_eq!(profile["model_name"], "qwen3.8-flash-next");
+        assert_eq!(profile["args"][2], path_text(&weights));
+        assert!(profile["log"]
+            .as_str()
+            .is_some_and(|log| log.ends_with("strata-test.log")));
         assert_eq!(spec.log_name, "strata-test");
         assert_eq!(
             spec.custody.as_deref(),
@@ -481,271 +894,329 @@ mod tests {
             "every strata launch rides the custody sidecar (slice 10b)"
         );
         assert!(spec.env.is_empty());
-        assert_eq!(
-            spec.readiness,
-            ReadinessSpec::Then(
-                Box::new(ReadinessSpec::Http {
-                    path: "/health".to_string(),
-                    expect_status: 200,
-                }),
-                Box::new(ReadinessSpec::HttpFlag {
-                    path: "/health".to_string(),
-                    expect_status: 200,
-                    field: "loaded".to_string(),
-                }),
-            )
+    }
+
+    /// Every optional knob lands in the rendered JSON with its engine shape.
+    #[test]
+    fn every_owned_field_lands_in_the_render() {
+        let base = fixture_pairs();
+        let pack = crate::testutil::temp_dir("strata-pack");
+        let spec = spec_of(
+            &base,
+            &[
+                ("strata_args", &format!("--pack, {}", path_text(&pack))),
+                ("strata_lib_dirs", path_text(&pack)),
+                ("strata_env", "STRATA_KVA=0 STRATA_HC_Q8=1"),
+                ("strata_gpu", "0"),
+                ("strata_parallel", "1"),
+                ("strata_gpus_asked", "true"),
+                (
+                    "strata_vision",
+                    &format!(
+                        "exe={} mmproj={} model={} gpu=true max_tokens=1024",
+                        path_text(&pack),
+                        path_text(&pack),
+                        path_text(&pack)
+                    ),
+                ),
+            ],
         );
-        let _ = std::fs::remove_file(config);
+        let text = spec.rendered_profile.expect("template render");
+        let profile: serde_json::Value = serde_json::from_str(&text).expect("rendered JSON");
+        assert_eq!(profile["lib_dirs"][0], path_text(&pack));
+        assert_eq!(profile["env"]["STRATA_KVA"], "0");
+        assert_eq!(profile["gpu"], 0);
+        assert_eq!(profile["parallel"], 1);
+        assert_eq!(profile["gpus_asked"], true);
+        assert_eq!(profile["vision"]["max_tokens"], 1024);
+        let last_arg = profile["args"].as_array().expect("args").last().cloned();
+        assert_eq!(
+            last_arg,
+            Some(serde_json::Value::String("--vision".to_string())),
+            "the vision block switches the engine on at the canonical tail: {text}"
+        );
     }
 
     #[test]
-    fn yaml_overrides_interpreter_and_cwd() {
-        let config = real_file("override");
-        let python = std::env::current_exe().expect("a real interpreter stand-in");
-        let cwd = std::env::temp_dir();
-        let spec = StrataAdapter::default()
+    fn a_superseded_row_is_refused_naming_the_import_command() {
+        let err = StrataAdapter::default()
             .spec(
-                &entry(&[
-                    ("strata_config", config.to_str().expect("utf-8 path")),
-                    ("strata_python", python.to_str().expect("utf-8 path")),
-                    ("strata_cwd", cwd.to_str().expect("utf-8 path")),
-                ]),
-                18110,
+                &entry(&[("strata_config", "C:\\Strata\\strata-iq3_s.json")]),
+                18109,
             )
-            .expect("valid spec");
-        assert_eq!(spec.argv[0], python.to_str().expect("utf-8 path"));
-        assert_eq!(spec.argv[8], "18110");
-        assert_eq!(spec.cwd, cwd);
-        let _ = std::fs::remove_file(config);
-    }
-
-    /// Pin of the `cpu_offload` engine scoping: the strata adapter reads exactly
-    /// `strata_config`/`strata_python`/`strata_cwd` — the key is inert for this
-    /// engine, so absent, `true` and `false` must produce a byte-identical
-    /// [`LaunchSpec`] (argv, env, readiness, cwd, container alike). Falsifier: if
-    /// this adapter starts reading the key, the equality fails here.
-    #[test]
-    fn cpu_offload_changes_nothing_for_a_strata_launch() {
-        let config = real_file("inert-offload");
-        let path = config.to_str().expect("utf-8 path");
-        let base = StrataAdapter::default()
-            .spec(&entry(&[("strata_config", path)]), 18109)
-            .expect("absent key");
-        for value in ["true", "false"] {
-            let spec = StrataAdapter::default()
-                .spec(
-                    &entry(&[("strata_config", path), ("cpu_offload", value)]),
-                    18109,
-                )
-                .expect("an inert key never refuses a launch");
-            assert_eq!(
-                spec, base,
-                "cpu_offload: {value} must change nothing — if the strata adapter \
-                 starts reading the key, this fails"
-            );
-        }
-        let _ = std::fs::remove_file(config);
+            .expect_err("external mode is superseded (row 19)");
+        assert!(
+            matches!(&err, EngineError::Rejected { reason, .. }
+                if reason.contains("simplehar-se import strata") && reason.contains("superseded")),
+            "{err}"
+        );
     }
 
     #[test]
-    fn missing_profile_is_a_missing_field_refusal() {
+    fn declaring_both_profile_sources_is_a_refusal_not_a_priority() {
+        let base = fixture_pairs();
+        let mut pairs: Vec<(&str, &str)> =
+            base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        pairs.push(("strata_config", "C:\\Strata\\manual.json"));
+        let err = StrataAdapter::default()
+            .spec(&entry(&pairs), 18109)
+            .expect_err("one launch, one profile source");
+        assert!(
+            matches!(&err, EngineError::Rejected { reason, .. }
+                if reason.contains("mutually exclusive")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_row_naming_no_profile_source_is_a_missing_field_naming_strata_exe() {
         let err = StrataAdapter::default()
             .spec(&entry(&[]), 18109)
-            .expect_err("must refuse");
-        assert!(matches!(
-            err,
-            EngineError::MissingField { ref field, .. } if field == "strata_config"
-        ));
+            .expect_err("nothing to render");
+        assert!(
+            matches!(&err, EngineError::MissingField { ref field, .. } if field == "strata_exe"),
+            "{err}"
+        );
     }
 
+    /// Pin of the `cpu_offload` engine scoping: the key stays inert for the
+    /// strata adapter, so absent, `true` and `false` produce a byte-identical
+    /// [`LaunchSpec`]. Falsifier: if this adapter starts reading the key, the
+    /// equality fails here.
     #[test]
-    fn absent_profile_or_interpreter_is_rejected_before_spawn() {
-        let err = StrataAdapter::default()
-            .spec(
-                &entry(&[("strata_config", "Z:\\nope\\missing.json")]),
-                18109,
+    fn cpu_offload_changes_nothing_for_a_strata_launch() {
+        let base = fixture_pairs();
+        let as_str: Vec<(&str, &str)> =
+            base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let spec_entry = |value: Option<&str>| {
+            let mut pairs = as_str.clone();
+            if let Some(value) = value {
+                pairs.push(("cpu_offload", value));
+            }
+            StrataAdapter::new(
+                std::env::current_exe().expect("real .exe"),
+                std::env::temp_dir(),
             )
-            .expect_err("must refuse");
-        assert!(matches!(&err, EngineError::Rejected { reason, .. }
-            if reason.starts_with("strata_config not found:")));
+            .spec(&entry(&pairs), 18109)
+            .expect("an inert key never refuses a launch")
+        };
+        let base_spec = spec_entry(None);
+        for value in ["true", "false"] {
+            assert_eq!(spec_entry(Some(value)), base_spec, "cpu_offload: {value}");
+        }
+    }
 
-        let config = real_file("badpy");
-        let err = StrataAdapter::new(
-            PathBuf::from("Z:\\nope\\python.exe"),
-            PathBuf::from(DEFAULT_CWD),
+    /// The renderer refuses every shape a hostile-or-tired hand can type, and
+    /// every refusal names the yaml key that must change (G6).
+    #[test]
+    fn shape_refusals_name_the_key_that_carries_the_value() {
+        let base = fixture_pairs();
+        let cases: &[(&str, &str, &str)] = &[
+            ("strata_exe", "relative/exe.exe", "absolute path"),
+            ("strata_gpu", "0;rm", "non-negative integer"),
+            ("strata_env", "LD_PRELOAD=x", "STRATA_"),
+            ("strata_args", "--pack,,--native", "non-empty"),
+            ("strata_args", "--host, 0.0.0.0", "harness-forced argv"),
+            ("strata_vision", "exe=nowhere", "absolute path"),
+        ];
+        for (key, value, must_say) in cases {
+            let mut pairs: Vec<(&str, &str)> =
+                base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            pairs.push((key, value));
+            let err = StrataAdapter::new(
+                std::env::current_exe().expect("real .exe"),
+                std::env::temp_dir(),
+            )
+            .spec(&entry(&pairs), 18109)
+            .expect_err("{key} must refuse");
+            let EngineError::Rejected { reason, .. } = &err else {
+                panic!("{key}={value}: expected Rejected, got {err:?}");
+            };
+            assert!(
+                reason.contains(key) && reason.contains(must_say),
+                "{key}={value}: {reason}"
+            );
+        }
+    }
+
+    /// A model file deleted between scan and load meets the same typed walk
+    /// refusal the scan gave (both doors run `validate_profile_text`).
+    #[test]
+    fn a_referenced_path_the_disk_lacks_refuses_the_launch() {
+        let base = fixture_pairs();
+        let spec_err = StrataAdapter::new(
+            std::env::current_exe().expect("real .exe"),
+            std::env::temp_dir(),
         )
         .spec(
-            &entry(&[("strata_config", config.to_str().expect("utf-8 path"))]),
+            &entry(
+                &(base
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .chain(std::iter::once((
+                        "strata_args",
+                        "--native, Z:\\nope\\weights.gguf",
+                    )))
+                    .collect::<Vec<_>>()),
+            ),
             18109,
         )
-        .expect_err("must refuse");
+        .expect_err("a doomed path must refuse");
         assert!(
-            matches!(&err, EngineError::Rejected { reason, .. }
-            if reason.starts_with("strata_python not found:")),
-            "{err}"
+            matches!(&spec_err, EngineError::Rejected { reason, .. }
+                if reason.contains("references missing path")
+                    && reason.contains("Z:\\nope\\weights.gguf")),
+            "{spec_err}"
         );
-        let _ = std::fs::remove_file(config);
     }
 
-    /// FINDINGS2-0910 [5]'s probe, turned into a pin: `argv[0]` is the program
-    /// CreateProcessW starts, and an existing batch file is not an interpreter. The
-    /// reviewer's `python.cmd` must be refused naming the yaml key.
+    /// Defense in depth for the 22[1] leg: the renderer structurally cannot
+    /// emit a harness-forced field, but a JSON that shows one anyway — whatever
+    /// wrote it — is refused naming every claim and its owner.
     #[test]
-    fn a_batch_file_is_refused_as_the_interpreter() {
-        let config = real_file("cmd-python-config");
+    fn a_profile_claiming_a_policy_field_refuses_even_from_the_harness_itself() {
+        let exe = std::env::current_exe().expect("existing path for the walk");
+        let problem = validate_profile_text(&format!(
+            r#"{{"exe": "{}", "host": "0.0.0.0", "port": 8080}}"#,
+            path_text(&exe).replace('\\', "\\\\")
+        ))
+        .expect_err("claims must refuse");
+        assert_eq!(
+            problem.describe("rendered:test"),
+            policy_field_claims(
+                "rendered:test",
+                &[
+                    (
+                        "host",
+                        "the engine bind is harness-forced (loopback, \u{a7}5)"
+                    ),
+                    (
+                        "port",
+                        "the engine port is harness-assigned from category config"
+                    ),
+                ]
+            )
+        );
+    }
+
+    /// FINDINGS2-0910 [5]'s interpreter floor survives the template: `argv[0]`
+    /// is still the program CreateProcessW starts — a batch shim and a
+    /// directory are both refused naming `strata_python`.
+    #[test]
+    fn the_interpreter_floor_still_refuses_a_shim_and_a_directory() {
+        let base = fixture_pairs();
         let shim = real_file_with_extension("cmd-python", "cmd");
-        let err = StrataAdapter::default()
-            .spec(
-                &entry(&[
-                    ("strata_config", config.to_str().expect("utf-8 path")),
-                    ("strata_python", shim.to_str().expect("utf-8 path")),
-                ]),
-                18109,
-            )
-            .expect_err("a .cmd cannot be the launched program");
-        assert!(
-            matches!(&err, EngineError::Rejected { reason, .. }
-                if reason.contains("strata_python") && reason.contains(".exe")),
-            "{err}"
-        );
-        let _ = std::fs::remove_file(config);
-        let _ = std::fs::remove_file(shim);
-    }
-
-    /// A directory that exists is not a program either: `Path::exists()` alone would
-    /// have accepted it as `strata_python`.
-    #[test]
-    fn a_directory_is_refused_as_the_interpreter() {
-        let config = real_file("dir-python-config");
         let dir = crate::testutil::temp_dir("strata-python-dir");
-        std::fs::create_dir_all(&dir).expect("temp dir as interpreter");
-        let err = StrataAdapter::default()
-            .spec(
-                &entry(&[
-                    ("strata_config", config.to_str().expect("utf-8 path")),
-                    ("strata_python", dir.to_str().expect("utf-8 path")),
-                ]),
-                18109,
-            )
-            .expect_err("a directory cannot be the launched program");
-        assert!(
-            matches!(&err, EngineError::Rejected { reason, .. }
-                if reason.contains("strata_python") && reason.contains("not a file")),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_file(config);
-    }
-
-    /// The cwd reaches `Command::current_dir`: today a missing one surfaces only as
-    /// `cannot spawn` from the runtime (10[6]'s opaque failure, [5]'s companion).
-    #[test]
-    fn a_missing_or_non_directory_cwd_is_refused_at_spec_time() {
-        let config = real_file("cwd-config");
-        let path = config.to_str().expect("utf-8 path");
-        let as_file = real_file_with_extension("cwd-not-a-dir", "json");
         for (value, expect) in [
-            ("Z:\\no-such-dir", "not an existing directory"),
-            (file_str(&as_file), "not an existing directory"),
+            (path_text(&shim), "must be an existing .exe file"),
+            (path_text(&dir), "not a file"),
         ] {
+            let mut pairs: Vec<(&str, &str)> =
+                base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            pairs.push(("strata_python", value));
             let err = StrataAdapter::default()
-                .spec(
-                    &entry(&[("strata_config", path), ("strata_cwd", value)]),
-                    18109,
-                )
-                .expect_err("a cwd the child cannot enter must not be launched");
+                .spec(&entry(&pairs), 18109)
+                .expect_err("a non-interpreter must not launch");
             assert!(
                 matches!(&err, EngineError::Rejected { reason, .. }
-                    if reason.contains("strata_cwd") && reason.contains(expect)),
+                    if reason.contains("strata_python") && reason.contains(expect)),
                 "{value}: {err}"
             );
         }
-        let _ = std::fs::remove_file(config);
-        let _ = std::fs::remove_file(as_file);
     }
 
-    fn file_str(path: &std::path::Path) -> &str {
-        path.to_str().expect("utf-8 path")
-    }
-
-    /// The floor refuses garbage, it does not narrow legitimate config: the real
-    /// interpreter + profile + cwd trio still produces the exact v3.3 spec.
     #[test]
-    fn a_valid_interpreter_profile_and_cwd_still_launch() {
-        let config = real_file("valid-trio");
-        let python = std::env::current_exe().expect("a real .exe stand-in");
-        let spec = StrataAdapter::new(python.clone(), std::env::temp_dir())
-            .spec(&entry(&[("strata_config", file_str(&config))]), 18109)
-            .expect("a real trio must launch");
-        assert_eq!(spec.argv[0], python.to_str().expect("utf-8 path"));
-        assert_eq!(spec.cwd, std::env::temp_dir());
-        let _ = std::fs::remove_file(config);
-    }
-
-    /// A profile written after the scan is re-validated at spawn (slice 10c):
-    /// claimed policy fields (22[1]), a broken reference, and unparseable JSON
-    /// all refuse the launch with the same sentence the scan would have
-    /// reported — the engine is never silently launched on a mix.
-    #[test]
-    fn a_profile_the_scan_would_refuse_is_refused_at_spawn_too() {
-        let dir = crate::testutil::temp_dir("strata-validate");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let python = std::env::current_exe().expect("a real .exe stand-in");
-        let adapter = StrataAdapter::new(python, std::env::temp_dir());
-        let cases = [
-            (
-                "claims-port",
-                r#"{"port": 8080}"#,
-                "`port`",
-                "never obeyed from engine-side files",
-            ),
-            (
-                "claims-host",
-                r#"{"host": "0.0.0.0"}"#,
-                "`host`",
-                "harness-forced",
-            ),
-            ("broken-json", "not json at all", "not readable", ""),
-            (
-                "missing-ref",
-                r#"{"model_file": "Z:\\nope\\weights.gguf"}"#,
-                "references missing path",
-                "Z:\\nope\\weights.gguf",
-            ),
-        ];
-        for (name, body, must_name, must_say) in cases {
-            let profile = dir.join(format!("{name}.json"));
-            std::fs::write(&profile, body).expect("write profile");
-            let err = adapter
-                .spec(&entry(&[("strata_config", file_str(&profile))]), 18109)
-                .expect_err("a refused profile must never launch");
-            let EngineError::Rejected { reason, .. } = &err else {
-                panic!("{name}: expected Rejected, got {err:?}");
-            };
+    fn a_missing_or_non_directory_cwd_is_refused_at_spec_time() {
+        let base = fixture_pairs();
+        let not_a_dir = real_file_with_extension("cwd-not-a-dir", "json");
+        for value in ["Z:\\no-such-dir", path_text(&not_a_dir)] {
+            let mut pairs: Vec<(&str, &str)> =
+                base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            pairs.push(("strata_cwd", value));
+            let err = StrataAdapter::default()
+                .spec(&entry(&pairs), 18109)
+                .expect_err("a cwd the child cannot enter must not be launched");
             assert!(
-                reason.contains(must_name) && (must_say.is_empty() || reason.contains(must_say)),
-                "{name}: {reason}"
+                matches!(&err, EngineError::Rejected { reason, .. }
+                    if reason.contains("strata_cwd") && reason.contains("not an existing directory")),
+                "{value}: {err}"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The check that refuses a claimed field accepts a profile that decides
-    /// nothing the harness owns: nested objects and harness-blind names are
-    /// config, not claims.
+    /// The golden round-trip (ruling 19c): a manual profile imports to a row,
+    /// and the row renders a profile that carries the same engine contract —
+    /// minus the harness-owned `host`/`port`/`log` home, and with vision
+    /// spelled ONCE (the block), the switch re-appended canonically.
     #[test]
-    fn a_profile_deciding_nothing_harness_owned_launches() {
-        let dir = crate::testutil::temp_dir("strata-clean");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let profile = dir.join("clean.json");
+    fn import_then_render_reproduces_the_manual_profile() {
+        let home = crate::testutil::temp_dir("roundtrip");
+        let gguf = home.join("weights.gguf");
+        let pack = home.join("pack");
+        std::fs::write(&gguf, b"gguf").expect("weights");
+        std::fs::create_dir_all(&pack).expect("pack");
+        let profile = home.join("strata-iq3_s.json");
         std::fs::write(
             &profile,
-            r#"{"vision": {"port_hint": 1}, "nested": {"key_note": "x"}, "log": "Z:\\logs"}"#,
+            format!(
+                r#"{{
+                "exe": "{}",
+                "args": ["--pack", "{}", "--native", "{}", "--vision"],
+                "cwd": "{}",
+                "tokenizer": "{}",
+                "model_name": "qwen3.8-flash-next-iq3_s",
+                "log": "C:\\Strata\\strata-iq3_s.log",
+                "lib_dirs": ["{}"],
+                "port": 8003,
+                "gpu": 0,
+                "gpus_asked": true,
+                "host": "0.0.0.0",
+                "env": {{"STRATA_KVA": "0"}},
+                "vision": {{"exe": "{}", "mmproj": "{}", "model": "{}",
+                            "gpu": true, "max_tokens": 1024}}
+            }}"#,
+                path_text(&gguf).replace('\\', "\\\\"),
+                path_text(&pack).replace('\\', "\\\\"),
+                path_text(&gguf).replace('\\', "\\\\"),
+                path_text(&home).replace('\\', "\\\\"),
+                path_text(&pack).replace('\\', "\\\\"),
+                path_text(&pack).replace('\\', "\\\\"),
+                path_text(&gguf).replace('\\', "\\\\"),
+                path_text(&gguf).replace('\\', "\\\\"),
+                path_text(&gguf).replace('\\', "\\\\"),
+            ),
         )
-        .expect("write profile");
-        StrataAdapter::default()
-            .spec(&entry(&[("strata_config", file_str(&profile))]), 18109)
-            .expect("nested names are not top-level claims; `log` is exempt");
-        let _ = std::fs::remove_dir_all(&dir);
+        .expect("write fixture profile");
+        let yaml = crate::import::strata_yaml(&profile).expect("imports");
+        let keys: BTreeMap<String, String> = yaml
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split_once(": "))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let model = ModelEntry::from_flat(&keys, "strata-roundtrip").expect("row parses");
+        let rendered = render_profile(&model, &home).expect("row renders");
+        let got: serde_json::Value = serde_json::from_str(&rendered).expect("rendered JSON");
+        let wanted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&profile).expect("read back"))
+                .expect("fixture JSON");
+        assert_eq!(got["exe"], wanted["exe"]);
+        assert_eq!(
+            got["args"], wanted["args"],
+            "the vision switch round-trips at the canonical tail"
+        );
+        assert_eq!(got["cwd"], wanted["cwd"]);
+        assert_eq!(got["tokenizer"], wanted["tokenizer"]);
+        assert_eq!(got["model_name"], wanted["model_name"]);
+        assert_eq!(got["lib_dirs"], wanted["lib_dirs"]);
+        assert_eq!(got["gpu"], wanted["gpu"]);
+        assert_eq!(got["gpus_asked"], wanted["gpus_asked"]);
+        assert_eq!(got["env"], wanted["env"]);
+        assert_eq!(got["vision"], wanted["vision"]);
+        assert!(got.get("host").is_none() && got.get("port").is_none());
+        assert!(got["log"]
+            .as_str()
+            .is_some_and(|log| !log.contains("C:\\Strata")));
+        validate_profile_text(&rendered).expect("the round-tripped render validates");
     }
 }

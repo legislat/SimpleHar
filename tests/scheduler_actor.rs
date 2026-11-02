@@ -1346,11 +1346,11 @@ fn assert_refused_without_damage(
 }
 
 #[tokio::test]
-async fn a_strata_model_without_strata_config_is_refused_before_the_victim_dies() {
-    // Chunk 10 [2]: `strata_config` is required by the real adapter and existence
-    // checked there. 30 (AUX) + 60 (WORK) > 72 - 2, so admission plans aux30 as the
-    // victim: without the pre-Dispose preflight the kill runs first and the refusal
-    // arrives over a corpse.
+async fn a_strata_model_without_a_profile_source_is_refused_before_the_victim_dies() {
+    // Chunk 10 [2], row 19 shape: the template's `strata_exe` is required by the
+    // real adapter and existence checked there. 30 (AUX) + 60 (WORK) > 72 - 2, so
+    // admission plans aux30 as the victim: without the pre-Dispose preflight the
+    // kill runs first and the refusal arrives over a corpse.
     let (handle, runtime) = harness5(
         config(5),
         &[
@@ -1370,9 +1370,9 @@ async fn a_strata_model_without_strata_config_is_refused_before_the_victim_dies(
     let error = handle
         .swap("strata-nocfg", CategoryId::Work)
         .await
-        .expect_err("a missing strata_config must refuse the load");
+        .expect_err("a missing profile source must refuse the load");
     assert!(
-        error.to_string().contains("required field `strata_config`"),
+        error.to_string().contains("required field `strata_exe`"),
         "the refusal must name the missing key, was: {error}"
     );
 
@@ -1382,7 +1382,7 @@ async fn a_strata_model_without_strata_config_is_refused_before_the_victim_dies(
         "strata-nocfg",
         CategoryId::Aux,
         "aux30",
-        "required field `strata_config`",
+        "required field `strata_exe`",
     );
     assert_eq!(runtime.server_count(), 1, "nothing killed, nothing spawned");
     assert!(

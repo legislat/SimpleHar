@@ -860,6 +860,7 @@ impl EngineAdapter for NinferAdapter {
             ),
             container: Some(container.to_string()),
             script,
+            rendered_profile: None,
             custody: None,
         })
     }

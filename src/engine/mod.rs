@@ -100,6 +100,17 @@ pub struct LaunchSpec {
     /// `Some` demands argv shape `[..., "bash", <script>, ...]`. `None` for process
     /// engines and for a launch that runs the operator's own script verbatim.
     pub script: Option<String>,
+    /// A strata profile JSON the runtime must stage into the harness's own
+    /// profile root and pass via `--config` **instead of** the operator path named
+    /// in argv (strata template mode, operator ruling 2026-11-02 row 19): the
+    /// adapter renders the full profile from validated row-yaml values, so the
+    /// child can only ever read a file the harness wrote — `host`/`port`/`key`
+    /// are absent by construction and the bind/port stay harness-forced argv.
+    /// The runtime stages the bytes content-addressed (atomic write, keep-N
+    /// prune, hash-in-name verified against the bytes) and rewrites the
+    /// `--config` value to the staged absolute path before spawning. `None` for
+    /// every other engine.
+    pub rendered_profile: Option<String>,
     /// The engine id when this launch must be recorded in the harness custody
     /// sidecar (chunk 10 slice 10b): the runtime writes the started child's
     /// pid + start-time token + slot port + instance name (the model, as

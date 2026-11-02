@@ -94,10 +94,48 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
     }
 }
 
+/// The command-line verbs the binary answers instead of booting. Today one:
+/// `import strata <profile.json>` (ruling 2026-11-02 row 19c) — the yaml lands
+/// on stdout (pipeable bytes, no log decoration), refusals on the tracing
+/// stream. `None` means "not a command line, boot the harness".
+fn run_cli(mut words: impl Iterator<Item = String>) -> Option<ExitCode> {
+    let first = words.next()?;
+    if first != "import" {
+        return None;
+    }
+    let verb = words.next().unwrap_or_default();
+    let path = words.next().unwrap_or_default();
+    if verb != "strata" || path.trim().is_empty() || words.next().is_some() {
+        tracing::error!(
+            "usage: simplehar-se import strata <profile.json> \
+             (prints the row yaml, deletes nothing)"
+        );
+        return Some(ExitCode::FAILURE);
+    }
+    match simplehar_se::import::strata_yaml(std::path::Path::new(path.trim())) {
+        Ok(yaml) => {
+            print!("{yaml}");
+            Some(ExitCode::SUCCESS)
+        }
+        Err(reason) => {
+            tracing::error!(reason = %reason, "import refused");
+            Some(ExitCode::FAILURE)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let boot_started = std::time::Instant::now();
     observability::init();
+    // `simplehar-se import strata <profile.json>` (operator ruling 2026-11-02
+    // row 19c): the one-shot migration tool — read a manual strata profile,
+    // print the row yaml, delete nothing. It is a command, not a serve: no
+    // guard, no config, no listener, and the only sanctioned reader of a
+    // `C:\Strata` profile.
+    if let Some(code) = run_cli(std::env::args().skip(1)) {
+        return code;
+    }
     // The boot identity, emitted before anything can fail: a harness that dies at the
     // single-instance guard or on an invalid config still leaves an artifact that says
     // which build and which process died. Non-secret facts only — the token is

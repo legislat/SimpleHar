@@ -36,7 +36,7 @@ use crate::ownership::{
 };
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -474,6 +474,9 @@ pub struct ProcessRuntime {
     /// confirmed release, swept at boot — one shared record per process
     /// lifetime, the same single-authority rule as the claim ledger.
     custody: Arc<Mutex<CustodyLedger>>,
+    /// The root harness-rendered strata profiles stage into (ruling 2026-11-02
+    /// row 19): beside the custody sidecar, owned by the harness alone.
+    strata_profiles_root: PathBuf,
     client: reqwest::Client,
     logs_dir: PathBuf,
     wsl_distro: String,
@@ -727,17 +730,18 @@ pub fn script_content_hash(script: &str) -> u64 {
     fnv1a64(script.as_bytes())
 }
 
-/// The in-distro path a script's bytes stage to: `~/.simplehar/autostart/<slug>-<fnv>.sh`.
-/// The slug comes from an already-validated container name and the hash is hex, so the
-/// whole path stays inside the `valid_word` charset the WSL argv demands. Pure, so the
-/// shape is pinned without a distro. The leading `~` is a *bare word* in every position
-/// it is used at inside the staging command, so the login shell expands it to the
-/// `-u <user>` account's home — the same coordinate rule `valid_word` exists to enforce
-/// elsewhere; here it is the deliberate, single exception, spelled as `$HOME`-parented
-/// by the command itself rather than by shell luck.
-fn staged_script_path(slug: &str, script: &str) -> String {
-    let slug: String = slug
-        .chars()
+/// How many staged profile renders of one model survive in the rendered-profile
+/// root (the keep-N twin of [`STAGED_SCRIPT_KEEP`], strata template mode,
+/// operator ruling 2026-11-02 row 19).
+const STAGED_PROFILE_KEEP: usize = 10;
+
+/// The slug alphabet every staged artifact shares: the model or container name
+/// with anything outside `[A-Za-z0-9._-]` replaced by `_`, so a staged file
+/// name is always filesystem-bare and the keep-N prune matches one model's
+/// pool literally.
+#[must_use]
+pub(crate) fn sanitize_slug(slug: &str) -> String {
+    slug.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
                 c
@@ -745,7 +749,29 @@ fn staged_script_path(slug: &str, script: &str) -> String {
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+/// The absolute directory harness-rendered strata profiles stage into: the
+/// [`crate::engine::policy::STRATA_RENDERED_PROFILES_ROOT`] tail resolved
+/// under the executable's own directory — beside the strata custody sidecar,
+/// the same exe-adjacent home [`strata_custody_path`] keeps (operator ruling
+/// 2026-11-02 row 19; single source from the compiled-in cell, exactly how
+/// [`staged_scripts_root`] pins the ninfer side).
+#[must_use]
+pub(crate) fn strata_profiles_dir() -> PathBuf {
+    let root = crate::engine::policy::engine_policy("strata")
+        .and_then(|row| row.custody_data_roots.first())
+        .copied()
+        .expect("invariant: the compiled-in strata row ships its rendered-profiles custody root");
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(root)))
+        .unwrap_or_else(|| PathBuf::from(root))
+}
+
+fn staged_script_path(slug: &str, script: &str) -> String {
+    let slug = sanitize_slug(slug);
     let root = staged_scripts_root();
     format!("~/{root}/{slug}-{:016x}.sh", fnv1a64(script.as_bytes()))
 }
@@ -800,6 +826,117 @@ fn rewrite_script_slot(mut argv: Vec<String>, path: String) -> Option<Vec<String
     let slot = argv.get_mut(dashes + 2)?;
     *slot = path;
     Some(argv)
+}
+
+/// Point the `--config` slot of a rendered-profile argv at `path`, or refuse.
+/// The marker is the strata row's `path_markers` cell; a spec that carries a
+/// rendered profile but no config slot is a builder bug, and the launch fails
+/// closed rather than spawning a child pointed at the placeholder.
+///
+/// # Arguments
+///
+/// * `argv` - the adapter's launch argv, harness-minted placeholder in the slot.
+/// * `path` - the staged absolute path to install as the flag's value.
+///
+/// # Returns
+///
+/// The rewritten argv, or `None` when no `--config` token carries a value.
+fn rewrite_config_slot(mut argv: Vec<String>, path: &str) -> Option<Vec<String>> {
+    let slot = argv
+        .iter()
+        .position(|arg| arg == "--config")?
+        .checked_add(1)?;
+    *argv.get_mut(slot)? = path.to_string();
+    Some(argv)
+}
+
+/// Stage a harness-rendered strata profile into the exe-adjacent profile root
+/// (operator ruling 2026-11-02 row 19). Three guarantees, one door:
+///
+/// * **name binds bytes** — the argv placeholder must equal
+///   `<slug>-<fnv>.json` recomputed from `text`, so a hand-built spec cannot
+///   stage one profile under another model's name;
+/// * **atomic write** — hash-named temp plus `rename` (same-directory,
+///   replace-on-publish), then the published bytes are read back and re-hashed:
+///   what the child reads is what the adapter validated;
+/// * **bounded** — keep-N prune of this slug's `<slug>-<16hex>.json` pool,
+///   newest first (the in-distro script driver's [`STAGED_SCRIPT_KEEP`] rule
+///   ported to the Windows filesystem).
+///
+/// # Returns
+///
+/// The absolute staged path on success, or the refusal sentence.
+fn stage_strata_profile(
+    root: &Path,
+    slug: &str,
+    text: &str,
+    placeholder: &str,
+) -> Result<PathBuf, String> {
+    let expected = crate::engine::strata::staged_profile_name(slug, text);
+    if placeholder != expected {
+        return Err(format!(
+            "the argv names `{placeholder}` but these bytes render `{expected}`: a staged \
+             profile must carry its own content address"
+        ));
+    }
+    std::fs::create_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    let target = root.join(&expected);
+    let temp = root.join(format!(".staging.{expected}.tmp"));
+    std::fs::write(&temp, text.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", temp.display()))?;
+    if let Err(error) = std::fs::rename(&temp, &target) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("cannot publish {}: {error}", target.display()));
+    }
+    let landed = std::fs::read(&target)
+        .map_err(|e| format!("cannot read back {}: {e}", target.display()))?;
+    if script_content_hash(&String::from_utf8_lossy(&landed)) != script_content_hash(text) {
+        return Err(format!(
+            "the staged profile at {} is not the bytes the harness rendered",
+            target.display()
+        ));
+    }
+    prune_staged_profiles(root, slug);
+    Ok(target)
+}
+
+/// Keep-N prune of one slug's staged-profile pool, newest by mtime. Entries
+/// are matched exactly — `<slug>-<16 hex>.json` — so a dot-bearing slug
+/// (`har.a`) can never prune another model's pool (the lesson the ninfer
+/// staging driver learned on the distro's findutils, review 2026-10-31).
+fn prune_staged_profiles(root: &Path, slug: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let prefix = format!("{slug}-");
+    let mut pool: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let address = name.strip_suffix(".json")?.strip_prefix(prefix.as_str())?;
+            // Exactly the 16-hex content address, nothing else, marks the pool.
+            let is_address = address.len() == 16
+                && address
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+            if !is_address {
+                return None;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((mtime, entry.path()))
+        })
+        .collect();
+    if pool.len() <= STAGED_PROFILE_KEEP {
+        return;
+    }
+    pool.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, stale) in &pool[STAGED_PROFILE_KEEP..] {
+        let _ = std::fs::remove_file(stale);
+    }
 }
 
 /// The POSIX `cksum` value of `bytes` — CRC-32 with polynomial `0x04C11DB7`
@@ -1170,6 +1307,7 @@ impl ProcessRuntime {
             // rule (slice 10b): recorded when a custodied launch really
             // started, cleared on confirmed release, swept at boot.
             custody: Arc::new(Mutex::new(CustodyLedger::load(strata_custody_path()))),
+            strata_profiles_root: strata_profiles_dir(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
@@ -1214,6 +1352,16 @@ impl ProcessRuntime {
     #[must_use]
     pub fn with_custody_ledger(mut self, path: impl Into<PathBuf>) -> Self {
         self.custody = Arc::new(Mutex::new(CustodyLedger::load(path)));
+        self
+    }
+
+    /// Points this runtime's rendered-profile root at `path`. Test-only, the
+    /// same rule as the ledger seams: pins must neither touch the directory
+    /// beside the test exe nor the harness's release folder.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_profiles_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.strata_profiles_root = path.into();
         self
     }
 
@@ -1452,6 +1600,44 @@ impl EngineRuntime for ProcessRuntime {
                     argv,
                     ..spec.clone()
                 })
+            }
+        };
+        // Strata template mode (operator ruling 2026-11-02 row 19): a spec
+        // carrying a rendered profile reads THAT file — the bytes stage into
+        // the harness's own root, the placeholder in the `--config` slot is
+        // rewritten to the staged absolute path, and the name's content address
+        // is verified against the bytes before the child can read them. A
+        // failed staging is a spawn failure, never a fallback.
+        let spec = match spec.rendered_profile.as_deref() {
+            None => spec,
+            Some(text) => {
+                let staged = stage_strata_profile(
+                    &self.strata_profiles_root,
+                    &spec.log_name,
+                    text,
+                    spec.argv
+                        .iter()
+                        .position(|arg| arg == "--config")
+                        .and_then(|at| spec.argv.get(at + 1))
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                );
+                match staged.and_then(|path| {
+                    rewrite_config_slot(spec.argv.clone(), &path.to_string_lossy())
+                        .ok_or_else(|| "a rendered-profile spec must carry --config".to_string())
+                }) {
+                    Ok(argv) => std::borrow::Cow::Owned(LaunchSpec {
+                        argv,
+                        ..spec.as_ref().clone()
+                    }),
+                    Err(reason) => {
+                        return Err(SpawnError::SpawnFailed {
+                            reason: format!(
+                                "cannot stage the harness-rendered strata profile: {reason}"
+                            ),
+                        });
+                    }
+                }
             }
         };
         let Some((program, rest)) = spec.argv.split_first() else {
@@ -2881,6 +3067,7 @@ mod tests {
             },
             container: None,
             script: None,
+            rendered_profile: None,
             custody: None,
         }
     }
@@ -3466,6 +3653,7 @@ mod tests {
             },
             container: None,
             script: None,
+            rendered_profile: None,
             custody: None,
         };
         let tk = SpawnTicket {

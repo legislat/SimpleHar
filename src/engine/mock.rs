@@ -45,6 +45,7 @@ impl EngineAdapter for MockAdapter {
             },
             container: None,
             script: None,
+            rendered_profile: None,
             custody: None,
         })
     }

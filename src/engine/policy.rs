@@ -37,6 +37,16 @@ pub(crate) const NINFER_STAGED_SCRIPTS_ROOT: &str = ".simplehar/autostart";
 /// harness-owned locations).
 pub(crate) const NINFER_KEYS_ROOT: &str = "$HOME/.simplehar/keys";
 
+/// The Windows directory harness-rendered strata profiles stage into, as the
+/// tail below the executable's own directory — beside the strata custody
+/// sidecar (operator ruling 2026-11-02 row 19). Like the ninfer staged-scripts
+/// root, it is outside every engine home: the rendered copy can never shadow or
+/// be confused with a manual `C:\Strata` profile, and the spawn rewrites
+/// `--config` to exactly the staged file, so the child reads only what the
+/// harness wrote. `process::strata_profiles_dir` resolves it to an absolute
+/// path from the single source that this cell spells.
+pub(crate) const STRATA_RENDERED_PROFILES_ROOT: &str = ".simplehar/strata-profiles";
+
 /// The CLOSED allow-list of `extra_args` option words an operator may pass
 /// through to llama-server (FINDINGS2-0910 [1]): the inversion of the old
 /// `HARNESS_OWNED_FLAGS` denial list, which could only ever name ten of the
@@ -368,7 +378,22 @@ const LLAMA_KNOBS: &[&str] = &[
     "fit_ctx",
 ];
 
-const STRATA_KNOBS: &[&str] = &["strata_config", "strata_python", "strata_cwd"];
+const STRATA_KNOBS: &[&str] = &[
+    "strata_config",
+    "strata_python",
+    "strata_cwd",
+    // Template mode (operator ruling 2026-11-02 row 19): the row yaml owns the
+    // profile's fields and the harness renders the JSON at every load.
+    "strata_exe",
+    "strata_args",
+    "strata_tokenizer",
+    "strata_lib_dirs",
+    "strata_env",
+    "strata_gpu",
+    "strata_parallel",
+    "strata_gpus_asked",
+    "strata_vision",
+];
 
 const NINFER_KNOBS: &[&str] = &[
     "ninfer_autostart",
@@ -670,6 +695,14 @@ static STRATA_ROW: EnginePolicy = EnginePolicy {
             value: ForcedValue::Literal("strata"),
         },
         ForcedField {
+            flag: "--host",
+            // Same loopback literal the llama row forces: server.py resolves the
+            // flag ahead of any profile `host`, and its own default is loopback,
+            // so the bind is harness-forced argv and the rendered profile carries
+            // no `host` key at all (22[1] clean by construction, row 19).
+            value: ForcedValue::Literal(LLAMA_ENGINE_HOST),
+        },
+        ForcedField {
             flag: "--config",
             value: ForcedValue::OperatorData,
         },
@@ -678,16 +711,20 @@ static STRATA_ROW: EnginePolicy = EnginePolicy {
             value: ForcedValue::SlotPort,
         },
     ],
-    // No operator word reaches the strata argv (only existence-checked paths
-    // do), so there is nothing to scrub by name; the custody slice governs the
-    // profile and interpreter paths through the custody cells below.
+    // No operator word reaches the strata argv (template mode renders the whole
+    // profile from validated yaml values — row 19), so there is nothing to scrub
+    // by name; the custody cells below govern the locations.
     forbidden_words: &[],
     allow_words: &[],
     extra_words: None,
     knobs: STRATA_KNOBS,
     path_markers: &["--config"],
     custody_exec_roots: &[],
-    custody_data_roots: &[],
+    // The data cell is load-bearing since row 19: the engine's profile is the
+    // harness-rendered file under [`STRATA_RENDERED_PROFILES_ROOT`], and the
+    // spawn rewrites `--config` to exactly that path — an operator profile is
+    // no longer a launch input at all.
+    custody_data_roots: &[STRATA_RENDERED_PROFILES_ROOT],
     serve_template: None,
     profile_field: Some("strata_config"),
     // The harness-side strata defaults live in the config `engines:` section
@@ -933,6 +970,8 @@ mod tests {
         out.push('\u{1}');
         out.push_str(spec.script.as_deref().unwrap_or(""));
         out.push('\u{1}');
+        out.push_str(spec.rendered_profile.as_deref().unwrap_or(""));
+        out.push('\u{1}');
         out.push_str(spec.custody.as_deref().unwrap_or(""));
         out
     }
@@ -977,12 +1016,22 @@ mod tests {
                 ],
             ),
             "strata" => {
-                let config = crate::testutil::temp_dir("policy").join("profile.json");
-                std::fs::write(&config, b"{}").expect("profile fixture");
-                entry(
+                let dir = crate::testutil::temp_dir("policy");
+                let exe = dir.join("strata.exe");
+                let tokenizer = dir.join("tokenizer.bin");
+                std::fs::write(&exe, b"x").expect("exe fixture");
+                std::fs::write(&tokenizer, b"t").expect("tokenizer fixture");
+                let mut model = entry(
                     "strata",
-                    &[("strata_config", config.to_str().expect("utf-8 path"))],
-                )
+                    &[
+                        ("strata_exe", exe.to_str().expect("utf-8 path")),
+                        ("strata_tokenizer", tokenizer.to_str().expect("utf-8 path")),
+                        ("strata_cwd", dir.to_str().expect("utf-8 path")),
+                        ("strata_args", "--native"),
+                    ],
+                );
+                model.serve_model = Some("strata-policy".to_string());
+                model
             }
             "ninfer" => entry(
                 "ninfer",
