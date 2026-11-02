@@ -79,6 +79,14 @@ const BUILT_IN_PROFILES: [(&str, &str, &str, &str, &str); 5] = [
     ("e", "65536", "65536", "1", "fp8"),
 ];
 
+/// The profile a ninfer row selects when its yaml names none (the autostart
+/// scripts' own default, operator decision 2026-10-28 "LEAVE AS-IS"). One home:
+/// the spawn resolution, the template render and the void-rule identity in
+/// [`profile_stamp`] must resolve the default identically or a `ninfer_profile`
+/// change would compare two different resolutions and mis-void an
+/// `engine_report` booking.
+const DEFAULT_PROFILE: &str = "b";
+
 /// KV dtypes the harness will encode into a launch. Extending this list is the day
 /// the engine grows a dtype the operator asks for; until then an unknown dtype is a
 /// refusal naming the key, never a surprise the distro discovers. `int8` and
@@ -144,7 +152,7 @@ pub fn profile_stamp(raw: &BTreeMap<String, String>) -> Option<String> {
         .get("ninfer_profile")
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "b".to_string());
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
     // The scan-time caller has no adapter identity; an unresolvable profile renders
     // the figure incomparable regardless of which refusal name the launch would use.
     let (kv, source) = profile_override("scan", raw, &profile)
@@ -388,8 +396,13 @@ fn profile_override(
     }
     if !valid_profile_name(profile) {
         return Err(rejected(format!(
-            "`ninfer_profile` must be one of a|b|c|d|e or a custom name (lowercase \
-             [a-z0-9_], <=16 chars): {profile}"
+            "`ninfer_profile` must be one of {} or a custom name (lowercase \
+             [a-z0-9_], <=16 chars): {profile}",
+            BUILT_IN_PROFILES
+                .iter()
+                .map(|(name, ..)| *name)
+                .collect::<Vec<_>>()
+                .join("|")
         )));
     }
     let key = format!("ninfer_profile_{profile}");
@@ -518,7 +531,8 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
             "`ninfer_gpu_device` must be a comma-separated word list: {gpu_device}"
         )));
     }
-    let profile = optional_param(model, "ninfer_profile").unwrap_or_else(|| "b".to_string());
+    let profile =
+        optional_param(model, "ninfer_profile").unwrap_or_else(|| DEFAULT_PROFILE.to_string());
     let (max_ctx, kv_cap, conc, kv_dtype, profile_source) =
         profile_override(&model.name, &model.raw, &profile)?;
     // The row's `extra_words` contract, re-run at render (defense in depth):
@@ -755,7 +769,7 @@ impl EngineAdapter for NinferAdapter {
             .get("ninfer_profile")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "b".to_string());
+            .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
         if !valid_word(&profile) {
             return Err(rejected(format!(
                 "ninfer_profile must be a plain word (no spaces or shell metacharacters): {profile}"

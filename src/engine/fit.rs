@@ -146,10 +146,14 @@ impl FitRow {
         self.name != "Host"
     }
 
-    /// The row's total MiB across the three projected columns.
+    /// The row's total MiB across the three projected columns. Saturating, so
+    /// a tool answer carrying absurd columns fails the caller's plausibility
+    /// (an over-GiB-scale figure) instead of wrapping to a small booking.
     #[must_use]
     fn total_mib(&self) -> u64 {
-        self.model_mib + self.ctx_mib + self.compute_mib
+        self.model_mib
+            .saturating_add(self.ctx_mib)
+            .saturating_add(self.compute_mib)
     }
 }
 
@@ -316,7 +320,9 @@ pub(crate) fn book_gb(
     } else {
         0.0
     };
-    let sum_mib: u64 = devices.iter().map(|row| row.total_mib()).sum();
+    let sum_mib: u64 = devices
+        .iter()
+        .fold(0u64, |sum, row| sum.saturating_add(row.total_mib()));
     Ok(sum_mib as f64 / 1024.0 + surcharge + constants.margin_gb * devices.len() as f64)
 }
 

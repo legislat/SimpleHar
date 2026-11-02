@@ -880,7 +880,7 @@ mod tests {
     use crate::config::CategoryId;
     use crate::engine::{EngineAdapter, LaunchSpec};
     use crate::model::{CostClass, ModelEntry};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn raw(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -1466,5 +1466,26 @@ mod tests {
         assert!(ninfer_serve_arg_owner(abbreviated).is_some());
         assert_eq!(forbidden_serve_flag("--spec"), None);
         assert_eq!(llama_extra_arg_owner("--foo"), None);
+        // The other direction (the "one entry per member" claim both owner
+        // tables make): an owner entry no forbidden word cites is a dead
+        // sentence pretending to teach, so the sets must match exactly.
+        let owners: BTreeSet<&str> = LLAMA_EXTRA_ARG_OWNERS.iter().map(|(w, _)| *w).collect();
+        assert_eq!(
+            owners,
+            LLAMA_FORBIDDEN_EXTRA_WORDS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "the llama owner table must carry exactly one entry per forbidden word"
+        );
+        let owners: BTreeSet<&str> = NINFER_SERVE_ARG_OWNERS.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            owners,
+            NINFER_FORBIDDEN_SERVE_FLAGS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "the ninfer owner table must carry exactly one entry per forbidden flag"
+        );
     }
 }
