@@ -7,7 +7,7 @@ with a typed, single-writer scheduler, admits loads on the card's own reading
 (the *witness*) minus a reserve, with in-flight bookings — and **refuses, with
 reasons**, rather than overcommitting.
 
-Current build: **v1.0.1** (release tag pending) — `cargo build --release` produces
+Current build: **v1.0.1** (`v1.0.1` tag) — `cargo build --release` produces
 `target\release\simplehar-se.exe`, or use the shipped exe directly.
 
 ## Who this is for
