@@ -19,8 +19,11 @@ use thiserror::Error;
 /// A single per-field configuration problem.
 ///
 /// Collected (never panicked on) so boot and `/har/status` can report every issue at
-/// once, with the file and key named (Step 9, G6).
+/// once, with the file and key named (Step 9, G6). On the wire (`/har/status`
+/// `config_errors`) each entry carries a snake_case `kind` beside its `field` and
+/// `reason`, matching the `catalog_errors` vocabulary.
 #[derive(Debug, Clone, PartialEq, Error, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConfigError {
     /// A field has the wrong shape, an unknown name, or an out-of-range value.
     #[error("field `{field}`: {reason}")]

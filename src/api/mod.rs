@@ -15,7 +15,7 @@
 //!   timeout because `/har/load` deliberately waits through the load (Step 12
 //!   idempotency: a double-click attaches to the same job).
 
-use crate::config::{AppConfig, CategoryId};
+use crate::config::{AppConfig, CategoryId, ConfigError};
 use crate::model::writeback::WritebackError;
 use crate::model::ModelEntry;
 use crate::scheduler::{JobId, Reply, SchedulerError, SchedulerHandle, SchedulerStatus};
@@ -459,6 +459,15 @@ pub struct ApiState {
     /// the boot config (Step 9: the yaml/json stays the source of truth; overrides
     /// persist back to it on every set).
     default_overrides: Arc<Mutex<BTreeMap<CategoryId, Option<String>>>>,
+    /// Per-field verdict on the boot config file as of the last landing harness
+    /// write-back (07[11]: the `/har/status` `config_errors` producer). A boot that
+    /// validates dirty never serves a status (§0.2 step 1 fails the boot), so the
+    /// starting state is honestly empty; the only way to non-empty is a write-back
+    /// that published bytes the next boot would refuse. Every boot-file mutation
+    /// path must feed its landed bytes through [`ApiState::record_config_errors`] —
+    /// pinned by
+    /// `a_write_back_that_lands_a_boot_invalid_file_names_it_in_config_errors`.
+    config_errors: Arc<Mutex<Vec<ConfigError>>>,
     /// Last-use hints per model (fallback MRU for AUX x N; eviction LRU later).
     usage: Arc<Mutex<HashMap<String, Instant>>>,
     /// Shared secret for API/proxy routes when configured (`control_token` or
@@ -516,6 +525,7 @@ impl ApiState {
             witness,
             boot: Arc::new(std::sync::RwLock::new(boot)),
             default_overrides: Arc::new(Mutex::new(BTreeMap::new())),
+            config_errors: Arc::new(Mutex::new(Vec::new())),
             usage: Arc::new(Mutex::new(HashMap::new())),
             control_token,
             guard_trace: Arc::new(Mutex::new(GuardTrace::default())),
@@ -808,6 +818,13 @@ impl ApiState {
     /// `simplehar-se.json` atomically (temp file + rename). In-memory wins even when
     /// persistence fails (logged); the response says which happened.
     ///
+    /// A write that lands re-validates the published bytes against the boot schema
+    /// (07[11]): the landed tree is exactly what the next boot will read, so its
+    /// per-field verdict is recorded for `/har/status` `config_errors` — the field's
+    /// only producer, replacing the last verdict on every landing write and never
+    /// touched by a write that did not land (the file still holds the bytes the
+    /// previous verdict described).
+    ///
     /// The write-back runs on a blocking thread (FINDINGS-07 [8]): the handler's
     /// async worker must not park on the gated read-patch-copy-rename, while the
     /// `persisted` answer still means what it always meant — the handler waits for
@@ -831,7 +848,13 @@ impl ApiState {
         })
         .await
         {
-            Ok(persisted) => persisted,
+            Ok(outcome) => {
+                let (persisted, verdict) = outcome;
+                if persisted {
+                    self.record_config_errors(verdict);
+                }
+                persisted
+            }
             Err(error) => {
                 tracing::error!(
                     error = %error,
@@ -841,6 +864,28 @@ impl ApiState {
             }
         };
         (owned_model, persisted)
+    }
+
+    /// Records the per-field validation verdict on the boot config file, replacing
+    /// the previous one. Call only after a write-back's landed bytes have been
+    /// re-validated — an empty vector is the claim "the file on disk now boots clean"
+    /// and must be earned the same way (07[11]).
+    pub fn record_config_errors(&self, errors: Vec<ConfigError>) {
+        *self
+            .config_errors
+            .lock()
+            .expect("config errors lock poisoned by a writer panic") = errors;
+    }
+
+    /// The recorded per-field config problems: the only thing `/har/status`
+    /// `config_errors` renders. A cached-state read by design — the status render path
+    /// never touches the filesystem (pinned by the structural scan in this file).
+    #[must_use]
+    pub fn config_errors(&self) -> Vec<ConfigError> {
+        self.config_errors
+            .lock()
+            .expect("config errors lock poisoned by a writer panic")
+            .clone()
     }
 
     fn touch(&self, model: &str) {
@@ -900,7 +945,17 @@ fn config_write_path(config: &AppConfig) -> std::path::PathBuf {
 /// It is the synchronous core by design — [`ApiState::set_default_model`] runs it
 /// inside `tokio::task::spawn_blocking`, so the gate is held on a blocking thread
 /// where parking is allowed and the reactor never is (FINDINGS-07 [8]).
-fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option<&str>) -> bool {
+///
+/// Returns `(persisted, verdict)`: the verdict is the boot-config validation of the
+/// bytes that actually landed (07[11]) — non-empty means "the file is on disk and
+/// reads back as published, and the next boot would name these fields". Only the
+/// `true` leg carries a verdict; a write that never landed left a file the previous
+/// verdict still describes.
+fn persist_default_model(
+    config: &AppConfig,
+    category: CategoryId,
+    model: Option<&str>,
+) -> (bool, Vec<ConfigError>) {
     // One critical section with every yaml rewrite (FINDINGS-07 [3]): the second
     // writer can no longer read the ORIGINAL while the first one is between its
     // patch and its rename, which is how a persisted field used to vanish from disk.
@@ -932,7 +987,7 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
     }
     let Some(categories) = root.get_mut("categories").and_then(|c| c.as_array_mut()) else {
         tracing::error!(path = %path.display(), "cannot persist default_model: no categories in the config file");
-        return false;
+        return (false, Vec::new());
     };
     let mut patched = false;
     for entry in categories.iter_mut() {
@@ -955,7 +1010,7 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
     }
     if !patched {
         tracing::error!(category = %id, "cannot persist default_model: category not found");
-        return false;
+        return (false, Vec::new());
     }
     let text = serde_json::to_string_pretty(&root).expect("invariant: JSON serializes");
     // Unique per (process, sequence), mirroring the yaml temp in `model::writeback`:
@@ -968,7 +1023,7 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
     ));
     if let Err(error) = std::fs::write(&tmp, text.as_bytes()) {
         tracing::error!(error = %error, "cannot persist default_model: write failed");
-        return false;
+        return (false, Vec::new());
     }
     // Keep the previous version beside the live file: schema additions are a
     // one-way door for `deny_unknown_fields` (an old binary refuses a file a new
@@ -984,7 +1039,7 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
         // permanent litter (writeback does the same on its rename failure).
         let _ = std::fs::remove_file(&tmp);
         tracing::error!(error = %error, "cannot persist default_model: rename failed");
-        return false;
+        return (false, Vec::new());
     }
     // The symmetric leg the yaml writer has had since D4 and this one lacked
     // (FINDINGS2-0507 [7]): `rename()` returning `Ok` is the OS accepting the move, not
@@ -1004,20 +1059,42 @@ fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option
             serde_json::from_str::<Value>(&text)
                 .map_err(|error| format!("re-parse failed: {error}"))
         }) {
-        Ok(read_back) if read_back == root => Ok(()),
+        Ok(read_back) if read_back == root => Ok(read_back),
         Ok(_) => Err("the file parses to a different tree than the one published".to_string()),
         Err(error) => Err(error),
     };
-    if let Err(error) = verified {
-        tracing::error!(
-            error = %error,
-            path = %path.display(),
-            "cannot verify the persisted config file; answering persisted:false"
-        );
-        return false;
-    }
+    let read_back = match verified {
+        Ok(read_back) => read_back,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                path = %path.display(),
+                "cannot verify the persisted config file; answering persisted:false"
+            );
+            return (false, Vec::new());
+        }
+    };
     tracing::info!(category = %id, model = ?model, path = %path.display(), "default_model persisted to the config file");
-    true
+    (true, validate_published_config(&read_back))
+}
+
+/// Re-validate the tree the boot config file now holds after a landing write-back
+/// (07[11]: the `/har/status` `config_errors` producer). The harness cannot fix a file
+/// the operator hand-edited while it ran — reload re-reads the catalog and nothing
+/// else (Step 9, LOCKED) — but the moment a harness write-back publishes the file it
+/// owns every byte the next boot will read, so the verdict the boot would render
+/// ([`AppConfig::validate`]) is reported while the harness is still alive to be asked.
+/// A tree that no longer parses as the schema (a hand-edited unknown key rides the
+/// read-patch-write as `Value` passthrough) yields one error naming the file root —
+/// the same shape [`AppConfig::parse`] gives at boot.
+fn validate_published_config(root: &Value) -> Vec<ConfigError> {
+    match serde_json::from_value::<AppConfig>(root.clone()) {
+        Ok(landed) => landed.validate(),
+        Err(error) => vec![ConfigError::Invalid {
+            field: crate::config::CONFIG_FILE.to_string(),
+            reason: error.to_string(),
+        }],
+    }
 }
 
 /// Paths whose post-rename verification read is preceded by a byte corruption
@@ -1077,8 +1154,9 @@ async fn har_status(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
 }
 
 /// The full `/har/status` document: config categories, mem, boot, listener
-/// health (raw verdicts plus the two derived booleans), slots, jobs, and catalog
-/// errors — one call (G13). Also the body of every SSE `har_state` event
+/// health (raw verdicts plus the two derived booleans), slots, jobs, catalog
+/// errors, and the boot config file's per-field write-back verdict — one call (G13).
+/// Also the body of every SSE `har_state` event
 /// (Step 14: one push replaces the page's state).
 async fn status_document(state: &ApiState) -> Result<Value, ApiError> {
     let scheduler = state.scheduler.status().await.map_err(ApiError::from)?;
@@ -1155,7 +1233,11 @@ async fn render_status_document(state: &ApiState, scheduler: &SchedulerStatus) -
         "jobs": &scheduler.jobs,
         "last_error": last_error,
         "catalog_errors": &scheduler.catalog_errors,
-        "config_errors": [],
+        // The boot config file's per-field verdict as of the last landing harness
+        // write-back (07[11]): cached state only — the boot itself exits on any
+        // invalid field (§0.2 step 1), so a served document starts empty and the
+        // write-back validator is the only producer.
+        "config_errors": state.config_errors(),
     });
     // R5 report-only reconcile (ruling 9): the stranded-container names the
     // reconcile warned about ride the SAME snapshot, so the page and the log can
@@ -4419,9 +4501,15 @@ mod tests {
             ..AppConfig::default()
         };
 
+        let (persisted, verdict) =
+            persist_default_model(&config, CategoryId::Work, Some("honest.gguf"));
         assert!(
-            persist_default_model(&config, CategoryId::Work, Some("honest.gguf")),
+            persisted,
             "a write that reads back as published is a persistence the API may claim"
+        );
+        assert!(
+            verdict.is_empty(),
+            "clean published bytes earn an empty boot-config verdict: {verdict:?}"
         );
         let on_disk: Value = serde_json::from_str(
             &std::fs::read_to_string(&path).expect("the config file exists after a true answer"),
@@ -4441,9 +4529,15 @@ mod tests {
         // The volume accepted the rename and the bytes are there — they are simply not
         // the tree that was published, and only the real compare can tell.
         arm_config_read_back_fault(&path);
+        let (persisted, verdict) =
+            persist_default_model(&config, CategoryId::Work, Some("phantom.gguf"));
         assert!(
-            !persist_default_model(&config, CategoryId::Work, Some("phantom.gguf")),
+            !persisted,
             "an unverifiable write may only ever be answered `persisted: false`"
+        );
+        assert!(
+            verdict.is_empty(),
+            "a write that never landed may not restate the boot-config verdict: {verdict:?}"
         );
         release_config_read_back_fault(&path);
         let tampered: Value = serde_json::from_str(
@@ -4931,7 +5025,7 @@ mod tests {
                     (0..ROUNDS)
                         .map(|round| {
                             let name = format!("{prefix}-t{index}-r{round}");
-                            persist_default_model(&per_writer, category, Some(&name))
+                            persist_default_model(&per_writer, category, Some(&name)).0
                         })
                         .collect::<Vec<bool>>()
                 })
@@ -4990,6 +5084,170 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "a failed rename must not leave its temp behind: {leftovers:?}"
+        );
+    }
+
+    /// FINDINGS-07 [11] producer falsifier: the write-back is the one moment the
+    /// harness becomes the last writer of the boot config, and its read-patch-write
+    /// carries every OTHER byte as `Value` passthrough — so an operator hand-edit made
+    /// while the harness ran (reload re-reads the catalog and nothing else, Step 9
+    /// LOCKED) survives into the published file. Pre-fix, `persist_default_model`
+    /// answered a bare bool and `/har/status` hardcoded `config_errors: []`, so a
+    /// hand-edited `load_timeout_s: 0` (a boot-fatal field per §0.2 step 1) rode the
+    /// harness's own `persisted: true` write unseen until the harness refused to
+    /// start. The verdict is the boot's own validator over the landed tree, so the
+    /// field can never drift from what boot would say.
+    #[test]
+    fn a_landed_write_back_validates_the_published_boot_file_per_field() {
+        let dir = crate::testutil::temp_dir("api-config-verdict");
+        let path = dir.join("simplehar-se.json");
+        let config = AppConfig {
+            source_path: Some(path.clone()),
+            ..AppConfig::default()
+        };
+        // Mid-run hand-edit: valid JSON, contents the boot must refuse.
+        let mut root = serde_json::to_value(&config).expect("seed serializes");
+        root["load_timeout_s"] = json!(0);
+        root["vram_total_gb"] = json!(-1.0);
+        std::fs::write(&path, root.to_string()).expect("seed the hand-edited file");
+
+        let (persisted, verdict) =
+            persist_default_model(&config, CategoryId::Work, Some("pinned.gguf"));
+        assert!(
+            persisted,
+            "the bytes landed and read back; persisted honesty is unchanged by the verdict"
+        );
+        let named = verdict
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            named.contains("load_timeout_s") && named.contains("vram_total_gb"),
+            "every boot-refused field must be named while the harness is alive to say it: {named}"
+        );
+
+        // A hand-edited unknown key no longer parses as the schema at all: one error
+        // naming the file root, the same shape `AppConfig::parse` gives at boot.
+        let mut root = serde_json::to_value(&config).expect("seed serializes");
+        root["wrok_port"] = json!(9);
+        std::fs::write(&path, root.to_string()).expect("seed the unknown key");
+        let (persisted, verdict) =
+            persist_default_model(&config, CategoryId::Work, Some("pinned2.gguf"));
+        assert!(persisted, "the unknown key rode the passthrough and landed");
+        assert_eq!(verdict.len(), 1, "one parse-level error: {verdict:?}");
+        let text = verdict[0].to_string();
+        assert!(
+            text.contains(crate::config::CONFIG_FILE) && text.contains("wrok_port"),
+            "the error must name the file and the key, as boot's parse does: {text}"
+        );
+    }
+
+    /// FINDINGS-07 [11] render wiring: `config_errors` is the recorded verdict, in the
+    /// `kind`/`field`/`reason` vocabulary `catalog_errors` established, and an empty
+    /// array is earned (clean boot, clean later write) rather than asserted. Falsifier:
+    /// restoring the hardcoded `[]` leaves both non-empty legs red; flattening the
+    /// verdict into `last_error` (or into `catalog_errors`) is red on the shape leg.
+    #[tokio::test]
+    async fn config_errors_reports_the_recorded_verdict_and_starts_empty() {
+        let api = live_state(BootTimings::default());
+        let doc = status_document(&api).await.expect("status document");
+        assert_eq!(
+            doc["config_errors"],
+            json!([]),
+            "a boot that validated dirty never served this document: a fresh state is clean"
+        );
+        api.record_config_errors(vec![ConfigError::Invalid {
+            field: "vram_total_gb".to_string(),
+            reason: "must be a finite number greater than 0".to_string(),
+        }]);
+        let doc = status_document(&api).await.expect("status document");
+        assert_eq!(
+            doc["config_errors"],
+            json!([{
+                "kind": "invalid",
+                "field": "vram_total_gb",
+                "reason": "must be a finite number greater than 0"
+            }]),
+            "the wire shape is kind+field+reason, like catalog_errors"
+        );
+        api.record_config_errors(Vec::new());
+        let doc = status_document(&api).await.expect("status document");
+        assert_eq!(
+            doc["config_errors"],
+            json!([]),
+            "a later landing write that validates clean replaces the verdict"
+        );
+    }
+
+    /// FINDINGS-07 [11] end-to-end tripwire: the page-visible field through the real
+    /// `/har/config/default` path (`set_default_model` → gated blocking write-back →
+    /// recorded verdict → status document). The named test is the pin the `ApiState`
+    /// field's doc cites: a future boot-file mutation that forgets
+    /// `record_config_errors`, or a render path that regresses to `[]`, fails here.
+    /// `persisted` stays `true` — the bytes DID land; the field reports that the file
+    /// on disk will refuse the next boot, which is a different fact.
+    #[tokio::test]
+    async fn a_write_back_that_lands_a_boot_invalid_file_names_it_in_config_errors() {
+        let dir = crate::testutil::temp_dir("api-config-e2e");
+        let path = dir.join("simplehar-se.json");
+        let mut config = AppConfig::default();
+        let mut root = serde_json::to_value(&config).expect("seed serializes");
+        root["load_timeout_s"] = json!(0);
+        std::fs::write(&path, root.to_string()).expect("seed the mid-run hand-edit");
+        config.source_path = Some(path.clone());
+
+        let mut adapters: BTreeMap<String, Arc<dyn crate::engine::EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "mock".to_string(),
+            Arc::new(crate::engine::mock::MockAdapter) as Arc<dyn crate::engine::EngineAdapter>,
+        );
+        let scheduler = crate::scheduler::Scheduler::start(
+            config.clone(),
+            crate::testutil::temp_dir("api-config-e2e-boot"),
+            adapters,
+            Arc::new(crate::process::ProcessRuntime::new())
+                as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(crate::budget::LedgerOnlyWitness),
+        );
+        let api = ApiState::new(
+            config,
+            scheduler,
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        );
+
+        let doc = status_document(&api).await.expect("status document");
+        assert_eq!(
+            doc["config_errors"],
+            json!([]),
+            "nothing is recorded before any harness write-back"
+        );
+        let (effective, persisted) = api
+            .set_default_model(CategoryId::Work, Some("pinned.gguf"))
+            .await;
+        assert_eq!(effective.as_deref(), Some("pinned.gguf"));
+        assert!(persisted, "the patched file landed and read back");
+
+        let doc = status_document(&api).await.expect("status document");
+        assert!(
+            doc["config_errors"]
+                .as_array()
+                .expect("config_errors stays an array")
+                .iter()
+                .any(|entry| entry["field"] == json!("load_timeout_s")),
+            "the field the next boot would refuse is named now: {doc}"
+        );
+        assert_eq!(
+            doc["categories"]
+                .as_array()
+                .expect("categories array")
+                .iter()
+                .find(|c| c["id"] == json!("WORK"))
+                .and_then(|c| c["default_model"].as_str()),
+            Some("pinned.gguf"),
+            "the write-back itself is unchanged: only the verdict was added"
         );
     }
 }
