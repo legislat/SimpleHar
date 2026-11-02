@@ -859,7 +859,8 @@ fn rewrite_config_slot(mut argv: Vec<String>, path: &str) -> Option<Vec<String>>
 /// * **atomic write** — hash-named temp plus `rename` (same-directory,
 ///   replace-on-publish), then the published bytes are read back and re-hashed:
 ///   what the child reads is what the adapter validated;
-/// * **bounded** — keep-N prune of this slug's `<slug>-<16hex>.json` pool,
+/// * **bounded** — keep-N prune of this slug's
+///   `<sanitized-slug>-<16hex>.json` pool ([`prune_staged_profiles`]),
 ///   newest first (the in-distro script driver's [`STAGED_SCRIPT_KEEP`] rule
 ///   ported to the Windows filesystem).
 ///
@@ -900,15 +901,20 @@ fn stage_strata_profile(
     Ok(target)
 }
 
-/// Keep-N prune of one slug's staged-profile pool, newest by mtime. Entries
-/// are matched exactly — `<slug>-<16 hex>.json` — so a dot-bearing slug
-/// (`har.a`) can never prune another model's pool (the lesson the ninfer
-/// staging driver learned on the distro's findutils, review 2026-10-31).
+/// Keep-N prune of one slug's staged-profile pool, newest by mtime. Entries are
+/// matched exactly — `<sanitized-slug>-<16 hex>.json`, the SAME name
+/// [`crate::engine::strata::staged_profile_name`] writes (review 25 [3]: raw
+/// vs sanitized would prune zero of its own files and grow the pool without
+/// bound) — so a dot-bearing slug (`har.a`) can never prune another model's
+/// pool (the lesson the ninfer staging driver learned on the distro's
+/// findutils, review 2026-10-31). Two names that sanitize identically
+/// (`a b` / `a_b`) share one pool by construction: the name is the content
+/// address's owner and a launch re-stages its own bytes anyway.
 fn prune_staged_profiles(root: &Path, slug: &str) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    let prefix = format!("{slug}-");
+    let prefix = format!("{}-", sanitize_slug(slug));
     let mut pool: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
@@ -2440,6 +2446,159 @@ mod tests {
         // in a file, never on a command line).
         assert_eq!(script_content_hash(""), script_content_hash(""));
         assert_ne!(script_content_hash("a"), script_content_hash("b"));
+    }
+
+    /// Ruling 19's staging door, tested directly (review 25 [2]+[3]): a name
+    /// that is not filesystem-bare must still prune its OWN pool — the writer
+    /// sanitizes, so the prune has to match the sanitized prefix or every yaml
+    /// edit stages a permanent file — and one slug's pool must never touch
+    /// another's.
+    #[test]
+    fn staged_profiles_prune_their_own_sanitized_pool_and_nobody_elses() {
+        let root = crate::testutil::temp_dir("strata-stage");
+        let slug = "strata iq3s";
+        let stage = |i: u32| -> PathBuf {
+            let text = format!("{{\"render\": {i}}}");
+            let placeholder = crate::engine::strata::staged_profile_name(slug, &text);
+            let landed = stage_strata_profile(&root, slug, &text, &placeholder).expect("stages");
+            assert_eq!(
+                std::fs::read_to_string(&landed).expect("reads back"),
+                text,
+                "the staged bytes are the rendered bytes"
+            );
+            // Distinct mtimes keep the newest-first prune order observable.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            landed
+        };
+        let first = stage(0);
+        for i in 1..12 {
+            stage(i);
+        }
+        let last = stage(12);
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .expect("root readable")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let mine: Vec<&String> = names
+            .iter()
+            .filter(|n| n.starts_with("strata_iq3s-"))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            STAGED_PROFILE_KEEP,
+            "the prune must match the writer's sanitized name: {names:?}"
+        );
+        assert!(last.is_file(), "the newest render is never pruned");
+        assert!(!first.is_file(), "the oldest render is the first to go");
+        // A second slug stages beside the first and keeps its own pool.
+        let other_text = "{\"other\": true}";
+        let other = stage_strata_profile(
+            &root,
+            "other",
+            other_text,
+            &crate::engine::strata::staged_profile_name("other", other_text),
+        )
+        .expect("stages");
+        assert!(other.is_file(), "one slug's prune never touches another's");
+        // The name binds its bytes: a hand-built spec cannot stage one
+        // profile under another model's name.
+        let wrong = stage_strata_profile(
+            &root,
+            slug,
+            "{\"n\": 1}",
+            "strata_iq3s-0000000000000000.json",
+        );
+        assert!(
+            wrong.is_err_and(|reason| reason.contains("content address")),
+            "a placeholder that is not these bytes' address must refuse"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_config_slot_rewrites_only_a_flag_that_carries_a_value() {
+        let argv = vec!["py".to_string(), "--config".to_string(), "ph".to_string()];
+        let rewritten = rewrite_config_slot(argv, "C:\\s.json").expect("rewrites");
+        assert_eq!(rewritten[2], "C:\\s.json");
+        assert!(
+            rewrite_config_slot(vec!["py".to_string(), "--port".to_string()], "p").is_none(),
+            "argv without --config cannot carry a staged path"
+        );
+        assert!(
+            rewrite_config_slot(vec!["py".to_string(), "--config".to_string()], "p").is_none(),
+            "a --config with no value slot would silently add a path to another flag"
+        );
+    }
+
+    /// The spawn wiring (review 25 [2]): a spec carrying a rendered profile
+    /// stages under the runtime's profile root BEFORE any spawn attempt, and
+    /// the `--config` placeholder the argv carries is the name those bytes
+    /// hash to — a broken placeholder extraction would surface as the staging
+    /// refusal, which this test pins absent by reaching the spawn error.
+    #[tokio::test]
+    async fn a_rendered_profile_stages_under_the_profile_root_before_the_child() {
+        let dir = crate::testutil::temp_dir("strata-spawn-stage");
+        let profiles = dir.join("profiles");
+        let text = "{\"model_name\": \"probe\"}".to_string();
+        let slug = "strata iq3s";
+        let placeholder = crate::engine::strata::staged_profile_name(slug, &text);
+        let runtime = ProcessRuntime::new().with_profiles_root(&profiles);
+        let spec = LaunchSpec {
+            argv: vec![
+                "C:\\simplehar-absent\\no-such-engine.exe".to_string(),
+                "-m".to_string(),
+                "serve.server".to_string(),
+                "--engine".to_string(),
+                "strata".to_string(),
+                "--host".to_string(),
+                "127.0.0.1".to_string(),
+                "--config".to_string(),
+                placeholder.clone(),
+                "--port".to_string(),
+                "18197".to_string(),
+            ],
+            cwd: dir.clone(),
+            env: spec_map(&[]),
+            log_name: slug.to_string(),
+            readiness: ReadinessSpec::Http {
+                path: "/health".to_string(),
+                expect_status: 200,
+            },
+            container: None,
+            script: None,
+            rendered_profile: Some(text.clone()),
+            custody: None,
+        };
+        let tk = SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 0,
+            port: 18_197,
+        };
+        let error = runtime
+            .spawn(&spec, tk)
+            .await
+            .expect_err("the absent program cannot start");
+        let SpawnError::SpawnFailed { reason } = error else {
+            panic!("expected a spawn failure, got {error:?}");
+        };
+        assert!(
+            reason.contains("cannot spawn C:\\simplehar-absent"),
+            "the run must reach the spawn step: {reason}"
+        );
+        assert!(
+            !reason.contains("cannot stage"),
+            "staging completed, so the argv placeholder matched its bytes: {reason}"
+        );
+        let staged = profiles.join(&placeholder);
+        assert!(
+            staged.is_file(),
+            "the rendered bytes must sit at the name the argv carried: {}",
+            staged.display()
+        );
+        assert_eq!(std::fs::read_to_string(&staged).expect("reads back"), text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The keep-N prune matches the slug LITERALLY (review 2026-10-31, MEDIUM):

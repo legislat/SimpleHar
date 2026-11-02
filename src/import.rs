@@ -62,6 +62,12 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
             )
         })?;
     let str = |key: &str| -> Option<&str> { root.get(key).and_then(serde_json::Value::as_str) };
+    // The honesty channel (review 25 [4]): a MAPPED key the renderer's shape
+    // cannot carry is reported like an unmapped one — never dropped without a
+    // line — and nested unmapped keys are audited one level down ([1]), since
+    // a live profile turned out to carry `vision.threads` through the gap.
+    let mut wrong_type: Vec<&str> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     let mut out = String::new();
     out.push_str(&format!(
         "# strata template row rendered by `simplehar-se import strata {}` (ruling 2026-11-02).\n\
@@ -76,10 +82,16 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
     ));
     match str("model_name") {
         Some(name) => out.push_str(&format!("engine: strata\nserve_model: {name}\n")),
-        None => out.push_str(
-            "engine: strata\n# not mapped: model_name is absent — `serve_model` must come \
-             from the row\n",
-        ),
+        None => {
+            out.push_str("engine: strata\n");
+            if root.contains_key("model_name") {
+                wrong_type.push("model_name");
+            } else {
+                out.push_str(
+                    "# not mapped: model_name is absent — `serve_model` must come from the row\n",
+                );
+            }
+        }
     }
     if let Some(exe) = str("exe") {
         out.push_str(&format!("strata_exe: {exe}\n"));
@@ -89,68 +101,109 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
             profile_path.display()
         ));
     }
-    let has_vision = root.contains_key("vision");
-    if let Some(args) = root.get("args").and_then(serde_json::Value::as_array) {
-        let spelled: Vec<&str> = args.iter().filter_map(serde_json::Value::as_str).collect();
-        if spelled.len() != args.len() {
-            return Err(format!(
-                "{} `args` holds a token that is not a string: fix the profile before importing",
-                profile_path.display()
-            ));
-        }
-        if spelled.iter().any(|token| token.trim().is_empty()) {
-            return Err(format!(
-                "{} carries an empty `args` token: fix the profile before importing",
-                profile_path.display()
-            ));
-        }
-        // The canonical row spells vision ONCE, in the block: the renderer
-        // re-appends the switch, so the imported line must not carry it.
-        let tokens: Vec<&str> = spelled
-            .iter()
-            .copied()
-            .filter(|token| !(has_vision && *token == "--vision"))
-            .collect();
-        out.push_str(&format!("strata_args: {}\n", tokens.join(", ")));
+    // The block ONCE rule needs the block itself, not the key: a `vision`
+    // that is not an object can never render, so its args switch must survive
+    // in the imported line rather than be silently turned off.
+    let vision_block = root.get("vision").and_then(serde_json::Value::as_object);
+    if root.contains_key("vision") && vision_block.is_none() {
+        wrong_type.push("vision");
     }
-    if let Some(cwd) = str("cwd") {
-        out.push_str(&format!("strata_cwd: {cwd}\n"));
-    }
-    if let Some(tokenizer) = str("tokenizer") {
-        out.push_str(&format!("strata_tokenizer: {tokenizer}\n"));
-    }
-    if let Some(dirs) = root.get("lib_dirs").and_then(serde_json::Value::as_array) {
-        let entries: Vec<&str> = dirs.iter().filter_map(serde_json::Value::as_str).collect();
-        if entries.len() != dirs.len() {
-            return Err(format!(
-                "{} `lib_dirs` holds a non-string entry",
-                profile_path.display()
-            ));
+    if let Some(value) = root.get("args") {
+        match value.as_array() {
+            None => wrong_type.push("args"),
+            Some(args) => {
+                let spelled: Vec<&str> =
+                    args.iter().filter_map(serde_json::Value::as_str).collect();
+                if spelled.len() != args.len() {
+                    return Err(format!(
+                        "{} `args` holds a token that is not a string: fix the profile \
+                         before importing",
+                        profile_path.display()
+                    ));
+                }
+                if spelled.iter().any(|token| token.trim().is_empty()) {
+                    return Err(format!(
+                        "{} carries an empty `args` token: fix the profile before importing",
+                        profile_path.display()
+                    ));
+                }
+                // The canonical row spells vision ONCE, in the block: the
+                // renderer re-appends the switch, so a block that WILL render
+                // owns the token; a block that cannot leaves it in the data.
+                let has_vision = vision_block.is_some();
+                let tokens: Vec<&str> = spelled
+                    .iter()
+                    .copied()
+                    .filter(|token| !(has_vision && *token == "--vision"))
+                    .collect();
+                out.push_str(&format!("strata_args: {}\n", tokens.join(", ")));
+            }
         }
-        out.push_str(&format!("strata_lib_dirs: {}\n", entries.join(", ")));
     }
-    if let Some(env) = root.get("env").and_then(serde_json::Value::as_object) {
-        if env.values().any(|v| v.as_str().is_none()) {
-            return Err(format!(
-                "{} `env` holds a non-string value",
-                profile_path.display()
-            ));
+    if let Some(value) = root.get("cwd") {
+        match value.as_str() {
+            Some(cwd) => out.push_str(&format!("strata_cwd: {cwd}\n")),
+            None => wrong_type.push("cwd"),
         }
-        let tokens: Vec<String> = env
-            .iter()
-            .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
-            .collect();
-        out.push_str(&format!("strata_env: {}\n", tokens.join(" ")));
+    }
+    if let Some(value) = root.get("tokenizer") {
+        match value.as_str() {
+            Some(tokenizer) => out.push_str(&format!("strata_tokenizer: {tokenizer}\n")),
+            None => wrong_type.push("tokenizer"),
+        }
+    }
+    if let Some(value) = root.get("lib_dirs") {
+        match value.as_array() {
+            None => wrong_type.push("lib_dirs"),
+            Some(dirs) => {
+                let entries: Vec<&str> =
+                    dirs.iter().filter_map(serde_json::Value::as_str).collect();
+                if entries.len() != dirs.len() {
+                    return Err(format!(
+                        "{} `lib_dirs` holds a non-string entry",
+                        profile_path.display()
+                    ));
+                }
+                out.push_str(&format!("strata_lib_dirs: {}\n", entries.join(", ")));
+            }
+        }
+    }
+    if let Some(value) = root.get("env") {
+        match value.as_object() {
+            None => wrong_type.push("env"),
+            Some(env) => {
+                if env.values().any(|v| v.as_str().is_none()) {
+                    return Err(format!(
+                        "{} `env` holds a non-string value",
+                        profile_path.display()
+                    ));
+                }
+                let tokens: Vec<String> = env
+                    .iter()
+                    .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
+                    .collect();
+                out.push_str(&format!("strata_env: {}\n", tokens.join(" ")));
+            }
+        }
     }
     for (key, yaml) in [("gpu", "strata_gpu"), ("parallel", "strata_parallel")] {
-        if let Some(value) = root.get(key).and_then(serde_json::Value::as_u64) {
-            out.push_str(&format!("{yaml}: {value}\n"));
+        if let Some(value) = root.get(key) {
+            match value.as_u64() {
+                Some(number) => out.push_str(&format!("{yaml}: {number}\n")),
+                None => wrong_type.push(key),
+            }
         }
     }
-    if root.get("gpus_asked").and_then(serde_json::Value::as_bool) == Some(true) {
-        out.push_str("strata_gpus_asked: true\n");
+    if let Some(value) = root.get("gpus_asked") {
+        match value.as_bool() {
+            Some(true) => out.push_str("strata_gpus_asked: true\n"),
+            // An explicit false is the renderer's absent-key default (the
+            // profile key is written only when truthy): faithful as absent.
+            Some(false) => {}
+            None => wrong_type.push("gpus_asked"),
+        }
     }
-    if let Some(vision) = root.get("vision").and_then(serde_json::Value::as_object) {
+    if let Some(vision) = vision_block {
         let mut tokens: Vec<String> = Vec::new();
         for key in ["exe", "mmproj", "model"] {
             match vision.get(key).and_then(serde_json::Value::as_str) {
@@ -176,22 +229,35 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
         if let Some(tokens_n) = vision.get("max_tokens").and_then(serde_json::Value::as_u64) {
             tokens.push(format!("max_tokens={tokens_n}"));
         }
+        for key in vision.keys() {
+            if !["exe", "mmproj", "model", "gpu", "max_tokens"].contains(&key.as_str()) {
+                notes.push(format!("vision.{key}"));
+            }
+        }
         out.push_str(&format!("strata_vision: {}\n", tokens.join(" ")));
     }
-    if let Some(sampling) = root.get("sampling").and_then(serde_json::Value::as_object) {
-        let mut tokens: Vec<String> = Vec::new();
-        for (key, value) in sampling {
-            // `Value`'s Display keeps the source's numeric form (int stays
-            // int, 1.0 stays 1.0), which is what the renderer re-parses.
-            if value.as_u64().is_none() && value.as_f64().is_none() && value.as_bool().is_none() {
-                return Err(format!(
-                    "{} `sampling` value for `{key}` is neither number nor bool",
-                    profile_path.display()
-                ));
+    if let Some(value) = root.get("sampling") {
+        match value.as_object() {
+            None => wrong_type.push("sampling"),
+            Some(sampling) => {
+                let mut tokens: Vec<String> = Vec::new();
+                for (key, value) in sampling {
+                    // `Value`'s Display keeps the source's numeric form (int stays
+                    // int, 1.0 stays 1.0), which is what the renderer re-parses.
+                    if value.as_u64().is_none()
+                        && value.as_f64().is_none()
+                        && value.as_bool().is_none()
+                    {
+                        return Err(format!(
+                            "{} `sampling` value for `{key}` is neither number nor bool",
+                            profile_path.display()
+                        ));
+                    }
+                    tokens.push(format!("{key}={value}"));
+                }
+                out.push_str(&format!("strata_sampling: {}\n", tokens.join(" ")));
             }
-            tokens.push(format!("{key}={value}"));
         }
-        out.push_str(&format!("strata_sampling: {}\n", tokens.join(" ")));
     }
     if let Some(on) = root.get("uncensored") {
         match on.as_bool() {
@@ -215,11 +281,16 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
             owned.join(", ")
         ));
     }
-    let unmapped: Vec<&str> = root
-        .keys()
-        .filter(|key| !MAPPED_KEYS.contains(&key.as_str()) && !owned.contains(&key.as_str()))
-        .map(String::as_str)
+    let mut unmapped: Vec<String> = wrong_type
+        .iter()
+        .map(|key| format!("{key} (present, wrong type)"))
+        .chain(notes)
         .collect();
+    unmapped.extend(
+        root.keys()
+            .filter(|key| !MAPPED_KEYS.contains(&key.as_str()) && !owned.contains(&key.as_str()))
+            .cloned(),
+    );
     if !unmapped.is_empty() {
         out.push_str(&format!("# not mapped: {}\n", unmapped.join(", ")));
     }
@@ -317,6 +388,93 @@ mod tests {
         );
         let yaml = strata_yaml(&profile).expect("imports");
         assert!(yaml.contains("# not mapped: mystery"), "{yaml}");
+        let _ = std::fs::remove_file(profile);
+    }
+
+    /// Review 25 [4]: every MAPPED key whose JSON shape the renderer cannot
+    /// carry is reported on the not-mapped line — the module promise is that
+    /// the operator can merge the output blind, so a present-but-wrong-type
+    /// key may never simply vanish.
+    #[test]
+    fn a_mapped_key_of_the_wrong_shape_is_reported_not_dropped() {
+        let profile = temp_profile(
+            "wrong-type",
+            r#"{
+                "exe": "C:\\e.exe",
+                "model_name": 7,
+                "cwd": 5,
+                "lib_dirs": "C:\\x",
+                "env": "STRATA_KVA=0",
+                "gpu": "0",
+                "parallel": 1.5,
+                "gpus_asked": "yes",
+                "sampling": 5
+            }"#,
+        );
+        let yaml = strata_yaml(&profile).expect("imports");
+        for key in [
+            "model_name",
+            "cwd",
+            "lib_dirs",
+            "env",
+            "gpu",
+            "parallel",
+            "gpus_asked",
+            "sampling",
+        ] {
+            assert!(
+                yaml.contains(&format!("{key} (present, wrong type)")),
+                "{key} must be reported, not dropped: {yaml}"
+            );
+        }
+        assert!(
+            !yaml.contains("strata_cwd")
+                && !yaml.contains("strata_env")
+                && !yaml.contains("strata_sampling"),
+            "a key the renderer cannot carry never becomes a half-knob: {yaml}"
+        );
+        let _ = std::fs::remove_file(profile);
+    }
+
+    /// Review 25 [4], the worse-than-silent arm: a non-object `vision` that
+    /// strips `--vision` from the args line AND renders no block switches
+    /// vision off with nothing printed. The token must survive the import.
+    #[test]
+    fn a_vision_that_cannot_render_leaves_the_switch_in_the_args_line() {
+        let profile = temp_profile(
+            "vision-scalar",
+            r#"{"exe": "C:\\e.exe", "args": ["--pack", "P", "--vision"], "vision": true}"#,
+        );
+        let yaml = strata_yaml(&profile).expect("imports");
+        assert!(
+            yaml.contains("strata_args: --pack, P, --vision"),
+            "no block can carry the switch, so the data keeps it: {yaml}"
+        );
+        assert!(yaml.contains("vision (present, wrong type)"), "{yaml}");
+        let _ = std::fs::remove_file(profile);
+    }
+
+    /// Review 25 [1]: the nested audit — `vision.threads` rode a live profile
+    /// through the root-key-only gap and vanished without a line.
+    #[test]
+    fn a_nested_vision_key_without_a_knob_is_named_one_level_down() {
+        let profile = temp_profile(
+            "vision-nested",
+            r#"{
+                "exe": "C:\\e.exe",
+                "vision": {"exe": "C:\\v.exe", "mmproj": "M", "model": "D",
+                           "gpu": false, "max_tokens": 300, "threads": 16}
+            }"#,
+        );
+        let yaml = strata_yaml(&profile).expect("imports");
+        assert!(
+            yaml.contains("# not mapped: vision.threads"),
+            "the nested unmapped key must be named: {yaml}"
+        );
+        assert!(
+            yaml.contains("strata_vision: exe=C:\\v.exe mmproj=M model=D gpu=false max_tokens=300"),
+            "{yaml}"
+        );
         let _ = std::fs::remove_file(profile);
     }
 }

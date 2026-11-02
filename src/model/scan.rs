@@ -34,8 +34,6 @@ pub enum ScanKind {
     /// The model's backing file — or a path its strata profile references — is not
     /// on disk; the entry was dropped.
     ModelPathMissing,
-    /// A strata profile JSON could not be read or parsed; the entry was dropped.
-    ProfileUnreadable,
     /// A `name:` key contradicts the file stem, or the stem is empty; dropped.
     InvalidName,
     /// A configured engine binary does not exist (a `config` cross-check, raised by
@@ -631,19 +629,29 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 // the `log` key is exempt entirely (a log target's existence
                 // is not a load precondition).
                 if entry.engine == "strata" {
+                    let template = crate::engine::strata::template_mode(&entry);
                     if let Some(profile) = map
                         .get("strata_config")
                         .map(|v| v.trim())
                         .filter(|v| !v.is_empty())
                     {
+                        // A row that already carries the imported surface only
+                        // needs its `strata_config` line deleted — name that
+                        // door, not the import bridge it does not need; the
+                        // adapter refuses the same sentence (review 25 [7]).
+                        let reason = if template {
+                            crate::engine::strata::mutual_exclusion_sentence(profile)
+                        } else {
+                            crate::engine::strata::superseded_sentence(profile)
+                        };
                         catalog.errors.push(ScanError {
                             kind: ScanKind::PolicyRefused,
                             file: file_name.clone(),
-                            reason: crate::engine::strata::superseded_sentence(profile),
+                            reason,
                         });
                         continue;
                     }
-                    if crate::engine::strata::template_mode(&entry) {
+                    if template {
                         // The default cwd resolves exactly as the adapter's
                         // does (the `engines:` default — scan runs before the
                         // config-wired adapter exists, so the constant is the
@@ -1772,7 +1780,9 @@ mod tests {
 
     /// A row that still declares `strata_config` is the SUPERSEDED mode
     /// (ruling 2026-11-02 row 19): refused outright with the migration
-    /// sentence, whatever the profile file itself holds.
+    /// sentence, whatever the profile file itself holds — unless the row also
+    /// carries `strata_exe`, which means the import already happened and the
+    /// accurate sentence is the mutual-exclusion one (review 25 [7]).
     #[test]
     fn a_strata_config_row_is_refused_naming_the_import_command() {
         let dir = crate::testutil::temp_dir("scan-strata-superseded");
@@ -1791,8 +1801,17 @@ mod tests {
             )
             .expect("write");
         }
+        std::fs::write(
+            dir.join("both.yaml"),
+            format!(
+                "engine: strata\nstrata_exe: C:\\Strata\\engine\\strata.exe\n\
+                 strata_config: {}\nvram_gb: 8\n",
+                dir.join("broken.json").display()
+            ),
+        )
+        .expect("write");
         let catalog = scan_dir(&dir);
-        assert!(catalog.models.is_empty(), "neither row may publish");
+        assert!(catalog.models.is_empty(), "no row may publish");
         for file in ["nofile.yaml", "manual.yaml"] {
             assert!(
                 catalog
@@ -1806,6 +1825,20 @@ mod tests {
                 catalog.errors
             );
         }
+        // Review 25 [7]: a row that already carries the imported surface only
+        // needs its `strata_config` line deleted, so the scan names the
+        // mutual-exclusion door, not a re-import the row does not need.
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .any(|e| e.kind == ScanKind::PolicyRefused
+                    && e.file.contains("both.yaml")
+                    && e.reason.contains("mutually exclusive")
+                    && !e.reason.contains("simplehar-se import strata")),
+            "both-sources row must meet the mutual-exclusion sentence: {:?}",
+            catalog.errors
+        );
     }
 
     /// Template mode moves the path walk onto the RENDERA: a row whose engine
@@ -2721,7 +2754,6 @@ mod tests {
         assert_eq!(json["file"], "m.yaml");
         assert_eq!(json["reason"], "model file not found: F:/x.gguf");
         for (kind, name) in [
-            (ScanKind::ProfileUnreadable, "profile_unreadable"),
             (ScanKind::InvalidName, "invalid_name"),
             (ScanKind::EngineBinaryMissing, "engine_binary_missing"),
             (ScanKind::EngineUnavailable, "engine_unavailable"),

@@ -616,9 +616,14 @@ pub(crate) struct EnginePolicy {
     /// The L3 serve-args/script artifact the harness renders for this engine;
     /// `None` where the adapter builds argv directly.
     pub serve_template: Option<&'static str>,
-    /// The yaml key naming this engine's harness-owned L2 profile (strata's
-    /// `strata_config` is the only one today); the scheduler tracks the profile
-    /// layer through this cell instead of testing engine names.
+    /// The yaml key naming this engine's harness-owned L2 profile; the
+    /// scheduler tracks the profile layer through this cell instead of testing
+    /// engine names. NO engine populates it since ruling 2026-11-02 row 19:
+    /// strata's profile became harness-rendered L3 bytes, and a row still
+    /// declaring `strata_config` is refused at scan before it can publish — so
+    /// the scheduler's profile-layer leg is dormant and the yaml fingerprint
+    /// (`queue_fingerprint` → `spawn_config`) is the whole `stale_config`
+    /// story (review 25 [5]; retiring the dormant leg is a follow-up).
     pub profile_field: Option<&'static str>,
     /// Harness-config keys this engine consumes; the knob-parity test alarms
     /// when the config grows an engine-scoped key that joins neither a row nor
@@ -728,7 +733,7 @@ static STRATA_ROW: EnginePolicy = EnginePolicy {
     // no longer a launch input at all.
     custody_data_roots: &[STRATA_RENDERED_PROFILES_ROOT],
     serve_template: None,
-    profile_field: Some("strata_config"),
+    profile_field: None,
     // The harness-side strata defaults live in the config `engines:` section
     // (slice 10d); the dotted claims are the knob-parity test's pointers into
     // that section, which the test walks in a populated serialization.

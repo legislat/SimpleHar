@@ -218,6 +218,18 @@ pub(crate) fn superseded_sentence(path: &str) -> String {
     )
 }
 
+/// The sentence a row naming BOTH profile sources meets, at either door (the
+/// scan for a row that already carries `strata_exe` and so only needs its old
+/// `strata_config` line deleted — review 25 [7]; the adapter as
+/// defense-in-depth): one launch, exactly one profile source.
+pub(crate) fn mutual_exclusion_sentence(config_path: &str) -> String {
+    format!(
+        "`strata_exe` (harness-rendered profile) and `strata_config` (operator file) are \
+         mutually exclusive: a launch has exactly one profile source, and the row still \
+         names the file: {config_path}"
+    )
+}
+
 /// The template-mode selector: a strata row renders its profile when the yaml
 /// carries `strata_exe` — the engine binary the rendered profile will name.
 pub(crate) fn template_mode(model: &ModelEntry) -> bool {
@@ -697,11 +709,7 @@ impl EngineAdapter for StrataAdapter {
         let legacy = knob(model, "strata_config");
         if template_mode(model) {
             if let Some(path) = legacy {
-                return Err(rejected(format!(
-                    "`strata_exe` (harness-rendered profile) and `strata_config` (operator \
-                     file) are mutually exclusive: a launch has exactly one profile source, \
-                     and the row still names the file: {path}"
-                )));
+                return Err(rejected(mutual_exclusion_sentence(path)));
             }
         } else if let Some(path) = legacy {
             return Err(rejected(superseded_sentence(path)));
