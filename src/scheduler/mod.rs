@@ -2854,17 +2854,14 @@ impl ActorState {
             && entry.measured_offload == data.offload
             && entry.measured_attribution == data.attribution
             && entry.measured_profile == data.profile;
-        // The row is not the only fold target: the spawn anchor of THIS launch is
-        // what the slot's `container_reported_gb` reads. When the engine's fresh
-        // figure equals the stamp a previous launch persisted, row-idempotence alone
-        // hides a lagging anchor — the live engine serves on never self-reported
-        // (card runs 2026-11-02: C2 polled `container_reported_gb` for 150 s through
-        // a ninfer serve whose 43.8 GiB report matched the persisted stamp).
-        let anchor_same = self
-            .jobs
-            .get(&spawned_job)
-            .and_then(|job| job.measured.as_ref())
-            .is_some_and(|a| a.attribution == data.attribution && a.range == Some((high, low)));
+        // The row is not the fold's only target: the slot's `container_reported_gb`
+        // reads THIS launch's spawn anchor. Row-idempotence alone would hide a
+        // lagging anchor whenever a fresh reading equals what an earlier launch
+        // persisted — the same engine_report figure across boots is the standing
+        // case (card runs 2026-11-02: C2 polled a null `container_reported_gb` for
+        // 150 s through a ninfer serve whose 43.8 GiB report matched the stamp).
+        let anchor_same =
+            anchor.attribution == data.attribution && anchor.range == Some((high, low));
         if entry_same && anchor_same {
             return;
         }

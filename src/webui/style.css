@@ -310,6 +310,15 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
   overflow-wrap: anywhere;
 }
 
+/* The fault flash (role=alert) is a fault: red ink, its own class, never the
+   hygiene amber (FINDINGS-24 [3]). */
+.sh-flash {
+  color: var(--sh-bad);
+  font-size: 0.85rem;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
 /* Small controls: unload buttons and the two static header-corner buttons. */
 .sh-mini {
   padding: 0.2rem 0.6rem;
