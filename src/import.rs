@@ -226,11 +226,30 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
             }
             None => {}
         }
-        if let Some(tokens_n) = vision.get("max_tokens").and_then(serde_json::Value::as_u64) {
-            tokens.push(format!("max_tokens={tokens_n}"));
+        // The three numeric keys of the server's vision contract (ruling
+        // 2026-11-02): a present value the token shape cannot carry is
+        // reported, never dropped (the same rule as the root keys).
+        for key in ["max_tokens", "min_tokens", "threads"] {
+            match vision.get(key) {
+                None => {}
+                Some(value) => match value.as_u64() {
+                    Some(n) => tokens.push(format!("{key}={n}")),
+                    None => notes.push(format!("vision.{key} (present, wrong type)")),
+                },
+            }
         }
         for key in vision.keys() {
-            if !["exe", "mmproj", "model", "gpu", "max_tokens"].contains(&key.as_str()) {
+            if ![
+                "exe",
+                "mmproj",
+                "model",
+                "gpu",
+                "max_tokens",
+                "min_tokens",
+                "threads",
+            ]
+            .contains(&key.as_str())
+            {
                 notes.push(format!("vision.{key}"));
             }
         }
@@ -454,8 +473,10 @@ mod tests {
         let _ = std::fs::remove_file(profile);
     }
 
-    /// Review 25 [1]: the nested audit — `vision.threads` rode a live profile
-    /// through the root-key-only gap and vanished without a line.
+    /// Ruling 2026-11-02 (FINDINGS-25 [1] settled): `threads` and `min_tokens`
+    /// are tokens now — a live profile's `vision.threads` imports faithful —
+    /// while a nested key the server contract does not carry, and a nested
+    /// number of the wrong shape, are still reported one level down.
     #[test]
     fn a_nested_vision_key_without_a_knob_is_named_one_level_down() {
         let profile = temp_profile(
@@ -463,17 +484,22 @@ mod tests {
             r#"{
                 "exe": "C:\\e.exe",
                 "vision": {"exe": "C:\\v.exe", "mmproj": "M", "model": "D",
-                           "gpu": false, "max_tokens": 300, "threads": 16}
+                           "gpu": false, "max_tokens": 300, "min_tokens": 4,
+                           "threads": "16", "quality": 2}
             }"#,
         );
         let yaml = strata_yaml(&profile).expect("imports");
         assert!(
-            yaml.contains("# not mapped: vision.threads"),
-            "the nested unmapped key must be named: {yaml}"
+            yaml.contains("strata_vision: exe=C:\\v.exe mmproj=M model=D gpu=false max_tokens=300 min_tokens=4"),
+            "{yaml}"
         );
         assert!(
-            yaml.contains("strata_vision: exe=C:\\v.exe mmproj=M model=D gpu=false max_tokens=300"),
-            "{yaml}"
+            yaml.contains("vision.threads (present, wrong type)"),
+            "a nested number spelled as text is reported, not dropped: {yaml}"
+        );
+        assert!(
+            yaml.contains("vision.quality"),
+            "a nested key the server contract lacks must be named: {yaml}"
         );
         let _ = std::fs::remove_file(profile);
     }

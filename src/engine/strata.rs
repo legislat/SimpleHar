@@ -361,7 +361,10 @@ fn env_map(
 /// The `strata_vision` block: whitespace-separated `k=v` tokens over the fixed
 /// key set — `exe`, `mmproj` and `model` are absolute paths (required together,
 /// the vision server cannot start without them), `gpu` is truthy (default on,
-/// as every manual profile has it), `max_tokens` an unsigned count. Rendering
+/// as every manual profile has it), `max_tokens`, `min_tokens` and `threads`
+/// unsigned counts (operator ruling 2026-11-02: the set mirrors the vision
+/// spawn's full cfg contract in `serve.server` — server.py:1936-1946 — so no
+/// hand-edited engine key can ride the knob unreported). Rendering
 /// the block also appends the engine's `--vision` switch to `args` (server.py
 /// derives the switch from the block's presence); the canonical row therefore
 /// spells the vision ONCE, in the block.
@@ -375,10 +378,13 @@ fn vision_block(
     let mut taken = serde_json::Map::new();
     let mut gpu = true;
     let mut max_tokens: Option<u64> = None;
+    let mut min_tokens: Option<u64> = None;
+    let mut threads: Option<u64> = None;
     for token in line.split_whitespace() {
         let Some((key, value)) = token.split_once('=') else {
             return Err(rejected(format!(
-                "`strata_vision` tokens must be k=v over exe, mmproj, model, gpu, max_tokens: {token}"
+                "`strata_vision` tokens must be k=v over exe, mmproj, model, gpu, \
+                 max_tokens, min_tokens, threads: {token}"
             )));
         };
         match key {
@@ -401,10 +407,23 @@ fn vision_block(
                     ))
                 })?);
             }
+            "min_tokens" => {
+                min_tokens = Some(value.parse::<u64>().map_err(|_| {
+                    rejected(format!(
+                        "`strata_vision` min_tokens must be a number: {value}"
+                    ))
+                })?);
+            }
+            "threads" => {
+                threads = Some(value.parse::<u64>().map_err(|_| {
+                    rejected(format!("`strata_vision` threads must be a number: {value}"))
+                })?);
+            }
             other => {
                 return Err(rejected(format!(
-                "`strata_vision` key `{other}` is not one of exe, mmproj, model, gpu, max_tokens"
-            )))
+                    "`strata_vision` key `{other}` is not one of exe, mmproj, model, gpu, \
+                 max_tokens, min_tokens, threads"
+                )))
             }
         }
     }
@@ -418,6 +437,12 @@ fn vision_block(
     taken.insert("gpu".to_string(), serde_json::Value::Bool(gpu));
     if let Some(tokens) = max_tokens {
         taken.insert("max_tokens".to_string(), serde_json::json!(tokens));
+    }
+    if let Some(tokens) = min_tokens {
+        taken.insert("min_tokens".to_string(), serde_json::json!(tokens));
+    }
+    if let Some(n) = threads {
+        taken.insert("threads".to_string(), serde_json::json!(n));
     }
     Ok(Some(taken))
 }
@@ -998,7 +1023,7 @@ mod tests {
                 (
                     "strata_vision",
                     &format!(
-                        "exe={} mmproj={} model={} gpu=true max_tokens=1024",
+                        "exe={} mmproj={} model={} gpu=true max_tokens=1024 min_tokens=4 threads=16",
                         path_text(&pack),
                         path_text(&pack),
                         path_text(&pack)
@@ -1014,6 +1039,8 @@ mod tests {
         assert_eq!(profile["parallel"], 1);
         assert_eq!(profile["gpus_asked"], true);
         assert_eq!(profile["vision"]["max_tokens"], 1024);
+        assert_eq!(profile["vision"]["min_tokens"], 4);
+        assert_eq!(profile["vision"]["threads"], 16);
         assert_eq!(profile["sampling"]["temperature"], serde_json::json!(1.0));
         assert_eq!(profile["sampling"]["top_k"], serde_json::json!(20));
         assert_eq!(profile["sampling"]["uncensored"], serde_json::json!(false));
@@ -1265,8 +1292,8 @@ mod tests {
                 "env": {{"STRATA_KVA": "0"}},
                 "sampling": {{"temperature": 1.0, "top_p": 0.95, "top_k": 20}},
                 "uncensored": false,
-                "vision": {{"exe": "{}", "mmproj": "{}", "model": "{}",
-                            "gpu": true, "max_tokens": 1024}}
+                "vision": {{"exe": "{}", "mmproj": "{}", "model": "{}", "gpu": true,
+                            "max_tokens": 1024, "min_tokens": 4, "threads": 16}}
             }}"#,
                 path_text(&gguf).replace('\\', "\\\\"),
                 path_text(&pack).replace('\\', "\\\\"),
