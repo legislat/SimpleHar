@@ -618,6 +618,68 @@ async fn cancel_of_a_swap_mid_victim_release_kills_the_victim_and_empties_its_sl
 }
 
 #[tokio::test]
+async fn a_repeat_unload_of_a_stuck_swap_reports_nothing_new() {
+    // FINDINGS-09 [1]: with the first unload's cancel still stuck in
+    // `CancelRequested` (the victim's kill held), a second `unload_model` moves
+    // nothing — the unload commitment is already armed behind the same job and
+    // the job is already cancelled — yet pre-fix it answered like a command
+    // that had armed a second release and cancelled a second job.
+    let (handle, runtime) = hold_kill_harness(config(10));
+    let victim = serve_hold_model(&handle).await;
+    assert_eq!(runtime.server_count(), 1, "the victim engine is live");
+    swap_parked_in_dispose_over_a_victim(&handle).await;
+
+    assert!(matches!(
+        handle
+            .unload_model(HOLD_MODEL)
+            .await
+            .expect("first unload accepted"),
+        Reply::Unloaded {
+            unloading: 1,
+            jobs_cancelled: 1
+        }
+    ));
+    // The stuck state the finding names: the cancel has landed, the job is
+    // non-terminal, and the slot is armed to unload behind it.
+    wait_until(&handle, 5, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.model == INCOMING_MODEL && j.state == SwapState::CancelRequested)
+    })
+    .await;
+
+    assert!(
+        matches!(
+            handle
+                .unload_model(HOLD_MODEL)
+                .await
+                .expect("repeat unload accepted"),
+            Reply::Unloaded {
+                unloading: 0,
+                jobs_cancelled: 0
+            }
+        ),
+        "the repeat command armed and cancelled nothing new and must not say otherwise"
+    );
+
+    runtime.release_held_kills();
+    wait_until(&handle, 8, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    assert_eq!(
+        runtime.server_count(),
+        0,
+        "the reported-nothing repeat must still leave the held kill landed"
+    );
+    assert!(
+        runtime.is_dead(victim.port).await,
+        "and the victim's port refused, not just the count"
+    );
+}
+
+#[tokio::test]
 async fn second_unload_of_a_slow_unload_kills_the_victim_and_empties_its_slot() {
     // The mirror case of chunk 4 [1]: `begin_unload_slot` sets `victim`, never
     // `spawned`, so the second /har/unload of a slow unload cancels the first while
@@ -643,10 +705,23 @@ async fn second_unload_of_a_slow_unload_kills_the_victim_and_empties_its_slot() 
         "the engine is still live when the second unload lands"
     );
 
-    handle
-        .unload(CategoryId::Work)
-        .await
-        .expect("second unload accepted");
+    // FINDINGS-09 [2]: the command disarms an in-flight UNLOAD job, which is a
+    // change of `unloading` commitment (the release is re-armed behind the
+    // cancel), not a cancellation of a load — `cancelled` per README names only
+    // load jobs. Pre-fix this answered `jobs_cancelled: 1` for an Unload row.
+    assert!(
+        matches!(
+            handle
+                .unload(CategoryId::Work)
+                .await
+                .expect("second unload accepted"),
+            Reply::Unloaded {
+                unloading: 1,
+                jobs_cancelled: 0
+            }
+        ),
+        "the repeat unload may claim the rearmed release, never a cancelled load"
+    );
     runtime.release_held_kills();
 
     wait_until(&handle, 8, |s| {

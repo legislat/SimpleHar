@@ -137,9 +137,16 @@ pub enum Reply {
     /// itself stays job-verified — this is an acceptance ledger, not release proof.
     Unloaded {
         /// Slots whose occupant the actor committed to free: unload jobs started
-        /// now, plus occupants armed to unload behind a cancelled swap.
+        /// now, plus occupants armed to unload behind the in-flight job this
+        /// command cancelled. A commitment counts only when it is new — a
+        /// repeat command that would re-arm an already-armed slot reports `0`
+        /// (FINDINGS-09 [1]).
         unloading: usize,
-        /// In-flight loads cancelled and parked loads dropped by this command.
+        /// In-flight LOADS cancelled and parked loads dropped by this command.
+        /// Cancelling an in-flight Unload job is not this: it removes an
+        /// unloading commitment rather than a load, and rides `unloading`
+        /// instead (FINDINGS-09 [2]). A re-entered cancel of an already
+        /// cancel-requested job counts nowhere: it moved nothing.
         jobs_cancelled: usize,
     },
 }
@@ -1287,6 +1294,14 @@ struct ActorState {
     /// an id-less occupant retries, but never piles concurrent `GET /v1/models`
     /// calls behind a slow engine.
     serve_id_refresh: HashSet<(u16, u64)>,
+    /// `(port, generation)` of every occupant whose re-discovery silence has
+    /// already been named (FINDINGS-11 [2]): the warn marks the CHANGE into
+    /// silence, the same doctrine as the R5 reconcile dedupe — a permanently
+    /// silent engine hammered by resolves logs one warn per spawn, never one
+    /// per probe. A landed id clears the mark (the silence state ended, so a
+    /// return to silence is news again), and every new generation is a fresh
+    /// mark; `clear_occupant` retires it with the occupant.
+    serve_id_silence_warned: HashSet<(u16, u64)>,
     /// R5 report-only reconcile: a probe per catalog application, never two at
     /// once (the R9 in-flight bound) — a rescan landing mid-probe is answered
     /// by the next application, never by a pile of concurrent `docker ps`.
@@ -1641,6 +1656,7 @@ impl ActorState {
             tx,
             snapshot_in_flight: HashSet::new(),
             serve_id_refresh: HashSet::new(),
+            serve_id_silence_warned: HashSet::new(),
             reconcile_in_flight: false,
             last_reported_stranded: None,
             fit_cache: HashMap::new(),
@@ -2341,7 +2357,13 @@ impl ActorState {
     /// is dropped here too: an operator's unload must never be followed by the load
     /// they abandoned starting on the slot it just freed (FINDINGS-02 [3]).
     /// The reply reports the facts the command moved (`Reply::Unloaded`,
-    /// FINDINGS-07 [5]) — never a blanket acceptance while nothing moved.
+    /// FINDINGS-07 [5]) — never a blanket acceptance while nothing moved. A
+    /// repeat command therefore moves nothing it can report: re-arming a slot
+    /// already armed behind the same job is a set no-op (FINDINGS-09 [1]), and
+    /// cancelling a job that already carries `CancelRequested` cancels nothing
+    /// new. Cancelling an in-flight UNLOAD job is not a `jobs_cancelled` fact
+    /// either: it removes an unloading commitment rather than a load, and the
+    /// re-armed release rides `unloading` (FINDINGS-09 [2]).
     fn unload_slots(&mut self, slots: Vec<usize>, reply: Waiter) {
         let mut unloading = 0usize;
         let mut jobs_cancelled = 0usize;
@@ -2358,16 +2380,29 @@ impl ActorState {
             }
             match self.slots[slot].job {
                 Some(job_id) => {
-                    let job_live = self.jobs.get(&job_id).is_some_and(|job| !job.terminal);
+                    let (job_live, cancels_a_fresh_load) = self
+                        .jobs
+                        .get(&job_id)
+                        .map(|job| {
+                            (
+                                !job.terminal,
+                                !job.terminal
+                                    && job.kind == JobKind::Load
+                                    && job.state != SwapState::CancelRequested,
+                            )
+                        })
+                        .unwrap_or((false, false));
                     // Flagged before the cancel: it may terminalize the job inline,
-                    // and that finish is exactly where the flag is consumed.
-                    let cancel_continues_into_unload =
-                        job_live && self.slots[slot].occupant.is_some();
-                    if cancel_continues_into_unload {
-                        self.unload_after_finish.insert(slot);
+                    // and that finish is exactly where the flag is consumed. The
+                    // set's answer IS the count: only a slot not armed until now
+                    // gained a commitment from this command (FINDINGS-09 [1]).
+                    if job_live
+                        && self.slots[slot].occupant.is_some()
+                        && self.unload_after_finish.insert(slot)
+                    {
                         unloading += 1;
                     }
-                    if job_live {
+                    if cancels_a_fresh_load {
                         jobs_cancelled += 1;
                     }
                     self.cancel_job(job_id, "unloaded by request");
@@ -2510,6 +2545,10 @@ impl ActorState {
     /// that drops an occupant has to come through here (review, 2026-10-27).
     fn clear_occupant(&mut self, slot: usize) {
         if let Some(occupant) = self.slots[slot].occupant.take() {
+            // The occupant's silence state dies with it (FINDINGS-11 [2]):
+            // no stale dedupe mark may outlive the spawn it described.
+            self.serve_id_silence_warned
+                .remove(&(occupant.ticket.port, occupant.ticket.generation));
             if let Some(task) = occupant.measure {
                 task.abort();
             }
@@ -4996,7 +5035,8 @@ impl ActorState {
     ///   answer for a replaced occupant is dropped, never laundered onto a new
     ///   engine that was installed with a real id.
     /// * `discovered` — the id the engine now reports, `None` for continued
-    ///   silence (warned; the next resolve retries).
+    ///   silence (named ONCE per unchanged silence state per spawn, the
+    ///   reconcile doctrine of FINDINGS-11 [2]; the next resolve retries).
     ///
     /// # Returns
     ///
@@ -5019,17 +5059,25 @@ impl ActorState {
             return false;
         };
         let Some(id) = discovered else {
-            tracing::warn!(
-                model = %occupant.model,
-                port,
-                "serve_id re-discovery still reports nothing; the proxy forwards \
-                 the harness name and the next resolve retries"
-            );
+            // Warn on the transition INTO silence, never on every landed
+            // silence (FINDINGS-11 [2]): a client hammering a permanently
+            // silent engine used to log ~0.5 warns/s/slot forever.
+            if self.serve_id_silence_warned.insert((port, generation)) {
+                tracing::warn!(
+                    model = %occupant.model,
+                    port,
+                    "serve_id re-discovery still reports nothing; the proxy forwards \
+                     the harness name and the next resolve retries"
+                );
+            }
             return false;
         };
         if occupant.serve_id.is_some() {
             return false;
         }
+        // The landed id ends the silence state: a later silence for this same
+        // spawn is a new outcome and may name itself once again.
+        self.serve_id_silence_warned.remove(&(port, generation));
         tracing::info!(
             model = %occupant.model,
             port,
@@ -9269,6 +9317,164 @@ mod tests {
             "the superseded epoch's figure is void"
         );
         assert_eq!(state.fit_cache.len(), 0, "and it never seeds the cache");
+    }
+
+    /// One WORK slot holding one occupant of `(port, generation)`, for the
+    /// serve-id fold-door pins (FINDINGS-11 [1]): fold answers land as direct
+    /// calls, so the never-called runtime is never reached.
+    fn serve_id_state(port: u16, generation: u64, serve_id: Option<&str>) -> ActorState {
+        let BootWiring {
+            adapters,
+            runtime,
+            witness,
+            tx,
+        } = boot_stub_wiring();
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            crate::testutil::temp_dir("serve-id-door"),
+            adapters,
+            runtime,
+            witness,
+            tx,
+        );
+        state.slots = vec![Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: port,
+            occupant: Some(Occupant {
+                model: format!("door-{generation}"),
+                need: Gibibytes(2.0),
+                port,
+                ticket: SpawnTicket {
+                    generation,
+                    kind: ResourceKind::ChildProcess,
+                    pid: 4242,
+                    port,
+                },
+                loaded_at: Instant::now(),
+                launched_at_wall: std::time::SystemTime::now(),
+                spawn_config: None,
+                spawn_profile: None,
+                stale_config: false,
+                serve_id: serve_id.map(str::to_string),
+                measure: None,
+            }),
+            job: None,
+        }];
+        state
+    }
+
+    /// Silence re-discovery warns captured for one model name (FINDINGS-11 [2]).
+    fn silence_warns(capture: &Arc<Mutex<Vec<CapturedWarn>>>, model: &str) -> usize {
+        capture
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .filter(|(message, fields)| {
+                message.contains("re-discovery still reports nothing")
+                    && fields.get("model").is_some_and(|name| name.contains(model))
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_serve_id_answer_for_a_replaced_generation_is_dropped_at_the_door() {
+        // FINDINGS-11 [1], the sibling of `a_stale_epoch_fit_answer_is_dropped_at_the_door`:
+        // the occupant on this port was replaced mid-probe, so an answer naming
+        // the dead generation describes an engine that no longer exists and may
+        // not patch the one that does.
+        let mut state = serve_id_state(19_111, 7, None);
+        assert!(
+            !state.on_serve_id_refreshed(19_111, 6, Some("engine-dead")),
+            "an answer for a superseded spawn reports no change"
+        );
+        let occupant = state.slots[0]
+            .occupant
+            .as_ref()
+            .expect("the current occupant stands");
+        assert_eq!(
+            occupant.serve_id, None,
+            "a replaced generation's id is never laundered onto the current engine"
+        );
+    }
+
+    #[test]
+    fn a_serve_id_answer_is_refused_over_an_occupant_that_already_has_one() {
+        // FINDINGS-11 [1], the second guard: an id that landed at install (or
+        // an earlier probe) is the engine's word for THIS spawn — a later
+        // answer, however fresh, may not overwrite it, and a fold that
+        // overwrites would report a publish for a change that never happened.
+        let mut state = serve_id_state(19_112, 7, Some("engine-first"));
+        assert!(
+            !state.on_serve_id_refreshed(19_112, 7, Some("engine-second")),
+            "installing over an occupant with an id is refused, not published"
+        );
+        let occupant = state.slots[0]
+            .occupant
+            .as_ref()
+            .expect("the occupant keeps its seat");
+        assert_eq!(
+            occupant.serve_id.as_deref(),
+            Some("engine-first"),
+            "the already-held id is never replaced"
+        );
+    }
+
+    #[test]
+    fn silence_warns_once_per_spawn_and_a_changed_outcome_arms_the_warn_again() {
+        // FINDINGS-11 [2], mirroring `the_reconcile_warns_once_and_an_unchanged_set_never_re_warns`:
+        // every resolve of an id-less occupant re-runs discovery, so a client
+        // hammering a permanently silent engine used to log one warn per landed
+        // silence (~0.5/s/slot forever). The warn marks the CHANGE into silence.
+        let capture = install_warn_capture();
+        // Warm the reporting callsite and PROVE delivery before the measured
+        // window (the D9 rule): a sentinel name no assertion below reads about.
+        let mut warm = serve_id_state(19_113, 1, None);
+        assert!(!warm.on_serve_id_refreshed(19_113, 1, None));
+        assert_eq!(
+            silence_warns(&capture, "door-1"),
+            1,
+            "the reporting callsite was warmed but never delivered"
+        );
+
+        let mut state = serve_id_state(19_114, 5, None);
+        for _ in 0..3 {
+            assert!(
+                !state.on_serve_id_refreshed(19_114, 5, None),
+                "silence installs nothing and publishes nothing"
+            );
+        }
+        assert_eq!(
+            silence_warns(&capture, "door-5"),
+            1,
+            "a hammered silence must name the unchanged state exactly once"
+        );
+
+        // A landed id is a NEW outcome: the silence state ends, so a return to
+        // silence is news again and may name itself once more.
+        assert!(state.on_serve_id_refreshed(19_114, 5, Some("engine-x")));
+        assert!(!state.on_serve_id_refreshed(19_114, 5, None));
+        assert_eq!(
+            silence_warns(&capture, "door-5"),
+            2,
+            "silence that ended and returned is a changed state, not the old one"
+        );
+
+        // A new spawn on the same port is a new silence state: first warn again.
+        {
+            let occupant = state.slots[0]
+                .occupant
+                .as_mut()
+                .expect("the occupant still holds its seat");
+            occupant.ticket.generation = 6;
+            occupant.serve_id = None;
+        }
+        assert!(!state.on_serve_id_refreshed(19_114, 6, None));
+        assert_eq!(
+            silence_warns(&capture, "door-5"),
+            3,
+            "the next generation is a fresh silence state and warns once on its own"
+        );
     }
 
     #[tokio::test]

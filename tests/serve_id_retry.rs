@@ -148,6 +148,128 @@ async fn get_json(app: &Router, path: &str) -> (StatusCode, Value) {
     )
 }
 
+/// Control and WORK listeners over one PERMANENTLY silent engine (`/v1/models`
+/// always 404s — the `mock-nodiscovery` class): the shape where every resolve
+/// re-runs discovery and every re-run lands silence (FINDINGS-11 [2]).
+fn silent_app(model: &str) -> (Router, Router) {
+    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+    adapters.insert(
+        "mock-nodiscovery".to_string(),
+        Arc::new(simplehar_se::engine::mock::MockAdapter) as Arc<dyn EngineAdapter>,
+    );
+    let dir = simplehar_se::testutil::temp_dir("serve-id-silent");
+    std::fs::write(
+        dir.join(format!("{model}.yaml")),
+        format!("name: {model}\nengine: mock-nodiscovery\ncategory: WORK\nvram_gb: 4.0\n"),
+    )
+    .expect("model yaml");
+    let config = AppConfig {
+        source_path: Some(dir.join("simplehar-se.json")),
+        ..AppConfig::default()
+    };
+    let scheduler = Scheduler::start(
+        config.clone(),
+        dir,
+        adapters,
+        Arc::new(MockRuntime::new()) as Arc<dyn EngineRuntime>,
+        Arc::new(LedgerOnlyWitness),
+    );
+    let state = Arc::new(ApiState::new(
+        config,
+        scheduler,
+        ListenerRegistry::new(),
+        Arc::new(LedgerOnlyWitness),
+        BootTimings::default(),
+    ));
+    (
+        control_router(Arc::clone(&state)),
+        category_router(state, CategoryId::Work),
+    )
+}
+
+/// Re-discovery silence warns captured for one model name.
+fn silence_warns(lines: &Arc<Mutex<Vec<String>>>, model: &str) -> usize {
+    lines
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .filter(|line| {
+            line.contains("re-discovery still reports nothing")
+                && line.contains(&format!("model={model}"))
+        })
+        .count()
+}
+
+async fn wait_for_silence_warn(lines: &Arc<Mutex<Vec<String>>>, model: &str) -> bool {
+    for _ in 0..200 {
+        if silence_warns(lines, model) >= 1 {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_hammered_silent_engine_is_warned_about_once_per_spawn() {
+    // FINDINGS-11 [2], the client-hammer falsifier: a permanently silent engine
+    // answers nothing to EVERY re-discovery, so pre-fix a hammering client
+    // logged ~0.5 warns/s/slot forever. The reconcile doctrine stands: the warn
+    // names the state, and an unchanged state is named once per spawn.
+    let lines = capture_lines();
+
+    // Warm the reporting callsite and PROVE delivery before the measured window
+    // (the D9 rule): a sentinel model no assertion below reads about.
+    let (warm_control, warm_work) = silent_app("quiet-sentry");
+    let (status, body) = post_json(&warm_control, "/har/load", r#"{"model":"quiet-sentry"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the silent engine still loads: {body}"
+    );
+    let (status, echo) = post_json(
+        &warm_work,
+        "/v1/chat/completions",
+        r#"{"model":"quiet-sentry","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "proxy: {echo}");
+    assert!(
+        wait_for_silence_warn(&lines, "quiet-sentry").await,
+        "the reporting callsite was warmed but never delivered"
+    );
+
+    let (control, work) = silent_app("mute");
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"mute"}"#).await;
+    assert_eq!(status, StatusCode::OK, "load: {body}");
+
+    // Hammer resolves: each round trip re-arms discovery behind the in-flight
+    // mark and its answer lands as one more silence — the finding's exact
+    // ~0.5 probes/s/slot, eight rounds deep.
+    for _ in 0..8 {
+        let (status, echo) = post_json(
+            &work,
+            "/v1/chat/completions",
+            r#"{"model":"mute","messages":[]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "proxy: {echo}");
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    }
+    assert!(
+        wait_for_silence_warn(&lines, "mute").await,
+        "the retries never landed a silence: the hammer measured nothing"
+    );
+    // Let any straggler probe land before the exact count: the silence state
+    // NEVER changed across the hammer, so it must have been named exactly once.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        silence_warns(&lines, "mute"),
+        1,
+        "an unchanged silence state is warned once per spawn, not once per probe"
+    );
+}
+
 #[tokio::test]
 async fn a_discovery_miss_warns_and_the_next_resolve_carries_the_landed_id() {
     let lines = capture_lines();
