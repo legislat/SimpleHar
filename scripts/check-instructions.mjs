@@ -17,6 +17,13 @@ const ROOT = resolve(HERE, "..");
 
 const GATE_MARKER_A = "cargo check --all-targets";
 const GATE_MARKER_B = "node tests/webui/webui_dom_test.mjs";
+const GATE_MARKERS = [
+  "cargo check --all-targets",
+  "cargo test",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo fmt --check",
+  "node tests/webui/webui_dom_test.mjs",
+];
 const VERIFICATION = "docs/process/VERIFICATION.md";
 
 const failures = [];
@@ -105,9 +112,10 @@ const scanSet = [
 
 for (const rel of scanSet) {
   const text = read(rel);
-  if (text.includes(GATE_MARKER_A) && text.includes(GATE_MARKER_B)) {
-    fail(rel, 1, "duplicates the full cardless gate command block; only " +
-      `${VERIFICATION} may hold it (link instead)`);
+  const hits = GATE_MARKERS.filter((m) => text.includes(m)).length;
+  if (hits >= 3) {
+    fail(rel, 1, `duplicates ${hits} cardless gate commands; only ` +
+      `${VERIFICATION} may hold the command list (link instead)`);
   }
 }
 

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposal - requires owner approval |
+| Status | Approved 2026-11-02; this file is the improvement record |
 | Date | 2026-11-02 |
 | Inputs | `docs/audit/AUDIT_REPORT.md`, `docs/audit/TARGET_STRUCTURE.md` |
 | Scope | Agent workflow, instructions, Git, review, task lifecycle, planning, handoff, documentation lifecycle, technical debt, QA/automation, parallel work, release, security, onboarding |

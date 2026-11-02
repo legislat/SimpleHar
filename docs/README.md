@@ -82,7 +82,7 @@ durable and belongs in this tree.
 | File | Owns | Status |
 |---|---|---|
 | [DOCTRINE.md](architecture/DOCTRINE.md) | One-page binding invariants; every agent must carry it | active |
-| [DECISIONS.md](architecture/DECISIONS.md) | Full ruling ledger: LOCKED / DEFERRED / ARCHIVED (tracked copy; `handoff/DECISIONS.md` is the local live copy pending removal) | active |
+| [DECISIONS.md](architecture/DECISIONS.md) | Full ruling ledger: LOCKED / DEFERRED / ARCHIVED (single home; `handoff/DECISIONS.md` is a pointer stub) | active |
 | [OVERVIEW.md](architecture/OVERVIEW.md) | Current architecture, modules, data flow | active |
 | `ADR/` | Long-form decisions only, on demand | planned |
 
@@ -110,8 +110,9 @@ Empty today.
 
 ## 4. Documentation language
 
-Durable documentation uses ASD-STE100 Simplified Technical English: active
-voice, one idea per sentence, short sentences, no idioms or metaphors. The
+Durable documentation must use ASD-STE100 Simplified Technical English: active
+voice, one idea per sentence, short sentences, no idioms or metaphors. New or
+changed text must comply immediately; existing text migrates in phases. The
 rules, exceptions, and verification method live in
 [docs/process/ENGINEERING.md](process/ENGINEERING.md). Exact operator
 doctrine and LOCKED ruling wording stays verbatim and is never reworded for
@@ -122,7 +123,8 @@ style.
 - Front matter: every durable file starts with `title`, `owner`, `status`,
   `audience`, `source_of_truth_for`, `last_reviewed`, `review_trigger`. A
   document without an owner is a defect. The operator owns every durable
-  document.
+  document. Audit snapshots in `docs/audit/` are exempt; they record a dated
+  audit and keep their own status table.
 - Same-change rule: a change that alters behavior updates every affected
   durable document in the same change, or states why none is affected.
 - Contradiction rule: a contradiction is a stop-the-line event. Record it as

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposal - requires owner approval |
+| Status | Approved 2026-11-02; this file is the approved target record |
 | Date | 2026-11-02 |
 | Based on | `docs/audit/AUDIT_REPORT.md` |
 | Design goal | A minimal, navigable, reproducible system in which every fact has one home and every task can be resumed |
@@ -757,7 +757,7 @@ At each release:
 
 ## 11. Approval decisions
 
-The target structure requires explicit owner decisions before implementation:
+The target structure required explicit owner decisions before implementation. The owner approved D1-D11 on 2026-11-02:
 
 1. **Repo self-containedness.** Approve committing the durable core (recommended) and confirm repository visibility. Keep live state local.
 2. **`DECISIONS.md` home.** Move the full ledger to `docs/architecture/DECISIONS.md` and track it, with a short `DOCTRINE.md` card.

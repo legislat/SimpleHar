@@ -1242,7 +1242,7 @@ mod tests {
             ("ninfer_internal_port", "8090"),
             (
                 "ninfer_model_roots",
-                "/mnt/d/Models,/home/legislat/ai/models",
+                "/mnt/d/Models,/home/u/ai/models",
             ),
             (
                 "ninfer_serve_args",
@@ -1579,7 +1579,7 @@ mod tests {
             ("ninfer_key_file", "$HOME/keys/x;id.key", "ninfer_key_file"),
             (
                 "ninfer_key_file",
-                "/home/legislat/.ssh/id_rsa",
+                "/home/u/.ssh/id_rsa",
                 "$HOME/.simplehar/keys/",
             ),
             (

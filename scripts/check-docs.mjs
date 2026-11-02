@@ -135,6 +135,10 @@ for (const rel of docs) {
       if (m && !PRODUCT_DEFAULT_PATH.test(e.line)) {
         fail(rel, e.n, `absolute Windows path in durable doc: ${m[2]}:\\...`);
       }
+      const home = e.line.match(/\/(?:home|Users)\/[A-Za-z0-9._-]+\//);
+      if (home && !/\/(?:home|Users)\/(?:you|user|username)\//.test(home[0])) {
+        fail(rel, e.n, `author home path in durable doc: ${home[0]}`);
+      }
     });
   }
 

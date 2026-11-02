@@ -10,7 +10,8 @@ review_trigger: new-decision, release
 
 # DECISIONS - settled doctrine and rulings (binding; do not re-open without reason)
 
-This is the tracked copy. `handoff/DECISIONS.md` is the local live copy pending removal by the orchestrator. Do not delete the local file.
+This is the tracked ledger and the single home. `handoff/DECISIONS.md` is a pointer
+stub; it holds no rulings and is safe to delete.
 
 Three sections: **LOCKED** = active doctrine every brief must carry; **DEFERRED** = decided
 later, with the tripwire that re-opens them; **ARCHIVED** = one-line tombstones (the ruling,

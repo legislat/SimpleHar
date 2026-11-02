@@ -73,25 +73,21 @@ Falsifiers proven red on the pre-fix code; <gate result> (review <n>).
 
 Each of these requires explicit operator approval before you run it:
 
-- force-push, in any variant;
 - `git reset --hard` and other commands that discard working-tree changes;
 - `git commit --amend` and interactive rebase;
-- any history rewrite;
 - deletion of branches or tags;
 - pushes, tags, and release actions.
 
-AGENTS.md section 4 keeps force-push and history rewrite forbidden by default. They become
-possible only under a current, explicit operator instruction.
+Force-push and history rewrite are forbidden, always (`AGENTS.md` Section 4). Do not run
+them even with approval. There is no exception.
 
 Before an approved destructive step, state the expected impact and verify the target.
 Never run these operations to make a tree look clean.
 
 ## Review and merge
 
+- Review method and closure live in `docs/process/REVIEW.md`.
 - The author cannot review their own work.
-- The reviewer must be writer-capable and must not be the author.
-- Review findings close by a named commit or a named operator ruling. Nothing else closes
-  a finding.
 - A change with open findings cannot land on `main`.
 
 ## Release

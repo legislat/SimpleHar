@@ -40,7 +40,7 @@ Run the handoff checkpoint at each of these points:
 
 ## Required fields
 
-The task file progress state must carry these fields:
+The task file progress state must carry these fields. `docs/process/TASKS.md` owns their definitions:
 
 - status
 - done
@@ -51,7 +51,7 @@ The task file progress state must carry these fields:
 - files changed
 - evidence
 - constraints
-- next command
+- next step (the exact command)
 
 Write "none" in an empty field. Do not delete the field.
 
@@ -95,11 +95,9 @@ Reconcile `git status` against the task file before the first edit.
 
 ## Ownership
 
-- One active task per session.
-- At most two working subagents at the same time. They own disjoint files.
-- A subagent never edits a shared ledger and never commits.
-- The owning session writes the queue row and the snapshot. Other sessions
-  write only their own task file.
+Ownership and subagent limits follow `AGENTS.md` Section 4. One active task per session.
+The owning session writes the queue row and the snapshot. Other sessions write only their
+own task file.
 
 ## Snapshot template
 

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Proposal - do not execute until the owner approves |
+| Status | Approved 2026-11-02; execution in progress |
 | Date | 2026-11-02 |
 | Inputs | `docs/audit/AUDIT_REPORT.md`, `docs/audit/TARGET_STRUCTURE.md`, `docs/audit/PROCESS_IMPROVEMENTS.md` |
 | Scope | Documentation, instructions, process, and automation. No product behavior change is proposed except where a document is corrected to match shipped behavior. |

@@ -192,8 +192,6 @@ A task is done only when all of these hold:
 
 ## Working rules
 
-- One active task per session.
-- At most two working subagents at the same time, with disjoint file ownership.
-- A subagent never edits a shared ledger and never commits.
-- The owning session writes the queue row and the handoff snapshot. Other sessions write
-  only their own task file.
+Ownership and subagent limits follow `AGENTS.md` Section 4. One active task per session.
+The owning session writes the queue row and the handoff snapshot. Other sessions write
+only their own task file.

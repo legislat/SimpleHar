@@ -32,13 +32,15 @@ pointed to, never copied here.
 Every session, including a resumed one:
 
 1. `AGENTS.md` (this file)
-2. `HANDOFF.md` (snapshot and next task)
-3. `handoff/PENDING_CHECKLIST.md` (queue index)
-4. `handoff/tasks/<ID>.md` (this task file, if present)
+2. `HANDOFF.md` (local-only snapshot and next task)
+3. `handoff/PENDING_CHECKLIST.md` (local-only queue index)
+4. `handoff/tasks/<ID>.md` (local-only task file, if present)
 5. `docs/architecture/DOCTRINE.md` (binding invariant card)
 6. Task-specific docs from the reading matrix in Section 5.
 
-If the task file is absent, create or request one before editing shared state.
+If the task file is absent, create or request one before editing shared state. On a fresh
+clone the local-only layer is absent; create it from `docs/process/HANDOFF.md` and
+`docs/process/TASKS.md` before the first edit.
 
 ## 3. Precedence
 
@@ -50,7 +52,8 @@ Rules win over lower numbers.
 4. `docs/process/*`: scoped how-to rules (engineering, verification, git, tasks, handoff, review).
 5. Task file: scope, non-goals, acceptance criteria for this task.
 6. `docs/architecture/DECISIONS.md`: full ruling ledger; resolves ambiguity.
-7. `docs/architecture/OVERVIEW.md`, `README.md`, `docs/reference/*`: current descriptive truth.
+7. `docs/architecture/OVERVIEW.md`, `README.md`, `docs/reference/*` (planned; README
+   owns the content until the reference split) - current descriptive truth.
 8. `DESIGN.md`: historical rationale only; never a current spec.
 9. Code and tests: behavioral truth.
 
@@ -101,7 +104,7 @@ Subagent and ownership rules:
 |---|---|---|
 | Routine code change | this file, `ENGINEERING.md`, `VERIFICATION.md`, task file | `DESIGN.md`, full `DECISIONS.md` |
 | Scheduler / admission / swap | above plus `DOCTRINE.md`, `OVERVIEW.md`, relevant decisions, `GOTCHAS.md` | `DESIGN.md` history |
-| Engine adapter | above plus `MODELS.md`, engine-specific decisions, `GOTCHAS.md` | unrelated architecture |
+| Engine adapter | above plus `MODELS.md` (planned; README model table for now), engine-specific decisions, `GOTCHAS.md` | unrelated architecture |
 | Review | this file, `REVIEW.md`, task file, `GOTCHAS.md`, code under review | full design history |
 | Release | `GIT_WORKFLOW.md`, `VERIFICATION.md`, `CHANGELOG.md`, `README.md` | task-level detail |
 | Handoff | `docs/process/HANDOFF.md`, `HANDOFF.md`, active task file | everything else |
@@ -123,6 +126,8 @@ Routine code changes never require `DESIGN.md`.
   `docs/process/PUBLICATION.md`.
 
 ## 7. Definition of done
+
+This is a summary. `docs/process/TASKS.md` owns the full field list and archive rules.
 
 A task is done only when all hold:
 

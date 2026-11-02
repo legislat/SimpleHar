@@ -26,9 +26,9 @@
 
 ### 0.2 Facts reported by project documents but not independently re-verified
 
-- Gate results (`703` tests, `0` failures, `24` ignored; DOM `102` legs) are reported in `handoff/HANDOFF.md` Section 2 and `handoff/PENDING_CHECKLIST.md:32-39`. They were not re-run because the audit was constrained to read-only analysis and the machine hosts live inference services.
-- The GitHub repository visibility is unknown. `handoff/DECISIONS-PENDING.md:16` states that `github.com/legislat/SimpleHar` cannot be checked for privacy from this machine because `gh` is unavailable.
-- Runtime behavior around GPU/card windows was not exercised. Card evidence is explicitly gated to an operator-run, freed-card window (`handoff/DECISIONS.md:109-116`).
+- At audit time, gate results (`703` tests, `0` failures, `24` ignored; DOM `102` legs) were reported in the then-current handoff and queue. The pre-migration queue is archived at `handoff/archive/PENDING_CHECKLIST-2026-11-02-pre-migration.md`; current evidence is in `handoff/evidence/2026-11-02-governance/gate.txt`. They were not re-run during the audit because it was constrained to read-only analysis and the machine hosts live inference services.
+- The GitHub repository visibility is unconfirmed. Only the operator can check the remote setting; `gh` was unavailable on this machine.
+- Runtime behavior around GPU/card windows was not exercised. Card evidence is explicitly gated to an operator-run, freed-card window (`docs/architecture/DECISIONS.md`).
 
 ### 0.3 Assumptions
 
@@ -741,7 +741,7 @@ Priority order:
 7. **Automate the invariants.** Gate script, docs checker, template validator, CI.
 8. **Add release discipline.** Version, changelog, tag, artifact hash.
 
-No implementation should start until the owner approves the target structure and the decisions listed at the end of `IMPLEMENTATION_PLAN.md`.
+Implementation started after the owner approved the target structure and decisions D1-D11 on 2026-11-02. The approval record is in `IMPLEMENTATION_PLAN.md`.
 
 ---
 

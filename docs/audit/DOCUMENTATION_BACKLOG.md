@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Ready for issue-tracker import after owner approval |
+| Status | Approved 2026-11-02; ready for issue-tracker import |
 | Date | 2026-11-02 |
 | Source | `docs/audit/AUDIT_REPORT.md` |
 | Ordering | Priority first, then dependency. Do not start an item whose `Blocked by` is unresolved. |
