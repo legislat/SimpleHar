@@ -3596,6 +3596,19 @@ impl ActorState {
                     );
                 }
                 Err((considered, blockers)) => {
+                    // Row-10 guard (RULED 2026-11-01): when NO release the harness
+                    // may perform reaches the floor, refuse BEFORE any kill —
+                    // "no releases allow for the VRAM floor - check foreign
+                    // residents". Releasable = the same-slot victim (already
+                    // credited in `free`) plus every evictable candidate; blockers
+                    // and foreign holders never count toward meeting a floor
+                    // (R5's principle, same arithmetic as R3's `unreleasable`).
+                    // The guard precedes the release-first arm: destroying the
+                    // resident is an accepted cost only for a deficit a release
+                    // could actually fix, never for a floor the card denies.
+                    let best_free = free.0 + considered.iter().map(|v| v.need_gib).sum::<f64>();
+                    let no_releases_reach =
+                        floor.is_some_and(|f| f - self.cfg.witness_tolerance_gb > best_free);
                     // Ruling (operator 2026-11-01, REVISABLE): release-then-resample
                     // for same-slot replacements. The victim's booked need can
                     // understate what it actually holds, and a swap that physically
@@ -3605,7 +3618,10 @@ impl ActorState {
                     // physically re-sampled. Cross-slot victims are NOT queued here:
                     // the planner found no sufficient set, and nothing beyond the
                     // already-doomed resident may be killed on a paper decision.
-                    if self.jobs[&job_id].victim.is_some() && !self.jobs[&job_id].release_first {
+                    if !no_releases_reach
+                        && self.jobs[&job_id].victim.is_some()
+                        && !self.jobs[&job_id].release_first
+                    {
                         if let Some(job) = self.jobs.get_mut(&job_id) {
                             job.release_first = true;
                         }
@@ -3630,7 +3646,12 @@ impl ActorState {
                             facts.used_gib = Some(Gibibytes(occupied));
                             facts.booked_total = Some(self.ledger_sum());
                         }
-                        let error = if floor_deficit > 0.0 && floor_deficit >= need_deficit {
+                        // An unreachable floor is always shaped as the floor
+                        // refusal: the guard sentence is the actionable fact even
+                        // when a (smaller) need deficit also bound.
+                        let error = if (floor_deficit > 0.0 && floor_deficit >= need_deficit)
+                            || no_releases_reach
+                        {
                             AdmissionError::BelowLaunchFloor {
                                 min_free: Gibibytes(floor.expect(
                                     "invariant: floor_deficit > 0 implies a configured floor",
@@ -3641,6 +3662,7 @@ impl ActorState {
                                 facts: Box::new(facts),
                                 victims_considered: considered,
                                 blockers,
+                                no_releases_reach,
                             }
                         } else {
                             AdmissionError::Insufficient {
@@ -7886,6 +7908,136 @@ mod tests {
             "{:?}",
             state.catalog_errors
         );
+    }
+
+    /// Row-10 guard (RULED 2026-11-01): a floor the card denies must refuse BEFORE
+    /// any kill. The release-first ruling buys the victim's bytes only when the
+    /// deficit is one a release could actually fix — when freeing everything the
+    /// harness may release still leaves the floor out of reach, the cost is not
+    /// bought. Field case (GOTCHAS, R5 2026-11-01): foreign residents hold the
+    /// card at 70.5/72 and nothing is evictable.
+    #[tokio::test]
+    async fn a_floor_no_release_can_reach_refuses_before_the_victim_dies() {
+        let dir = crate::testutil::temp_dir("r10-floor");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("greedy.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncategory: work\ncost: greedy\nvram_gb: 2\nlaunch_only_with_at_least_vram_free: 60\n",
+        )
+        .expect("seed");
+        let mut state = fold_state(&dir);
+        state.cfg.vram_total_gb = 72.0;
+        state.cfg.vram_reserve_gb = 2.0;
+        let entry = rescan_entry(&yaml, "greedy");
+        assert_eq!(
+            entry.launch_floor_gb,
+            Some(60.0),
+            "the floor key must survive the real parser"
+        );
+        state.catalog = vec![entry.clone()];
+        let ticket = fold_ticket(19_049);
+        seat_spawn(&mut state, &entry, &ticket, 19_049);
+        // Arm the row against its own slot exactly as `start_queued_load` does,
+        // then hand the admit the witness sample the armed sample task would send.
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.slots[0].job = Some(job_id);
+        if let Some(job) = state.jobs.get_mut(&job_id) {
+            job.need = Some(Gibibytes(2.0));
+            job.victim = Some(super::Victim {
+                model: entry.name.clone(),
+                ticket: ticket.clone(),
+                slot: 0,
+                evicted: false,
+                cost: 2.0,
+            });
+        }
+        state.step(job_id, SwapState::Admit);
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 70.5,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(job.terminal, "an unreachable floor must refuse at the gate");
+        assert!(
+            !job.release_first,
+            "the guard precedes release-first: no resident is doomed for a floor the card denies"
+        );
+        let error = job
+            .error
+            .as_ref()
+            .expect("the refusal travels with the row")
+            .to_string();
+        assert!(
+            error.contains("no releases allow for the VRAM floor")
+                && error.contains("check foreign residents"),
+            "{error}"
+        );
+        assert!(error.contains("unreleasable"), "{error}");
+        assert!(
+            state.slots[0].occupant.is_some(),
+            "refusal before kill: the resident the ruling protects is still seated"
+        );
+        assert!(
+            state.slots[0].job.is_none(),
+            "the refused row releases its claim on the slot"
+        );
+    }
+
+    /// The other half: the guard guards the FLOOR only. A `need`-short swap with a
+    /// same-slot victim still takes the release-first path (ruling 2026-11-01,
+    /// REVISABLE): the settle window re-gates it against the physical card.
+    #[tokio::test]
+    async fn a_need_short_swap_still_takes_the_release_first_path() {
+        let dir = crate::testutil::temp_dir("r10-release-first");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("big.yaml");
+        std::fs::write(&yaml, "engine: mock\ncategory: work\nvram_gb: 40\n").expect("seed");
+        let mut state = fold_state(&dir);
+        state.cfg.vram_total_gb = 72.0;
+        state.cfg.vram_reserve_gb = 2.0;
+        let entry = rescan_entry(&yaml, "big");
+        assert_eq!(entry.launch_floor_gb, None, "this row carries no floor");
+        state.catalog = vec![entry.clone()];
+        let ticket = fold_ticket(19_050);
+        seat_spawn(&mut state, &entry, &ticket, 19_050);
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.slots[0].job = Some(job_id);
+        if let Some(job) = state.jobs.get_mut(&job_id) {
+            job.need = Some(Gibibytes(40.0));
+            job.victim = Some(super::Victim {
+                model: entry.name.clone(),
+                ticket,
+                slot: 0,
+                evicted: false,
+                cost: 2.0,
+            });
+        }
+        state.step(job_id, SwapState::Admit);
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 70.5,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(
+            job.release_first,
+            "a releasable deficit still re-gates on the physical card: {:?}",
+            job.error
+        );
+        assert!(!job.terminal, "release-first proceeds, it does not refuse");
+        assert_eq!(job.state, SwapState::Dispose);
     }
 
     fn job(id: u64, kind: JobKind, model: &str, error: Option<&str>, outcome: &str) -> JobStatus {

@@ -214,9 +214,15 @@ pub enum AdmissionError {
     /// time sits below `launch_only_with_at_least_vram_free`, so the
     /// load is refused BEFORE spawn — launching a greedy-offload quant onto a
     /// busy card thrashes RAM/SSD for minutes (operator design note 2026-10-26).
-    #[error("launch floor not met: at least {min_free} free required, free {free}, reserve {reserve}{detail}{tail}",
+    #[error(
+        "launch floor not met: at least {min_free} free required, free {free}, reserve {reserve}{detail}{tail}{guard}",
         detail = .facts.detail(*free),
-        tail = insufficient_tail(.victims_considered, .blockers)
+        tail = insufficient_tail(.victims_considered, .blockers),
+        guard = if *no_releases_reach {
+            "; no releases allow for the VRAM floor - check foreign residents"
+        } else {
+            ""
+        }
     )]
     BelowLaunchFloor {
         /// Configured floor in GiB (model key, or the greedy global default).
@@ -231,6 +237,11 @@ pub enum AdmissionError {
         victims_considered: Vec<VictimInfo>,
         /// Models that cannot be evicted, with reasons.
         blockers: Vec<BlockerInfo>,
+        /// Row-10 guard (operator ruling 2026-11-01): even freeing everything the
+        /// harness may release — its own booked same-slot occupant plus every
+        /// evictable resident, never foreign occupancy — would not reach the floor.
+        /// The refusal says so and the load was refused BEFORE any release.
+        no_releases_reach: bool,
     },
 }
 
@@ -555,11 +566,16 @@ mod tests {
             facts: Box::default(),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
+            no_releases_reach: false,
         }
         .to_string();
         assert!(
             floor.contains("launch floor") && floor.contains('6') && floor.contains('4'),
             "{floor}"
+        );
+        assert!(
+            !floor.contains("no releases allow"),
+            "a plain floor refusal must not claim the unreachable-floor guard: {floor}"
         );
         assert!(AdmissionError::ExactUndeclared
             .to_string()
@@ -574,6 +590,29 @@ mod tests {
                 && claimed.contains("8004")
                 && claimed.contains("manual namespace"),
             "the R10 refusal must name key, number, and namespace: {claimed}"
+        );
+    }
+
+    /// Row-10 guard (operator ruling 2026-11-01): when NO release the harness may
+    /// perform reaches the floor, the refusal names it — the operator's diagnosis is
+    /// foreign residents, not a numeric shrug. The sentence rides only the guarded
+    /// refusal (the `false` leg above pins its absence).
+    #[test]
+    fn the_unreachable_floor_guard_names_the_ruling_sentence() {
+        let unreachable = AdmissionError::BelowLaunchFloor {
+            min_free: Gibibytes(60.0),
+            free: Gibibytes(1.5),
+            reserve: Gibibytes(2.0),
+            facts: Box::default(),
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
+            no_releases_reach: true,
+        }
+        .to_string();
+        assert!(
+            unreachable.contains("no releases allow for the VRAM floor")
+                && unreachable.contains("check foreign residents"),
+            "{unreachable}"
         );
     }
 
