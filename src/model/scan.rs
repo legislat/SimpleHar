@@ -2605,11 +2605,10 @@ mod tests {
     /// Fork C gate: the strict acceptance must not blind-side the live catalog.
     /// Since slice 10c "fully clean" is stated as a closed debt ledger: the
     /// live dir publishes every file whose bytes carry no harness-owned claim,
-    /// and the reports are exactly the ruled ones — since row 19 the three
-    /// strata rows are refused with the SUPERSEDED migration sentence (their
-    /// `strata_config` lines await the operator's `simplehar-se import strata`
-    /// adoption; an in-flight serve is unaffected, the refusal lands on the
-    /// next load gesture). The `context` inert hints that
+    /// and the report ledger is exactly the ruled one — empty since the three
+    /// strata rows adopted their rendered template blocks 2026-11-02 (row 19;
+    /// the `strata_config` refusal is gone, `strata_exe` etc. carry the profile
+    /// the harness renders at load). The `context` inert hints that
     /// once sat on the ninfer rows landed their cleanup 2026-11-02: the key is
     /// live llama config and the ninfer context rides its `ninfer_profile`
     /// line, so the rows no longer carry it. Every entry is pinned by file and
@@ -2654,14 +2653,7 @@ mod tests {
                 "one file carried two ledger reports: {error:?}"
             );
         }
-        let mut want: BTreeMap<&str, &str> = BTreeMap::new();
-        for file in [
-            "strata-fp4local-bf16ple.yaml",
-            "strata-iq3s.yaml",
-            "strata-nvfp4-gptq.yaml",
-        ] {
-            want.insert(file, "refused");
-        }
+        let want: BTreeMap<&str, &str> = BTreeMap::new();
         let got: BTreeMap<&str, &str> = got
             .iter()
             .map(|(file, label)| (file.as_str(), *label))
