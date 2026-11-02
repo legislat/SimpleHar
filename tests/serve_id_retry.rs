@@ -112,6 +112,7 @@ async fn post_json(app: &Router, path: &str, body: &str) -> (StatusCode, Value) 
         .clone()
         .oneshot(
             Request::post(path)
+                .header("host", "127.0.0.1:8708")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .expect("static request"),
@@ -133,6 +134,7 @@ async fn get_json(app: &Router, path: &str) -> (StatusCode, Value) {
         .clone()
         .oneshot(
             Request::get(path)
+                .header("host", "127.0.0.1:8708")
                 .body(Body::empty())
                 .expect("static request"),
         )

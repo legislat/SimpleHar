@@ -17,8 +17,51 @@ use simplehar_se::engine::mock::MockAdapter;
 use simplehar_se::engine::{EngineAdapter, EngineRuntime};
 use simplehar_se::scheduler::Scheduler;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tower::ServiceExt;
+use tracing::Subscriber;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
+
+/// Process-global line capture for the one pin that must watch the operator's
+/// channel (`os_failure_text_reaches_the_ring_but_never_the_client_body`).
+/// Same shape as `tests/serve_id_retry.rs`: a `tracing_subscriber` registry is
+/// installed once via `try_init`, so the ring stays untouched and the pin reads
+/// what `tracing::error!` produced (FINDINGS-05 [6]).
+#[derive(Clone)]
+struct Capture(Arc<Mutex<Vec<String>>>);
+
+struct LineVisitor<'a> {
+    parts: &'a mut Vec<String>,
+}
+
+impl tracing::field::Visit for LineVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.parts.push(format!("{}={:?}", field.name(), value));
+    }
+}
+
+impl<S: Subscriber> Layer<S> for Capture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut parts = Vec::new();
+        event.record(&mut LineVisitor { parts: &mut parts });
+        self.0.lock().expect("capture lock").push(parts.join(" "));
+    }
+}
+
+fn capture_lines() -> Arc<Mutex<Vec<String>>> {
+    static STORE: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let store = Arc::new(Mutex::new(Vec::new()));
+            let _ = tracing_subscriber::registry()
+                .with(Capture(store.clone()))
+                .try_init();
+            store
+        })
+        .clone()
+}
 
 type Spec = (&'static str, &'static str, CategoryId, Option<f64>);
 
@@ -118,11 +161,15 @@ fn app(
     build_app(config, specs, &[])
 }
 
+/// Every builder here carries a loopback `Host`: the guard's DNS-rebinding gate now
+/// runs on every request (FINDINGS-05 [5]), and a `tower::ServiceExt::oneshot`
+/// request carries no `Host` header on its own.
 async fn post_json(app: &Router, path: &str, body: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
         .oneshot(
             Request::post(path)
+                .header("host", "127.0.0.1:8708")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .expect("static request"),
@@ -142,6 +189,7 @@ async fn get_json(app: &Router, path: &str) -> (StatusCode, Value) {
         .clone()
         .oneshot(
             Request::get(path)
+                .header("host", "127.0.0.1:8708")
                 .body(Body::empty())
                 .expect("static request"),
         )
@@ -175,6 +223,7 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
         .clone()
         .oneshot(
             Request::get("/har/models")
+                .header("host", "127.0.0.1:8708")
                 .header("x-har-token", "nope")
                 .body(Body::empty())
                 .expect("static request"),
@@ -187,6 +236,7 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
         .clone()
         .oneshot(
             Request::get("/har/status")
+                .header("host", "127.0.0.1:8708")
                 .header("x-har-token", "s3cret")
                 .body(Body::empty())
                 .expect("static request"),
@@ -199,6 +249,7 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
         .clone()
         .oneshot(
             Request::get("/har/models")
+                .header("host", "127.0.0.1:8708")
                 .header("authorization", "Bearer s3cret")
                 .body(Body::empty())
                 .expect("static request"),
@@ -221,6 +272,7 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
             .clone()
             .oneshot(
                 Request::get(path)
+                    .header("host", "127.0.0.1:8708")
                     .body(Body::empty())
                     .expect("static request"),
             )
@@ -639,6 +691,7 @@ async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
         .clone()
         .oneshot(
             Request::post("/v1/chat/completions")
+                .header("host", "127.0.0.1:8708")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"model":"QWEN3","stream":true}"#))
                 .expect("static request"),
@@ -732,6 +785,7 @@ async fn proxy_passes_the_engines_content_encoding_through_verbatim() {
         .clone()
         .oneshot(
             Request::post("/v1/chat/completions")
+                .header("host", "127.0.0.1:8708")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"model":"qwen3","mock_encoded_reply":true}"#))
                 .expect("static request"),
@@ -1017,6 +1071,7 @@ async fn get_json_html(app_router: &Router, path: &str) -> (StatusCode, String) 
         .clone()
         .oneshot(
             Request::get(path)
+                .header("host", "127.0.0.1:8708")
                 .body(Body::empty())
                 .expect("static request"),
         )
@@ -1329,6 +1384,7 @@ async fn control_bodies_are_capped_below_the_proxy_ceiling() {
         .clone()
         .oneshot(
             Request::post("/har/load")
+                .header("host", "127.0.0.1:8708")
                 .header("content-type", "application/json")
                 .body(Body::from(body))
                 .expect("static request"),
@@ -1362,6 +1418,7 @@ async fn proxy_bodies_are_capped_at_64_mib() {
     let response = work
         .oneshot(
             Request::post("/v1/chat/completions")
+                .header("host", "127.0.0.1:8708")
                 .header("content-type", "application/json")
                 .body(Body::from(oversized))
                 .expect("static request"),
@@ -1409,6 +1466,7 @@ async fn events_stream_serves_sse_with_an_immediate_state() {
         .clone()
         .oneshot(
             Request::get("/har/events")
+                .header("host", "127.0.0.1:8708")
                 .body(Body::empty())
                 .expect("static request"),
         )
@@ -1804,7 +1862,12 @@ async fn config_model_reports_writeback_refusals_by_http_class() {
     );
 
     // 500 internal: the file itself vanished under a still-published entry — that
-    // one genuinely is the harness's/environment's problem, and stays 500.
+    // one genuinely is the harness's/environment's problem, and stays 500 with the
+    // `internal` code. FINDINGS-05 [6] moved the OS sentence out of the client
+    // body and into the ring: the body keeps the class, names the harness log as
+    // the place the detail lives, and must not carry the path; the full reason's
+    // presence in the ring is pinned by
+    // `os_failure_text_reaches_the_ring_but_never_the_client_body`.
     std::fs::write(&file, "name: qwen3\nengine: mock\n").expect("restore");
     std::fs::remove_file(&file).expect("delete");
     let (status, body) = post_json(
@@ -1815,13 +1878,23 @@ async fn config_model_reports_writeback_refusals_by_http_class() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
     assert_eq!(body["code"], "internal");
+    assert_eq!(body["error"]["code"], "internal");
+    assert_eq!(body["error"]["message"], body["message"]);
+    let message = body["message"].as_str().unwrap_or_default();
     assert!(
-        body["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("cannot read"),
-        "{body}"
+        message.starts_with("internal error:") && message.contains("harness log"),
+        "the stable sentence keeps the class and points at the detail: {message}"
     );
+    for leaked in [
+        "cannot read",
+        "qwen3.yaml",
+        modelconf.to_str().unwrap_or("?"),
+    ] {
+        assert!(
+            !body.to_string().contains(leaked),
+            "the 500 body may not carry the OS detail or its path ({leaked}): {body}"
+        );
+    }
 
     // And the healthy path is untouched by the typing: same endpoint, same 200.
     std::fs::write(&file, "name: qwen3\nengine: mock\ncategory: WORK\n").expect("reseed");
@@ -2805,6 +2878,7 @@ async fn request_ids_are_echoed_or_generated() {
 
     // Absent id is generated (req-<epoch>-<counter> shape).
     let response = control
+        .clone()
         .oneshot(
             Request::get("/health")
                 .header("host", "127.0.0.1:8708")
@@ -2820,6 +2894,381 @@ async fn request_ids_are_echoed_or_generated() {
         .unwrap_or_default()
         .to_string();
     assert!(id.starts_with("req-"), "generated id: {id}");
+
+    // FINDINGS-05 [7]: the echo above is the useful half; the wall is that an
+    // oversized id, or one carrying a space or a tab, is regenerated rather than
+    // echoed — the ring and the response may not be an attacker's echo chamber.
+    // Falsifier (pre-fix): every leg below echoes verbatim. The same values are
+    // pinned into the `request complete` ring line in-crate by
+    // `client_request_ids_are_capped_and_sanitized_before_echo_and_log`.
+    for rejected in [
+        "a".repeat(65),
+        "has space".to_string(),
+        "tab\there".to_string(),
+    ] {
+        let response = control
+            .clone()
+            .oneshot(
+                Request::get("/har/status")
+                    .header("host", "127.0.0.1:8708")
+                    .header("x-request-id", &rejected)
+                    .body(Body::empty())
+                    .expect("static request"),
+            )
+            .await
+            .expect("in-process request");
+        let id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            id.starts_with("req-") && id != rejected,
+            "a {rejected:?} id must regenerate, not echo: {id:?}"
+        );
+    }
+}
+
+/// FINDINGS-05 [3]: `har_config_logging` was the only POST handler taking a bare
+/// `Json<Value>`, so a malformed body answered axum's default 400 `text/plain`
+/// and broke the documented `{code,message}` + OpenAI-envelope contract on that
+/// route — nothing could branch on a missing `code`. Falsifier: revert the
+/// handler to `Json(body): Json<Value>` and the JSON parse dies on the
+/// text/plain sentence.
+#[tokio::test]
+async fn malformed_logging_body_answers_the_project_envelope() {
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
+    for malformed in ["{", "{\"enabled\":", ""] {
+        let response = control
+            .clone()
+            .oneshot(
+                Request::post("/har/config/logging")
+                    .header("host", "127.0.0.1:8708")
+                    .header("content-type", "application/json")
+                    .body(Body::from(malformed))
+                    .expect("static request"),
+            )
+            .await
+            .expect("in-process request");
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bounded body");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "malformed {malformed:?}: {text}"
+        );
+        assert!(
+            content_type.starts_with("application/json"),
+            "malformed {malformed:?} must answer the JSON envelope, not text/plain: {content_type} / {text}"
+        );
+        let body: Value = serde_json::from_slice(&bytes).expect("envelope JSON");
+        assert_eq!(body["code"], "bad_request");
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert_eq!(body["error"]["message"], body["message"]);
+    }
+}
+
+/// FINDINGS-05 [4]: `loopback_host` accepted every IP literal and threw the port
+/// away (`rsplit_once(':')`), so `Host: 203.0.113.9:8708`, `Host: 0.0.0.0:8708`
+/// and any wrong port on any listener passed the DNS-rebinding gate — looser
+/// than the guard's own doc. Falsifier (pre-batch): every BAD_REQUEST leg below
+/// answers 200. Falsifier (FINDINGS-16 N[1]): the `0.0.0.0`-bind OK leg answers
+/// 400 against a gate keyed on `Host == internal_host` instead of the
+/// unspecified-bind rule, so the suite sees the real published posture.
+#[tokio::test]
+async fn the_host_gate_closes_on_address_and_port_not_just_syntax() {
+    async fn probe(router: &Router, host: &str) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                Request::get("/har/status")
+                    .header("host", host)
+                    .body(Body::empty())
+                    .expect("static request"),
+            )
+            .await
+            .expect("in-process request")
+            .status()
+    }
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
+    // A wrong port on the right address: the port the request was addressed to is
+    // part of "this harness", not decoration the guard may drop.
+    assert_eq!(
+        probe(&control, "127.0.0.1:9999").await,
+        StatusCode::BAD_REQUEST
+    );
+    // Routable and unspecified addresses, even on a real port.
+    assert_eq!(
+        probe(&control, "203.0.113.9:8708").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        probe(&control, "0.0.0.0:8708").await,
+        StatusCode::BAD_REQUEST
+    );
+    // Non-regression: the whole loopback family — bare and bracketed v6, with or
+    // without a port from the configured set.
+    for host in [
+        "127.0.0.1",
+        "127.0.0.2:8711",
+        "localhost:8709",
+        "[::1]",
+        "[0:0:0:0:0:0:0:1]:8710",
+    ] {
+        assert_eq!(
+            probe(&control, host).await,
+            StatusCode::OK,
+            "host {host} is this harness"
+        );
+    }
+    // The publish posture (FINDINGS-16 N[1]/N[2]): `0.0.0.0` is the only
+    // non-loopback bind boot validation allows and the operator's live shape, so
+    // the legs use the real boot-valid configs, never a hand-built unicast bind.
+    // The same LAN Host must stay 400 on the loopback bind and answer 200 on the
+    // publish bind; hostnames and foreign ports stay refused on both.
+    assert_eq!(
+        probe(&control, "192.168.1.23:8708").await,
+        StatusCode::BAD_REQUEST,
+        "a loopback bind never answers a LAN-addressed Host"
+    );
+    let published = AppConfig {
+        internal_host: "0.0.0.0".parse().expect("publish bind"),
+        ..AppConfig::default()
+    };
+    let (published_control, _, _, _, _, _) = app(published, &[]);
+    assert_eq!(
+        probe(&published_control, "192.168.1.23:8708").await,
+        StatusCode::OK,
+        "the published posture (guard is the floor) answers its LAN clients"
+    );
+    assert_eq!(
+        probe(&published_control, "192.168.1.23:9999").await,
+        StatusCode::BAD_REQUEST,
+        "the publish widening does not excuse a foreign port"
+    );
+    assert_eq!(
+        probe(&published_control, "evil.example:8708").await,
+        StatusCode::BAD_REQUEST,
+        "a hostname Host stays refused even on the publish bind"
+    );
+}
+
+/// FINDINGS-05 [5]: the Host gate ran only `if let Some(host)`, so a request
+/// carrying no `Host` at all skipped the DNS-rebinding gate instead of being
+/// refused by it — a conditional floor is not a floor, and the published-host
+/// posture is documented as relying on the guard, not on a stack property.
+/// Falsifier (pre-fix): every leg below answers 200/401 instead of 400.
+#[tokio::test]
+async fn a_request_without_a_host_header_is_refused_not_skipped() {
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
+    let response = control
+        .clone()
+        .oneshot(
+            Request::get("/har/status")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    let body: Value = serde_json::from_slice(&bytes).expect("refusal envelope");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["code"], "bad_request");
+    assert_eq!(body["error"]["code"], "bad_request");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Host"),
+        "the refusal must name the header it needs: {body}"
+    );
+
+    // Structural before token (DECISIONS LOCKED): the right token does not excuse
+    // a request the guard cannot inspect.
+    let config = AppConfig {
+        control_token: Some("s3cret".to_string()),
+        ..AppConfig::default()
+    };
+    let (guarded, _, _, _, _, _) = app(config, &[]);
+    let response = guarded
+        .oneshot(
+            Request::post("/har/config/logging")
+                .header("content-type", "application/json")
+                .header("x-har-token", "s3cret")
+                .body(Body::from(r#"{"enabled":false}"#))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// FINDINGS-05 [6]: `error_body` passed the `Internal`/`Upstream` reasons through
+/// verbatim, and those reasons embed absolute paths (model yaml, log file,
+/// engine exe), so a published harness with no token told any host on the
+/// segment its install tree. The full sentence now goes to `tracing::error!` —
+/// the ring and the log file — and the client keeps only the stable class
+/// sentence. Falsifier (pre-fix): no captured line carries the OS sentence at
+/// all, and the wire body carries it (the 500 leg of
+/// `config_model_reports_writeback_refusals_by_http_class` pins that half).
+#[tokio::test]
+async fn os_failure_text_reaches_the_ring_but_never_the_client_body() {
+    let capture = capture_lines();
+    // The reporting callsite must deliver into this subscriber (D9): warm it on a
+    // throwaway app whose model name no assertion reads, rebuild cached interest,
+    // THEN take the measurement.
+    let (warm, _, _, _, _, warm_dir) = build_app(
+        AppConfig::default(),
+        &[("warmer", "mock", CategoryId::Work, Some(4.0))],
+        &[],
+    );
+    let (_, published) = get_json(&warm, "/har/models").await;
+    assert!(
+        published["data"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .any(|entry| entry["id"] == "warmer"),
+        "the warm row must be published before its file moves: {published}"
+    );
+    std::fs::remove_file(warm_dir.join("warmer.yaml")).expect("warm: delete under published row");
+    post_json(
+        &warm,
+        "/har/config/model",
+        r#"{"model":"warmer","category":"AUX"}"#,
+    )
+    .await;
+    tracing::callsite::rebuild_interest_cache();
+
+    let (control, _, _, _, _, modelconf) = build_app(
+        AppConfig::default(),
+        &[("osleak", "mock", CategoryId::Work, Some(4.0))],
+        &[],
+    );
+    let (_, published) = get_json(&control, "/har/models").await;
+    assert!(
+        published["data"]
+            .as_array()
+            .expect("list")
+            .iter()
+            .any(|entry| entry["id"] == "osleak"),
+        "the row must be published before the file moves: {published}"
+    );
+    std::fs::remove_file(modelconf.join("osleak.yaml")).expect("delete under published row");
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"osleak","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["code"], "internal");
+    assert_eq!(body["error"]["code"], "internal");
+    assert_eq!(body["message"], body["error"]["message"]);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("internal error:"),
+        "the stable sentence keeps the class: {body}"
+    );
+    for leaked in [
+        "cannot read",
+        "osleak.yaml",
+        modelconf.to_str().unwrap_or("?"),
+    ] {
+        assert!(
+            !body.to_string().contains(leaked),
+            "the client body may not carry {leaked:?}: {body}"
+        );
+    }
+    // The operator's channel holds the whole truth the socket no longer sees.
+    let lines = capture.lock().expect("capture lock");
+    assert!(
+        lines.iter().any(|line| line.contains("cannot read")
+            && line.contains("osleak.yaml")
+            && line.contains("detail")),
+        "the full OS reason must reach the harness log, not the client: {lines:?}"
+    );
+}
+
+/// FINDINGS-05 [8]: the `Bearer` scheme was stripped byte-exactly, so an
+/// OpenAI-style client sending `authorization: bearer <token>` got a 401 that
+/// read as a wrong token; RFC 7235 makes auth-schemes case-insensitive. The
+/// constant-time half of the finding is pinned against the shipped source
+/// in-crate (`the_token_wall_is_constant_time_and_scheme_case_insensitive`);
+/// this is the wire matrix — any scheme case passes, a same-length wrong token
+/// and a different-length one are both refused, and a bare token still passes.
+#[tokio::test]
+async fn bearer_scheme_is_accepted_in_any_case_and_only_the_right_token_passes() {
+    let config = AppConfig {
+        control_token: Some("s3cret-token".to_string()),
+        ..AppConfig::default()
+    };
+    let (control, _, _, _, _, _) = app(config, &[]);
+    for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+        let response = control
+            .clone()
+            .oneshot(
+                Request::get("/har/models")
+                    .header("host", "127.0.0.1:8708")
+                    .header("authorization", format!("{scheme} s3cret-token"))
+                    .body(Body::empty())
+                    .expect("static request"),
+            )
+            .await
+            .expect("in-process request");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "scheme {scheme} is RFC-valid and must be accepted"
+        );
+    }
+    // Wrong stays wrong in both directions: one byte flipped at equal length (the
+    // fold decides) and a different length (the length gate decides).
+    for wrong in ["s3cret-tokeN", "s3cret", "s3cret-token-longer"] {
+        let response = control
+            .clone()
+            .oneshot(
+                Request::get("/har/models")
+                    .header("host", "127.0.0.1:8708")
+                    .header("x-har-token", wrong)
+                    .body(Body::empty())
+                    .expect("static request"),
+            )
+            .await
+            .expect("in-process request");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong token {wrong:?} must be refused"
+        );
+    }
+    // A bare token with no scheme still passes, as the page sends it.
+    let response = control
+        .oneshot(
+            Request::get("/har/models")
+                .header("host", "127.0.0.1:8708")
+                .header("x-har-token", "s3cret-token")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

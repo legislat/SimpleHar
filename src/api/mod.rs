@@ -170,6 +170,12 @@ impl ApiError {
     /// `writeback_errors_map_to_their_http_class_without_rewording` (all eight, in
     /// crate) and, for the classes the endpoint can genuinely reach, by the
     /// `/har/config/model` tests in `tests/api_surface.rs`.
+    ///
+    /// `reason` is what the *variant* carries and what the ring receives; the
+    /// `500 internal` sentence reaches the client body only through `error_body`,
+    /// which withholds the OS text of the two harness-failure classes (FINDINGS-05
+    /// [6]) — the verbatim `to_string()` comparisons above and beside this table
+    /// are statements about `reason`, unchanged by that withholding.
     pub(crate) fn from_writeback(file: &std::path::Path, error: WritebackError) -> Self {
         match error {
             WritebackError::WouldBreakFile { .. } | WritebackError::EmptyFile => {
@@ -194,8 +200,29 @@ impl ApiError {
 
 /// The single JSON error body (A2): SE-native flat `code`/`message` plus the
 /// OpenAI-compatible `error` envelope with the same values.
+///
+/// The two harness-failure classes carry OS-level failure text — absolute paths
+/// into model yamls, log files, the engine executable (FINDINGS-05 [6]). That
+/// text is the operator's diagnostic, not the client's: it goes to
+/// `tracing::error!` (ring + log file) and the client receives a stable
+/// sentence that keeps the class prefix and points at the harness log. The
+/// machine-readable class was always `code`; the numbers a client branches on
+/// live in the *request-side* classes (`unavailable`, `below_launch_floor`),
+/// whose messages pass through here unchanged, exactly like every other variant.
 fn error_body(error: &ApiError) -> Value {
-    let message = error.to_string();
+    let message = match error {
+        ApiError::Internal { reason } => {
+            tracing::error!(detail = %reason, code = %error.code(), "harness failure; OS detail stays in the harness log");
+            "internal error: the harness could not complete this operation; the full reason is in the harness log"
+                .to_string()
+        }
+        ApiError::Upstream { reason } => {
+            tracing::error!(detail = %reason, code = %error.code(), "engine failure; OS detail stays in the harness log");
+            "upstream failure: the engine could not complete this operation; the full reason is in the harness log"
+                .to_string()
+        }
+        other => other.to_string(),
+    };
     let code = error.code();
     json!({
         "code": code,
@@ -1714,6 +1741,25 @@ fn next_request_id() -> String {
     format!("req-{epoch:x}-{counter:x}")
 }
 
+/// Ceiling for a client-supplied request id (FINDINGS-05 [7]): the ring is the
+/// operator's only "why did the last load fail" channel and the guard is its one
+/// request producer, so an echoed id must stay one short line — never a flood of
+/// attacker-chosen text that evicts real evidence one request at a time.
+const REQUEST_ID_MAX_CHARS: usize = 64;
+
+/// Whether a client's `x-request-id` may be echoed and logged verbatim: non-empty,
+/// at most [`REQUEST_ID_MAX_CHARS`], printable ASCII only. Rejected ids get a
+/// freshly generated one rather than a truncation, deliberately: a truncated
+/// attacker string still reads like a harness id in the ring, while a regenerated
+/// `req-` id is visibly the harness's own. `HeaderValue::to_str` already limits
+/// what can reach `raw` to visible ASCII plus tab, so `len` never over-counts a
+/// multibyte character here — and tab is exactly what `is_ascii_graphic` refuses.
+fn accepted_request_id(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= REQUEST_ID_MAX_CHARS
+        && raw.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 /// Routes that must answer before a token exists, so the page can load and ask for
 /// one. Exact matches only — never a prefix, which would re-open `/har/*`-adjacent
 /// paths.
@@ -1776,9 +1822,9 @@ fn auth_reason(state: &ApiState, request: &axum::extract::Request) -> Option<Api
         .get("x-har-token")
         .or_else(|| headers.get(axum::http::header::AUTHORIZATION))
         .and_then(|value| value.to_str().ok())
-        .map(|raw| raw.strip_prefix("Bearer ").unwrap_or(raw).trim());
+        .map(presented_token);
     match presented {
-        Some(given) if given == expected => None,
+        Some(given) if token_matches(given.as_bytes(), expected.as_bytes()) => None,
         _ => Some(ApiError::Unauthorized {
             reason: format!(
                 "{} requires the control token (X-Har-Token or Authorization: Bearer)",
@@ -1788,14 +1834,51 @@ fn auth_reason(state: &ApiState, request: &axum::extract::Request) -> Option<Api
     }
 }
 
+/// The credential inside a presented header value: the `Bearer` scheme is stripped
+/// ASCII-case-insensitively — RFC 7235 defines auth-schemes as case-insensitive, and
+/// `authorization: bearer <token>` from an OpenAI-style client was refused with a
+/// message that read as a wrong token (FINDINGS-05 [8]). Any other value is the
+/// token itself. The trim matches `resolve_control_token`'s handling of the expected
+/// value, as before.
+fn presented_token(raw: &str) -> &str {
+    match raw.split_once(' ') {
+        Some((scheme, credential)) if scheme.eq_ignore_ascii_case("bearer") => credential.trim(),
+        _ => raw.trim(),
+    }
+}
+
+/// Constant-time token equality (FINDINGS-05 [8]): every byte of an equal-length
+/// pair is examined, so the wall cannot short-circuit on the first differing byte
+/// and leak its position through timing. A length mismatch returns early — the
+/// length remains observable, which the finding accepts as the honest residual of
+/// a single-line fix. No dependency is added: `Cargo.lock` carries no
+/// `subtle`/`constant_time_eq` today, and this is nine lines with no allocation.
+fn token_matches(given: &[u8], expected: &[u8]) -> bool {
+    if given.len() != expected.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (g, e) in given.iter().zip(expected) {
+        difference |= g ^ e;
+    }
+    difference == 0
+}
+
 /// The guard + correlation middleware (Step 11 "kept regardless", Step 12):
-/// - **Host** must be loopback-shaped (an IP literal or `localhost`) — a hostname
-///   means a DNS-rebinding attempt, refused `400` before any handler runs;
+/// - **Host** must address a loopback — or any address when the harness publishes
+///   on the unspecified bind (`internal_host = 0.0.0.0`, the documented no-auth
+///   LAN posture where this guard is the floor) — on one of its own configured
+///   ports; a hostname, an address outside the bind, a foreign port or a missing
+///   `Host` is refused `400` before any handler runs (DNS-rebinding guard; the
+///   gate runs on every request, not only the ones that bother to declare a Host,
+///   FINDINGS-05 [4][5], FINDINGS-16 N[1]);
 /// - **Origin** (when the client sends one — browsers do on cross-site POSTs) must
 ///   match the request's Host authority, else `403` (CSRF guard);
 /// - a **POST** body must declare `application/json`, else `415` (Step 11);
-/// - the **request id** comes from the client's `x-request-id` or is generated,
-///   echoed in the response header, and logged at request completion (G6).
+/// - the **request id** comes from the client's `x-request-id` only when it is
+///   short and printable (see [`accepted_request_id`]) and is generated otherwise,
+///   echoed in the response header, and logged at request completion (G6,
+///   FINDINGS-05 [7]).
 ///
 /// Applied in `main` on every listener router, so guards wrap uniformly.
 pub async fn guard(
@@ -1807,6 +1890,7 @@ pub async fn guard(
         .headers()
         .get(&X_REQUEST_ID)
         .and_then(|value| value.to_str().ok())
+        .filter(|raw| accepted_request_id(raw))
         .map(str::to_string)
         .unwrap_or_else(next_request_id);
 
@@ -1820,7 +1904,7 @@ pub async fn guard(
     // is what makes swapping the two blocks below a red suite instead of a green one
     // (FINDINGS2-0507 [2]; the two refusals are also individually pinned in
     // `tests/api_surface.rs`, but only on a token-less app, which cannot see the order).
-    if let Some(reason) = reject_reason(&request) {
+    if let Some(reason) = reject_reason(&state, &request) {
         state.note_guard_refusal(&reason, &method, &path, &request_id);
         let response = (reason.status(), Json(error_body(&reason))).into_response();
         return with_request_id(response, &request_id);
@@ -1859,16 +1943,26 @@ pub async fn guard(
 }
 
 /// The guard verdict for a request: `Some(reason)` refuses it.
-fn reject_reason(request: &axum::extract::Request) -> Option<ApiError> {
+fn reject_reason(state: &ApiState, request: &axum::extract::Request) -> Option<ApiError> {
     let headers = request.headers();
-    if let Some(host) = headers
+    // The Host gate runs on every request, including one that carries no `Host`
+    // at all: a conditional floor is not a floor, and the safety of a published
+    // `internal_host` without a token may rest only on what the guard asserts,
+    // never on an undocumented property of the HTTP stack (FINDINGS-05 [5]).
+    match headers
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
     {
-        if !loopback_host(host) {
+        None => {
+            return Some(ApiError::BadRequest {
+                reason: "request carries no `Host` header; SE is a loopback tool and the DNS-rebinding guard must see the address the request was sent to".to_string(),
+            });
+        }
+        Some(host) if loopback_host(state, host) => {}
+        Some(host) => {
             return Some(ApiError::BadRequest {
                 reason: format!(
-                    "Host `{host}` is not a loopback address; SE is a loopback tool and refuses requests addressed by hostname (DNS-rebinding guard)"
+                    "Host `{host}` is not this harness's loopback address on one of its own ports; SE is a loopback tool and refuses requests addressed by hostname or foreign address (DNS-rebinding guard)"
                 ),
             });
         }
@@ -1912,13 +2006,61 @@ fn reject_reason(request: &axum::extract::Request) -> Option<ApiError> {
     None
 }
 
-/// `true` for IP literals and `localhost` (with any port, v6 bracketed).
-fn loopback_host(host: &str) -> bool {
-    let authority = host
-        .rsplit_once(':')
-        .map_or(host, |(authority, _)| authority);
-    let authority = authority.trim_start_matches('[').trim_end_matches(']');
-    authority.parse::<std::net::IpAddr>().is_ok() || authority.eq_ignore_ascii_case("localhost")
+/// `true` when `host` addresses this harness. An IP-literal authority passes on
+/// either of two rules: the address is loopback, or the configured bind
+/// `internal_host` is unspecified — `0.0.0.0` is the publish posture whose
+/// documented security floor is this very guard (no-auth LAN by design), so it
+/// must answer every address the machine's LAN clients put in `Host`; boot
+/// `validate` refuses every other bind, so there is no unicast bound address a
+/// legitimate client could ever address (FINDINGS-16 N[1]: the old equality leg
+/// against `internal_host` was dead code and 400'd every real LAN client). A
+/// non-IP authority passes only as `localhost`: rebinding attacks deliver the
+/// attacker's hostname in `Host`, so hostnames stay refused — that is the
+/// DNS-rebinding defense. If the value carries a port, it must be one of the
+/// harness's own configured ports (FINDINGS-05 [4]: accepting every IP literal
+/// left `Host: 203.0.113.9:8708` and any wrong port passing, load-bearing only
+/// because the Origin check happened to also compare the port). The allowed
+/// ports come from the boot config, and the listener binds derive from it, so
+/// the two cannot diverge.
+fn loopback_host(state: &ApiState, host: &str) -> bool {
+    let Some((authority, port)) = split_host(host) else {
+        return false;
+    };
+    let address_ok = match authority.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback() || state.config.internal_host.is_unspecified(),
+        Err(_) => authority.eq_ignore_ascii_case("localhost"),
+    };
+    address_ok
+        && port.is_none_or(|port| {
+            state
+                .config
+                .categories
+                .iter()
+                .any(|category| category.public_port == port)
+        })
+}
+
+/// Splits a `Host` value into authority and optional port. An IPv6 address may
+/// appear bracketed only (RFC 3986 §3.2.2 — the form every browser sends): an
+/// unbracketed address contains an inner colon and is refused, and so are
+/// malformed authorities or unparseable ports, since none is a `Host` a
+/// legitimate client produces.
+fn split_host(host: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = host.strip_prefix('[') {
+        let (inner, suffix) = rest.split_once(']')?;
+        let port = match suffix {
+            "" => None,
+            suffix => Some(suffix.strip_prefix(':')?.parse().ok()?),
+        };
+        return Some((inner, port));
+    }
+    match host.split_once(':') {
+        None => Some((host, None)),
+        Some((authority, port)) if !authority.contains(':') => {
+            Some((authority, Some(port.parse().ok()?)))
+        }
+        Some(_) => None,
+    }
 }
 
 /// The authority (`host[:port]`) of an `Origin` header value.
@@ -2230,10 +2372,18 @@ async fn har_rescan(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
 /// `POST /har/config/logging {"enabled": bool}` — the page's "Extended Logging"
 /// switch: decision-level scheduler lines plus the full request ring. Runtime
 /// only; every boot starts with it off.
+///
+/// The body is buffered through the same `Result<Json<Value>, JsonRejection>`
+/// wall as every sibling POST (FINDINGS-05 [3]): a bare `Json<Value>` handed
+/// axum's default `text/plain` rejection straight to the client, breaking the
+/// documented `{code,message}` + OpenAI-envelope contract on this one route.
 async fn har_config_logging(
     State(_state): State<Arc<ApiState>>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
+        reason: format!("body must be JSON with `enabled`: {rejection}"),
+    })?;
     let Some(enabled) = body.get("enabled").and_then(Value::as_bool) else {
         return Err(ApiError::BadRequest {
             reason: "enabled (boolean) is required".to_string(),
@@ -3714,6 +3864,7 @@ mod tests {
             let response = control_router(Arc::clone(&warm))
                 .oneshot(
                     Request::get("/health")
+                        .header("host", "127.0.0.1:8708")
                         .body(Body::empty())
                         .expect("warm-up request"),
                 )
@@ -3729,6 +3880,7 @@ mod tests {
                 let response = control_router(Arc::clone(&api))
                     .oneshot(
                         Request::get(path)
+                            .header("host", "127.0.0.1:8708")
                             .body(Body::empty())
                             .expect("routine poll request"),
                     )
@@ -3742,6 +3894,7 @@ mod tests {
         let other = control_router(Arc::clone(&api))
             .oneshot(
                 Request::get("/health")
+                    .header("host", "127.0.0.1:8708")
                     .body(Body::empty())
                     .expect("health request"),
             )
@@ -3846,7 +3999,7 @@ mod tests {
             origin: Option<&'static str>,
             json: bool,
         ) -> StatusCode {
-            let mut builder = Request::post(path);
+            let mut builder = Request::post(path).header("host", "127.0.0.1:8708");
             if let Some(origin) = origin {
                 builder = builder.header("origin", origin);
             }
@@ -3906,6 +4059,7 @@ mod tests {
             let response = control_router(Arc::clone(&guarded))
                 .oneshot(
                     Request::post("/har/rescan")
+                        .header("host", "127.0.0.1:8708")
                         .header("content-type", "application/json")
                         .header("authorization", "Bearer nope")
                         .body(Body::empty())
@@ -3939,6 +4093,7 @@ mod tests {
         let poll = control_router(Arc::clone(&api))
             .oneshot(
                 Request::get("/har/status")
+                    .header("host", "127.0.0.1:8708")
                     .body(Body::empty())
                     .expect("poll request"),
             )
@@ -3950,6 +4105,7 @@ mod tests {
             control_router(Arc::clone(&api))
                 .oneshot(
                     Request::get("/health")
+                        .header("host", "127.0.0.1:8708")
                         .body(Body::empty())
                         .expect("health request"),
                 )
@@ -4091,6 +4247,7 @@ mod tests {
                     let response = control_router(Arc::clone(&warm))
                         .oneshot(
                             Request::post(format!("/warm/{index}"))
+                                .header("host", "127.0.0.1:8708")
                                 .header("origin", "http://warm.example")
                                 .header("content-type", "application/json")
                                 .body(Body::empty())
@@ -4104,6 +4261,7 @@ mod tests {
                 let health = control_router(Arc::clone(&warm))
                     .oneshot(
                         Request::get("/health")
+                            .header("host", "127.0.0.1:8708")
                             .header("x-har-token", "warm-up-token")
                             .body(Body::empty())
                             .expect("warm-up health read"),
@@ -4144,6 +4302,7 @@ mod tests {
             let response = control_router(Arc::clone(&api))
                 .oneshot(
                     Request::post("/har/rescan")
+                        .header("host", "127.0.0.1:8708")
                         .header("content-type", "application/json")
                         .header("authorization", "Bearer wrong-token")
                         .body(Body::empty())
@@ -4176,6 +4335,7 @@ mod tests {
         let health = control_router(Arc::clone(&api))
             .oneshot(
                 Request::get("/health")
+                    .header("host", "127.0.0.1:8708")
                     .header("x-har-token", OFFERED)
                     .body(Body::empty())
                     .expect("health request"),
@@ -4224,7 +4384,9 @@ mod tests {
         ));
 
         async fn probe(api: &Arc<ApiState>, path: &str, origin: Option<&str>) -> StatusCode {
-            let mut builder = Request::post(path).header("content-type", "application/json");
+            let mut builder = Request::post(path)
+                .header("host", "127.0.0.1:8708")
+                .header("content-type", "application/json");
             if let Some(origin) = origin {
                 builder = builder.header("origin", origin);
             }
@@ -4361,6 +4523,7 @@ mod tests {
         let health = control_router(Arc::clone(&api))
             .oneshot(
                 Request::get("/health")
+                    .header("host", "127.0.0.1:8708")
                     .header("x-har-token", OFFERED)
                     .body(Body::empty())
                     .expect("health request"),
@@ -4421,7 +4584,9 @@ mod tests {
     /// the token must be told the security reason it triggered, not that a route wants
     /// a secret — the 401 is an oracle for "this route exists and is protected".
     /// Falsifier: move the `auth_reason` block above `reject_reason` in `guard` and all
-    /// three structural arms below fail with 401.
+    /// three structural arms below fail with 401. The fourth arm is FINDINGS-05 [5]:
+    /// a request that carries no `Host` at all is itself a structural refusal and is
+    /// answered `400`, not allowed past the DNS-rebinding gate to the token.
     #[tokio::test]
     async fn structural_refusals_are_answered_before_the_token_is_consulted() {
         let config = AppConfig {
@@ -4444,13 +4609,14 @@ mod tests {
                 .status()
         };
         assert_eq!(
-            structural(Request::post("/har/rescan")).await,
+            structural(Request::post("/har/rescan").header("host", "127.0.0.1:8708")).await,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "a content-type probe with no token is a 415, never a 401"
         );
         assert_eq!(
             structural(
                 Request::post("/har/rescan")
+                    .header("host", "127.0.0.1:8708")
                     .header("content-type", "application/json")
                     .header("origin", "http://evil.example")
             )
@@ -4468,14 +4634,335 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "a DNS-rebinding Host with no token is a 400, never a 401"
         );
+        assert_eq!(
+            structural(
+                Request::post("/har/rescan")
+                    .header("content-type", "application/json")
+                    .header("x-har-token", "a-token-never-presented")
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "the right token does not excuse a request the Host gate cannot inspect"
+        );
         // And the token check is still there behind them: structurally clean + no
         // credential is the one case that may answer 401.
         assert_eq!(
-            structural(Request::post("/har/rescan").header("content-type", "application/json"))
-                .await,
+            structural(
+                Request::post("/har/rescan")
+                    .header("host", "127.0.0.1:8708")
+                    .header("content-type", "application/json")
+            )
+            .await,
             StatusCode::UNAUTHORIZED,
             "with nothing structural to refuse, the token is what gates the route"
         );
+    }
+
+    /// FINDINGS-05 [4] + FINDINGS-16 N[1]/N[2]: the Host gate must be exactly as
+    /// tight as its doc. The authority/port split is pinned directly (brackets
+    /// required for IPv6, unparseable ports refused), and the gate accepts IP
+    /// literals that are loopback — or any address on the only non-loopback bind
+    /// boot validation allows (`0.0.0.0`) — plus `localhost`, each only on one of
+    /// the harness's own configured ports. Pre-batch every IP literal passed
+    /// (`203.0.113.9`, `0.0.0.0`) and `rsplit_once(':')` threw the port away, so
+    /// the routable-address and wrong-port legs read red against it; the
+    /// publish-bind accept leg reads red against the dead equality-against-
+    /// `internal_host` leg the batch shipped (FINDINGS-16 N[1]).
+    #[test]
+    fn the_host_gate_accepts_loopback_published_binds_and_our_own_ports() {
+        for (host, authority, port) in [
+            ("127.0.0.1:8708", "127.0.0.1", Some(8708u16)),
+            ("[::1]:8708", "::1", Some(8708)),
+            ("[0:0:0:0:0:0:0:1]", "0:0:0:0:0:0:0:1", None),
+            ("localhost", "localhost", None),
+            ("localhost:8709", "localhost", Some(8709)),
+        ] {
+            assert_eq!(
+                split_host(host),
+                Some((authority, port)),
+                "a Host a legitimate browser sends must parse: {host}"
+            );
+        }
+        for host in [
+            "::1",
+            "127.0.0.1:",
+            "127.0.0.1:99x",
+            "127.0.0.1:8708:9",
+            "[::1",
+            "[::1]x",
+        ] {
+            assert_eq!(split_host(host), None, "malformed Host {host:?} is refused");
+        }
+        let default = ApiState::new(
+            AppConfig::default(),
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        );
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:8708",
+            "127.0.0.42:8711",
+            "localhost:8708",
+            "LOCALHOST",
+            "[::1]:8710",
+        ] {
+            assert!(
+                loopback_host(&default, host),
+                "{host} addresses this harness"
+            );
+        }
+        for host in [
+            "203.0.113.9:8708",
+            "0.0.0.0:8708",
+            "10.1.2.3:8708",
+            "198.51.100.7:8708",
+            "evil.example.com",
+            "::1",
+            "[fe80::1]:8708",
+            "127.0.0.1:9999",
+            "[::1]:18109",
+        ] {
+            assert!(
+                !loopback_host(&default, host),
+                "{host} is not this harness's loopback address on its own port"
+            );
+        }
+        // The publish posture is the only non-loopback bind boot `validate`
+        // allows, so the second acceptance rule is pinned on `0.0.0.0`, never on
+        // a hand-built unicast bind the boot validator refuses (FINDINGS-16
+        // N[2]): any address the bind covers answers on its own port, the port
+        // rule still refuses a foreign port, and hostname clients stay refused
+        // — the DNS-rebinding defense does not care how the harness is bound.
+        let published = ApiState::new(
+            AppConfig {
+                internal_host: "0.0.0.0".parse().expect("publish bind"),
+                ..AppConfig::default()
+            },
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        );
+        assert!(
+            loopback_host(&published, "192.168.1.23:8708"),
+            "a published harness answers LAN clients addressing its real address"
+        );
+        assert!(
+            !loopback_host(&published, "192.168.1.23:9999"),
+            "the publish widening does not excuse a foreign port"
+        );
+        assert!(
+            !loopback_host(&published, "evil.example:8708"),
+            "a hostname Host stays refused even on the publish bind"
+        );
+    }
+
+    /// FINDINGS-05 [8]: the credential wall compares every byte of an
+    /// equal-length pair (`difference |= g ^ e`, never a short-circuiting `==`),
+    /// and the `Bearer` scheme is stripped in any ASCII case (RFC 7235) — the old
+    /// byte-exact `strip_prefix("Bearer ")` refused `bearer <token>` from
+    /// OpenAI-style clients with a message that read as a wrong token. The
+    /// structural legs read the shipped source, because a passing behavioral
+    /// matrix today does not stop `==` creeping back tomorrow.
+    #[test]
+    fn the_token_wall_is_constant_time_and_scheme_case_insensitive() {
+        assert!(token_matches(b"secret", b"secret"));
+        assert!(token_matches(b"", b""));
+        for index in 0..6 {
+            let mut differing = *b"secret";
+            differing[index] ^= 0x20;
+            assert!(
+                !token_matches(&differing, b"secret"),
+                "byte {index} must decide the verdict"
+            );
+        }
+        assert!(!token_matches(b"secre", b"secret"), "shorter is refused");
+        assert!(!token_matches(b"secre!", b"secret"), "longer is refused");
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            assert_eq!(
+                presented_token(&format!("{scheme} s3cret")),
+                "s3cret",
+                "RFC 7235: the auth-scheme is case-insensitive"
+            );
+        }
+        assert_eq!(
+            presented_token("s3cret"),
+            "s3cret",
+            "without a scheme the value IS the token"
+        );
+        assert_eq!(
+            presented_token("bearer  s3cret "),
+            "s3cret",
+            "the trim matches `resolve_control_token`"
+        );
+        let source = include_str!("mod.rs");
+        let body_of = |name: &str| {
+            let start = source
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            source[start..start + source[start..].find("\n}\n").expect("function end") + 3]
+                .to_string()
+        };
+        let auth = body_of("fn auth_reason(");
+        assert!(
+            auth.contains("token_matches(") && !auth.contains("given == expected"),
+            "auth_reason must compare through the constant-time wall: back to `==` is \
+             the FINDINGS-05 [8] regression: {auth}"
+        );
+        let fold = body_of("fn token_matches(");
+        assert!(
+            fold.contains("|=") && fold.contains('^'),
+            "the wall must examine every byte of an equal-length pair: {fold}"
+        );
+        let scheme = body_of("fn presented_token(");
+        assert!(
+            scheme.contains("eq_ignore_ascii_case(\"bearer\")")
+                && !scheme.contains("strip_prefix(\"Bearer \")"),
+            "scheme stripping must be ASCII-case-insensitive: {scheme}"
+        );
+    }
+
+    /// FINDINGS-05 [6]: the two harness-failure classes carry OS-level failure
+    /// text — paths into model yamls, log files, the engine exe. The class stays
+    /// legible (`code` and message prefix unchanged, both envelope shapes equal),
+    /// but the client body must not carry the detail; `error_body` sends it to
+    /// `tracing::error!` instead (the live 500 with a capturing subscriber is
+    /// pinned in `tests/api_surface.rs`). The request-side classes still state
+    /// their own numbers verbatim: the withholding is scoped, not a mute.
+    #[test]
+    fn harness_failure_bodies_hide_the_os_detail_but_keep_the_class() {
+        let leaked = "cannot read C:\\ModelConf\\qwen3.yaml: Access is denied. (os error 5)";
+        for (error, prefix) in [
+            (
+                ApiError::Internal {
+                    reason: leaked.to_string(),
+                },
+                "internal error:",
+            ),
+            (
+                ApiError::Upstream {
+                    reason: leaked.to_string(),
+                },
+                "upstream failure:",
+            ),
+        ] {
+            let body = error_body(&error);
+            assert_eq!(body["code"], error.code());
+            assert_eq!(body["error"]["code"], error.code());
+            assert_eq!(body["error"]["message"], body["message"]);
+            let message = body["message"].as_str().expect("string message");
+            assert!(
+                message.starts_with(prefix),
+                "{prefix} must survive: {message}"
+            );
+            assert!(
+                message.contains("harness log"),
+                "the body must say where the full reason lives: {message}"
+            );
+            for secret in ["cannot read", "ModelConf", "qwen3.yaml", "os error"] {
+                assert!(
+                    !body.to_string().contains(secret),
+                    "the client body may not carry OS detail ({secret}): {body}"
+                );
+            }
+        }
+        let numbers = ApiError::Unavailable {
+            reason: "the load needs 18.0 GiB free; 9.4 GiB is".to_string(),
+        };
+        let body = error_body(&numbers);
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("18.0 GiB free; 9.4 GiB")),
+            "admission numbers are the client's business: {body}"
+        );
+    }
+
+    /// FINDINGS-05 [7]: the ring is the operator's only "why did the last load
+    /// fail" channel and the guard its one request producer, so a client id must
+    /// not become an eviction channel or a megabyte echo. The useful half (a
+    /// short printable id echoes) is pinned by
+    /// `request_ids_are_echoed_or_generated`; this pins the wall — an oversized
+    /// id, or one with a space or a tab, regenerates a `req-` id in the response
+    /// header AND in the `request complete` line, and the rejected text never
+    /// reaches the ring. Falsifier: drop the `.filter(accepted_request_id)` in
+    /// `guard` and the three regenerated legs echo verbatim red.
+    #[tokio::test]
+    async fn client_request_ids_are_capped_and_sanitized_before_echo_and_log() {
+        crate::observability::set_extended_logging(false);
+        let api = Arc::new(unit_state());
+        warm_capture_lines(&["request complete"], || async {
+            let response = control_router(Arc::clone(&api))
+                .oneshot(
+                    Request::get("/health")
+                        .header("host", "127.0.0.1:8708")
+                        .body(Body::empty())
+                        .expect("warm-up request"),
+                )
+                .await
+                .expect("in-process warm-up");
+            assert_eq!(response.status(), StatusCode::OK);
+        })
+        .await;
+        let session = crate::tray::testlog::Session::start();
+        let echoed_id = |builder: axum::http::request::Builder| {
+            let api = Arc::clone(&api);
+            async move {
+                let response = control_router(api)
+                    .oneshot(builder.body(Body::empty()).expect("probe request"))
+                    .await
+                    .expect("in-process probe");
+                assert_eq!(response.status(), StatusCode::OK);
+                response
+                    .headers()
+                    .get(&X_REQUEST_ID)
+                    .expect("request id header")
+                    .to_str()
+                    .expect("ascii id")
+                    .to_string()
+            }
+        };
+        let printable_64 = "i".repeat(REQUEST_ID_MAX_CHARS);
+        assert_eq!(
+            echoed_id(
+                Request::get("/health")
+                    .header("host", "127.0.0.1:8708")
+                    .header("x-request-id", &printable_64)
+            )
+            .await,
+            printable_64,
+            "a printable id at the cap still echoes verbatim"
+        );
+        let oversized = "a".repeat(REQUEST_ID_MAX_CHARS + 1);
+        let rejected_ids = [&oversized[..], "has space", "tab\there"];
+        for rejected in &rejected_ids {
+            let echoed = echoed_id(
+                Request::get("/health")
+                    .header("host", "127.0.0.1:8708")
+                    .header("x-request-id", *rejected),
+            )
+            .await;
+            assert!(
+                echoed.starts_with("req-") && echoed != *rejected,
+                "a {rejected:?} id must regenerate, not echo or truncate into an \
+                 id-shaped echo: {echoed:?}"
+            );
+        }
+        let lines = session.stop();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("request complete") && line.contains(&printable_64)),
+            "the accepted id is the id in the ring line: {lines:?}"
+        );
+        for rejected in &rejected_ids {
+            assert!(
+                lines.iter().all(|line| !line.contains(*rejected)),
+                "the rejected id {rejected:?} must never reach the ring: {lines:?}"
+            );
+        }
     }
 
     /// FINDINGS2-0507 [7]: `rename()` returning `Ok` is the OS accepting the move, not

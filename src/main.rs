@@ -1384,9 +1384,15 @@ Start Port    End Port
     }
 
     async fn status_json(state: &Arc<ApiState>) -> serde_json::Value {
+        // The guard's Host gate accepts only the harness's own configured ports
+        // (FINDINGS-05 [4]), and these boot tests run on ephemeral configs whose
+        // public ports may be 0, so the request declares the port THIS state is
+        // configured to answer on rather than a literal.
+        let host = format!("127.0.0.1:{}", state.config.control_category().public_port);
         let response = control_router(Arc::clone(state))
             .oneshot(
                 Request::get("/har/status")
+                    .header("host", host)
                     .body(Body::empty())
                     .expect("static request"),
             )

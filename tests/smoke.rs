@@ -42,6 +42,7 @@ async fn health_and_status_answer_on_default_config() {
         .clone()
         .oneshot(
             Request::get("/health")
+                .header("host", "127.0.0.1:8708")
                 .body(Body::empty())
                 .expect("static request"),
         )
@@ -52,6 +53,7 @@ async fn health_and_status_answer_on_default_config() {
     let response = app
         .oneshot(
             Request::get("/har/status")
+                .header("host", "127.0.0.1:8708")
                 .body(Body::empty())
                 .expect("static request"),
         )
@@ -82,6 +84,7 @@ async fn unknown_route_is_typed_not_found() {
     let response = app()
         .oneshot(
             Request::get("/har/nope")
+                .header("host", "127.0.0.1:8708")
                 .body(Body::empty())
                 .expect("static request"),
         )
