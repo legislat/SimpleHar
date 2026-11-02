@@ -1449,7 +1449,11 @@ fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>, fit_validated: boo
             .raw
             .get("cpu_offload")
             .is_some_and(|v| crate::engine::llama::jinja_on(v)),
-        "context": entry.raw.get("context"),
+        // The EFFECTIVE served context (operator ruling 2026-11-02): llama's own
+        // row knob, strata's `--max-context` argv token, ninfer's resolved
+        // profile max-context — never the inert row key; null when the engine
+        // speaks none (the one home is `engine::effective_context`).
+        "context": crate::engine::effective_context(entry),
         "serve_model": entry.serve_model,
         "model_ref": entry.model_ref,
     });

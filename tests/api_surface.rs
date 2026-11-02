@@ -952,6 +952,146 @@ async fn har_models_lists_the_full_catalog() {
     assert_eq!(body["data"].as_array().map(Vec::len), Some(2));
 }
 
+/// The app behind the effective-context falsifiers (operator ruling
+/// 2026-11-02): an empty catalog plus stand-in adapters under the real engine
+/// ids, so rows written afterwards join via an explicit rescan.
+fn effective_ctx_app() -> (
+    Router,
+    Router,
+    Router,
+    Router,
+    MockRuntime,
+    std::path::PathBuf,
+) {
+    build_app(
+        AppConfig::default(),
+        &[],
+        &[
+            ("llama", Arc::new(MockAdapter)),
+            ("strata", Arc::new(MockAdapter)),
+            ("ninfer", Arc::new(MockAdapter)),
+        ],
+    )
+}
+
+/// Drops one raw yaml row into the (already-scanned) modelconf dir and
+/// publishes it with `POST /har/rescan`.
+async fn add_row(control: &Router, modelconf: &std::path::Path, name: &str, yaml: &str) {
+    std::fs::write(modelconf.join(format!("{name}.yaml")), yaml).expect("row yaml");
+    let (status, body) = post_json(control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "rescan after {name}: {body}");
+}
+
+fn catalog_row<'a>(body: &'a Value, id: &str) -> &'a Value {
+    body["data"]
+        .as_array()
+        .expect("list")
+        .iter()
+        .find(|m| m["id"] == id)
+        .unwrap_or_else(|| panic!("{id} published in the listing: {body}"))
+}
+
+#[tokio::test]
+async fn a_strata_row_shows_the_argv_max_context_as_its_context() {
+    // Falsifier: pre-fix `model_json` shipped the row `context` key verbatim,
+    // so a strata row serving 262144 through `strata_args` displayed nothing.
+    let (control, _, _, _, _, modelconf) = effective_ctx_app();
+    add_row(
+        &control,
+        &modelconf,
+        "stratamax",
+        "engine: strata\ncategory: WORK\nstrata_args: --pack, --native, --max-context, 262144\n",
+    )
+    .await;
+    let (_, body) = get_json(&control, "/har/models").await;
+    assert_eq!(catalog_row(&body, "stratamax")["context"], "262144");
+}
+
+#[tokio::test]
+async fn a_ninfer_row_shows_the_resolved_profiles_table_max_context() {
+    // Falsifier: pre-fix a ninfer row carried only an inert `context` key (or
+    // none), never the profile its container really serves. Table values pinned
+    // from `BUILT_IN_PROFILES`: the default `b` (262144) and explicit `d`
+    // (16384) — the same resolution the spawn encodes.
+    let (control, _, _, _, _, modelconf) = effective_ctx_app();
+    add_row(
+        &control,
+        &modelconf,
+        "nindefault",
+        "engine: ninfer\ncategory: WORK\n",
+    )
+    .await;
+    add_row(
+        &control,
+        &modelconf,
+        "nind",
+        "engine: ninfer\ncategory: WORK\nninfer_profile: d\n",
+    )
+    .await;
+    let (_, body) = get_json(&control, "/har/models").await;
+    assert_eq!(catalog_row(&body, "nindefault")["context"], "262144");
+    assert_eq!(catalog_row(&body, "nind")["context"], "16384");
+}
+
+#[tokio::test]
+async fn a_stale_context_key_never_beats_the_effective_source() {
+    // Falsifier: pre-fix both stale rows displayed their inert `context: 4096`
+    // while the engine serves 262144, and the mock row displayed its dead key.
+    // The truth precedence: the effective source wins; where the engine speaks
+    // none (mock, and a strata argv without `--max-context`) the answer is
+    // null, never the dead key.
+    let (control, _, _, _, _, modelconf) = effective_ctx_app();
+    add_row(
+        &control,
+        &modelconf,
+        "stratastale",
+        "engine: strata\ncategory: WORK\ncontext: 4096\nstrata_args: --max-context, 262144\n",
+    )
+    .await;
+    add_row(
+        &control,
+        &modelconf,
+        "stranamax",
+        "engine: strata\ncategory: WORK\ncontext: 4096\nstrata_args: --pack, --native\n",
+    )
+    .await;
+    add_row(
+        &control,
+        &modelconf,
+        "ninstale",
+        "engine: ninfer\ncategory: WORK\ncontext: 4096\n",
+    )
+    .await;
+    add_row(
+        &control,
+        &modelconf,
+        "mockstale",
+        "engine: mock\ncategory: WORK\ncontext: 4096\n",
+    )
+    .await;
+    let (_, body) = get_json(&control, "/har/models").await;
+    assert_eq!(catalog_row(&body, "stratastale")["context"], "262144");
+    assert!(catalog_row(&body, "stranamax")["context"].is_null());
+    assert_eq!(catalog_row(&body, "ninstale")["context"], "262144");
+    assert!(catalog_row(&body, "mockstale")["context"].is_null());
+}
+
+#[tokio::test]
+async fn a_llama_row_still_shows_its_own_context_key() {
+    // Falsifier for over-reach: the llama row key is the served `-c`, so it
+    // keeps shipping verbatim (this test pins the unchanged behavior).
+    let (control, _, _, _, _, modelconf) = effective_ctx_app();
+    add_row(
+        &control,
+        &modelconf,
+        "llamactx",
+        "engine: llama\ncategory: WORK\ncontext: 32768\n",
+    )
+    .await;
+    let (_, body) = get_json(&control, "/har/models").await;
+    assert_eq!(catalog_row(&body, "llamactx")["context"], "32768");
+}
+
 #[tokio::test]
 async fn default_model_endpoint_validates_and_takes_effect() {
     let (control, work, _, _, _, _) = app(

@@ -149,6 +149,36 @@ pub enum Probe {
     Failed { reason: String },
 }
 
+/// The context a catalog entry effectively serves — the single computation home
+/// behind the `/har/models` `context` field and the page's Ctx column (operator
+/// ruling 2026-11-02: the display shows what each engine really serves, never
+/// the inert row key). Per engine: llama reads its own `context` knob (the one
+/// engine mapping it to a flag, unchanged); strata answers the `--max-context`
+/// token of its `strata_args` argv ([`strata::effective_context`]); ninfer
+/// answers the max-context of the profile its launcher resolves
+/// ([`ninfer::effective_context`]); every other engine (mock) has no context
+/// statement and answers `None`. A `None` ships as null: a stale `context:`
+/// line on a row whose engine never reads it is the dead key the scan reports,
+/// never a display fallback.
+///
+/// # Arguments
+///
+/// * `entry` - the catalog entry to answer for.
+///
+/// # Returns
+///
+/// The effective served context as spelled by the row's own engine source, or
+/// `None` when the engine speaks none.
+#[must_use]
+pub fn effective_context(entry: &ModelEntry) -> Option<String> {
+    match entry.engine.as_str() {
+        "llama" => entry.raw.get("context").cloned(),
+        "strata" => strata::effective_context(&entry.raw),
+        crate::ownership::NINFER_ENGINE => ninfer::effective_context(&entry.raw),
+        _ => None,
+    }
+}
+
 /// Produces launch specs for one engine id (Step 7). The harness assigns the engine
 /// port from the slot plan (config `engine_ports`); the adapter embeds it in argv.
 pub trait EngineAdapter: Send + Sync {
@@ -567,6 +597,44 @@ mod tests {
             http_probe(&client(), 1, &spec).await,
             Probe::Failed { .. }
         ));
+    }
+
+    #[test]
+    fn effective_context_dispatches_per_engine() {
+        let entry = |engine: &str, keys: &[(&str, &str)]| {
+            let mut keys: BTreeMap<String, String> = keys
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            keys.insert("engine".to_string(), engine.to_string());
+            ModelEntry::from_flat(&keys, "dispatch-row").expect("flat keys parse")
+        };
+        assert_eq!(
+            effective_context(&entry("llama", &[("context", "32768")])).as_deref(),
+            Some("32768")
+        );
+        assert_eq!(
+            effective_context(&entry(
+                "strata",
+                &[("strata_args", "--max-context, 262144")]
+            ))
+            .as_deref(),
+            Some("262144")
+        );
+        assert_eq!(
+            effective_context(&entry("ninfer", &[])).as_deref(),
+            Some("262144"),
+            "the default profile's table value"
+        );
+        // The dead row key never travels on a row whose engine never reads it.
+        assert_eq!(
+            effective_context(&entry("mock", &[("context", "4096")])),
+            None
+        );
+        assert_eq!(
+            effective_context(&entry("strata", &[("context", "4096")])),
+            None
+        );
     }
 
     #[test]

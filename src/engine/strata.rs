@@ -246,6 +246,40 @@ fn knob<'a>(model: &'a ModelEntry, key: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
+/// The `strata_args` tokenization: comma-separated engine argv tokens, each
+/// trimmed — the one owner of the shape (the render refuses an empty entry by
+/// counting what it spelled, [`effective_context`] reads the argv back).
+fn arg_tokens(line: &str) -> Vec<String> {
+    line.split(',')
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// The context a strata row actually serves: the value riding the engine's own
+/// argv — the token following `--max-context` in the comma-separated
+/// `strata_args` list (e.g. `--pack, --max-context, 262144`). The row
+/// `context:` key is the llama knob the strata engine never reads (the scan
+/// reports it as `InertKey`), so it is never a fallback: no token, no answer.
+///
+/// # Arguments
+///
+/// * `raw` - the row's raw yaml keys (its `strata_args` line, if any).
+///
+/// # Returns
+///
+/// The spelled max-context value, `None` when the argv names none.
+#[must_use]
+pub fn effective_context(raw: &BTreeMap<String, String>) -> Option<String> {
+    let line = raw
+        .get("strata_args")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())?;
+    let tokens = arg_tokens(line);
+    let at = tokens.iter().position(|token| token == "--max-context")?;
+    tokens.get(at + 1).cloned()
+}
+
 /// A required single-value key that must carry an absolute-path shape
 /// (drive-letter or UNC): the rendered profile is walked for existence at both
 /// doors, but shape refuses here so the error names the yaml key a hand-shape
@@ -548,13 +582,8 @@ pub(crate) fn render_profile(model: &ModelEntry, cwd: &Path) -> Result<String, E
     };
     let mut args: Vec<String> = match knob(model, "strata_args") {
         Some(line) => {
-            let tokens: Vec<String> = line
-                .split(',')
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty())
-                .collect();
-            let spelled = line.split(',').count();
-            if tokens.len() != spelled {
+            let tokens = arg_tokens(line);
+            if tokens.len() != line.split(',').count() {
                 return Err(rejected(format!(
                     "`strata_args` must be comma-separated non-empty engine tokens: {line}"
                 )));
@@ -860,6 +889,21 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn effective_context_reads_the_argv_max_context_token() {
+        let raw = raw(&[("strata_args", "--pack, --native, --max-context, 262144")]);
+        assert_eq!(effective_context(&raw).as_deref(), Some("262144"));
+    }
+
+    #[test]
+    fn effective_context_names_no_value_without_the_token() {
+        for line in ["--pack, --native", "--max-context", ""] {
+            let raw = raw(&[("strata_args", line)]);
+            assert_eq!(effective_context(&raw), None, "`{line}` names no value");
+        }
+        assert_eq!(effective_context(&raw(&[])), None, "no knob, no answer");
     }
 
     fn entry(pairs: &[(&str, &str)]) -> ModelEntry {

@@ -325,7 +325,7 @@ const driver = `
     const bookedModel = {
       id: "bookedone", engine: "ninfer", category: "WORK", vram_gb: 34, cost: "fixed",
       cost_basis: "declared", launch_floor_gb: null, measured_gb: null,
-      measured_min_gb: null, context: null, model_ref: "ninfer://box:8004/served",
+      measured_min_gb: null, context: "262144", model_ref: "ninfer://box:8004/served",
       serve_model: null, cpu_offload: false,
     };
     const bookedSlot = {
@@ -372,6 +372,46 @@ const driver = `
     check("the session keeps the last loaded figure in the tooltip",
       after.text === "34 GiB" && after.cls.includes("sh-cost-unchecked")
         && after.title.includes("44.0 GiB on last load"), JSON.stringify(after));
+    applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+  }
+
+  // Effective context (operator ruling 2026-11-02): the Ctx column shows what
+  // each engine really serves - the llama row key, the strata argv
+  // --max-context, the ninfer profile max-context, and nothing (em dash) where
+  // the engine speaks none. The API derives the number; the page renders it.
+  {
+    const ctxModels = [
+      { id: "llamax", engine: "llama", category: "WORK", vram_gb: 4, cost: "fixed",
+        cost_basis: "declared",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: "32768",
+        model_ref: "F:/l.gguf", serve_model: null, cpu_offload: false },
+      { id: "stratactx", engine: "strata", category: "WORK", vram_gb: 55, cost: "greedy",
+        cost_basis: "declared",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: "262144",
+        model_ref: "strata://s", serve_model: null, cpu_offload: false },
+      { id: "ninferctx", engine: "ninfer", category: "WORK", vram_gb: 26, cost: "fixed",
+        cost_basis: "declared",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: "262144",
+        model_ref: "ninfer://box:8004/served", serve_model: null, cpu_offload: false },
+      { id: "mockctx", engine: "mock", category: "WORK", vram_gb: 4, cost: "fixed",
+        cost_basis: "declared",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        model_ref: "mock://m", serve_model: null, cpu_offload: false },
+    ];
+    applyState({ ...fixtures["/har/status"], models: ctxModels });
+    const ctxCell = (id) => {
+      for (const tr of findAll(document.getElementById("sh-main"), "tr")) {
+        const tds = findAll(tr, "td");
+        const strong = tds.map((td) => findAll(td, "strong")[0]).find(Boolean);
+        if (strong && textOf(strong) === id) return textOf(tds[5]);
+      }
+      return "row missing";
+    };
+    const ctxOf = (id) => id + "=" + ctxCell(id);
+    check("Ctx shows each engine's effective served context",
+      ctxCell("llamax") === "32768" && ctxCell("stratactx") === "262144" &&
+        ctxCell("ninferctx") === "262144" && ctxCell("mockctx") === "\u2014",
+      ["llamax", "stratactx", "ninferctx", "mockctx"].map(ctxOf).join(" "));
     applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
   }
 
@@ -443,7 +483,9 @@ const driver = `
     models: [
       { id: "greedyone", engine: "strata", category: "WORK", vram_gb: 55, cost: "greedy",
         cost_basis: "declared",
-        launch_floor_gb: 65, measured_gb: null, measured_min_gb: null, context: null,
+        // The Ctx the server derives from the row's argv (ruling 2026-11-02):
+        // the strata_args --max-context token, not the (deleted) inert key.
+        launch_floor_gb: 65, measured_gb: null, measured_min_gb: null, context: "262144",
         model_ref: "strata://g", serve_model: null, cpu_offload: false },
       { id: "measuredone", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
         cost_basis: "measured", measured_attribution: "per_process",
@@ -460,10 +502,10 @@ const driver = `
       { id: "engineone", engine: "ninfer", category: "WORK", vram_gb: null, cost: "exact",
         cost_basis: "measured", measured_attribution: "engine_report",
         launch_floor_gb: null, measured_gb: 31.2, measured_min_gb: 31.2, est_vram_gb: null,
-        context: null, model_ref: "ninfer://box:8004/served", serve_model: null, cpu_offload: false },
+        context: "262144", model_ref: "ninfer://box:8004/served", serve_model: null, cpu_offload: false },
       { id: "ninferone", engine: "ninfer", category: "WORK", vram_gb: 26, cost: "fixed",
         cost_basis: "declared",
-        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: "262144",
         model_ref: "ninfer://box:8004/served", serve_model: null, cpu_offload: false },
       { id: "mockone", engine: "mock", category: "WORK", vram_gb: 4, cost: "fixed",
         cost_basis: "declared",

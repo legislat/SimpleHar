@@ -165,6 +165,37 @@ pub fn profile_stamp(raw: &BTreeMap<String, String>) -> Option<String> {
     })
 }
 
+/// The context a ninfer row actually serves: the max-context of the profile its
+/// launcher resolves — the built-in table or the `ninfer_profile_<name>`
+/// override line, answered by the same [`profile_override`] the spawn
+/// (`template_params`) and the void-rule identity ([`profile_stamp`]) use, so
+/// card, page and spawn can never disagree about what the container serves.
+/// `None` when nothing resolves (a dead built-in override key, an invalid
+/// profile): the display answers null — the row's inert `context:` line is the
+/// llama knob the scan already reports, never a fallback.
+///
+/// # Arguments
+///
+/// * `raw` - the row's raw yaml keys (`ninfer_profile` and its override line,
+///   if any).
+///
+/// # Returns
+///
+/// The resolved profile's max-context exactly as spelled by the table or the
+/// override line.
+#[must_use]
+pub fn effective_context(raw: &BTreeMap<String, String>) -> Option<String> {
+    let profile = raw
+        .get("ninfer_profile")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
+    // The display-time caller has no adapter identity either, exactly like
+    // `profile_stamp`: a refusal the launch would answer with is a null here.
+    let (max_ctx, _, _, _, _) = profile_override("scan", raw, &profile).ok()?;
+    Some(max_ctx)
+}
+
 /// A custom profile name: lowercase word, short, and safe to interpolate into the
 /// script and into the yaml key that carries its override.
 fn valid_profile_name(name: &str) -> bool {
@@ -877,6 +908,35 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn effective_context_follows_the_launchers_profile_resolution() {
+        // The built-in table rows the launch encodes, pinned: default `b` and
+        // explicit `d`, plus a custom line's own `ctx` value.
+        assert_eq!(effective_context(&raw(&[])).as_deref(), Some("262144"));
+        assert_eq!(
+            effective_context(&raw(&[("ninfer_profile", "d")])).as_deref(),
+            Some("16384")
+        );
+        assert_eq!(
+            effective_context(&raw(&[
+                ("ninfer_profile", "fast"),
+                ("ninfer_profile_fast", "ctx=8192 kv=8192 conc=1"),
+            ]))
+            .as_deref(),
+            Some("8192")
+        );
+    }
+
+    #[test]
+    fn effective_context_answers_none_where_the_launch_refuses() {
+        // The dead built-in override key and an invalid name are launch
+        // refusals; the display must answer null, never invent or fall back.
+        let dead = raw(&[("ninfer_profile_b", "ctx=999 kv=999 conc=1")]);
+        assert_eq!(effective_context(&dead), None);
+        let invalid = raw(&[("ninfer_profile", "B")]);
+        assert_eq!(effective_context(&invalid), None);
     }
 
     fn entry(pairs: &[(&str, &str)]) -> ModelEntry {
