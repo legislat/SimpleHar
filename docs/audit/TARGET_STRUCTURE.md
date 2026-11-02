@@ -208,7 +208,7 @@ Routing table shape:
 | Purpose | Durable coding, testing, documentation, security, and platform standards |
 | Owner | Operator |
 | Audience | Contributors and agents |
-| Expected content | Rust style; error handling; concurrency; allocation/performance; test expectations; doc-comment rules; platform constraints (Windows, PowerShell 5.1, UTF-8); security rules; dependency policy; module ownership; explicit non-rules (do not add unused tooling) |
+| Expected content | Rust style; error handling; concurrency; allocation/performance; test expectations; doc-comment rules; ASD-STE100 documentation language; platform constraints (Windows, PowerShell 5.1, UTF-8); security rules; dependency policy; module ownership; explicit non-rules (do not add unused tooling) |
 | Source of truth for | How code is written |
 | Replaces | Generic sections of `AGENTS.md`; stack-specific rules moved to an "only if present" appendix |
 
@@ -442,6 +442,35 @@ Each topic has exactly one authoritative home. Everything else is a link.
 
 ---
 
+### 5.6 Documentation language: ASD-STE100
+
+Durable documentation must use ASD-STE100 Simplified Technical English. This applies to
+`README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `docs/reference/*`, `docs/process/*`, and
+new `docs/architecture/*` text.
+
+Required rules:
+
+- Use the active voice and the imperative for instructions.
+- Write one idea per sentence. Keep procedural sentences to 20 words or fewer and
+  descriptive sentences to 25 words or fewer.
+- Use approved, consistent terminology. Define a term once, then use the same word.
+- Use simple verb tenses and "must"/"should"/"can". Do not use "shall".
+- Keep noun clusters to three words or fewer.
+- Use a vertical list for three or more steps or conditions.
+- Do not use idioms, metaphors, humor, or wordplay.
+- Keep code blocks byte-synced with their source of truth.
+
+Exceptions:
+
+- Exact operator doctrine and LOCKED decision wording stays verbatim.
+- Code identifiers, command names, paths, log text, and API field names are not reworded.
+- `DESIGN.md` is historical and is not rewritten wholesale.
+- Existing documents migrate in phases. New text must comply immediately.
+
+Verification: check each changed section against the STE main rules and the approved
+dictionary. Record the check in the review or release evidence. A vocabulary-only check is
+not proof of compliance.
+
 ## 6. Task and handoff templates
 
 ### 6.1 Task file template
@@ -673,6 +702,7 @@ At each release:
 5. `DOCTRINE.md` and `DECISIONS.md` reflect any ruling since the last release.
 6. Artifact hash is recorded.
 7. Stale worktrees are checked.
+8. Changed durable documentation passes the ASD-STE100 review in Section 5.6.
 
 ### 9.5 Review cadence
 
@@ -738,5 +768,8 @@ The target structure requires explicit owner decisions before implementation:
 8. **Tracked vs local gotchas/findings.** Confirm these stay local (recommended) or approve a scrub-and-track path.
 9. **Backup.** Approve an independent backup location and cadence for `handoff/` and `ModelConf/`.
 10. **Versioning.** Approve the version/changelog/tag coupling rule.
+11. **Documentation language.** Adopt ASD-STE100 for durable documentation, with the
+    exceptions in Section 5.6.
 
-Until these are approved, no file in the existing repository should be moved, rewritten, or deleted.
+These decisions were approved on 2026-11-02. The implementation sequence and the exact
+scopes are in `IMPLEMENTATION_PLAN.md`.

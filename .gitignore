@@ -6,13 +6,11 @@
 /.env
 # Local model configs (absolute machine paths), same local-only rationale.
 /ModelConf
-# Governing docs are local-only per operator decision (2026-10-25).
-/AGENTS.md
-/AUX-RULES.md
-/DESIGN.md
-/GIT_RULES.md
+# Durable documentation is tracked with the code.
+# Live state and machine-specific artifacts stay local:
+#   HANDOFF.md, handoff/, ModelConf/, .kilo/, archive/, base-archive/
 /HANDOFF.md
-# Agent handoff briefs: they quote the local-only docs and name machine paths.
+# Agent handoff briefs: they quote live state and name machine paths.
 /handoff
 # Kilo agent config (skills, worktrees, session state) is local-only.
 /.kilo

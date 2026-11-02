@@ -413,23 +413,69 @@ Documents have no owner, status, audience, or review trigger. Stale claims survi
 
 **I. Line budgets.** Enforce the budgets in `TARGET_STRUCTURE.md` Section 7.4.
 
-### 8.3 Expected benefits
+**J. ASD-STE100 language.** Durable user-facing and process docs must follow ASD-STE100
+Simplified Technical English. New text complies immediately; existing text migrates in
+phases. Exact LOCKED wording, code identifiers, paths, and log text are exempt. See
+`TARGET_STRUCTURE.md` Section 5.6.
+
+### 8.3 ASD-STE100 compliance
+
+**Current problem.** The project has a distinctive, figurative house voice. `README.md`
+uses metaphors ("config is king", "the page learns"), long sentences, and inconsistent
+terms. Users and agents must infer meaning. The existing backlog already asks for README
+compliance, but no durable standard defines it, so the rewrite cannot be reviewed or
+repeated.
+
+**Proposed solution.**
+
+- Adopt ASD-STE100 Simplified Technical English for durable documentation:
+  `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `docs/reference/*`, `docs/process/*`,
+  and new `docs/architecture/*` text.
+- Apply the rules in `TARGET_STRUCTURE.md` Section 5.6: active voice, one idea per
+  sentence, 20-word procedural and 25-word descriptive limits, approved terminology,
+  simple tenses, no idioms or metaphors, noun clusters of three words or fewer.
+- Keep exact operator doctrine and LOCKED decision wording verbatim. Do not rewrite a
+  binding sentence to satisfy a style rule.
+- Keep code identifiers, commands, paths, log text, and API field names unchanged.
+- Add a short glossary to each document that introduces more than three project terms.
+- Review changed sections against the STE main rules and the approved dictionary. Record
+  the review in the task or release evidence. A vocabulary-only check is not sufficient.
+- Migrate in order: README and reference docs first, then process docs, then architecture
+  overview. Do not rewrite the historical `DESIGN.md` wholesale.
+- Do not claim full compliance without a section-by-section check.
+
+**Expected benefits.**
+
+- Users understand setup and failure text faster.
+- Reviewers have an objective style standard.
+- Translations, if ever needed, become cheaper.
+- The house voice stops hiding requirements in metaphor.
+
+**Measures.**
+
+- New or changed durable sections checked against STE: target 100%.
+- Documents with a glossary where required: target 100%.
+- Review findings for unexplained metaphor or inconsistent term: declining.
+- README rewrite completed and accepted in the release that ships it.
+
+### 8.4 Expected benefits
 
 - Stale documentation is detected at release, not by users.
 - New contributors know where to write.
 - The repository stays navigable as it grows.
 - The documentation set stops expanding without control.
 
-### 8.4 Measures
+### 8.5 Measures
 
 - Documents with missing front matter: target zero.
 - Broken links/paths: target zero.
 - Stale claims found at release: declining.
 - Documents over budget: target zero.
 
-### 8.5 Audit references
+### 8.6 Audit references
 
-`DOC-02`, `DOC-03`, `DOC-04`, `DOC-05`, `DOC-07`, `DOC-08`, `PRO-14`.
+`DOC-02`, `DOC-03`, `DOC-04`, `DOC-05`, `DOC-07`, `DOC-08`, `PRO-14`; operator requirement
+2026-11-02 (ASD-STE100).
 
 ---
 

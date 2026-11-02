@@ -26,8 +26,9 @@ These decisions are not implementation tasks. They determine whether and how the
 | D8 | Keep `GOTCHAS.md` and `FINDINGS-OPEN.md` local? | Yes; promote scrubbed, reusable entries only. | P2-01, P3-06 | PRO-12 |
 | D9 | Approve an independent backup for `handoff/` and `ModelConf/`? | Yes; daily or per-cycle, separate disk. | P1-01 (risk reduction) | GOV-01 |
 | D10 | Approve version/changelog/tag coupling? | Yes. No tag without a changelog and matching version. | P1-08, P4-05 | PRO-09, DOC-05 |
+| D11 | Adopt ASD-STE100 for durable documentation? | Yes. Exact LOCKED wording and code identifiers stay unchanged. | P2-09 | Operator requirement 2026-11-02 |
 
-**Gate:** Do not start Phase 1 until D1-D10 are answered. If D1 is "keep everything local", Phase 2 and Phase 4 shrink to documentation quality and local scripts; the portability findings remain accepted risk.
+**Gate:** D1-D11 are approved as of 2026-11-02. Phase 1 started on that approval. If D1 had been "keep everything local", Phase 2 and Phase 4 would shrink to documentation quality and local scripts.
 
 ---
 
@@ -244,6 +245,18 @@ Objective: establish the durable tree, move durable knowledge out of the live la
 | Acceptance criteria | Every archive pointer resolves. No current document points to a superseded archive as authoritative. Retention rules are written. |
 | Risks | Deleting history. Mitigate: move, never delete; compress only after verification. |
 
+### P2-09 - Adopt ASD-STE100 documentation language
+
+| Field | Value |
+|---|---|
+| Priority | P1 |
+| Description | Add the ASD-STE100 standard to `docs/process/ENGINEERING.md` and apply it to new or changed durable documentation. Define scope, rules, exceptions (LOCKED wording, code identifiers, paths, logs), a glossary rule, and a section-by-section review method. Migrate README and reference docs first; do not rewrite `DESIGN.md` wholesale. |
+| Dependencies | P2-01, P2-02, P2-07; operator requirement 2026-11-02 |
+| Affected files | `docs/process/ENGINEERING.md`, `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `docs/reference/*`, `docs/process/*`, `docs/architecture/OVERVIEW.md` |
+| Expected outcome | Durable documentation uses controlled, plain English. Users can read setup and failure text without interpreting metaphor. Reviewers have an objective style standard. |
+| Acceptance criteria | The standard is stated once in `ENGINEERING.md`. New or changed sections are checked against the STE main rules and dictionary. A glossary exists where a document introduces more than three project terms. The README and reference rewrite is reviewed section by section. Exact LOCKED wording and code identifiers are unchanged. |
+| Risks | Over-editing binding doctrine; losing useful house voice; claiming compliance from a vocabulary-only check. Mitigate: keep exact doctrine verbatim; allow a short plain-language preface plus the exact ruling; require review evidence. |
+
 ### Phase 2 exit criteria
 
 - `docs/` is the durable home; `handoff/` is the live/evidence home.
@@ -253,6 +266,7 @@ Objective: establish the durable tree, move durable knowledge out of the live la
 - Every durable doc has front matter and is listed in the index.
 - README reference detail has a declared home.
 - Archive pointers resolve.
+- The ASD-STE100 standard is stated once and new documentation follows it.
 
 ---
 
@@ -478,7 +492,8 @@ D1..D10 (owner decisions)
 |   |-- P2-05 process consolidation
 |   |-- P2-06 reference split
 |   |-- P2-07 front matter
-|   `-- P2-08 archive cleanup
+|   |-- P2-08 archive cleanup
+|   `-- P2-09 ASD-STE100 language
 |
 +-- Phase 3 workflows (needs P2-01, P2-05)
 |   |-- P3-01 TASKS + queue
@@ -511,10 +526,10 @@ Estimates assume one operator plus agents, cardless work only, and no product ch
 |---|---|---:|---|
 | Phase 0 | Decisions | 0.5 day | Mostly operator thought; do not rush D1-D3 |
 | Phase 1 | 8 | 2-3 days | README and AGENTS are the largest writing tasks |
-| Phase 2 | 8 | 3-4 days | Migration and mapping tables are careful work |
+| Phase 2 | 9 | 3-5 days | Migration, mapping tables, and ASD-STE100 review |
 | Phase 3 | 7 | 3-4 days | Task migration is the largest; handoff is small |
 | Phase 4 | 7 | 2-3 days | Scripts and CI; Node/Rust tooling exists |
-| **Total** | **30** | **10-14 days** | Spread over cycles; no big-bang rewrite |
+| **Total** | **31** | **11-16 days** | Spread over cycles; no big-bang rewrite |
 
 Recommended rollout:
 
@@ -552,6 +567,8 @@ The plan is complete when:
 8. Stale worktrees are gone and the worktree model is explicit.
 9. There is one debt register with owners and aging.
 10. The five audit reports are retained in `docs/audit/` and referenced by the docs index.
+11. Changed durable documentation follows ASD-STE100, and the review evidence names the
+    section-level check.
 
 ---
 
@@ -572,19 +589,18 @@ The plan is complete when:
 
 ## 11. Approval checklist
 
-Before implementation, the owner should answer:
+Approved by the owner on 2026-11-02:
 
-- [ ] D1: Track the durable core? Repository private?
-- [ ] D2: Move `DECISIONS.md` and add `DOCTRINE.md`?
-- [ ] D3: Reclassify `DESIGN.md` as historical?
-- [ ] D4: Approve file moves and redirects?
-- [ ] D5: Serial or parallel agents? Delete stale worktrees?
-- [ ] D6: Narrative or imperative commit style?
-- [ ] D7: Allow cardless CI?
-- [ ] D8: Keep `GOTCHAS.md`/`FINDINGS-OPEN.md` local?
-- [ ] D9: Approve an independent backup?
-- [ ] D10: Approve version/changelog/tag coupling?
-- [ ] Approve Phase 1 scope and start date.
-- [ ] Confirm no product behavior change is authorized by this plan.
-
-Only after these are answered should any existing file be modified.
+- [x] D1: Track the durable core? Repository private?
+- [x] D2: Move `DECISIONS.md` and add `DOCTRINE.md`?
+- [x] D3: Reclassify `DESIGN.md` as historical?
+- [x] D4: Approve file moves and redirects?
+- [x] D5: Maximum two working subagents; delete stale worktrees and old build artifacts?
+- [x] D6: Narrative commit style?
+- [x] D7: Allow cardless CI?
+- [x] D8: Keep `GOTCHAS.md`/`FINDINGS-OPEN.md` local?
+- [x] D9: Approve an independent backup?
+- [x] D10: Approve version/changelog/tag coupling?
+- [x] D11: Adopt ASD-STE100 for durable documentation?
+- [x] Approve Phase 1 scope and start date.
+- [x] Confirm no product behavior change is authorized by this plan.

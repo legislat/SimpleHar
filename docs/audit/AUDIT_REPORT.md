@@ -797,3 +797,20 @@ Not executed: `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`, DOM test
 | Operator preference on file moves | Target structure proposes moves/renames | Needs approval |
 | Whether `GOTCHAS.md` can be scrubbed and tracked | It contains valuable reusable knowledge and machine-specific paths | Needs owner decision |
 | Whether PR workflow is desired | Current practice is direct-to-main | Needs owner decision |
+
+---
+
+## Addendum - operator requirement 2026-11-02: ASD-STE100
+
+The owner added a requirement after the audit: durable documentation must follow
+ASD-STE100 Simplified Technical English. This requirement was not scored as a finding in
+the original audit. It is now part of the target design and the implementation plan:
+
+- Standard and exceptions: `TARGET_STRUCTURE.md` Section 5.6.
+- Process change and measures: `PROCESS_IMPROVEMENTS.md` Section 8.3.
+- Implementation task: `IMPLEMENTATION_PLAN.md` P2-09.
+- Backlog item: `DOCUMENTATION_BACKLOG.md` BL-36.
+
+The requirement applies to new or changed durable text. Exact LOCKED wording, code
+identifiers, paths, log text, and the historical `DESIGN.md` are exempt from wholesale
+rewriting. A vocabulary-only check is not proof of compliance.

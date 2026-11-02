@@ -306,6 +306,14 @@ Priorities: **P0** = false or dangerous instructions / release blocker; **P1** =
 - **Description:** Add a release check for known stale phrases ("there is no auth", "arrive with their own turns") and a `cargo doc` warning check.
 - **Definition of Done:** The check fails on a reintroduced stale phrase. `cargo doc` is warning-free. The check is part of the release process, not a separate ritual.
 
+### BL-36 - Adopt ASD-STE100 for durable documentation
+
+- **Priority:** P1
+- **Category:** docs
+- **Related audit:** DOC-08, PRO-14; operator requirement 2026-11-02
+- **Description:** Add ASD-STE100 Simplified Technical English to `docs/process/ENGINEERING.md`. Apply it to new or changed durable docs: README, CONTRIBUTING, CHANGELOG, reference, process, and new architecture text. Keep exact LOCKED wording, code identifiers, paths, and log text unchanged. Define a glossary rule and a section-by-section review method.
+- **Definition of Done:** The standard is stated once. New or changed sections are checked against the STE main rules and dictionary, and the review evidence names the check. A glossary exists where a document introduces more than three project terms. README and reference rewrites are reviewed section by section. No binding ruling is reworded. Full compliance is not claimed from a vocabulary-only check.
+
 ---
 
 ## Ready-to-file summary
@@ -313,8 +321,10 @@ Priorities: **P0** = false or dangerous instructions / release blocker; **P1** =
 | Priority | Items | Purpose |
 |---|---|---|
 | P0 | BL-01, BL-04, BL-05, BL-06 | Remove false user instructions and establish the agent entry point and autonomy |
-| P1 | BL-02, BL-03, BL-07, BL-08, BL-09, BL-10, BL-11, BL-12, BL-13, BL-14, BL-18, BL-19, BL-20, BL-21, BL-22, BL-25, BL-26, BL-28, BL-32 | Durable architecture and operational process |
+| P1 | BL-02, BL-03, BL-07, BL-08, BL-09, BL-10, BL-11, BL-12, BL-13, BL-14, BL-18, BL-19, BL-20, BL-21, BL-22, BL-25, BL-26, BL-28, BL-32, BL-36 | Durable architecture and operational process |
 | P2 | BL-15, BL-16, BL-17, BL-23, BL-24, BL-27, BL-29, BL-30, BL-33, BL-34 | Reference cleanup, debt, onboarding, automation, security |
 | P3 | BL-31, BL-35 | Metrics and long-term freshness |
 
-All items are blocked until the owner decisions D1-D10 in `IMPLEMENTATION_PLAN.md` Section 1 are answered. Items that require a repository-visibility confirmation (BL-10, BL-12, BL-28, BL-32) must not move local artifacts into Git before that confirmation.
+Owner decisions D1-D11 in `IMPLEMENTATION_PLAN.md` Section 1 were approved on 2026-11-02.
+Items that require a repository-visibility confirmation (BL-10, BL-12, BL-28, BL-32) must
+not move local artifacts into Git before that confirmation.

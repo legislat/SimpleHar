@@ -7,7 +7,8 @@ with a typed, single-writer scheduler, admits loads on the card's own reading
 (the *witness*) minus a reserve, with in-flight bookings — and **refuses, with
 reasons**, rather than overcommitting.
 
-Current build: **v1.0.1** (`v1.0.1` tag) — `cargo build --release` produces
+Latest release: **v1.0.1** (`v1.0.1` tag). Repository HEAD may be ahead of the
+tag; HEAD is not itself a release. `cargo build --release` produces
 `target\release\simplehar-se.exe`, or use the shipped exe directly.
 
 ## Who this is for
@@ -28,7 +29,7 @@ You run local LLMs on one NVIDIA GPU and want:
 | Engine | What runs | Stack required on the machine |
 |---|---|---|
 | `llama` (default) | a native `llama-server.exe` process per model, serving a GGUF file | [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server.exe` (default expected at `C:\Inference\llama.cpp\llama-server.exe`, configurable) |
-| `strata` | `python -m serve.server --engine strata` in a Python venv | a strata install with its virtualenv (default `C:\Strata\.venv\Scripts\python.exe`, cwd `C:\Strata`) and a per-model profile JSON |
+| `strata` | `python -m serve.server --engine strata` in a Python venv, on a harness-rendered profile | a strata install with its virtualenv (default `C:\Strata\.venv\Scripts\python.exe`, cwd `C:\Strata`); no per-model profile JSON is needed - the model row's yaml owns the profile fields and the harness renders the JSON |
 | `ninfer` | a GPU container inside WSL2, started from a harness-rendered and -staged autostart script and reaped by container name | WSL2 distro + Docker, the ninfer container image; set `wsl_distro` / `wsl_user` in the config |
 
 Common requirements:
@@ -73,13 +74,13 @@ hold exactly one. Engine ports are allocated per slot sequentially from 18109
 with six AUX slots). Everything here is declarative — see `categories` in the
 config.
 
-llama engines are **forced** to `--host 127.0.0.1` by the harness; ninfer
-containers under template mode are **forced** to a loopback-only publish
-(`--publish 127.0.0.1:…`) by the canonical script the harness renders — a
-**legacy** ninfer script publishes wherever its own `docker run` says, so keep
-that loopback unless you mean to publish. Strata takes its bind address from its
-own external config (the strata profile `host`) — keep that loopback unless you
-mean to publish.
+llama engines are **forced** to `--host 127.0.0.1` by the harness; strata
+engines are forced to the same `--host 127.0.0.1` argv (server.py resolves the
+flag ahead of any profile key, and the harness-rendered profile carries no
+`host` key at all); ninfer containers under template mode are **forced** to a
+loopback-only publish (`--publish 127.0.0.1:...`) by the canonical script the
+harness renders — a **legacy** ninfer script publishes wherever its own
+`docker run` says, so keep that loopback unless you mean to publish.
 
 Each public listener answers OpenAI-style `/v1/models` (category-filtered),
 `/v1/chat/completions`, `/v1/completions` and `/v1/embeddings`. A request
@@ -173,9 +174,19 @@ edit never leaves a half-written model file live.
 | `is_embedding_model` | Truthy forces category `EMB` (conflicts with another explicit category) |
 | `context`, `batch`, `flash_attn`, … | Mapped to the corresponding `llama-server` flags. `context` is **llama only** — on other engines it stays an inert key (the scan says so), and the page/API never display it there; the Ctx figure shown for a strata row is its `strata_args` `--max-context` figure (or `--max-context=` spelling; digits only), for a ninfer row the resolved profile's max-context |
 | `load_timeout` | Per-model readiness deadline in seconds (llama default 120; strata/ninfer cold starts commonly need 600–1200) |
-| `strata_config` | **Required for strata.** Profile JSON path; must be an existing **file** (refused up front, before any eviction or spawn). Weights/quant/context live in this file, never in argv |
+| `strata_exe` | **Required for strata** (template mode): absolute path of the engine binary the harness-rendered profile names; its presence selects template mode. `serve_model` is required too: it becomes the profile's served model name |
+| `strata_tokenizer` | **Required for strata**: absolute tokenizer path the rendered profile names |
 | `strata_python` | Interpreter: must be an existing `.exe` **file** — it is the program the harness launches (default `C:\Strata\.venv\Scripts\python.exe`) |
 | `strata_cwd` | Working directory; must be an existing directory (default `C:\Strata`) |
+| `strata_args` | Comma-separated engine argv tokens rendered into the profile's `args` (weights/quant/context ride here, e.g. `--native D:\Models\m.gguf`). `--host` and `--port` are harness-forced argv and refused in this list; a `strata_vision` block appends the engine's `--vision` switch, so do not spell that token here too |
+| `strata_lib_dirs` | Comma-separated absolute directories rendered as the profile's `lib_dirs` |
+| `strata_env` | Whitespace-separated `STRATA_<NAME>=<VALUE>` tokens rendered as the profile's `env`; only uppercase `STRATA_`-prefixed engine settings pass |
+| `strata_gpu` / `strata_parallel` | Non-negative integers rendered as the profile's `gpu` / `parallel` |
+| `strata_gpus_asked` | Truthy renders `gpus_asked: true` in the profile |
+| `strata_vision` | Whitespace-separated `k=v` vision block over the closed key set `exe`, `mmproj`, `model`, `gpu`, `max_tokens`, `min_tokens`, `threads` (`exe`/`mmproj`/`model` are absolute paths, required together; `gpu` defaults on); rendering the block also appends the `--vision` switch to `args` |
+| `strata_sampling` | Whitespace-separated `key=value` sampling defaults (number or bool) rendered as the profile's `sampling` dict |
+| `strata_uncensored` | Strict `true`/`false` rendered as the profile's `uncensored` switch; an explicit `false` is written intent, distinct from absent |
+| `strata_config` | **Superseded** (operator ruling 2026-11-02, row 19). A row that still declares it is refused at scan with the migration sentence: run `simplehar-se import strata <profile.json>`, merge its emitted knob block into the row, and delete the `strata_config` line. A row carrying both `strata_exe` and `strata_config` meets the mutual-exclusion refusal - delete the `strata_config` line |
 | `extra_args` | **Closed allow-list, not a denial list.** Whitespace-split words are appended to the argv only if each is a reviewed option — `--embedding`, `--embeddings`, `--pooling <mode>`, `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`, `--warmup`, `--no-warmup` — plus the value words it consumes (a value may not be option-shaped, so it cannot smuggle another flag). **Anything else is refused with the launch**, naming the word: model, host, port, gpu-layers, jinja, api-key, lora, rpc and every other option are admitted by absence, so there is nothing to dodge. The harness's forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` are appended after it and win |
 | `ninfer_image` | Selects **template mode, the supported path** — its presence means the harness renders the canonical autostart script from your yaml, stages it into the distro, verifies it by distro-side checksum, and launches THAT. Exactly one of `ninfer_image`/`ninfer_autostart` must be present. Its required companions: `ninfer_model_name` (the directory holding the artifact), `ninfer_artifact` (the file inside it), `ninfer_model_roots` (comma-separated absolute WSL directories searched in order) — all plain words, refused with the key named. `ninfer_internal_port` (the port the container binds inside its own namespace) is optional and defaults to the SE internal number **8808** (the harness's 87xx family at +100, clear of the manual 80xx world, the 87xx listeners, and the 181xx engine plan); it may not name a `protected_ports`, public-listener, or harness engine port — the manual/harness separation covers container-internal numbers too, so a row that borrows one is refused at load and named by the rescan |
 | `ninfer_serve_cmd` | The server command inside the container (default `ninfer-serve`) |
@@ -188,6 +199,11 @@ edit never leaves a half-written model file live.
 | `ninfer_container` | **Required for ninfer.** Container name; reaped with `docker rm -f` on unload, scoped strictly to the name this harness started (claim ledger: `ninfer-claims.json` beside the harness exe). Must be docker-legal and must not look like a container ID (4+ hex chars) |
 | `ninfer_profile` | Template mode: one of the built-in VRAM profiles `a`–`e` (default `b`; the table is the operator's own — `a` 262k ctx/524k kv/2 conc, `b` 262k/262k/1, `c` 131k/131k/1, `d` 16k/32k/2 nvfp4, `e` 64k/64k/1) or a custom lowercase name resolved by a `ninfer_profile_<name> = ctx=… kv=… conc=… kv_dtype=…` line (`kv_dtype` one of `fp8`/`nvfp4`/`fp16`/`bf16`/`int8`/`rk8v4`, `kv` must cover `ctx`). The override line applies to custom names only — the built-in table wins for `a`–`e`, so a `ninfer_profile_b`-style line is refused at launch rather than silently ignored. Legacy mode: passed to your script as `$1` verbatim |
 | `ninfer_key` | Truthy (`true`/`1`/`yes`/`on`) sends `key` as `$2` (template mode: `cat`s the `ninfer_key_file` into `--api-key`); anything else sends `nokey` |
+
+Strata rows are rendered, not handed to the engine: at every load the harness
+writes the full profile JSON into `.simplehar\strata-profiles` beside the exe
+(content-addressed `<model>-<hash>.json`, atomic write, keep-N prune) and
+launches only its own staged copy - see "Strata engines" below.
 
 Unknown keys are preserved for reference and reported as `unknown_key`
 warnings — the model still loads. `host` and `port` keys are harness-owned and
@@ -209,14 +225,27 @@ between the two.
 
 ### Strata engines
 
-Strata models (`engine: strata`) launch
-`python -m serve.server --engine strata --config <strata_config> --port <assigned>`
-in `strata_cwd`; the harness passes the assigned `--port` last, after the
-profile — pin the port outside the strata profile rather than relying on the
-engine to arbitrate. Readiness requires `/health` 200 **and** the JSON `loaded`
-flag not being `false` (strata answers 200 while weights stream in). A strata
-engine starts only when you load it (or a client request names it); booting the
-harness spawns nothing.
+Strata models (`engine: strata`) run in **template mode, the supported path**:
+the row yaml owns the profile fields (the `strata_*` keys above) and the harness
+renders the full profile JSON at every load, launching
+`python -m serve.server --engine strata --host 127.0.0.1 --config <rendered> --port <assigned>`
+in `strata_cwd`. The render is staged under `.simplehar\strata-profiles` beside
+the exe (content-addressed `<model>-<hash>.json`, atomic write, keep-N prune)
+and the spawn rewrites `--config` to exactly that file - the child can never
+be pointed at another profile. The bind is the forced `--host 127.0.0.1` argv and
+the port the harness-assigned `--port` (server.py resolves both flags ahead of
+any profile key), so the rendered profile carries no `host`, `port` or key at
+all. Readiness requires `/health` 200 **and** the JSON `loaded` flag not being
+`false` (strata answers 200 while weights stream in). A strata engine starts
+only when you load it (or a client request names it); booting the harness
+spawns nothing.
+
+The external-profile mode is superseded (operator ruling 2026-11-02, row 19):
+`simplehar-se import strata <profile.json>` reads a manual profile and **emits**
+the yaml knob block - it never touches the row or the profile file, so adoption
+is your own paste of the emitted block. `C:\Strata` stays the manual-launch
+home the harness never reads on the serve path; the import CLI is the one
+sanctioned reader.
 
 ### Ninfer engines
 
@@ -489,6 +518,7 @@ With no token set the harness has **no authentication**: `internal_host:
 0.0.0.0` (Publish to LAN) then trusts every machine on the segment to
 load/unload models and drive the GPUs; it exists for LAN boxes and warns loudly
 at boot. Default is loopback only. The token guards only the harness's own
-listeners — engine ports have no harness auth, so a published strata profile
-(`host` non-loopback) needs its own `api_key`, and llama is forced loopback
-regardless of `internal_host`.
+listeners — engine ports have no harness auth, so llama and strata engines are
+forced loopback regardless of `internal_host`, template-mode ninfer publishes
+loopback-only, and only a legacy ninfer script that itself chooses to publish
+can put an unauthenticated engine on the segment.

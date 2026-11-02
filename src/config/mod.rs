@@ -387,8 +387,10 @@ pub struct LlamaEngineConfig {
 pub struct AppConfig {
     /// Address every listener binds on (operator note 2026-10-25): a loopback
     /// address (default 127.0.0.1) or `0.0.0.0` to publish to the local net.
-    /// Any other address is refused by validation. Note: there is no auth —
-    /// publishing to 0.0.0.0 trusts every machine on the segment (§0.4).
+    /// Any other address is refused by validation. Posture: the optional
+    /// `control_token` (env `SIMPLEHAR_TOKEN` overrides it) gates every route
+    /// but the page assets; publishing to 0.0.0.0 with no token set trusts
+    /// every machine on the segment.
     #[serde(default = "default_internal_host")]
     pub internal_host: IpAddr,
     /// The four category definitions (Step 5); validation requires all four exactly once.
@@ -1031,7 +1033,9 @@ impl AppConfig {
             errors.push(ConfigError::Invalid {
                 field: "internal_host".to_string(),
                 reason: format!(
-                    "must be a loopback address or 0.0.0.0 (local net, no auth - §0.4); got {}",
+                    "must be a loopback address or 0.0.0.0 (publishing to the local net: \
+                     `control_token`/SIMPLEHAR_TOKEN gate every route but the page assets; \
+                     with no token set the segment is trusted); got {}",
                     self.internal_host
                 ),
             });
