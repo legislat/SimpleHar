@@ -410,6 +410,72 @@ fn vision_block(
     Ok(Some(taken))
 }
 
+/// The `strata_sampling` block: whitespace-separated `key=value` sampling
+/// defaults (server.py's `sampling` profile dict) — every value a number or a
+/// bool literal, the two shapes the server validates there. The block is
+/// rendered as a JSON object; an integer-looking value keeps its integer form
+/// so an import→render round-trip reproduces the profile bytes' types.
+fn sampling_map(
+    model: &ModelEntry,
+    rejected: &dyn Fn(String) -> EngineError,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, EngineError> {
+    let Some(line) = knob(model, "strata_sampling") else {
+        return Ok(None);
+    };
+    let mut map = serde_json::Map::new();
+    for token in line.split_whitespace() {
+        let bad = || {
+            Err(rejected(format!(
+                "`strata_sampling` tokens must be key=value with a number or bool: {token}"
+            )))
+        };
+        let Some((key, value)) = token.split_once('=') else {
+            return bad();
+        };
+        if key.is_empty() {
+            return bad();
+        }
+        let json = match value {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            other => match other.parse::<u64>() {
+                Ok(n) => serde_json::json!(n),
+                Err(_) => other
+                    .parse::<f64>()
+                    .map(serde_json::Value::from)
+                    .map_err(|_| {
+                        rejected(format!(
+                            "`strata_sampling` value must be a number or bool: {token}"
+                        ))
+                    })?,
+            },
+        };
+        map.insert(key.to_string(), json);
+    }
+    Ok(Some(map))
+}
+
+/// The `strata_uncensored` switch: this strata fork's honest name for the
+/// speed-projection default (server.py maps the profile `uncensored` key); a
+/// present knob must read as a strict bool word, and its value — `true` OR
+/// `false` — is rendered, because the server treats an explicit `false` as
+/// written intent, distinct from an absent key.
+fn uncensored_switch(
+    model: &ModelEntry,
+    rejected: &dyn Fn(String) -> EngineError,
+) -> Result<Option<bool>, EngineError> {
+    let Some(value) = knob(model, "strata_uncensored") else {
+        return Ok(None);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(Some(true)),
+        "false" | "0" => Ok(Some(false)),
+        _ => Err(rejected(format!(
+            "`strata_uncensored` must be `true` or `false`: {value}"
+        ))),
+    }
+}
+
 /// Renders the complete strata profile JSON from the row's yaml (operator
 /// ruling 2026-11-02 row 19 — the L3 render of the ninfer idiom: the harness
 /// writes the artifact, so the launch is exactly what this function checked).
@@ -539,6 +605,12 @@ pub(crate) fn render_profile(model: &ModelEntry, cwd: &Path) -> Result<String, E
     }
     if let Some(vision) = vision {
         profile.insert("vision".to_string(), serde_json::Value::Object(vision));
+    }
+    if let Some(sampling) = sampling_map(model, rejected)? {
+        profile.insert("sampling".to_string(), serde_json::Value::Object(sampling));
+    }
+    if let Some(on) = uncensored_switch(model, rejected)? {
+        profile.insert("uncensored".to_string(), serde_json::Value::Bool(on));
     }
     // The content address is the version: one deterministic render per yaml,
     // so the pretty form only has to stay stable across harness builds, and
@@ -911,6 +983,11 @@ mod tests {
                 ("strata_parallel", "1"),
                 ("strata_gpus_asked", "true"),
                 (
+                    "strata_sampling",
+                    "temperature=1.0 top_k=20 uncensored=false",
+                ),
+                ("strata_uncensored", "true"),
+                (
                     "strata_vision",
                     &format!(
                         "exe={} mmproj={} model={} gpu=true max_tokens=1024",
@@ -929,6 +1006,10 @@ mod tests {
         assert_eq!(profile["parallel"], 1);
         assert_eq!(profile["gpus_asked"], true);
         assert_eq!(profile["vision"]["max_tokens"], 1024);
+        assert_eq!(profile["sampling"]["temperature"], serde_json::json!(1.0));
+        assert_eq!(profile["sampling"]["top_k"], serde_json::json!(20));
+        assert_eq!(profile["sampling"]["uncensored"], serde_json::json!(false));
+        assert_eq!(profile["uncensored"], serde_json::json!(true));
         let last_arg = profile["args"].as_array().expect("args").last().cloned();
         assert_eq!(
             last_arg,
@@ -1018,6 +1099,8 @@ mod tests {
             ("strata_args", "--pack,,--native", "non-empty"),
             ("strata_args", "--host, 0.0.0.0", "harness-forced argv"),
             ("strata_vision", "exe=nowhere", "absolute path"),
+            ("strata_sampling", "temperature=hot", "number or bool"),
+            ("strata_uncensored", "maybe", "`true` or `false`"),
         ];
         for (key, value, must_say) in cases {
             let mut pairs: Vec<(&str, &str)> =
@@ -1172,6 +1255,8 @@ mod tests {
                 "gpus_asked": true,
                 "host": "0.0.0.0",
                 "env": {{"STRATA_KVA": "0"}},
+                "sampling": {{"temperature": 1.0, "top_p": 0.95, "top_k": 20}},
+                "uncensored": false,
                 "vision": {{"exe": "{}", "mmproj": "{}", "model": "{}",
                             "gpu": true, "max_tokens": 1024}}
             }}"#,
@@ -1212,6 +1297,11 @@ mod tests {
         assert_eq!(got["gpu"], wanted["gpu"]);
         assert_eq!(got["gpus_asked"], wanted["gpus_asked"]);
         assert_eq!(got["env"], wanted["env"]);
+        assert_eq!(
+            got["sampling"], wanted["sampling"],
+            "sampling defaults round-trip with their source types"
+        );
+        assert_eq!(got["uncensored"], wanted["uncensored"]);
         assert_eq!(got["vision"], wanted["vision"]);
         assert!(got.get("host").is_none() && got.get("port").is_none());
         assert!(got["log"]

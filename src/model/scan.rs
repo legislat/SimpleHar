@@ -171,6 +171,8 @@ const CONSUMED_KEYS: &[&str] = &[
     "strata_parallel",
     "strata_gpus_asked",
     "strata_vision",
+    "strata_sampling",
+    "strata_uncensored",
     "ninfer_autostart",
     "ninfer_container",
     "ninfer_profile",
@@ -2326,6 +2328,8 @@ mod tests {
              strata_parallel: 1\n\
              strata_gpus_asked: true\n\
              strata_vision: exe=C:/Strata/vision.exe mmproj=D:/m/mmproj.gguf model=D:/m/m.gguf\n\
+             strata_sampling: temperature=1.0 top_p=0.95 top_k=20\n\
+             strata_uncensored: false\n\
              ninfer_autostart: /opt/a.sh\n\
              ninfer_container: golden-box\n\
              ninfer_profile: b\n\
@@ -2473,6 +2477,8 @@ mod tests {
             "strata_parallel",
             "strata_gpus_asked",
             "strata_vision",
+            "strata_sampling",
+            "strata_uncensored",
             "ninfer_autostart",
             "ninfer_container",
             "ninfer_profile",

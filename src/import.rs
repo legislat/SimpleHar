@@ -30,6 +30,8 @@ const MAPPED_KEYS: &[&str] = &[
     "parallel",
     "gpus_asked",
     "vision",
+    "sampling",
+    "uncensored",
     "model_name",
 ];
 
@@ -67,7 +69,9 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
          # the whole engine config. Copy the scheduling keys (`category`, `vram_gb`,\n\
          # `cost`, `load_timeout`, `launch_only_with_at_least_vram_free`, `context`)\n\
          # and `name`/`model` from the row you are replacing; `serve_model` rides the\n\
-         # `model_name` the profile already declares.\n",
+         # `model_name` the profile already declares. If the old row carried\n\
+         # `strata_python:`, copy that line too \u{2014} the interpreter is a row key, never a\n\
+         # profile field.\n",
         profile_path.display()
     ));
     match str("model_name") {
@@ -174,6 +178,32 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
         }
         out.push_str(&format!("strata_vision: {}\n", tokens.join(" ")));
     }
+    if let Some(sampling) = root.get("sampling").and_then(serde_json::Value::as_object) {
+        let mut tokens: Vec<String> = Vec::new();
+        for (key, value) in sampling {
+            // `Value`'s Display keeps the source's numeric form (int stays
+            // int, 1.0 stays 1.0), which is what the renderer re-parses.
+            if value.as_u64().is_none() && value.as_f64().is_none() && value.as_bool().is_none() {
+                return Err(format!(
+                    "{} `sampling` value for `{key}` is neither number nor bool",
+                    profile_path.display()
+                ));
+            }
+            tokens.push(format!("{key}={value}"));
+        }
+        out.push_str(&format!("strata_sampling: {}\n", tokens.join(" ")));
+    }
+    if let Some(on) = root.get("uncensored") {
+        match on.as_bool() {
+            Some(on) => out.push_str(&format!("strata_uncensored: {on}\n")),
+            None => {
+                return Err(format!(
+                    "{} `uncensored` must be a boolean",
+                    profile_path.display()
+                ))
+            }
+        }
+    }
     let owned: Vec<&str> = HARNESS_OWNED_KEYS
         .iter()
         .copied()
@@ -223,8 +253,10 @@ mod tests {
                 "parallel": 1,
                 "gpus_asked": true,
                 "host": "0.0.0.0",
-                "env": {"STRATA_KVA": "0"},
-                "vision": {"exe": "C:\\Strata\\engine\\strata-vision.exe",
+                 "env": {"STRATA_KVA": "0"},
+                 "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+                 "uncensored": false,
+                 "vision": {"exe": "C:\\Strata\\engine\\strata-vision.exe",
                            "mmproj": "D:\\Models\\mmproj.gguf",
                            "model": "D:\\Models\\m.gguf",
                            "gpu": true, "max_tokens": 1024}
@@ -248,6 +280,11 @@ mod tests {
             "{yaml}"
         );
         assert!(yaml.contains("strata_env: STRATA_KVA=0"), "{yaml}");
+        assert!(
+            yaml.contains("strata_sampling: temperature=1.0 top_k=20 top_p=0.95"),
+            "the sampling defaults ride the row in source type: {yaml}"
+        );
+        assert!(yaml.contains("strata_uncensored: false"), "{yaml}");
         assert!(yaml.contains("strata_gpu: 0"), "{yaml}");
         assert!(yaml.contains("strata_parallel: 1"), "{yaml}");
         assert!(yaml.contains("strata_gpus_asked: true"), "{yaml}");
