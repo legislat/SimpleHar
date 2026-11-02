@@ -7,7 +7,7 @@ with a typed, single-writer scheduler, admits loads on the card's own reading
 (the *witness*) minus a reserve, with in-flight bookings — and **refuses, with
 reasons**, rather than overcommitting.
 
-Current release: **v1.0.0** — `cargo build --release` produces
+Current release: **v1.0.1** — `cargo build --release` produces
 `target\release\simplehar-se.exe`, or use the shipped exe directly.
 
 ## Who this is for
@@ -137,6 +137,9 @@ invalid file is fatal with every problem logged — never silently defaulted.
 | `protected_ports` | small reserved set | Ports the harness must never bind or touch — extend it to cover any servers you run manually outside this app |
 | `wsl_distro` / `wsl_user` | `Ubuntu` / *(set for ninfer)* | WSL coordinates for ninfer containers |
 | `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary. First start prefers a `llama-server.exe` found on PATH (absolute entries only) and records the winner in the created file |
+| `engines.strata.python` / `engines.strata.cwd` | documented defaults | Interpreter and working directory for strata launches; per-model `strata_python`/`strata_cwd` still override the section |
+| `engines.llama.fit_probe` | `false` | Ask the engine's own `llama-fit-params` calculator (sibling of `llama_server_exe`) before spawn how much a llama row will need; every llama row is projected after boot and rescan, off the hot path |
+| `engines.llama.fit_margin_gb` / `engines.llama.mmproj_surcharge_gb` / `engines.llama.fit_probe_timeout_s` | unset | Calibration constants for the projection (added per active GPU; surcharge for vision rows; probe deadline). While the two figures are unset the probe stays silent and rows fall back down the cost ladder — set them once from a calibrated card window |
 | `modelconf_dir` | `<exe dir>\ModelConf` | Catalog directory |
 | `tray_enabled` | `true` | Tray icon at boot |
 
@@ -163,7 +166,7 @@ edit never leaves a half-written model file live.
 | `category` | `WORK`/`RP`/`AUX`/`EMB` |
 | `vram_gb` | Declared admission cost in GiB; `fixed` falls back to `file size × 1.15 + 2`, `exact` refuses without it |
 | `cost` | `fixed` (default): size binds admission · `greedy`: offloads to RAM/SSD, size never refuses but a launch floor is mandatory · `exact`: an engine-computed number, required and binding |
-| `launch_only_with_at_least_vram_free` | GiB. Refuse the load **before spawn** unless the physically free card reaches this floor (reserve deducted; foreign processes counted whenever per-process attribution is available) — the thrash guard for big/greedy quants. Greedy models without it inherit `greedy_launch_min_free_gb`; set `0` per-model to opt out |
+| `launch_only_with_at_least_vram_free` | GiB. Refuse the load **before spawn** unless the free card reaches this floor (reserve deducted; floor-meeting free counts only what the harness itself can make free — its own releasable residents — foreign occupancy never counts toward it). When no release the harness can perform would reach the floor, the refusal says so: "No releases allow for the VRAM floor. Check foreign residents." — the thrash guard for big/greedy quants. Greedy models without it inherit `greedy_launch_min_free_gb`; set `0` per-model to opt out |
 | `cpu_offload` | `true`/`1`/`on` → forces `-ngl 0` (**llama only** — other engines report an `inert_key` hint and the page offers no CPU control for them) |
 | `serve_model` | Expected engine-reported id; mismatch = recorded warning, never trusted |
 | `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served (high/low end). Written back after a load. Admission books `measured_gb` when `vram_gb` is absent — subject to `measured_attribution`, whose number it is: `engine_report` (the container's own startup reservation) and `per_process` (the witness attributed the bytes to this engine's process) book; `total_diff` (a free-memory delta) displays but never books; an **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure whatever the provenance — it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes — the profile name, plus the resolved `kv` for an override line (an edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, since the reservation follows the KV pool) |
@@ -189,7 +192,20 @@ edit never leaves a half-written model file live.
 Unknown keys are preserved for reference and reported as `unknown_key`
 warnings — the model still loads. `host` and `port` keys are harness-owned and
 inert: the bind is forced to loopback and the port is assigned from the
-category config.
+category config. `fit_gb` is the exception: it is the engine calculator's
+projection slot (see below), so a hand-written value is ignored and stripped,
+never booked.
+
+**Cost sources** decide which number binds admission, strongest word wins:
+an `engine_report` (ninfer container's own startup reservation) or, for llama, a
+**Fit** projection — when `engines.llama.fit_probe` is on, the harness runs the
+engine's own `llama-fit-params` calculator before spawn and books that figure if
+it exceeds the declared `vram_gb`. A Fit figure is **never persisted** (the
+stale-measurement failure class cannot exist for it) and is re-verified against
+the calculator's exact version on every launch. On the page a Fit row reads
+amber "engine-projected" until a witnessed serve confirms it within the margin,
+then turns green — colour is a confidence signal, the number never changes
+between the two.
 
 ### Strata engines
 
@@ -230,8 +246,13 @@ If a harness crash orphans a container, the next load of that name reconciles
 by removing the stale container before autostart runs. At boot, an orphan is
 reclaimed only when ownership is provable (the name is declared by a `ninfer`
 model, the name is legal, and the claim ledger proves this harness started it) —
-otherwise the harness warns and leaves it alone. Duplicate `ninfer_container`
-names across models are refused at scan, because reaping is by name.
+otherwise the harness warns and leaves it alone. A running container that matches
+a catalog `ninfer_container` but holds no claim is therefore never killed and
+never silent either: boot and every rescan name it in the log, in
+`/har/status.stranded_containers`, and in an amber page badge — its VRAM sits
+occupied and the harness will never reclaim it (report only). Duplicate
+`ninfer_container` names across models are refused at scan, because reaping is
+by name.
 
 #### autostart.sh template
 

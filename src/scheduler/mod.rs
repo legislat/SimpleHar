@@ -7975,8 +7975,8 @@ mod tests {
             .expect("the refusal travels with the row")
             .to_string();
         assert!(
-            error.contains("no releases allow for the VRAM floor")
-                && error.contains("check foreign residents"),
+            error.contains("No releases allow for the VRAM floor")
+                && error.contains("Check foreign residents"),
             "{error}"
         );
         assert!(error.contains("unreleasable"), "{error}");

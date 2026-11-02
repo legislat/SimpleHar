@@ -219,7 +219,7 @@ pub enum AdmissionError {
         detail = .facts.detail(*free),
         tail = insufficient_tail(.victims_considered, .blockers),
         guard = if *no_releases_reach {
-            "; no releases allow for the VRAM floor - check foreign residents"
+            "; No releases allow for the VRAM floor. Check foreign residents"
         } else {
             ""
         }
@@ -574,7 +574,7 @@ mod tests {
             "{floor}"
         );
         assert!(
-            !floor.contains("no releases allow"),
+            !floor.contains("No releases allow"),
             "a plain floor refusal must not claim the unreachable-floor guard: {floor}"
         );
         assert!(AdmissionError::ExactUndeclared
@@ -610,8 +610,8 @@ mod tests {
         }
         .to_string();
         assert!(
-            unreachable.contains("no releases allow for the VRAM floor")
-                && unreachable.contains("check foreign residents"),
+            unreachable.contains("No releases allow for the VRAM floor")
+                && unreachable.contains("Check foreign residents"),
             "{unreachable}"
         );
     }
