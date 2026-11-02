@@ -678,6 +678,75 @@ const driver = `
 
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
 
+  // ---- N6 (2026-11-02): the Cost cell is a FUNCTION of the server verdicts ----
+  // The legs above assert one rendered snapshot per fixture; this leg drives the
+  // SAME row through verdict flips (one field changed per applyState) and asserts
+  // the rendering moves with each flip: Fit amber -> green on the validated
+  // verdict, the basis flip moving the cell to the booked measured figure and
+  // shedding the calculator sentence, the attribution label riding ONLY the
+  // server's engine_report verdict, and a declared basis owning neither
+  // sentence. A render keyed on the row id or a fixture string instead of the
+  // verdict fields fails here on the second flip.
+  {
+    const trackModel = (over) => ({
+      id: "trackone", engine: "llama", category: "WORK", vram_gb: 12, cost: "fixed",
+      cost_basis: "fit", fit_gb: 12.0, fit_validated: false,
+      launch_floor_gb: null, measured_gb: 9.5, measured_min_gb: null,
+      measured_attribution: null, est_vram_gb: null, context: null,
+      model_ref: "F:/track.gguf", serve_model: null, cpu_offload: false, ...over,
+    });
+    const trackCost = () => {
+      for (const tr of findAll(document.getElementById("sh-main"), "tr")) {
+        const tds = findAll(tr, "td");
+        const strong = tds.map((td) => findAll(td, "strong")[0]).find(Boolean);
+        if (strong && textOf(strong) === "trackone" && tds[6]) {
+          return {
+            text: textOf(tds[6]),
+            cls: tds[6].attrs.class || "",
+            title: tds[6].attrs.title || "",
+          };
+        }
+      }
+      return { text: "row missing", cls: "", title: "" };
+    };
+    const trackState = (over) =>
+      applyState({ ...fixtures["/har/status"], models: [trackModel(over)] });
+    trackState({});
+    const unvalidated = trackCost();
+    trackState({ fit_validated: true });
+    const validated = trackCost();
+    trackState({ fit_validated: false, cost_basis: "measured" });
+    const measured = trackCost();
+    trackState({ cost_basis: "measured", measured_attribution: "engine_report" });
+    const reported = trackCost();
+    trackState({ cost_basis: "declared", measured_attribution: null });
+    const declared = trackCost();
+    check("the cost cell follows the fit verdict flip on one row",
+      unvalidated.cls.includes("sh-cost-unchecked") &&
+        unvalidated.text === "12.0 GiB" &&
+        !unvalidated.title.includes("confirmed") &&
+        validated.cls.includes("sh-cost-checked") &&
+        validated.title.includes("this session's launch confirmed it") &&
+        validated.text === unvalidated.text,
+      JSON.stringify([unvalidated, validated]));
+    check("a basis flip moves the cell to the booked measured figure",
+      measured.text === "9.5 GiB" && measured.cls.includes("sh-cost-checked") &&
+        measured.title.includes("measured 9.5 GiB") &&
+        !measured.title.includes("engine calculator"),
+      JSON.stringify(measured));
+    check("the attribution label rides only the server's engine_report verdict",
+      !measured.title.includes("(engine-reported)") &&
+        reported.text === "9.5 GiB" &&
+        reported.title.includes("(engine-reported)"),
+      JSON.stringify([measured, reported]));
+    check("a declared basis owns neither the fit nor the measured sentence",
+      declared.text === "12 GiB" && declared.cls.includes("sh-cost-unchecked") &&
+        declared.title.includes("declared 12 GiB") &&
+        !declared.title.includes("engine calculator") &&
+        !declared.title.includes("the gate books it"),
+      JSON.stringify(declared));
+  }
+
   // ---- FINDINGS-16 [4]: the header badge reads the server-computed verdicts ----
   // Red when the harness says a listener is down, amber when one is still without a
   // verdict (the tray's precedence, page-side), and never amber over red. The stub sees

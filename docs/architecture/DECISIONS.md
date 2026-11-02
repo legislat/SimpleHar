@@ -387,3 +387,14 @@ Unresolved questions live ONLY in `DECISIONS-PENDING.md`. This file only ever *g
   subagents, narrative commits, cardless CI, local gotchas/findings, live-layer backup,
   version/changelog coupling, and ASD-STE100 for durable docs. N2 closed by this ruling.
   | 2026-11-02 | `1bd78c8`
+
+- CALIBRATED 2026-11-02 (TASK-R11-FIT, C1 capture at `805c7d0`,
+  `handoff/wave-verify/logs/`): llama Fit constants stay margin 3 / surcharge 2 /
+  session slack 2.0. The C1 row books 31,717 MiB / 1024 (CUDA0 only; Host excluded)
+  + surcharge 2.0 (mmproj present) + margin 3.0 x 1 active device = 35.9736328125 GiB.
+  NVML observed_used_gb was 35.61735153198242, so the projection is 0.35628128051758
+  GiB above the observation: conservative on one sample. A numeric reduction needs
+  multi-sample card-window evidence. Pins: `src/engine/fit.rs` C1 arithmetic test and
+  the scheduler tolerance test. Deferred: the `engines.llama.fit_validate_slack_gib`
+  knob, which owes the llama policy row's `config_knobs` claim and the parity literal.
+  | 2026-11-02 | `TASK-R11-FIT`

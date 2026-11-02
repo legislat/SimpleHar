@@ -1,8 +1,8 @@
 //! Typed per-model configuration from `ModelConf/*.yaml` (DESIGN Steps 9-10).
 //!
 //! The v3.3 files are flat `key: value` documents. This module owns the typed entry and
-//! the documented alias rules; byte-preserving round-trip write-back arrives with the
-//! scan/write milestone (Step 9).
+//! the documented alias rules; the flat parser lives in [`scan`] and the byte-preserving
+//! round-trip write-back ships in [`writeback`].
 
 pub mod scan;
 pub mod writeback;

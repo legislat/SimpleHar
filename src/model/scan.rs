@@ -412,6 +412,82 @@ pub(crate) const TORTURE_SHAPES: &[(&str, &str)] = &[
     (" \"\u{feff}x\" # tail", "\u{feff}x"),
 ];
 
+/// The deterministic adversarial corpus for the hand-rolled flat-YAML reader
+/// (N4, "no fuzz/property test"): one fixed document list shared by both
+/// layers — `scan::tests` drives parse and entry building through it,
+/// `writeback::tests` drives the identical-write no-op and the value
+/// round-trip through it. A true property test needs a generating fuzz
+/// harness, which would be a new dependency; the dependency policy refuses
+/// that, so this corpus is the deterministic stand-in: every input fixed,
+/// every outcome asserted, and the reproducibility a fuzzer owes is asserted
+/// explicitly (parse twice, compare). Invalid UTF-8 is not a case and cannot
+/// be: the reader's input is a `&str`, so a byte-sequence reject happens
+/// upstream of this module, at the file read.
+#[cfg(test)]
+pub(crate) fn adversarial_docs() -> Vec<(&'static str, String)> {
+    vec![
+        ("empty", String::new()),
+        ("whitespace", "   \t \n \n".to_string()),
+        ("comment-only", "# just a note\n\n   \n".to_string()),
+        ("bom", "\u{feff}name: corpus\nengine: mock\n".to_string()),
+        (
+            "crlf",
+            "name: corpus\r\nengine: mock\r\nvram_gb: 4\r\n".to_string(),
+        ),
+        ("quotes", "name: \"corpus\"\nengine: 'mock'\n".to_string()),
+        (
+            "inline-comments",
+            "name: corpus # named\ncontext: 4096 # 32k\nengine: mock\n".to_string(),
+        ),
+        (
+            "duplicate-keys",
+            "name: corpus\nengine: mock\nengine: llama\n".to_string(),
+        ),
+        (
+            "unknown-key",
+            "name: corpus\nengine: mock\nfrobnicate: yes\n".to_string(),
+        ),
+        ("huge-line", format!("name: corpus\nnote: {}\n", "x".repeat(100_000))),
+        (
+            "control-chars",
+            "name: corpus\nweird: a\u{1}b\u{7}\nengine: mock\n".to_string(),
+        ),
+        (
+            "deep-quotes",
+            format!("name: corpus\nnote: {}\nengine: mock\n", "\"".repeat(14)),
+        ),
+        (
+            "deep-hash-chain",
+            "name: corpus\nnote: a # b # c # d # e # f # g\nengine: mock\n".to_string(),
+        ),
+        ("colon-only", ":\n:::\n".to_string()),
+        ("junk-line", "just text\nname: corpus\n".to_string()),
+        ("space-key", "bad key: 1\nname: corpus\n".to_string()),
+        (
+            "vram-overflow",
+            "name: corpus\nengine: mock\nvram_gb: 1e400\n".to_string(),
+        ),
+        (
+            "timeout-overflow",
+            "name: corpus\nengine: mock\nload_timeout: 99999999999999999999999999\n".to_string(),
+        ),
+        (
+            "vram-negative-zero",
+            "name: corpus\nengine: mock\nvram_gb: -0.0\n".to_string(),
+        ),
+        (
+            "many-keys",
+            (1..=200)
+                .map(|i| format!("filler_key_{i:03}: {i}\n"))
+                .collect(),
+        ),
+        (
+            "valid-round-trip",
+            "# operator header\nname: corpus # identity\nengine: mock\n category: WORK\nvram_gb: 4.5 # budget\ncontext: \"4096\" # quoted\r\n".to_string(),
+        ),
+    ]
+}
+
 /// The 13[5] Fork B acceptance gate: a config is exactly a **regular file** whose
 /// final extension is `.yaml`, case-insensitively. Never a symlink — the caller
 /// passes `DirEntry::file_type()`, which does not follow the link, so a symlink
@@ -1091,6 +1167,128 @@ mod tests {
             problems.iter().all(|p| p.contains("invalid key")),
             "{problems:?}"
         );
+    }
+
+    /// N4, first layer of [`adversarial_docs`]: every corpus document must (a)
+    /// never panic the parser, (b) respect its output shape - every reported
+    /// problem names a real line of that document and every published key obeys
+    /// the documented charset, (c) build the entry without a panic, and a clean
+    /// non-empty parse must land on a published entry or a **typed** reject, with
+    /// the three numeric-overflow shapes pinned to their exact variant, and
+    /// (d) parse identically on a second run - the reproducibility a generating
+    /// fuzzer would owe, asserted explicitly because the corpus replaced it.
+    #[test]
+    fn the_adversarial_corpus_never_panics_and_lands_typed_or_published() {
+        use crate::model::ModelError;
+        let reported = ["duplicate-keys", "colon-only", "junk-line", "space-key"];
+        let empty_map = ["empty", "whitespace", "comment-only"];
+        let overflow = ["vram-overflow", "timeout-overflow", "vram-negative-zero"];
+        for (name, doc) in adversarial_docs() {
+            let parsed = std::panic::catch_unwind(|| parse_flat_yaml(&doc))
+                .unwrap_or_else(|_| panic!("case `{name}`: the parser panicked"));
+            let (map, problems) = &parsed;
+            let line_count = doc.lines().count();
+            for problem in problems {
+                let rest = problem
+                    .strip_prefix("line ")
+                    .unwrap_or_else(|| panic!("case `{name}`: a problem names no line: {problem}"));
+                let number: usize = rest
+                    .split(':')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| {
+                        panic!("case `{name}`: unparsable problem line number: {problem}")
+                    });
+                assert!(
+                    (1..=line_count).contains(&number),
+                    "case `{name}`: a problem points outside the document: {problem}"
+                );
+            }
+            for key in map.keys() {
+                assert!(
+                    !key.is_empty()
+                        && key
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && key
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                    "case `{name}`: published key outside the documented charset: `{key}`"
+                );
+            }
+            assert_eq!(
+                parsed,
+                parse_flat_yaml(&doc),
+                "case `{name}`: parsing the same input twice disagreed"
+            );
+            if reported.contains(&name) {
+                assert!(
+                    !problems.is_empty(),
+                    "case `{name}`: a malformed document parsed clean: {map:?}"
+                );
+                continue;
+            }
+            if empty_map.contains(&name) {
+                assert!(
+                    problems.is_empty() && map.is_empty(),
+                    "case `{name}`: blank input must yield no keys and no problems, got map {map:?} problems {problems:?}"
+                );
+                continue;
+            }
+            assert!(problems.is_empty(), "case `{name}`: {problems:?}");
+            let built = std::panic::catch_unwind(|| ModelEntry::from_flat(map, "corpus"))
+                .unwrap_or_else(|_| panic!("case `{name}`: from_flat panicked"));
+            match built {
+                Err(error) => match name {
+                    "vram-overflow" => assert!(
+                        matches!(&error, ModelError::BadNumber { field, value }
+                            if field == "vram_gb" && value == "1e400"),
+                        "case `{name}`: {error}"
+                    ),
+                    "timeout-overflow" => assert!(
+                        matches!(&error, ModelError::BadNumber { field, value }
+                            if field == "load_timeout" && value == "99999999999999999999999999"),
+                        "case `{name}`: {error}"
+                    ),
+                    "vram-negative-zero" => assert!(
+                        matches!(&error, ModelError::BadNumber { field, .. } if field == "vram_gb"),
+                        "case `{name}`: {error}"
+                    ),
+                    _ => panic!("case `{name}`: a clean shape answered a reject: {error}"),
+                },
+                Ok(entry) => {
+                    assert!(
+                        !overflow.contains(&name),
+                        "case `{name}`: a numeric overflow published an entry"
+                    );
+                    match name {
+                        "valid-round-trip" => {
+                            assert_eq!(entry.category, CategoryId::Work);
+                            assert_eq!(entry.vram_gb, Some(4.5));
+                            assert_eq!(entry.raw.get("context").map(String::as_str), Some("4096"));
+                        }
+                        "huge-line" => {
+                            assert_eq!(entry.raw.get("note").map(String::len), Some(100_000));
+                        }
+                        "unknown-key" => assert_eq!(
+                            entry.raw.get("frobnicate").map(String::as_str),
+                            Some("yes"),
+                            "unknown keys stay preserved for reference"
+                        ),
+                        "deep-quotes" => assert_eq!(
+                            entry.raw.get("note").map(String::len),
+                            Some(12),
+                            "one quote pair peels, the chain residue is data"
+                        ),
+                        "deep-hash-chain" => {
+                            assert_eq!(entry.raw.get("note").map(String::as_str), Some("a"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     /// FINDINGS-13 [9] + Fork C boundary: a hyphenated key is a *key*, not a

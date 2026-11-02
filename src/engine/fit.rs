@@ -399,6 +399,47 @@ mod tests {
         assert_eq!(vision, 31_717.0 / 1024.0 + 1.25 + 0.5);
     }
 
+    /// TASK-R11-FIT calibration pin (C1 capture 2026-11-02 at 805c7d0,
+    /// `handoff/wave-verify/logs/`): the captured rows booked with the
+    /// Wave-C card constants from `wave-card-20261102-230736.json`
+    /// (`fit_margin_gb` 3, `mmproj_surcharge_gb` 2) equal EXACTLY the figure
+    /// the live `C1-evidence-20261102-230736.json` row recorded as `fit_gb`.
+    /// The device count is ONE (only `CUDA0` is active; the `Host` row is
+    /// RAM-side and excluded) and the row carries `mmproj:`
+    /// (`ModelConf/qwen3.8-27b-turbo-mtp-256k.yaml`), so the ruling's formula
+    /// reads: 31 717 MiB / 1024 + surcharge 2.0 + margin 3.0 x 1 device
+    /// = 30.9736328125 + 2.0 + 3.0 = 35.9736328125 GiB. Every figure is a
+    /// binary fraction, so the equality below is exact, not approximate.
+    /// The calibration verdict: the same capture's NVML `observed_used_gb`
+    /// is 35.61735153198242, i.e. the projection ran 0.35628128051758 GiB
+    /// ABOVE the quiescent reading - conservative. One sample is not grounds
+    /// to shrink either constant; a change needs a multi-sample card window
+    /// (the operator ruling 2026-11-01 set that bar for these numbers).
+    #[test]
+    fn the_captured_c1_row_books_the_recorded_projection_with_the_wave_card_constants() {
+        let rows = parse_output(CAPTURED).expect("the captured answer is contract-perfect");
+        assert_eq!(
+            rows.iter().filter(|row| row.is_device()).count(),
+            1,
+            "CUDA0 is the only ACTIVE device; Host is RAM-side"
+        );
+        let booked = book_gb(&rows, true, &constants(3.0, Some(2.0)))
+            .expect("the C1 row carries mmproj, so it books the surcharge");
+        assert_eq!(
+            booked, 35.9736328125,
+            "exactly the fit_gb the C1 evidence row carries"
+        );
+        let observed = 35.61735153198242;
+        assert!(
+            booked > observed,
+            "the projection must stay above the quiescent figure"
+        );
+        assert!(
+            (booked - observed - 0.35628128051758).abs() < 1e-9,
+            "the C1 headroom is pinned at 0.35628128051758 GiB"
+        );
+    }
+
     #[test]
     fn a_vision_row_without_the_surcharge_constant_refuses_rather_than_underbooks() {
         let rows = parse_output("CUDA0 100 0 0\n").expect("device row");

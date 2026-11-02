@@ -1791,6 +1791,121 @@ mod tests {
         }
     }
 
+    /// N4, second layer of `scan::adversarial_docs`: for every corpus document
+    /// the reader parses clean with keys, writing back each value the reader
+    /// itself published must be a byte-identical no-op, and the leg must prove
+    /// it ran every such document, not one broad document many times. What this
+    /// pins is the keep branch's byte-verbatim promise at whole-document level:
+    /// a file-leading BOM, CRLF endings, indentation, raw quoting, inline
+    /// comments, control characters and a 100 KB value pass through untouched,
+    /// with no panic on the way. It deliberately does NOT pin the reader/writer
+    /// boundary rule itself - both sides call the one `split_value_comment`, so
+    /// drift in that rule is invisible from inside this leg; the boundary
+    /// agreement is the torture-shapes pin above, and the round-trip leg below
+    /// pins the rewrite branch's preservation of unrelated bytes.
+    #[test]
+    fn every_adversarial_doc_survives_an_identical_write_of_its_own_values() {
+        let docs = crate::model::scan::adversarial_docs();
+        // The duty list is computed from the parse alone, before any exercise
+        // skip can shade it: every document the reader takes clean with keys
+        // owes this leg an identical-write pass.
+        let mut owed: Vec<&'static str> = Vec::new();
+        for (name, doc) in &docs {
+            let (map, problems) = parse_flat_yaml(doc);
+            if problems.is_empty() && !map.is_empty() {
+                owed.push(*name);
+            }
+        }
+        let mut exercised: Vec<&'static str> = Vec::new();
+        for (name, doc) in &docs {
+            let (map, problems) = parse_flat_yaml(doc);
+            if !problems.is_empty() || map.is_empty() {
+                // a file the scan gate refuses is refused at the write gate too,
+                // pinned by the WouldBreakFile/EmptyFile legs above.
+                continue;
+            }
+            for (key, value) in &map {
+                let written = std::panic::catch_unwind(|| set_key_in_text(doc, key, Some(value)))
+                    .unwrap_or_else(|_| {
+                        panic!("case `{name}`: set_key_in_text panicked on `{key}`")
+                    });
+                let updated = written.unwrap_or_else(|error| {
+                    panic!(
+                        "case `{name}`: an identical write of the reader's own value for `{key}` was refused: {error}"
+                    )
+                });
+                assert_eq!(
+                    updated, *doc,
+                    "case `{name}`: writing back the published value of `{key}` churned the document"
+                );
+            }
+            exercised.push(*name);
+        }
+        // The floor names the shapes this leg exists for, so dropping one from
+        // the corpus or skipping it here fails even while every other document
+        // passes - and one broad document (many-keys, 200 keys) cannot stand in
+        // for the rest.
+        for name in [
+            "bom",
+            "crlf",
+            "quotes",
+            "deep-hash-chain",
+            "huge-line",
+            "valid-round-trip",
+        ] {
+            assert!(
+                exercised.contains(&name),
+                "the corpus leg never exercised `{name}`"
+            );
+        }
+        assert_eq!(
+            exercised, owed,
+            "a clean corpus document was not exercised, or was skipped after counting"
+        );
+    }
+
+    /// N4, round-trip leg: the corpus's one fully valid document must move
+    /// through the write API and come back readable — an edit of one key keeps
+    /// the operator's other bytes (header, inline comments, the quoted value,
+    /// the CRLF line), the edited key lands, and the result rescans clean with
+    /// the typed entry following it to the new value.
+    #[test]
+    fn the_valid_corpus_document_round_trips_through_the_write_api() {
+        let doc = crate::model::scan::adversarial_docs()
+            .into_iter()
+            .find(|(name, _)| *name == "valid-round-trip")
+            .expect("the corpus defines its valid case")
+            .1;
+        let updated = set_key_in_text(&doc, "category", Some("RP")).expect("edit");
+        assert!(
+            updated.starts_with("# operator header\n"),
+            "header lost: {updated}"
+        );
+        assert!(
+            updated.contains("name: corpus # identity"),
+            "an untouched line's comment lost: {updated}"
+        );
+        assert!(
+            updated.contains("vram_gb: 4.5 # budget"),
+            "an untouched line's comment lost: {updated}"
+        );
+        assert!(
+            updated.contains("context: \"4096\" # quoted\r\n"),
+            "the CRLF line or its quoted value lost: {updated:?}"
+        );
+        assert!(updated.contains("category: RP"), "{updated}");
+        assert!(
+            !updated.contains("WORK"),
+            "the old value survived: {updated}"
+        );
+        let (map, problems) = parse_flat_yaml(&updated);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(map.get("category").map(String::as_str), Some("RP"));
+        assert_eq!(map.get("context").map(String::as_str), Some("4096"));
+        let entry = crate::model::ModelEntry::from_flat(&map, "corpus").expect("must scan");
+        assert_eq!(entry.category, crate::config::CategoryId::Rp);
+    }
+
     /// FINDINGS2-13 [1], superseding this pin's earlier form (which pinned the
     /// entry `trim` introduced by FINDINGS-BATCH-2026-10-28B [4]): the caller's word
     /// is honored **byte-exactly** — nothing is trimmed or peeled on the way in,

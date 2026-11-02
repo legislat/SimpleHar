@@ -450,6 +450,11 @@ async fn a_failed_launch_snapshots_its_container_log_and_can_snapshot_again() {
     let handle = Scheduler::start(
         AppConfig {
             load_timeout_s: 1,
+            // The held kill never completes, so the leg ends on this deadline
+            // expiring (Failed -> Reap), not on a confirmed release. The default
+            // 60 s waited out twice per run for no additional proof; 1 s is the
+            // tightest legal deadline and takes the same failure path.
+            release_timeout_s: 1,
             ..AppConfig::default()
         },
         dir.clone(),

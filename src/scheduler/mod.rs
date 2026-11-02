@@ -60,10 +60,17 @@ const FIT_WARM_DELAY: Duration = Duration::from_millis(1500);
 /// tolerance a live witness reading must fall inside to confirm a Fit booking
 /// for the page. A witness total-diff carries noise the deterministic
 /// projection does not (other tenants' sampling instants, KV growth under
-/// load), so the cross-check window is wider than the booking margin. This
-/// constant is a DOCUMENTED PLACEHOLDER pending the Wave-C calibration — the
-/// same window that calibrates `fit_margin_gb` itself owes this figure its
-/// real value.
+/// load), so the cross-check window is wider than the booking margin.
+///
+/// Calibration decision (TASK-R11-FIT, C1 capture 2026-11-02): margin 3,
+/// surcharge 2 and this 2.0 slack STAND - the capture booked conservative
+/// against the live witness figure on the single sample the card holds, and
+/// any numeric change needs multi-sample card-window evidence first. The C1
+/// fact set (rows, constants, figures, headroom) lives in exactly one home:
+/// the calibration pin in `src/engine/fit.rs` - cite it, do not restate it.
+/// A config knob (`engines.llama.fit_validate_slack_gib`) is DEFERRED: a
+/// fifth `engines.llama` key owes the llama row's `config_knobs` claim and
+/// the parity-test literal in `src/engine/policy.rs`.
 const FIT_VALIDATE_SLACK_GIB: f64 = 2.0;
 
 /// Failures reported to swap/unload/cancel callers, with the numbers used (G13).
@@ -3399,12 +3406,25 @@ impl ActorState {
         });
     }
 
+    /// The session cross-check's tolerance: `fit_margin_gb` plus
+    /// [`FIT_VALIDATE_SLACK_GIB`]. An absent or non-finite margin means NO
+    /// defined tolerance ([`None`] - the row never validates, silently, the
+    /// same degradation an unavailable reading gets). Split out of
+    /// [`Self::maybe_validate_fit`] so the composition carries a direct test
+    /// pin (TASK-R11-FIT: tolerance = margin + slack, default slack 2.0).
+    fn fit_validation_tolerance(margin_gb: Option<f64>) -> Option<f64> {
+        margin_gb
+            .filter(|margin| margin.is_finite())
+            .map(|margin| margin + FIT_VALIDATE_SLACK_GIB)
+    }
+
     /// R11 session cross-check (rule 2026-11-01, display-only, never a gate
     /// input): when a witness reading has survived every fold gate for a
     /// Fit-booked load, compare it against the projection that booked the
-    /// spawn. The tolerance is `fit_margin_gb` + [`FIT_VALIDATE_SLACK_GIB`] —
-    /// an uncalibrated margin (constant absent) is NO defined tolerance, hence
-    /// never-validated, degrading silently like an unavailable reading. A hit
+    /// spawn. The tolerance is [`Self::fit_validation_tolerance`] -
+    /// `fit_margin_gb` + [`FIT_VALIDATE_SLACK_GIB`]; an uncalibrated margin
+    /// (constant absent) is NO defined tolerance, hence never-validated,
+    /// degrading silently like an unavailable reading. A hit
     /// stamps the model under the current fit epoch; the stamp is in-memory
     /// only, retires with the epoch (a rescan re-stamps it away), and a
     /// calculator swap clears the map. The first refusal at an epoch warns
@@ -3416,12 +3436,9 @@ impl ActorState {
         let Some(fit) = anchor.fit_gb else {
             return false;
         };
-        let Some(margin) = self
-            .cfg
-            .llama_fit()
-            .and_then(|llama| llama.fit_margin_gb)
-            .filter(|margin| margin.is_finite())
-        else {
+        let Some(tolerance) = Self::fit_validation_tolerance(
+            self.cfg.llama_fit().and_then(|llama| llama.fit_margin_gb),
+        ) else {
             return false;
         };
         let gen = self.fit_gen();
@@ -3429,7 +3446,6 @@ impl ActorState {
         if seen == Some((gen, true)) {
             return false;
         }
-        let tolerance = margin + FIT_VALIDATE_SLACK_GIB;
         if (observed - fit).abs() > tolerance {
             if seen == Some((gen, false)) {
                 return false;
@@ -9108,6 +9124,40 @@ mod tests {
                 "silence, not a nag about an absent config key: {needle}"
             );
         }
+    }
+
+    /// TASK-R11-FIT pin: the session tolerance is exactly `fit_margin_gb` +
+    /// [`FIT_VALIDATE_SLACK_GIB`], that default slack is exactly 2.0 GiB, and
+    /// an absent or non-finite margin leaves NO defined tolerance (the row
+    /// never validates, silently). The C1 evidence figures live once, in the
+    /// calibration pin in `src/engine/fit.rs`.
+    #[test]
+    fn the_fit_validation_tolerance_is_the_margin_plus_the_pinned_default_slack() {
+        assert_eq!(
+            super::FIT_VALIDATE_SLACK_GIB,
+            2.0,
+            "the calibrated slack default"
+        );
+        assert_eq!(
+            ActorState::fit_validation_tolerance(Some(3.0)),
+            Some(5.0),
+            "tolerance = fit_margin_gb + slack, at the live margin 3"
+        );
+        assert_eq!(
+            ActorState::fit_validation_tolerance(Some(0.5)),
+            Some(2.5),
+            "the same composition the fold pins exercise"
+        );
+        assert_eq!(
+            ActorState::fit_validation_tolerance(None),
+            None,
+            "no margin, no tolerance: never-validate, silent"
+        );
+        assert!(
+            ActorState::fit_validation_tolerance(Some(f64::NAN)).is_none()
+                && ActorState::fit_validation_tolerance(Some(f64::INFINITY)).is_none(),
+            "a nonsense margin is no tolerance either (the parse_gib doctrine)"
+        );
     }
 
     /// The stamp's two retirements: a catalog rescan bumps the fit epoch (and

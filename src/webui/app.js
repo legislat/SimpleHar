@@ -616,6 +616,10 @@ function modelRow(status, model, category) {
     model.fit_gb !== undefined
   ) {
     costText = `${model.fit_gb.toFixed(1)} GiB`;
+    // Green promotion is the server's verdict, never a client-side compare:
+    // fit_validated only rides a live witness reading that landed inside
+    // fit_margin_gb + the pinned session slack (FIT_VALIDATE_SLACK_GIB,
+    // src/scheduler/mod.rs).
     costChecked = model.fit_validated === true;
     costTitle =
       `engine-projected ${model.fit_gb.toFixed(1)} GiB · engine calculator, pre-spawn, re-verified per launch` +
