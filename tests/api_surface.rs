@@ -868,6 +868,7 @@ async fn extended_logging_toggle_round_trips_and_validates() {
 async fn events_stream_serves_sse_with_an_immediate_state() {
     let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
     let response = control
+        .clone()
         .oneshot(
             Request::get("/har/events")
                 .body(Body::empty())
@@ -899,6 +900,31 @@ async fn events_stream_serves_sse_with_an_immediate_state() {
     .expect("frame is bytes");
     let text = String::from_utf8_lossy(&first);
     assert!(text.contains("har_state"), "frame: {text}");
+    // The tokenless page renders ONLY this frame, so its document must be the
+    // whole page state: every `/har/status` key plus the model table. Dropping
+    // either leg silently empties the table for SSE-only clients.
+    let payload = text
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("frame carries a data line");
+    let frame: serde_json::Value = serde_json::from_str(payload).expect("frame data is JSON");
+    let (_, status) = get_json(&control, "/har/status").await;
+    let mut want: Vec<&str> = status
+        .as_object()
+        .expect("status is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    want.push("models");
+    want.sort_unstable();
+    want.dedup();
+    let got: Vec<&str> = frame
+        .as_object()
+        .expect("frame is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(got, want, "SSE frame drifted from the /har/status document");
 }
 
 #[tokio::test]

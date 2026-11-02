@@ -715,6 +715,15 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                             .chars()
                             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
                     if profile_override_key {
+                        // On a non-ninfer row the line is dead config like every
+                        // foreign knob: warn (InertKey), never silently pass.
+                        if entry.engine != crate::ownership::NINFER_ENGINE {
+                            catalog.errors.push(ScanError {
+                                kind: ScanKind::InertKey,
+                                file: file_name.clone(),
+                                reason: inert_key_reason(key, &entry.engine),
+                            });
+                        }
                         continue;
                     }
                     if !crate::engine::policy::knob_live(key, &entry.engine)
@@ -731,6 +740,12 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                         let reason = match key.as_str() {
                             "host" => HOST_POLICY_HINT.to_string(),
                             "port" => PORT_POLICY_HINT.to_string(),
+                            // The slot is honest about its fate: unlike ordinary
+                            // unknown keys this one is stripped, never preserved.
+                            "fit_gb" => "`fit_gb` is the engine-calculator's projection \
+                                         slot, computed at load; a hand-written value is \
+                                         ignored and stripped, it never books"
+                                .to_string(),
                             other => format!(
                                 "unknown key `{other}` is not read by the harness (preserved \
                                  for reference){}",

@@ -14,3 +14,5 @@
 /HANDOFF.md
 # Agent handoff briefs: they quote the local-only docs and name machine paths.
 /handoff
+# Kilo agent config (skills, worktrees, session state) is local-only.
+/.kilo
