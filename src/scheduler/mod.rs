@@ -2849,23 +2849,36 @@ impl ActorState {
             attribution: Some(*attribution),
             profile: profile.clone(),
         };
-        if entry.measured_gb == Some(high)
+        let entry_same = entry.measured_gb == Some(high)
             && entry.measured_min_gb == Some(low)
             && entry.measured_offload == data.offload
             && entry.measured_attribution == data.attribution
-            && entry.measured_profile == data.profile
-        {
+            && entry.measured_profile == data.profile;
+        // The row is not the only fold target: the spawn anchor of THIS launch is
+        // what the slot's `container_reported_gb` reads. When the engine's fresh
+        // figure equals the stamp a previous launch persisted, row-idempotence alone
+        // hides a lagging anchor — the live engine serves on never self-reported
+        // (card runs 2026-11-02: C2 polled `container_reported_gb` for 150 s through
+        // a ninfer serve whose 43.8 GiB report matched the persisted stamp).
+        let anchor_same = self
+            .jobs
+            .get(&spawned_job)
+            .and_then(|job| job.measured.as_ref())
+            .is_some_and(|a| a.attribution == data.attribution && a.range == Some((high, low)));
+        if entry_same && anchor_same {
             return;
         }
-        if let Some(declared) = entry.vram_gb {
-            let drift = (high - declared).abs();
-            if drift > (declared * 0.25).max(2.0) {
-                tracing::warn!(
-                    model,
-                    declared,
-                    measured = high,
-                    "measured footprint diverges from the declared vram_gb"
-                );
+        if !entry_same {
+            if let Some(declared) = entry.vram_gb {
+                let drift = (high - declared).abs();
+                if drift > (declared * 0.25).max(2.0) {
+                    tracing::warn!(
+                        model,
+                        declared,
+                        measured = high,
+                        "measured footprint diverges from the declared vram_gb"
+                    );
+                }
             }
         }
         entry.measured_gb = Some(high);
@@ -2890,6 +2903,12 @@ impl ActorState {
             });
         }
         self.publish();
+        if entry_same {
+            // The disk already carries exactly these bytes: a rewrite would only
+            // churn the file's mtime and the fold's own fingerprint stamp — the
+            // promotion above was all that stayed pending.
+            return;
+        }
         let name = model.to_string();
         let tx = self.tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -6727,6 +6746,51 @@ mod tests {
             state.snapshot().slots[0].container_reported_gb,
             None,
             "a child-process spawn never reserves container memory, whoever reported it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A report equal to the freshly-persisted stamp must still anchor THIS launch:
+    /// the persisted pair proves an earlier launch spoke, not this one. The fold's
+    /// row-idempotence used to return before the anchor promotion, so the live
+    /// container never displayed as self-reported (card runs 2026-11-02: C2 polled
+    /// `container_reported_gb` for 150 s through a ninfer serve whose 43.8 GiB
+    /// report matched the stamp `ninfer-swift-fp8.yaml` already carried).
+    /// Falsifier: the pre-fix row-only idempotence guard in `fold`.
+    #[tokio::test]
+    async fn a_report_equal_to_the_persisted_stamp_still_promotes_the_anchor() {
+        let dir = crate::testutil::temp_dir("fold-stamp-promote");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir_all(dir.join("logs")).expect("logs dir");
+        let yaml = dir.join("sb.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: ninfer\ncost: exact\nmeasured_gb: 31.0\nmeasured_gb_min: 31.0\n\
+             measured_attribution: engine_report\nmeasured_profile: b\n",
+        )
+        .expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "sb");
+        assert_eq!(
+            spawned.measured_attribution,
+            Some(crate::model::MeasuredAttribution::EngineReport),
+            "the scanner kept the provenance stamp the live row carries"
+        );
+        let ticket = fold_ticket(19_017);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_017);
+        assert_eq!(
+            state.snapshot().slots[0].container_reported_gb,
+            None,
+            "the persisted stamp is display, not this launch's anchor"
+        );
+
+        state.engine_report("sb", &ticket, 31.0);
+        assert_eq!(
+            state.snapshot().slots[0].container_reported_gb,
+            Some(31.0),
+            "a fresh report matching the persisted stamp still anchors this launch"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
