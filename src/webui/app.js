@@ -429,21 +429,22 @@ function renderHeader(status) {
       text("Rescan"),
     ),
   );
+  // Operator order (2026-11-01): numbers first, tabs under them; the Extended
+  // Logging toggle belongs with the harness log at the page bottom, not the strip.
+  return el("div", {}, headline, renderMemory(status), controls);
+}
+
+// Catalog hygiene notices (inert keys, policy refusals): a long wall of them must
+// never push the table down, so they live at the PAGE BOTTOM under the harness log,
+// not in the header (operator 2026-11-02: "lengthy error message is still not moved
+// to the bottom").
+function catalogNotices(status) {
   const errors = (status.catalog_errors || []).map(
     (error) => `${error.file}: ${error.reason}`,
   );
-  // Operator order (2026-11-01): numbers first, tabs under them; the Extended
-  // Logging toggle belongs with the harness log at the page bottom, not the strip.
-  return el(
-    "div",
-    {},
-    headline,
-    renderMemory(status),
-    controls,
-    errors.length > 0
-      ? el("div", { class: "sh-catalog-errors" }, text(errors.join("\n")))
-      : null,
-  );
+  return errors.length > 0
+    ? el("div", { class: "sh-catalog-errors" }, text(errors.join("\n")))
+    : null;
 }
 
 // The loaded slot whose container reports its reservation (R9 display chain), or
@@ -850,6 +851,7 @@ function render() {
     el("summary", {}, text("Harness log (last events)")),
     logBody,
   );
+  const notices = catalogNotices(status);
   mainHost.replaceChildren(
     renderTab(status, state.activeTab),
     ...(jobs ? [jobs] : []),
@@ -872,6 +874,7 @@ function render() {
         text("Extended Logging"),
       ),
     ),
+    ...(notices ? [notices] : []),
     el(
       "footer",
       { class: "sh-footer" },

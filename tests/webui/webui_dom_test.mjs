@@ -862,6 +862,31 @@ const driver = `
     textOf(document.getElementById("sh-header")).indexOf("41.5") >= 0,
     "header=" + textOf(document.getElementById("sh-header")).slice(0, 90));
 
+  // Catalog notices live at the PAGE BOTTOM (operator 2026-11-02): a long wall of
+  // hygiene notices must never push the model table down. Header stays clean, the
+  // block sits between the harness log row and the footer, and it vanishes with
+  // the errors.
+  statusDoc.catalog_errors = [
+    { file: "ninfer-a.yaml", reason: "context does nothing here" },
+    { file: "strata-b.yaml", reason: "profile declares host" },
+  ];
+  await refresh();
+  const hdrNotices = findAll(document.getElementById("sh-header"), "div", "sh-catalog-errors");
+  const mainNotices = findAll(document.getElementById("sh-main"), "div", "sh-catalog-errors");
+  const kids = mainNow.children;
+  const noticeText = mainNotices.length ? textOf(mainNotices[0]) : "";
+  check("catalog notices sit at the page bottom above the footer",
+    hdrNotices.length === 0 && mainNotices.length === 1 &&
+      kids.indexOf(mainNotices[0]) === kids.length - 2 &&
+      kids[kids.length - 1].attrs.class === "sh-footer" &&
+      noticeText.indexOf("ninfer-a.yaml") >= 0 && noticeText.indexOf("strata-b.yaml") >= 0,
+    "hdr=" + hdrNotices.length + " main=" + mainNotices.length +
+      " idx=" + kids.indexOf(mainNotices[0]) + " last=" + (kids[kids.length - 1] || {}).attrs);
+  statusDoc.catalog_errors = [];
+  await refresh();
+  check("no catalog errors, no notice block",
+    findAll(document.getElementById("sh-main"), "div", "sh-catalog-errors").length === 0);
+
   for (const [name, ok, extra] of results)
     console.log((ok ? "PASS " : "FAIL ") + name + (ok || !extra ? "" : " :: " + extra));
   process.exit(results.every((r) => r[1]) ? 0 : 1);
