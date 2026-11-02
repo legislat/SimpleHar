@@ -883,8 +883,12 @@ fn stage_strata_profile(
     std::fs::create_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
     let target = root.join(&expected);
     let temp = root.join(format!(".staging.{expected}.tmp"));
-    std::fs::write(&temp, text.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", temp.display()))?;
+    if let Err(e) = std::fs::write(&temp, text.as_bytes()) {
+        // A partial temp the prune never matches (it only claims `.json`)
+        // must not survive its own failure (review 26 [3]).
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("cannot write {}: {e}", temp.display()));
+    }
     if let Err(error) = std::fs::rename(&temp, &target) {
         let _ = std::fs::remove_file(&temp);
         return Err(format!("cannot publish {}: {error}", target.display()));

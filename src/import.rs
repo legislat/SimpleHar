@@ -93,13 +93,32 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
             }
         }
     }
-    if let Some(exe) = str("exe") {
-        out.push_str(&format!("strata_exe: {exe}\n"));
-    } else {
-        return Err(format!(
-            "{} declares no `exe`: nothing to render",
-            profile_path.display()
-        ));
+    // `exe` is the one required key, so each unusable shape is refused under
+    // its own true name (review 26 [2]): "declares no exe" must not accuse a
+    // value that is present but misshapen, and an empty exe must not import to
+    // an empty knob line that only refuses at load.
+    match str("exe") {
+        Some(exe) if !exe.trim().is_empty() => {
+            out.push_str(&format!("strata_exe: {exe}\n"));
+        }
+        Some(_) => {
+            return Err(format!(
+                "{} declares an empty `exe`: nothing to render",
+                profile_path.display()
+            ));
+        }
+        None if root.contains_key("exe") => {
+            return Err(format!(
+                "{} declares an `exe` that is not a string: nothing to render",
+                profile_path.display()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "{} declares no `exe`: nothing to render",
+                profile_path.display()
+            ));
+        }
     }
     // The block ONCE rule needs the block itself, not the key: a `vision`
     // that is not an object can never render, so its args switch must survive
@@ -224,7 +243,11 @@ pub fn strata_yaml(profile_path: &Path) -> Result<String, String> {
                     profile_path.display()
                 ))
             }
-            None => {}
+            // server.py:1939 reads an ABSENT gpu as falsy, while the renderer's
+            // token-absent default is true — an omitted key imported silently
+            // would flip the encoder CPU→GPU (review 26 [1]). The faithful
+            // token for an absent key is the explicit false the engine ran.
+            None => tokens.push("gpu=false".to_string()),
         }
         // The three numeric keys of the server's vision contract (ruling
         // 2026-11-02): a present value the token shape cannot carry is
@@ -471,6 +494,49 @@ mod tests {
         );
         assert!(yaml.contains("vision (present, wrong type)"), "{yaml}");
         let _ = std::fs::remove_file(profile);
+    }
+
+    /// Review 26 [1]: server.py reads an absent `vision.gpu` as falsy, the
+    /// renderer's token-absent default is true — the import must spell the
+    /// false the engine ran, never leave the default to materialize a GPU.
+    #[test]
+    fn a_vision_block_without_gpu_imports_the_explicit_false_the_engine_ran() {
+        let profile = temp_profile(
+            "vision-nogpu",
+            r#"{"exe": "C:\\e.exe", "vision": {"exe": "C:\\v.exe", "mmproj": "M", "model": "D"}}"#,
+        );
+        let yaml = strata_yaml(&profile).expect("imports");
+        assert!(
+            yaml.contains("strata_vision: exe=C:\\v.exe mmproj=M model=D gpu=false"),
+            "an absent gpu must import as the explicit false: {yaml}"
+        );
+        assert!(
+            !yaml.contains("vision."),
+            "the contract-carrying block must leave nothing not mapped: {yaml}"
+        );
+        let _ = std::fs::remove_file(profile);
+    }
+
+    /// Review 26 [2]: `exe` is required, and each unusable shape meets its own
+    /// true refusal — "declares no exe" must not misname a present value.
+    #[test]
+    fn an_unusable_exe_is_refused_under_its_own_true_name() {
+        for (body, needle) in [
+            (r#"{"exe": "C:\\e.exe"}"#, "nothing to render"), // control: not this door
+            (r#"{"exe": 5}"#, "not a string"),
+            (r#"{"exe": " "}"#, "empty"),
+            (r#"{"tokenizer": "C:\\t"}"#, "declares no `exe`"),
+        ] {
+            let profile = temp_profile("exe-shape", body);
+            let outcome = strata_yaml(&profile);
+            if body.contains("C:\\\\e.exe") {
+                assert!(outcome.is_ok(), "control row must import");
+            } else {
+                let error = outcome.expect_err("an unusable exe must refuse");
+                assert!(error.contains(needle), "{body}: {error}");
+            }
+            let _ = std::fs::remove_file(profile);
+        }
     }
 
     /// Ruling 2026-11-02 (FINDINGS-25 [1] settled): `threads` and `min_tokens`

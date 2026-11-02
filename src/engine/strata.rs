@@ -1337,6 +1337,14 @@ mod tests {
             "sampling defaults round-trip with their source types"
         );
         assert_eq!(got["uncensored"], wanted["uncensored"]);
+        // The vision pin below is only a TYPE pin while number equality is
+        // variant-strict (review 26): 16 must never equal 16.0 here.
+        assert_ne!(
+            serde_json::json!(16),
+            serde_json::json!(16.0),
+            "number equality must stay variant-strict or the round-trip could \
+             pass with a drifted type"
+        );
         assert_eq!(got["vision"], wanted["vision"]);
         assert!(got.get("host").is_none() && got.get("port").is_none());
         assert!(got["log"]
