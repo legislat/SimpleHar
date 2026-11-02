@@ -623,6 +623,30 @@ impl Drop for ReconcileRelease {
     }
 }
 
+/// Serve-id re-discovery release (FINDINGS-06 [8]): every exit of the probe
+/// task — normal end, panic, cancellation — lands exactly one
+/// [`ActorMsg::ServeIdRefreshed`], so the in-flight mark can never wedge the
+/// next resolve into silence without a retry. An answer the probe never
+/// produced reports as silence (`None`), the same posture as the reconcile
+/// release above.
+struct ServeIdProbeRelease {
+    tx: mpsc::UnboundedSender<ActorMsg>,
+    port: u16,
+    generation: u64,
+    outcome: Option<Option<String>>,
+}
+
+impl Drop for ServeIdProbeRelease {
+    fn drop(&mut self) {
+        let discovered = self.outcome.take().flatten();
+        let _ = self.tx.send(ActorMsg::ServeIdRefreshed {
+            port: self.port,
+            generation: self.generation,
+            discovered,
+        });
+    }
+}
+
 #[derive(Debug)]
 enum ActorMsg {
     Command {
@@ -681,6 +705,16 @@ enum ActorMsg {
     /// with the stranded set (possibly empty); `None` = the probe could not run
     /// — silence, and the last-reported set stands untouched.
     ReconcileDone(Option<BTreeSet<String>>),
+    /// A `serve_id` re-discovery (FINDINGS-06 [8]) for a loaded occupant that
+    /// installed with no id has finished: `Some` = the id the engine now
+    /// reports; `None` = still silence, and the next resolve retries.
+    /// `(port, generation)` names the spawn the probe was launched for — an
+    /// answer for a replaced occupant is dropped at the door.
+    ServeIdRefreshed {
+        port: u16,
+        generation: u64,
+        discovered: Option<String>,
+    },
     /// The R11 fit version probe finished (warm pass and every fit admit lead
     /// with it): `Some` = the calculator's version line, `None` = the tool did
     /// not answer and the fit pass stays silent. `gen` is the catalog epoch the
@@ -1244,6 +1278,11 @@ struct ActorState {
     /// container, never a pile of concurrent `docker logs` clients from a
     /// crash-looping load — rather than a job-scoped handle.
     snapshot_in_flight: HashSet<String>,
+    /// `(port, generation)` of every `serve_id` re-discovery in flight
+    /// (FINDINGS-06 [8]): one probe per spawn at a time — the next resolve of
+    /// an id-less occupant retries, but never piles concurrent `GET /v1/models`
+    /// calls behind a slow engine.
+    serve_id_refresh: HashSet<(u16, u64)>,
     /// R5 report-only reconcile: a probe per catalog application, never two at
     /// once (the R9 in-flight bound) — a rescan landing mid-probe is answered
     /// by the next application, never by a pile of concurrent `docker ps`.
@@ -1459,6 +1498,16 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 state.reconcile_in_flight = false;
                 state.on_reconcile_done(outcome);
             }
+            ActorMsg::ServeIdRefreshed {
+                port,
+                generation,
+                discovered,
+            } => {
+                state.serve_id_refresh.remove(&(port, generation));
+                if state.on_serve_id_refreshed(port, generation, discovered.as_deref()) {
+                    state.publish();
+                }
+            }
             ActorMsg::FitVersionDone { gen, version } => state.on_fit_version(gen, version),
             ActorMsg::FitRowDone {
                 gen,
@@ -1544,6 +1593,7 @@ impl ActorState {
             events: tokio::sync::broadcast::channel(64).0,
             tx,
             snapshot_in_flight: HashSet::new(),
+            serve_id_refresh: HashSet::new(),
             reconcile_in_flight: false,
             last_reported_stranded: None,
             fit_cache: HashMap::new(),
@@ -1947,12 +1997,20 @@ impl ActorState {
         for &s in &slots {
             if let (Some(occupant), None) = (&self.slots[s].occupant, self.slots[s].job) {
                 if occupant.model == model {
+                    // FINDINGS-06 [8]: an occupant that installed with no id is
+                    // not sentenced to it — every resolve re-runs discovery
+                    // (contract on [`ActorState::install`]). The reply itself
+                    // stays the current state: a load never waits on a probe.
+                    let retry = occupant.serve_id.is_none().then(|| occupant.ticket.clone());
                     let _ = reply.send(Ok(Reply::Already {
                         model: occupant.model.clone(),
                         category,
                         port: occupant.port,
                         serve_id: occupant.serve_id.clone(),
                     }));
+                    if let Some(ticket) = retry {
+                        self.retry_serve_id(ticket);
+                    }
                     return;
                 }
             }
@@ -4505,6 +4563,15 @@ impl ActorState {
 
     /// `Ready -> Install -> Serving`: the one place an occupant is created (F-6 funnel).
     /// `discovered_id` is the engine's self-reported id (Step 10, F-4 fix).
+    ///
+    /// Retry contract (FINDINGS-06 [8]): a `None` here is not the occupant's
+    /// life sentence. The miss is a WARN (the model and what was tried), the
+    /// load still succeeds, and the proxy keeps the documented harness-name
+    /// fallback — but every later resolve that answers already-serving for
+    /// this exact spawn ([`ActorState::on_swap`]) re-runs the same discovery
+    /// off-thread; when the engine finally answers, [`ActorState::on_serve_id_refreshed`]
+    /// lands the id on the occupant and the following forward carries it. The
+    /// resolve itself never waits on or fails because of the probe.
     fn install(&mut self, job_id: JobId, discovered_id: Option<String>) {
         self.set_timing(job_id, |t| &mut t.ready_ms);
         self.step(job_id, SwapState::Install);
@@ -4530,6 +4597,20 @@ impl ActorState {
         // minutes after `begin_spawn`, and the process being judged was launched from
         // the bytes that anchor captured (FINDINGS-BATCH-2026-10-28L [L-2]).
         let serve_id = discovered_id;
+        if serve_id.is_none() {
+            // FINDINGS-06 [8]: a discovery miss used to be invisible — the slot
+            // reported the model as serving while every forward silently
+            // carried the harness name. Name the model and what was tried, and
+            // point at the recovery this file already runs for it.
+            tracing::warn!(
+                %job_id,
+                model = %model,
+                port = port.port,
+                "engine reported no model id: tried GET /v1/models at readiness; \
+                 the proxy forwards the harness name and re-discovers on every \
+                 resolve until an id lands"
+            );
+        }
         if let Some(job) = self.jobs.get_mut(&job_id) {
             if let Some(warning) = serve_model_warning(job.measured.as_ref(), serve_id.as_deref()) {
                 tracing::warn!(%job_id, model = %job.model, "{warning}");
@@ -4711,6 +4792,89 @@ impl ActorState {
             })),
             "loaded",
         );
+    }
+
+    /// Retries serve-id discovery for an occupant that installed with none
+    /// (FINDINGS-06 [8], contract on [`ActorState::install`]): one
+    /// [`EngineRuntime::discover_model_id`] per spawn at a time, off the
+    /// actor, answered back as [`ActorMsg::ServeIdRefreshed`] whatever the
+    /// probe's exit — so a resolve never waits on or fails because of the
+    /// probe, and a silent engine is retried by the next resolve rather than
+    /// latched.
+    fn retry_serve_id(&mut self, ticket: SpawnTicket) {
+        if !self
+            .serve_id_refresh
+            .insert((ticket.port, ticket.generation))
+        {
+            return;
+        }
+        let tx = self.tx.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let (port, generation) = (ticket.port, ticket.generation);
+        tokio::spawn(async move {
+            // RAII release (the R9 C1 rule): the in-flight mark clears on EVERY
+            // exit — a panic in the probe reports as silence, never as a mark
+            // wedged for the process lifetime.
+            let mut probe = ServeIdProbeRelease {
+                tx,
+                port,
+                generation,
+                outcome: None,
+            };
+            probe.outcome = Some(runtime.discover_model_id(port).await);
+        });
+    }
+
+    /// Folds a re-discovery answer back onto its occupant (FINDINGS-06 [8]).
+    ///
+    /// # Arguments
+    ///
+    /// * `port` / `generation` — the spawn the probe was launched for; an
+    ///   answer for a replaced occupant is dropped, never laundered onto a new
+    ///   engine that was installed with a real id.
+    /// * `discovered` — the id the engine now reports, `None` for continued
+    ///   silence (warned; the next resolve retries).
+    ///
+    /// # Returns
+    ///
+    /// `true` only when an id actually landed on a still-serving, id-less
+    /// occupant — the one change worth publishing.
+    fn on_serve_id_refreshed(
+        &mut self,
+        port: u16,
+        generation: u64,
+        discovered: Option<&str>,
+    ) -> bool {
+        let Some(slot) = self.slots.iter().position(|s| {
+            s.occupant
+                .as_ref()
+                .is_some_and(|o| o.ticket.port == port && o.ticket.generation == generation)
+        }) else {
+            return false;
+        };
+        let Some(occupant) = self.slots[slot].occupant.as_mut() else {
+            return false;
+        };
+        let Some(id) = discovered else {
+            tracing::warn!(
+                model = %occupant.model,
+                port,
+                "serve_id re-discovery still reports nothing; the proxy forwards \
+                 the harness name and the next resolve retries"
+            );
+            return false;
+        };
+        if occupant.serve_id.is_some() {
+            return false;
+        }
+        tracing::info!(
+            model = %occupant.model,
+            port,
+            serve_id = %id,
+            "serve_id re-discovery landed; the next forward carries the engine id"
+        );
+        occupant.serve_id = Some(id.to_string());
+        true
     }
 
     fn cancel_job(&mut self, job_id: JobId, reason: &str) {

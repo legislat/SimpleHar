@@ -9,7 +9,10 @@
 //! which is what makes a release in flight observable), `mock-hold-never` (never ready
 //! AND its kill parks: the spawn-failure path with the reap held, so the funnel's
 //! `Failed` park is an observable state), and `mock-nodiscovery` (instant ready but
-//! `/v1/models` 404s: the silent-engine discovery class). The id an engine reports at
+//! `/v1/models` 404s: the silent-engine discovery class), and `mock-late-discovery`
+//! (404s the FIRST `/v1/models` probe only, so a discovery miss at readiness is
+//! observable recovering on a later resolve — FINDINGS-06 [8]). The id an engine
+//! reports at
 //! `/v1/models` comes from `spec.env["MOCK_MODEL_ID"]` (default `mock-model`), so a
 //! test can give each engine a DISTINCT identity via [`MockIdAdapter`].
 
@@ -60,6 +63,10 @@ pub enum MockMode {
     /// `/health` answers immediately but `/v1/models` 404s: the silent-engine class
     /// where `discover_model_id` finds nothing and the harness must not invent an id.
     NeverDiscover,
+    /// `/health` answers immediately and `/v1/models` 404s for the FIRST probe only
+    /// (FINDINGS-06 [8]): discovery misses at readiness, and only a later re-probe
+    /// sees the id — the shape that makes a serve-id retry observable.
+    LateDiscover,
 }
 
 fn mode_for(engine: &str) -> MockMode {
@@ -72,6 +79,7 @@ fn mode_for(engine: &str) -> MockMode {
         "mock-hold-kill" => MockMode::HoldKill,
         "mock-hold-never" => MockMode::HoldKillNever,
         "mock-nodiscovery" => MockMode::NeverDiscover,
+        "mock-late-discovery" => MockMode::LateDiscover,
         _ => MockMode::Instant,
     }
 }
@@ -127,10 +135,18 @@ impl Drop for ParkedKill {
 struct MockState {
     mode: MockMode,
     model_id: Option<String>,
+    /// Remaining `/v1/models` probes that answer 404 before this engine starts
+    /// reporting its id (FINDINGS-06 [8]: the `LateDiscover` class).
+    discover_failures: Arc<AtomicU32>,
 }
 
 async fn models(State(state): State<MockState>) -> axum::response::Response {
-    if state.mode == MockMode::NeverDiscover {
+    let misses_discovery = state.mode == MockMode::NeverDiscover
+        || state
+            .discover_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+    if misses_discovery {
         // The silent engine: `/v1/models` answers nothing usable, so discovery
         // yields `None` and the proxy must fall back to the harness name.
         return axum::http::StatusCode::NOT_FOUND.into_response();
@@ -394,6 +410,12 @@ impl EngineRuntime for MockRuntime {
             .unwrap_or("mock");
         let mode = mode_for(engine);
         let model_id = spec.env.get("MOCK_MODEL_ID").cloned();
+        let discover_failures = Arc::new(AtomicU32::new(
+            spec.env
+                .get("MOCK_DISCOVERY_FAILURES")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0),
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| SpawnError::SpawnFailed {
@@ -412,6 +434,7 @@ impl EngineRuntime for MockRuntime {
             .with_state(MockState {
                 mode: mode.clone(),
                 model_id,
+                discover_failures,
             });
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -583,6 +606,34 @@ impl EngineAdapter for MockIdAdapter {
         let mut spec = simplehar_se::engine::mock::MockAdapter.spec(model, port)?;
         spec.env
             .insert("MOCK_MODEL_ID".to_string(), self.serve_id.to_string());
+        Ok(spec)
+    }
+}
+
+/// A `MockAdapter` whose engine misses the FIRST `/v1/models` discovery and
+/// reports `serve_id` on every probe after it (FINDINGS-06 [8]): the readiness
+/// discovery yields `None`, and only a re-probe — the kind the scheduler now
+/// runs when an occupant resolves with no id — can ever see the id.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // binaries that never script a late id still compile this module
+pub struct MockLateIdAdapter {
+    /// The `engine:` id the yaml must carry to select this adapter.
+    pub engine: &'static str,
+    /// The id this engine reports at `/v1/models` once it stops missing.
+    pub serve_id: &'static str,
+}
+
+impl EngineAdapter for MockLateIdAdapter {
+    fn engine_id(&self) -> &str {
+        self.engine
+    }
+
+    fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
+        let mut spec = simplehar_se::engine::mock::MockAdapter.spec(model, port)?;
+        spec.env
+            .insert("MOCK_MODEL_ID".to_string(), self.serve_id.to_string());
+        spec.env
+            .insert("MOCK_DISCOVERY_FAILURES".to_string(), "1".to_string());
         Ok(spec)
     }
 }
