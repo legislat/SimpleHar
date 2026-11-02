@@ -1240,10 +1240,7 @@ mod tests {
                 "Swift_1_5_qwen3_8_27b_uncensored_nvfp4.ninfer",
             ),
             ("ninfer_internal_port", "8090"),
-            (
-                "ninfer_model_roots",
-                "/mnt/d/Models,/home/u/ai/models",
-            ),
+            ("ninfer_model_roots", "/mnt/d/Models,/home/u/ai/models"),
             (
                 "ninfer_serve_args",
                 "--spec dflash2 --draft-tokens 7 --vision",
