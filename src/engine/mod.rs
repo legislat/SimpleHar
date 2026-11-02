@@ -153,8 +153,10 @@ pub enum Probe {
 /// behind the `/har/models` `context` field and the page's Ctx column (operator
 /// ruling 2026-11-02: the display shows what each engine really serves, never
 /// the inert row key). Per engine: llama reads its own `context` knob (the one
-/// engine mapping it to a flag, unchanged); strata answers the `--max-context`
-/// token of its `strata_args` argv ([`strata::effective_context`]); ninfer
+/// engine mapping it to a flag, unchanged); strata answers the context
+/// figure riding its `strata_args` argv — the token after `--max-context`
+/// or the `--max-context=` suffix, digits only ([`strata::effective_context`]);
+/// ninfer
 /// answers the max-context of the profile its launcher resolves
 /// ([`ninfer::effective_context`]); every other engine (mock) has no context
 /// statement and answers `None`. A `None` ships as null: a stale `context:`

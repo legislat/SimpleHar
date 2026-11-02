@@ -247,20 +247,35 @@ fn knob<'a>(model: &'a ModelEntry, key: &str) -> Option<&'a str> {
 }
 
 /// The `strata_args` tokenization: comma-separated engine argv tokens, each
-/// trimmed — the one owner of the shape (the render refuses an empty entry by
-/// counting what it spelled, [`effective_context`] reads the argv back).
-fn arg_tokens(line: &str) -> Vec<String> {
-    line.split(',')
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-        .collect()
+/// trimmed. The one well-formedness rule, shared by both consumers: an empty
+/// entry (bare or whitespace-only between commas) makes the line malformed —
+/// the render refuses it (one token per entry, FINDINGS-10 [3]) and
+/// [`effective_context`] answers `None` for the same line, so a row that
+/// never loads can never display a context (FINDINGS-17).
+fn well_formed_tokens(line: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    for entry in line.split(',') {
+        let token = entry.trim();
+        if token.is_empty() {
+            return None;
+        }
+        tokens.push(token.to_string());
+    }
+    Some(tokens)
 }
 
-/// The context a strata row actually serves: the value riding the engine's own
-/// argv — the token following `--max-context` in the comma-separated
-/// `strata_args` list (e.g. `--pack, --max-context, 262144`). The row
-/// `context:` key is the llama knob the strata engine never reads (the scan
-/// reports it as `InertKey`), so it is never a fallback: no token, no answer.
+/// The context a strata row actually serves: the figure riding the engine's
+/// own argv in the comma-separated `strata_args` list — the token after
+/// `--max-context` (`--pack, --max-context, 262144`) or the suffix of
+/// `--max-context=262144`. Either spelling must carry an all-ASCII-digits
+/// figure: a `--max-context` followed by a flag or other non-figure, or an
+/// eq suffix that is not a figure, answers `None` — Ctx shows only what the
+/// engine will actually serve, never a flag and never a guess. A line with
+/// an empty comma entry never loads (the render refuses it,
+/// [`well_formed_tokens`]), so the display answers `None` for it too. The
+/// row `context:` key is the llama knob the strata engine never reads (the
+/// scan reports it as `InertKey`), so it is never a fallback: no token, no
+/// answer.
 ///
 /// # Arguments
 ///
@@ -268,16 +283,32 @@ fn arg_tokens(line: &str) -> Vec<String> {
 ///
 /// # Returns
 ///
-/// The spelled max-context value, `None` when the argv names none.
+/// The spelled max-context figure, `None` when the argv names none the
+/// engine would serve.
 #[must_use]
 pub fn effective_context(raw: &BTreeMap<String, String>) -> Option<String> {
     let line = raw
         .get("strata_args")
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())?;
-    let tokens = arg_tokens(line);
-    let at = tokens.iter().position(|token| token == "--max-context")?;
-    tokens.get(at + 1).cloned()
+    let tokens = well_formed_tokens(line)?;
+    let mut tokens = tokens.iter();
+    while let Some(token) = tokens.next() {
+        if let Some(value) = token.strip_prefix("--max-context=") {
+            return context_figure(value).map(str::to_string);
+        }
+        if token == "--max-context" {
+            return context_figure(tokens.next()?).map(str::to_string);
+        }
+    }
+    None
+}
+
+/// The all-ASCII-digits shape of a context figure: what the engine would
+/// actually serve. Anything else — a flag, `auto`, the empty suffix of a
+/// bare `--max-context=` — is not a figure.
+fn context_figure(text: &str) -> Option<&str> {
+    (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())).then_some(text)
 }
 
 /// A required single-value key that must carry an absolute-path shape
@@ -581,15 +612,11 @@ pub(crate) fn render_profile(model: &ModelEntry, cwd: &Path) -> Result<String, E
         });
     };
     let mut args: Vec<String> = match knob(model, "strata_args") {
-        Some(line) => {
-            let tokens = arg_tokens(line);
-            if tokens.len() != line.split(',').count() {
-                return Err(rejected(format!(
-                    "`strata_args` must be comma-separated non-empty engine tokens: {line}"
-                )));
-            }
-            tokens
-        }
+        Some(line) => well_formed_tokens(line).ok_or_else(|| {
+            rejected(format!(
+                "`strata_args` must be comma-separated non-empty engine tokens: {line}"
+            ))
+        })?,
         None => Vec::new(),
     };
     if let Some(banned) = args
@@ -904,6 +931,61 @@ mod tests {
             assert_eq!(effective_context(&raw), None, "`{line}` names no value");
         }
         assert_eq!(effective_context(&raw(&[])), None, "no knob, no answer");
+    }
+
+    /// 10[1]: the eq form is spawn truth too (server.py splits `--flag=value`).
+    /// Falsifier: drop the eq-form arm from the lookup and this line answers
+    /// None while the engine would serve 262144.
+    #[test]
+    fn effective_context_reads_the_eq_form_figure() {
+        let raw = raw(&[("strata_args", "--pack, --max-context=262144, --kv, int8")]);
+        assert_eq!(effective_context(&raw).as_deref(), Some("262144"));
+    }
+
+    /// 10[2]: a flag in the value slot is not a figure. Falsifier: answer the
+    /// value as `tokens.get(at + 1)` with no plausibility guard and `--kv`
+    /// displays as the context.
+    #[test]
+    fn effective_context_refuses_a_flag_in_the_value_slot() {
+        let raw = raw(&[("strata_args", "--max-context, --kv, int8")]);
+        assert_eq!(effective_context(&raw), None, "a flag is not a figure");
+    }
+
+    /// Falsifier: drop the digits guard on the eq suffix and `auto` displays
+    /// as the context.
+    #[test]
+    fn effective_context_refuses_a_non_numeric_eq_value() {
+        let raw = raw(&[("strata_args", "--max-context=auto, --kv, int8")]);
+        assert_eq!(effective_context(&raw), None, "`auto` is not a figure");
+    }
+
+    /// 10[3]: the two consumers share [`well_formed_tokens`] — a line with an
+    /// empty entry refuses at render, so it shows no context either.
+    /// Falsifier: let `effective_context` tokenize leniently (skip the shared
+    /// well-formedness check) and the display shows `262144` for a row that
+    /// never loads.
+    #[test]
+    fn an_empty_entry_shows_no_context_and_refuses_the_render() {
+        let line = "--pack, , --max-context, 262144";
+        let raw = raw(&[("strata_args", line)]);
+        assert_eq!(effective_context(&raw), None, "`{line}` never loads");
+        let base = fixture_pairs();
+        let mut pairs: Vec<(&str, &str)> =
+            base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        pairs.push(("strata_args", line));
+        let err = StrataAdapter::new(
+            std::env::current_exe().expect("real .exe"),
+            std::env::temp_dir(),
+        )
+        .spec(&entry(&pairs), 18109)
+        .expect_err("an empty entry must refuse the render");
+        let EngineError::Rejected { reason, .. } = &err else {
+            panic!("expected Rejected, got {err:?}");
+        };
+        assert!(
+            reason.contains("strata_args") && reason.contains("non-empty"),
+            "{reason}"
+        );
     }
 
     fn entry(pairs: &[(&str, &str)]) -> ModelEntry {
