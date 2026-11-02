@@ -30,10 +30,9 @@ node tests/webui/webui_dom_test.mjs
 - The gate must not start an engine and must not load a model.
 - The gate runs from any session, including a served session.
 
-`scripts/gate.ps1` will be the executable form of this list. Once the script exists, the
-script is authoritative and this list describes it. Until the script exists, this list is
-the authoritative definition. A gate change needs an operator-approved change to this
-file first, then the same change in the script.
+`scripts/gate.ps1` is the executable form of this list. The script is authoritative and
+this list describes it. A gate change needs an operator-approved change to this file
+first, then the same change in the script.
 
 ## The card gate
 

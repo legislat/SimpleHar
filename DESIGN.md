@@ -1,3 +1,13 @@
+---
+title: Design decomposition (historical)
+owner: operator
+status: historical
+audience: [architect, agent]
+source_of_truth_for: []
+last_reviewed: 2026-11-02
+review_trigger: release
+---
+
 # SimpleHar SE — Design Decomposition (rewrite)
 
 > **HISTORICAL DESIGN RECORD.** This file preserves the design decomposition as

@@ -380,3 +380,9 @@ Unresolved questions live ONLY in `DECISIONS-PENDING.md`. This file only ever *g
   `# not mapped: vision.<key>` as since `d7e3858`. The golden import->render round-trip
   now carries both keys in every gate run, so the knob set cannot silently drift from
   the engine contract again.
+
+- Governance D1-D11 adopted 2026-11-02: durable core tracked, live state local, DESIGN
+  historical, decisions moved to `docs/architecture/DECISIONS.md`, maximum two working
+  subagents, narrative commits, cardless CI, local gotchas/findings, live-layer backup,
+  version/changelog coupling, and ASD-STE100 for durable docs. N2 closed by this ruling.
+  | 2026-11-02 | `1bd78c8`
