@@ -438,10 +438,14 @@ async fn unload_frees_slot_ledger_and_engine() {
     })
     .await;
     assert_eq!(runtime.server_count(), 0, "unload must kill the engine");
-    // Idempotent: unloading an empty category is a plain Done.
+    // Idempotent: unloading an empty category moved nothing, and the reply says so
+    // (FINDINGS-07 [5]: it used to be an indistinguishable `Done`).
     assert!(matches!(
         handle.unload(CategoryId::Work).await.expect("idempotent"),
-        Reply::Done
+        Reply::Unloaded {
+            unloading: 0,
+            jobs_cancelled: 0
+        }
     ));
 }
 
@@ -458,9 +462,12 @@ async fn unload_model_during_load_cancels_and_kills_engine() {
     assert!(
         matches!(
             handle.unload_model("qwen3").await.expect("accepted"),
-            Reply::Done
+            Reply::Unloaded {
+                unloading: 0,
+                jobs_cancelled: 1
+            }
         ),
-        "unload of a loading slot is a Done (the cancel rides the job)"
+        "a loading slot had no occupant: the reply names the cancelled job, not an unload"
     );
     wait_until(&handle, 5, |s| {
         s.jobs.iter().any(|j| j.id == job && j.terminal)
@@ -479,10 +486,13 @@ async fn unload_model_during_load_cancels_and_kills_engine() {
         0,
         "cancelled swap must not leak an engine"
     );
-    // T12.2: unloading a model that is not loaded is an idempotent Done.
+    // T12.2: unloading a model that is not loaded moved nothing; the reply says so.
     assert!(matches!(
         handle.unload_model("ghost").await.expect("idempotent"),
-        Reply::Done
+        Reply::Unloaded {
+            unloading: 0,
+            jobs_cancelled: 0
+        }
     ));
 }
 
@@ -560,7 +570,10 @@ async fn cancel_of_a_swap_mid_victim_release_kills_the_victim_and_empties_its_sl
             .unload(CategoryId::Work)
             .await
             .expect("cancel accepted"),
-        Reply::Done
+        Reply::Unloaded {
+            unloading: 1,
+            jobs_cancelled: 1
+        }
     ));
     assert_eq!(
         runtime.server_count(),
@@ -766,7 +779,10 @@ async fn unload_all_clears_every_category_and_cancels_inflight() {
 
     assert!(matches!(
         handle.unload_all().await.expect("accepted"),
-        Reply::Done
+        Reply::Unloaded {
+            unloading: 1,
+            jobs_cancelled: 1
+        }
     ));
     wait_until(&handle, 8, |s| {
         s.slots.iter().all(|slot| slot.model.is_none()) && s.jobs.iter().all(|j| j.terminal)
@@ -775,7 +791,10 @@ async fn unload_all_clears_every_category_and_cancels_inflight() {
     assert_eq!(runtime.server_count(), 0, "unload-all kills every engine");
     assert!(matches!(
         handle.unload_all().await.expect("idempotent"),
-        Reply::Done
+        Reply::Unloaded {
+            unloading: 0,
+            jobs_cancelled: 0
+        }
     ));
 }
 
@@ -1630,9 +1649,12 @@ async fn unload_during_a_swap_frees_the_slot_after_cancelling_the_swap() {
                 .unload_model(HOLD_MODEL)
                 .await
                 .expect("unload accepted"),
-            Reply::Done
+            Reply::Unloaded {
+                unloading: 1,
+                jobs_cancelled: 1
+            }
         ),
-        "the unload of a swapping slot is accepted"
+        "the unload of a swapping slot commits to free the occupant behind the cancel"
     );
 
     wait_until(&handle, 10, |s| {
@@ -1728,26 +1750,34 @@ async fn unload_during_a_swap_frees_the_slot_after_cancelling_the_swap() {
 }
 
 #[tokio::test]
-async fn unload_replies_done_before_any_release_evidence() {
-    // FINDINGS-02 [2], second half: the reply honesty pin. `unload_slots` answers
-    // `Reply::Done` as soon as the commands are dispatched, while the kill it
-    // triggered is still in flight, so a client cannot tell a freed slot from one
-    // whose release is unproven. This pins what the API returns TODAY: making the
-    // reply carry release evidence is API surgery outside this finding's approved fix
-    // (`Reply::Done` has no payload and `/har/unload` hands back no job id to poll).
+async fn unload_replies_acceptance_before_any_release_evidence() {
+    // FINDINGS-02 [2] second half + FINDINGS-07 [5] reply honesty: `unload_slots`
+    // answers `Reply::Unloaded` as soon as the commands are dispatched, while the
+    // kill it triggered is still in flight. The reply names the COMMITMENT (one
+    // slot unloading, one job cancelled), never a release: a client still cannot
+    // read a freed slot out of it, and the job ledger stays the release truth.
     let (handle, runtime) = parked_swap_harness();
     serve_and_submit_frozen_swap(&handle).await;
 
-    handle
-        .unload_model(HOLD_MODEL)
-        .await
-        .expect("unload accepted");
+    assert!(
+        matches!(
+            handle
+                .unload_model(HOLD_MODEL)
+                .await
+                .expect("unload accepted"),
+            Reply::Unloaded {
+                unloading: 1,
+                jobs_cancelled: 1
+            }
+        ),
+        "the reply is an acceptance while the release is still unproven"
+    );
 
     let status = handle.status().await.expect("actor alive");
     assert_eq!(
         slot_model(&status, CategoryId::Work),
         vec![Some(HOLD_MODEL.to_string())],
-        "the Done the caller already holds arrived with the slot still occupied"
+        "the acceptance the caller already holds arrived with the slot still occupied"
     );
     assert_eq!(
         runtime.server_count(),
@@ -2292,7 +2322,10 @@ async fn a_swap_whose_victim_never_proves_its_release_times_out_and_keeps_the_oc
                 .unload(CategoryId::Work)
                 .await
                 .expect("unload accepted"),
-            Reply::Done
+            Reply::Unloaded {
+                unloading: 1,
+                jobs_cancelled: 0
+            }
         ),
         "the slot the timeout kept is unloadable"
     );

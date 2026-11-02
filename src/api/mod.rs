@@ -7,8 +7,9 @@
 //! - a no-`model` body on a category listener means "use this category": the loaded
 //!   occupant (MRU among AUX x N), else the category's `default_model` loaded as a
 //!   normal job, else `400` (operator rule 2026-10-24, resolves F-2);
-//! - `/har/unload` bodies are strict: unparseable is `400`, never an implicit
-//!   unload-all (v3.3 CRITICAL fix);
+//! - `/har/unload` bodies are strict: unparseable is `400`, both scopes at once is
+//!   `400`, never an implicit unload-all (v3.3 CRITICAL fix); the reply reports what
+//!   the actor actually did, never a blanket `unloading` (FINDINGS-07 [5]/[6]);
 //! - proxy responses stream through byte-for-byte, SSE included;
 //! - `/har/*` lives on the one control listener; the control router has no request
 //!   timeout because `/har/load` deliberately waits through the load (Step 12
@@ -1258,14 +1259,17 @@ async fn har_load(
         } => {
             json!({ "status": "already", "model": model, "category": category, "port": port, "serve_id": serve_id })
         }
-        Reply::Done => json!({ "status": "done" }),
+        Reply::Done | Reply::Unloaded { .. } => json!({ "status": "done" }),
     }))
 }
 
 /// `POST /har/unload` — `{"category": "WORK"}` one category, `{"model": name}`
 /// one slot (T12.1), `{}` every occupied slot (T12.4, the explicit unload-all),
 /// garbage `400` (the v3.3 CRITICAL fix was about *unparseable* bodies, never an
-/// implicit unload-all). Unloading a loading slot cancels the load (T8).
+/// implicit unload-all), and both scopes at once `400` rather than a silently
+/// wider category kill (FINDINGS-07 [6]). Unloading a loading slot cancels the
+/// load (T8). The reply reports what the actor actually did — `unloading`,
+/// `cancelled` or `nothing_unloaded` (FINDINGS-07 [5]).
 async fn har_unload(
     State(state): State<Arc<ApiState>>,
     body: Result<Json<Value>, JsonRejection>,
@@ -1273,32 +1277,76 @@ async fn har_unload(
     let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
         reason: format!("body must be JSON: {rejection}"),
     })?;
+    if body.get("model").is_some() && body.get("category").is_some() {
+        return Err(ApiError::BadRequest {
+            reason: "send exactly one of `model` or `category`, never both: \
+                     `{\"model\": …}` unloads one model, `{\"category\": …}` every \
+                     occupant of the category"
+                .to_string(),
+        });
+    }
     if let Some(raw) = body.get("category").and_then(Value::as_str) {
         let category: CategoryId = raw
             .parse()
             .map_err(|reason| ApiError::BadRequest { reason })?;
-        state
+        let reply = state
             .scheduler
             .unload(category)
             .await
             .map_err(ApiError::from)?;
-        return Ok(Json(json!({ "status": "unloading", "category": category })));
+        return Ok(Json(unload_reply(("category", json!(category)), reply)?));
     }
     if let Some(model) = body.get("model").and_then(Value::as_str) {
-        state
+        let reply = state
             .scheduler
             .unload_model(model)
             .await
             .map_err(ApiError::from)?;
-        return Ok(Json(json!({ "status": "unloading", "model": model })));
+        return Ok(Json(unload_reply(("model", json!(model)), reply)?));
     }
     if body.as_object().is_some_and(|map| map.is_empty()) {
-        state.scheduler.unload_all().await.map_err(ApiError::from)?;
-        return Ok(Json(json!({ "status": "unloading", "scope": "all" })));
+        let reply = state.scheduler.unload_all().await.map_err(ApiError::from)?;
+        return Ok(Json(unload_reply(("scope", json!("all")), reply)?));
     }
     Err(ApiError::BadRequest {
         reason: "unrecognized body: send {} (all), {\"category\": …} or {\"model\": …}".to_string(),
     })
+}
+
+/// The honest reply shape for `/har/unload` (FINDINGS-07 [5]): `unloading` names
+/// slots whose release the actor committed to (the release itself still lands on
+/// the job ledger, GOTCHAS: a 200 is an acceptance, never a release), `cancelled`
+/// names a command that only cancelled in-flight or parked loads, and
+/// `nothing_unloaded` names a no-op — a never-loaded model or an empty harness
+/// may not answer like a scope that moved. An unload command answered with any
+/// other variant is an invariant violation, refused as one rather than dressed up
+/// as a status.
+fn unload_reply(scope: (&str, Value), reply: Reply) -> Result<Value, ApiError> {
+    let (unloading, jobs_cancelled) = match reply {
+        Reply::Unloaded {
+            unloading,
+            jobs_cancelled,
+        } => (unloading, jobs_cancelled),
+        other => {
+            return Err(ApiError::Internal {
+                reason: format!("the scheduler answered an unload command with {other:?}"),
+            })
+        }
+    };
+    let status = if unloading > 0 {
+        "unloading"
+    } else if jobs_cancelled > 0 {
+        "cancelled"
+    } else {
+        "nothing_unloaded"
+    };
+    let (key, value) = scope;
+    Ok(json!({
+        "status": status,
+        "unloading": unloading,
+        "jobs_cancelled": jobs_cancelled,
+        key: value,
+    }))
 }
 
 /// The loaded-side facts for one model row, joined server-side from ONE scheduler
@@ -2339,12 +2387,13 @@ async fn swap_for_port(
         Reply::Loaded(receipt) => (receipt.port, receipt.serve_id),
         Reply::Already { port, serve_id, .. } => (port, serve_id),
         // `on_swap` only ever answers a swap with `Already` or by attaching the waiter
-        // to a load that finishes `Loaded(receipt)`; `Done` is the unload/cancel reply.
+        // to a load that finishes `Loaded(receipt)`; `Done` is the cancel/reload reply
+        // and `Unloaded` belongs to the unload commands.
         // Fabricating `0` here handed the proxy `127.0.0.1:0` — a connect failure three
         // layers from the cause, and a port number that belongs to no listener
         // (FINDINGS2-0507 [10]). An answer that names no port is an invariant
         // violation, and it is reported as one.
-        Reply::Done => {
+        Reply::Done | Reply::Unloaded { .. } => {
             return Err(ApiError::Internal {
                 reason: format!(
                     "the scheduler acknowledged the swap of `{model}` into {category} without \

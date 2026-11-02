@@ -399,7 +399,7 @@ per-category, Exit.
 | `GET /har/log?limit=n` | Ring buffer of harness events |
 | `GET /har/models` | Full catalog (page view; includes paths) |
 | `POST /har/load` | `{model}` — loads into the model's own category (from its yaml) |
-| `POST /har/unload` | `{model}` \| `{category}` \| `{}` (all). Unloading a *loading* slot cancels that swap (cleanup still completes) |
+| `POST /har/unload` | `{model}` \| `{category}` \| `{}` (all) — never both keys at once (`400`). Reply status is honest: `unloading` (counts `unloading`/`jobs_cancelled`; 200 is an acceptance, release lands on the job ledger), `cancelled` (only load jobs were cancelled, nothing installed was freed), `nothing_unloaded`. Unloading a *loading* slot cancels that swap (cleanup still completes) |
 | `POST /har/rescan` | `{}` catalog rescan |
 | `POST /har/config/default` | `{category, model \| null}` — `model` is required; a string sets the default (stored as its canonical name), `null` clears it. Persists to the config file |
 | `POST /har/config/logging` | `{enabled: bool}` — toggles the verbose harness log |

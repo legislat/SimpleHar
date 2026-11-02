@@ -359,9 +359,11 @@ async fn unload_bodies_are_strict() {
     // Garbage: 400.
     let (status, _) = post_json(&control, "/har/unload", "not json").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    // Model unload of a not-loaded model: accepted (Done), idempotent (T12.2).
-    let (status, _) = post_json(&control, "/har/unload", r#"{"model":"never-loaded"}"#).await;
+    // Model unload of a not-loaded model: accepted (T12.2 idempotence), and the
+    // reply names the no-op instead of claiming an unload (FINDINGS-07 [5]).
+    let (status, body) = post_json(&control, "/har/unload", r#"{"model":"never-loaded"}"#).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "nothing_unloaded", "{body}");
     assert_eq!(
         runtime.server_count(),
         1,
@@ -392,6 +394,11 @@ async fn unload_bodies_are_strict() {
     let (status, body) = post_json(&control, "/har/unload", r#"{"category":"WORK"}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
+        body["status"], "unloading",
+        "a real category unload: {body}"
+    );
+    assert_eq!(body["unloading"], 1, "{body}");
+    assert_eq!(
         await_server_count(&runtime, 0).await,
         0,
         "the category unload frees its engine"
@@ -406,6 +413,146 @@ async fn unload_bodies_are_strict() {
     assert!(
         work_slot["model"].is_null(),
         "and the slot reads empty afterwards: {status}"
+    );
+}
+
+#[tokio::test]
+async fn unload_reply_names_what_the_actor_actually_did() {
+    // FINDINGS-07 [5]: the handler discarded the actor's `Reply` and always answered
+    // `{"status":"unloading"}` — the no-op arms (nothing loaded at all, or a model
+    // that never was) answered exactly like a scope that really moved. The reply
+    // must now name the fact: `nothing_unloaded` when the command moved nothing,
+    // `unloading` with the slot count when a real unload was accepted.
+    // Falsifier: pre-fix the two `nothing_unloaded` asserts fail on "unloading".
+    let (control, _, _, _, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+
+    let (status, body) = post_json(&control, "/har/unload", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an idempotent no-op stays 200: {body}"
+    );
+    assert_eq!(body["status"], "nothing_unloaded", "{body}");
+    assert_eq!(body["model"], "qwen3", "the scope echo survives");
+    let (_, body) = post_json(&control, "/har/unload", "{}").await;
+    assert_eq!(
+        body["status"], "nothing_unloaded",
+        "unload-all over an empty harness moved nothing: {body}"
+    );
+    assert_eq!(runtime.server_count(), 0, "a no-op frees nothing");
+
+    let (status, _) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "the engine is installed for the real leg"
+    );
+    let (_, body) = post_json(&control, "/har/unload", r#"{"category":"WORK"}"#).await;
+    assert_eq!(
+        body["status"], "unloading",
+        "a real unload still says unloading: {body}"
+    );
+    assert_eq!(body["unloading"], 1, "{body}");
+    assert_eq!(
+        await_server_count(&runtime, 0).await,
+        0,
+        "the accepted unload really frees the engine"
+    );
+}
+
+#[tokio::test]
+async fn unload_during_a_load_answers_cancelled_not_unloading() {
+    // FINDINGS-07 [5], the cancel arm: unloading a still-loading slot cancels the
+    // swap; no occupant was ever installed there, so the honest reply is
+    // `cancelled` — not the unconditional `unloading` the handler used to print.
+    // Falsifier: pre-fix the status assert reads "unloading".
+    let (control, _, _, _, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("slowcat", "mock-slow", CategoryId::Work, Some(4.0))],
+    );
+    let loader = {
+        let control = control.clone();
+        tokio::spawn(
+            async move { post_json(&control, "/har/load", r#"{"model":"slowcat"}"#).await },
+        )
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (_, status) = get_json(&control, "/har/status").await;
+        let loading = status["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .any(|slot| slot["category"] == "WORK" && !slot["loading_job"].is_null());
+        if loading {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the load never became a visible job: {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let (status, body) = post_json(&control, "/har/unload", r#"{"model":"slowcat"}"#).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["status"], "cancelled",
+        "a cancelled load with nothing installed says cancelled: {body}"
+    );
+    assert_eq!(body["unloading"], 0, "{body}");
+    assert_eq!(body["jobs_cancelled"], 1, "{body}");
+
+    let (load_status, load_body) = loader.await.expect("the load task survives");
+    assert_eq!(
+        load_status,
+        StatusCode::CONFLICT,
+        "the cancelled load must not report a loaded model: {load_body}"
+    );
+    assert_eq!(
+        await_server_count(&runtime, 0).await,
+        0,
+        "the cancelled swap leaks no engine"
+    );
+}
+
+#[tokio::test]
+async fn unload_body_with_both_model_and_category_is_refused() {
+    // FINDINGS-07 [6]: a body carrying BOTH scopes silently took the wider category
+    // branch (tested first), so "unload this one model from WORK" killed every WORK
+    // occupant and echoed only the category. README lists the three shapes as
+    // alternatives, never combinable: both keys are a structural 400 in the
+    // project's `{code, message}` envelope.
+    // Falsifier: pre-fix this answers 200 and the WORK engine dies.
+    let (control, _, _, _, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let (status, _) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(runtime.server_count(), 1, "one engine is loaded");
+
+    let (status, body) = post_json(
+        &control,
+        "/har/unload",
+        r#"{"model":"qwen3","category":"WORK"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body["code"], "bad_request", "flat envelope: {body}");
+    assert_eq!(
+        body["error"]["code"], "bad_request",
+        "the OpenAI envelope carries the same code"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "a refused scope must kill nothing"
     );
 }
 

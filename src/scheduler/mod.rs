@@ -130,8 +130,18 @@ pub enum Reply {
         /// The engine's self-reported id (may rewrite differently, F-4).
         serve_id: Option<String>,
     },
-    /// The command was accepted (cancel/unload).
+    /// The command was accepted with nothing further to report (cancel, reload).
     Done,
+    /// An accepted unload command, reporting what the actor actually did at accept
+    /// (FINDINGS-07 [5]): never a blanket `Done` while nothing moved. The release
+    /// itself stays job-verified — this is an acceptance ledger, not release proof.
+    Unloaded {
+        /// Slots whose occupant the actor committed to free: unload jobs started
+        /// now, plus occupants armed to unload behind a cancelled swap.
+        unloading: usize,
+        /// In-flight loads cancelled and parked loads dropped by this command.
+        jobs_cancelled: usize,
+    },
 }
 
 /// Terminal receipt of one load (Step 12 idempotency: a repeat returns this).
@@ -395,7 +405,8 @@ impl SchedulerHandle {
         self.call(Command::Cancel { job }).await
     }
 
-    /// Unloads every occupant of `category`; idempotent (an empty category is `Done`).
+    /// Unloads every occupant of `category`; idempotent (an empty category
+    /// answers [`Reply::Unloaded`] with both counts zero).
     ///
     /// # Errors
     ///
@@ -2109,7 +2120,11 @@ impl ActorState {
     /// and serving while the caller is told `Done`. A load parked on a targeted slot
     /// is dropped here too: an operator's unload must never be followed by the load
     /// they abandoned starting on the slot it just freed (FINDINGS-02 [3]).
+    /// The reply reports the facts the command moved (`Reply::Unloaded`,
+    /// FINDINGS-07 [5]) — never a blanket acceptance while nothing moved.
     fn unload_slots(&mut self, slots: Vec<usize>, reply: Waiter) {
+        let mut unloading = 0usize;
+        let mut jobs_cancelled = 0usize;
         for slot in slots {
             if let Some(queued) = self.pending.remove(&slot) {
                 self.finish_queued_load(
@@ -2119,27 +2134,36 @@ impl ActorState {
                     )),
                     "cancelled",
                 );
+                jobs_cancelled += 1;
             }
             match self.slots[slot].job {
                 Some(job_id) => {
+                    let job_live = self.jobs.get(&job_id).is_some_and(|job| !job.terminal);
                     // Flagged before the cancel: it may terminalize the job inline,
                     // and that finish is exactly where the flag is consumed.
                     let cancel_continues_into_unload =
-                        self.jobs.get(&job_id).is_some_and(|job| !job.terminal)
-                            && self.slots[slot].occupant.is_some();
+                        job_live && self.slots[slot].occupant.is_some();
                     if cancel_continues_into_unload {
                         self.unload_after_finish.insert(slot);
+                        unloading += 1;
+                    }
+                    if job_live {
+                        jobs_cancelled += 1;
                     }
                     self.cancel_job(job_id, "unloaded by request");
                 }
                 None => {
                     if self.slots[slot].occupant.is_some() {
                         self.begin_unload_slot(slot, "unloaded");
+                        unloading += 1;
                     }
                 }
             }
         }
-        let _ = reply.send(Ok(Reply::Done));
+        let _ = reply.send(Ok(Reply::Unloaded {
+            unloading,
+            jobs_cancelled,
+        }));
     }
 
     /// Starts one unload job for a specific slot (`note` becomes the job outcome:
