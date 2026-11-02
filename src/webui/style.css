@@ -301,7 +301,14 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
 .sh-job:last-child { border-bottom: 0; }
 .sh-job-error { color: var(--sh-bad); overflow-wrap: anywhere; }
 
-.sh-catalog-errors { color: var(--sh-bad); font-size: 0.8rem; margin: 0.4rem 0 0; }
+/* Catalog notices are hygiene warnings, not a fault: one per line, amber. */
+.sh-catalog-errors {
+  color: var(--sh-warn);
+  font-size: 0.8rem;
+  margin: 0.4rem 0 0;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
 
 /* Small controls: unload buttons and the two static header-corner buttons. */
 .sh-mini {

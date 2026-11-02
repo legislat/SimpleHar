@@ -441,7 +441,7 @@ function renderHeader(status) {
     renderMemory(status),
     controls,
     errors.length > 0
-      ? el("div", { class: "sh-catalog-errors" }, text(errors.join(" · ")))
+      ? el("div", { class: "sh-catalog-errors" }, text(errors.join("\n")))
       : null,
   );
 }
