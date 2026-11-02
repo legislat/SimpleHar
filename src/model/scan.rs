@@ -2582,12 +2582,13 @@ mod tests {
     /// Fork C gate: the strict acceptance must not blind-side the live catalog.
     /// Since slice 10c "fully clean" is stated as a closed debt ledger: the
     /// live dir publishes every file whose bytes carry no harness-owned claim,
-    /// and the reports are exactly the ruled ones — the `context` inert hints
-    /// on the ninfer rows (that key is live llama config; the ninfer context
-    /// rides its `ninfer_profile` line) and the policy-field refusals on the
-    /// strata profiles that still declare `host`/`port` (22[1]: the profiles
-    /// must drop the keys — an in-flight serve is unaffected, the refusal
-    /// lands on the next load gesture). Every entry is pinned by file and
+    /// and the reports are exactly the ruled ones — the policy-field refusals
+    /// on the strata profiles that still declare `host`/`port` (22[1]: the
+    /// profiles must drop the keys — an in-flight serve is unaffected, the
+    /// refusal lands on the next load gesture). The `context` inert hints that
+    /// once sat on the ninfer rows landed their cleanup 2026-11-02: the key is
+    /// live llama config and the ninfer context rides its `ninfer_profile`
+    /// line, so the rows no longer carry it. Every entry is pinned by file and
     /// kind: a live file growing any other report, or an unplanned new file,
     /// fails here, and the ledger shrinks as each cleanup gesture lands.
     /// Skipped when the dir is absent.
@@ -2630,15 +2631,6 @@ mod tests {
             );
         }
         let mut want: BTreeMap<&str, &str> = BTreeMap::new();
-        for file in [
-            "ninfer-bonsai-heretic.yaml",
-            "ninfer-bonsai.yaml",
-            "ninfer-qwen-fp8.yaml",
-            "ninfer-swift-fp8.yaml",
-            "ninfer-swift-nvfp4.yaml",
-        ] {
-            want.insert(file, "inert");
-        }
         for file in [
             "strata-fp4local-bf16ple.yaml",
             "strata-iq3s.yaml",
