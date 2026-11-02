@@ -807,7 +807,14 @@ impl ApiState {
     /// Sets (or clears, with `None`) the category default and persists it to
     /// `simplehar-se.json` atomically (temp file + rename). In-memory wins even when
     /// persistence fails (logged); the response says which happened.
-    pub fn set_default_model(
+    ///
+    /// The write-back runs on a blocking thread (FINDINGS-07 [8]): the handler's
+    /// async worker must not park on the gated read-patch-copy-rename, while the
+    /// `persisted` answer still means what it always meant — the handler waits for
+    /// the leg's verdict before replying, so `/har/config/default` keeps its
+    /// response honesty (06[5]). A blocking task that dies (panic/cancel) can only
+    /// ever be answered `persisted: false`.
+    pub async fn set_default_model(
         &self,
         category: CategoryId,
         model: Option<&str>,
@@ -816,8 +823,24 @@ impl ApiState {
             .lock()
             .expect("default override lock poisoned by a writer panic")
             .insert(category, model.map(str::to_string));
-        let persisted = persist_default_model(&self.config, category, model);
-        (model.map(str::to_string), persisted)
+        let owned_model = model.map(str::to_string);
+        let config = self.config.clone();
+        let persist_model = owned_model.clone();
+        let persisted = match tokio::task::spawn_blocking(move || {
+            persist_default_model(&config, category, persist_model.as_deref())
+        })
+        .await
+        {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "config persist task died; answering persisted:false"
+                );
+                false
+            }
+        };
+        (owned_model, persisted)
     }
 
     fn touch(&self, model: &str) {
@@ -873,6 +896,10 @@ fn config_write_path(config: &AppConfig) -> std::path::PathBuf {
 /// and `/har/config/model`'s dangling-default clear) on separate workers, and an
 /// ungated read-modify-write onto one fixed temp lost one of their fields while both
 /// answered `persisted: true` (FINDINGS-07 [3]).
+///
+/// It is the synchronous core by design — [`ApiState::set_default_model`] runs it
+/// inside `tokio::task::spawn_blocking`, so the gate is held on a blocking thread
+/// where parking is allowed and the reactor never is (FINDINGS-07 [8]).
 fn persist_default_model(config: &AppConfig, category: CategoryId, model: Option<&str>) -> bool {
     // One critical section with every yaml rewrite (FINDINGS-07 [3]): the second
     // writer can no longer read the ORIGINAL while the first one is between its
@@ -1917,7 +1944,9 @@ async fn har_config_default(
             })
         }
     };
-    let (effective, persisted) = state.set_default_model(category, requested.as_deref());
+    let (effective, persisted) = state
+        .set_default_model(category, requested.as_deref())
+        .await;
     Ok(Json(json!({
         "status": "ok",
         "category": category,
@@ -2010,20 +2039,39 @@ async fn har_config_model(
             reason: "nothing to edit: send `category` and/or `cpu`".to_string(),
         });
     }
-    let refs: Vec<(&str, Option<&str>)> = edits
-        .iter()
-        .map(|(key, value)| (*key, value.as_deref()))
-        .collect();
     // One rewrite for every edit: calling `set_flag_on_file` per key would leave
     // the file half-edited (category moved, alias still there) if a write failed
     // between the two — 1g's non-atomic defect, not replicated here.
-    crate::model::writeback::set_flags_on_file(&path, &refs)
-        .map_err(|error| ApiError::from_writeback(&path, error))?;
+    // FINDINGS-07 [8]: the gated rewrite and the fingerprint that feeds the
+    // re-baseline note run together on a blocking thread — the request worker
+    // never parks on the yaml's read-modify-rename. The order the interlock
+    // depends on survives intact: the write completes, the stat reads the bytes
+    // the write landed, and only then does this handler send the note (before
+    // dispatching the reload), so the actor's mailbox still orders the
+    // re-baseline ahead of the reload turn's verdict refresh.
+    let write_path = path.clone();
+    let write_edits = edits.clone();
+    let (written, fingerprint) = tokio::task::spawn_blocking(move || {
+        let refs: Vec<(&str, Option<&str>)> = write_edits
+            .iter()
+            .map(|(key, value)| (*key, value.as_deref()))
+            .collect();
+        let written = crate::model::writeback::set_flags_on_file(&write_path, &refs);
+        let fingerprint = written
+            .is_ok()
+            .then(|| crate::model::fingerprint(&write_path))
+            .flatten();
+        (written, fingerprint)
+    })
+    .await
+    .map_err(|error| ApiError::Internal {
+        reason: format!("model-yaml write task failed: {error}"),
+    })?;
+    written.map_err(|error| ApiError::from_writeback(&path, error))?;
     // Axis-2 interlock 5: the harness's own flag edit is not a config change since
     // launch. Re-baseline any resident's spawn-side capture from this file BEFORE
-    // the reload — the actor's mailbox orders the re-baseline ahead of the reload
-    // turn's verdict refresh, so toggling a flag never amber-dots its own model.
-    if let Some(fingerprint) = crate::model::fingerprint(&path) {
+    // the reload.
+    if let Some(fingerprint) = fingerprint {
         state
             .scheduler
             .note_model_file_written(&entry.name, &path, fingerprint);
@@ -2053,7 +2101,7 @@ async fn har_config_model(
             // operator's config file for a model that never moved.
             match crate::catalog::resolve(&default, &catalog) {
                 crate::catalog::Resolution::Found(d) if d.name == entry.name => {
-                    state.set_default_model(old_category, None);
+                    state.set_default_model(old_category, None).await;
                     tracing::info!(
                         model = %entry.name,
                         from = %old_category,
@@ -3215,6 +3263,75 @@ mod tests {
                     !body.contains(banned),
                     "`{head}` may only render cached scheduler/config state; found `{banned}`"
                 );
+            }
+        }
+    }
+
+    /// FINDINGS-07 [8] structural net: the two control-handler write paths must
+    /// run their synchronous filesystem sequences on a blocking thread, never
+    /// inline on the async request worker. The order test is the whole pin: the
+    /// write call (and the re-baseline stat that follows it) must appear only
+    /// AFTER `tokio::task::spawn_blocking(` in the handler body, i.e. inside the
+    /// blocking leg, so a reactor thread can never park behind the yaml/config
+    /// read-patch-rename. Response honesty is a behavioural matter and stays
+    /// pinned where it lives (`config_persistence_is_answered_only_after_the_bytes_read_back`
+    /// and the api_surface `persisted` legs) — the handler still awaits the leg's
+    /// verdict before answering.
+    ///
+    /// Falsifier: lift any of the three fs calls back out of its `spawn_blocking`
+    /// closure and the order assert fires first; delete the offload entirely and
+    /// the contains assert fires — both red on the pre-fix shape of this file.
+    /// Every occurrence of each token is checked, so a second inline call added
+    /// after the leg's `.await` trips the same assert.
+    #[test]
+    fn the_control_write_backs_run_on_a_blocking_thread() {
+        let source = include_str!("mod.rs");
+        for (head, tail, write_calls) in [
+            (
+                "async fn set_default_model(",
+                "default_overrides",
+                vec!["persist_default_model("],
+            ),
+            (
+                "async fn har_config_model(",
+                "\"status\": \"edited\"",
+                vec!["set_flags_on_file(", "crate::model::fingerprint("],
+            ),
+        ] {
+            let start = source
+                .find(head)
+                .unwrap_or_else(|| panic!("{head} is still here"));
+            let close = source[start..]
+                .find(if head.contains("set_default_model") {
+                    "\n    }\n"
+                } else {
+                    "\n}\n"
+                })
+                .unwrap_or_else(|| panic!("{head} closes where expected"));
+            let body = &source[start..start + close];
+            assert!(
+                body.contains(tail),
+                "the scan slice must reach {head}'s tail (early-close fragility)"
+            );
+            let offload = body
+                .find("tokio::task::spawn_blocking(")
+                .unwrap_or_else(|| {
+                    panic!("`{head}` must run its sync fs on a blocking thread (FINDINGS-07 [8])")
+                });
+            let joined = offload
+                + body[offload..]
+                    .find(".await")
+                    .unwrap_or_else(|| panic!("`{head}`'s blocking leg is never joined"));
+            for call in write_calls {
+                assert!(body.contains(call), "{head} must still perform `{call}`");
+                for (at, _) in body.match_indices(call) {
+                    assert!(
+                        offload < at && at < joined,
+                        "`{head}` reaches `{call}` outside its `spawn_blocking` leg — \
+                         the fs call is inline on the request thread again \
+                         (FINDINGS-07 [8])"
+                    );
+                }
             }
         }
     }

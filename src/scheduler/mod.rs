@@ -663,6 +663,10 @@ enum ActorMsg {
         /// The `llama-server.exe` verdict gathered on the same blocking leg as the
         /// scan (FINDINGS2-04 [2]); `None` means nothing to report.
         binary: Option<ScanError>,
+        /// The drift stats for the marker/queue rounds this application runs —
+        /// gathered on the reload task's blocking legs so the apply turn never
+        /// stats (FINDINGS-07 [8]).
+        drift: DriftStats,
     },
     /// The blocking scan task itself failed (panic or cancel): the previous
     /// catalog stays in place, the failure is reported, and the reload waiters
@@ -1416,6 +1420,46 @@ fn missing_binary_error(llama_server_exe: &std::path::Path) -> Option<ScanError>
     })
 }
 
+/// The filesystem evidence one catalog application judges: the resident captures
+/// and the queued rows' files, stat'ed **off the actor** by [`gather_drift_stats`]
+/// on the reload's blocking legs (FINDINGS-07 [8] — the scan half moved off-thread
+/// in FINDINGS-13 [6]/FINDINGS2-04 [2]; these stats were the reload turn's last
+/// inline `std::fs`).
+///
+/// Keyed by path, with a three-state answer the drift rounds must respect:
+/// - absent → the path was not gathered for this round (state moved after the
+///   reload was dispatched): absence of evidence, the verdict stays as it is;
+/// - present with `None` → the gather ran and the file could not be stat'ed
+///   (gone/ejected): for the resident marker this IS the accusation the rule
+///   already made ("the file demonstrably is not what it was"), for a queued row
+///   it never retires;
+/// - present with `Some(fp)` → the current bytes' fingerprint.
+#[derive(Debug, Default)]
+struct DriftStats {
+    stats: HashMap<PathBuf, Option<crate::model::FileFingerprint>>,
+    /// The parked rows the reload dispatch saw. A row absent from this set
+    /// registered after the dispatch: its fingerprint is by construction newer
+    /// than any stat gathered before its birth, so judging it could only invent
+    /// a "changed since queued" — late rows are kept unconditionally.
+    queued_at_dispatch: HashSet<JobId>,
+}
+
+/// The blocking-thread half of a reload's drift round: one stat per named path.
+/// Runs inside `spawn_blocking` on the reload task, never on the actor; a path
+/// whose stat fails is inserted with `None` (evidence of absence), and only the
+/// paths the actor named are ever inserted (so an absent key really means
+/// "not observed this round").
+fn gather_drift_stats(paths: &[PathBuf]) -> DriftStats {
+    let mut stats = HashMap::with_capacity(paths.len());
+    for path in paths {
+        stats.insert(path.clone(), crate::model::fingerprint(path));
+    }
+    DriftStats {
+        stats,
+        ..Default::default()
+    }
+}
+
 /// The actor's message loop. The initial catalog scan is the **first thing this task
 /// does**, before it takes any message: commands, ticks and reads queue behind it on
 /// the unbounded channel, exactly as when the scan ran synchronously in
@@ -1441,7 +1485,9 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
             reason: format!("cannot scan ModelConf: {reason}"),
         }],
     });
-    state.apply_catalog(catalog, binary);
+    // Boot carries no drift evidence to gather: no resident has captured a spawn
+    // file and no row can be queued yet, so the empty map is the complete answer.
+    state.apply_catalog(catalog, binary, &DriftStats::default());
     while let Some(msg) = rx.recv().await {
         match msg {
             ActorMsg::Command { cmd, reply } => state.on_command(cmd, reply),
@@ -1449,9 +1495,10 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 catalog,
                 seq,
                 binary,
+                drift,
             } => {
                 if seq > state.last_reload_applied {
-                    state.apply_catalog(catalog, binary);
+                    state.apply_catalog(catalog, binary, &drift);
                     state.last_reload_applied = seq;
                     state.publish();
                 }
@@ -1637,9 +1684,12 @@ impl ActorState {
     /// as `no adapter registered`, so early refusal is strictly better), the
     /// configured `llama-server.exe` verdict (gathered off-thread by
     /// [`ActorState::scan_blocking`], never by a stat in this function —
-    /// FINDINGS2-04 [2]) is carried into the report, and every `default_model` must
-    /// resolve.
-    fn apply_catalog(&mut self, catalog: Catalog, binary: Option<ScanError>) {
+    /// FINDINGS2-04 [2]) is carried into the report, every `default_model` must
+    /// resolve, and the drift rounds ([`ActorState::invalidate_queued_loads`],
+    /// [`ActorState::refresh_stale_markers`]) judge only the `drift` evidence
+    /// gathered off-thread on the reload's blocking legs (FINDINGS-07 [8]) — this
+    /// turn performs zero filesystem calls.
+    fn apply_catalog(&mut self, catalog: Catalog, binary: Option<ScanError>, drift: &DriftStats) {
         let mut errors = catalog.errors;
         let known: Vec<&str> = self.adapters.keys().map(String::as_str).collect();
         let models: Vec<ModelEntry> = catalog
@@ -1722,8 +1772,8 @@ impl ActorState {
         );
         self.catalog = models;
         self.catalog_errors = errors;
-        self.invalidate_queued_loads();
-        self.refresh_stale_markers();
+        self.invalidate_queued_loads(drift);
+        self.refresh_stale_markers(drift);
         // R5 report-only reconcile (ruling 9, 2026-11-01): every catalog
         // application — the boot scan and every rescan alike — re-checks which
         // declared container names are running with no claim. Off-thread like
@@ -1739,16 +1789,22 @@ impl ActorState {
     /// The resident half of reload (Axis 2 = B, operator ruling 2026-10-29): on the
     /// reload turn — and only here, at install, and on a harness write-back — the
     /// `stale_config` verdict is recomputed for every resident: the yaml it launched
-    /// from, re-stat'ed, against the install-time capture. The status/SSE path reads
+    /// from, re-stat'ed **off-thread** by [`gather_drift_stats`] on the reload's
+    /// blocking legs, against the install-time capture. The status/SSE path reads
     /// this cache and performs zero fs syscalls (FINDINGS2-04 [2]'s one-stat-per-event
-    /// rule extended to the marker; pinned by the api-side hidden-file counter-probe).
+    /// rule extended to the marker; pinned by the api-side hidden-file counter-probe,
+    /// and the reload turn's own stat-free shape by
+    /// `the_drift_rounds_judge_only_pre_gathered_evidence` — FINDINGS-07 [8]).
     ///
     /// Verdict rules, stated plainly:
-    /// - no capture (synthetic row, or the stat failed at install): never accuses;
-    ///   absence of evidence is not evidence of change (the queued rows' KEEP posture).
-    /// - capture exists, current stat `None` (file deleted/volume ejected since
+    /// - no capture (synthetic row): never accuses; absence of evidence is not
+    ///   evidence of change (the queued rows' KEEP posture).
+    /// - capture path not in the gathered map (the resident or its capture moved
+    ///   after the reload was dispatched): this round observed nothing of it, and
+    ///   an unobserved verdict is kept, never computed from a missing stat.
+    /// - capture gathered, current stat `None` (file deleted/volume ejected since
     ///   launch): accuses — the file demonstrably is not what it was.
-    /// - capture exists, stat differs (either leg): accuses. The comparison is
+    /// - capture gathered, stat differs (either leg): accuses. The comparison is
     ///   against the SPAWN capture, so re-saving byte-identical content does not
     ///   clear the verdict (the mtime moved) — honest conservatism: the operator's
     ///   gesture that matters is unload + reload, and a respawned engine re-captures
@@ -1759,23 +1815,33 @@ impl ActorState {
     /// not reached the running engine either, and the same amber names the same
     /// gesture. Only the yaml re-baselines on a harness write-back (the harness
     /// never writes a profile); a resident with neither capture is never accused.
-    fn refresh_stale_markers(&mut self) {
+    fn refresh_stale_markers(&mut self, drift: &DriftStats) {
         for slot in &mut self.slots {
             let Some(occupant) = slot.occupant.as_mut() else {
                 continue;
             };
-            if occupant.spawn_config.is_none() && occupant.spawn_profile.is_none() {
+            let (yaml, profile) = (
+                occupant.spawn_config.as_ref(),
+                occupant.spawn_profile.as_ref(),
+            );
+            if yaml.is_none() && profile.is_none() {
                 continue;
             }
-            let yaml_drift = occupant.spawn_config.as_ref().is_some_and(|(file, then)| {
-                let then = *then;
-                crate::model::fingerprint(file) != Some(then)
-            });
-            let profile_drift = occupant.spawn_profile.as_ref().is_some_and(|(file, then)| {
-                let then = *then;
-                crate::model::fingerprint(file) != Some(then)
-            });
-            occupant.stale_config = yaml_drift || profile_drift;
+            // `Some(drifted)` = this leg was judged from gathered evidence;
+            // `None` = no capture on this leg, or the path was never observed
+            // for this round (state moved after dispatch) — never an accusation.
+            let verdict = |capture: Option<&(PathBuf, crate::model::FileFingerprint)>| {
+                let (file, then) = capture?;
+                drift
+                    .stats
+                    .get(file.as_path())
+                    .map(|now| *now != Some(*then))
+            };
+            let (yaml_v, profile_v) = (verdict(yaml), verdict(profile));
+            if yaml_v.is_none() && profile_v.is_none() {
+                continue;
+            }
+            occupant.stale_config = yaml_v.unwrap_or(false) || profile_v.unwrap_or(false);
         }
     }
 
@@ -1815,6 +1881,51 @@ impl ActorState {
         }
     }
 
+    /// The parked (queued, un-armed) Load intents — the same candidate set
+    /// [`ActorState::invalidate_queued_loads`] judges, shared so the reload
+    /// dispatch gathers stats for exactly the rows the apply turn will read and
+    /// carries the ids back in [`DriftStats::queued_at_dispatch`] (FINDINGS-07 [8]).
+    fn queued_load_candidates(&self) -> Vec<JobId> {
+        self.pending
+            .values()
+            .copied()
+            .filter(|job_id| {
+                self.jobs.get(job_id).is_some_and(|job| {
+                    job.kind == JobKind::Load && !job.terminal && job.state == SwapState::Idle
+                })
+            })
+            .collect()
+    }
+
+    /// The model names behind a parked-row candidate set: the rows whose
+    /// new-catalog entry files the drift gather must stat.
+    fn queued_models_for(&self, candidates: &HashSet<JobId>) -> HashSet<String> {
+        candidates
+            .iter()
+            .filter_map(|job_id| self.jobs.get(job_id))
+            .map(|job| job.model.clone())
+            .collect()
+    }
+
+    /// The capture files of every current resident — the paths the marker round
+    /// compares, collected actor-side from slot state only (no fs); the stats
+    /// themselves are off-thread ([`gather_drift_stats`], FINDINGS-07 [8]).
+    fn drift_capture_files(&self) -> Vec<PathBuf> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.occupant.as_ref())
+            .flat_map(|occupant| {
+                [
+                    occupant.spawn_config.as_ref(),
+                    occupant.spawn_profile.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|(file, _)| file.clone())
+            })
+            .collect()
+    }
+
     /// The queued-intent half of reload (Axis 1 = **1b**, operator ruling
     /// 2026-10-29, `research/reload-slot-drift-2026-10-28.md` rows 12-13): a
     /// rescan retires parked/queued load rows whose model bytes moved or whose
@@ -1849,27 +1960,28 @@ impl ActorState {
     /// only re-implement the fingerprint with more ways to lie. Bytes moved means a
     /// frozen fact can now contradict the re-read fact: the intent is stale, so it
     /// retires and the operator re-queues on the new file. A missing fingerprint on
-    /// either side (`fingerprint` = `None`: unreadable stat) is the absence of
-    /// **evidence**, never evidence of change — the queue is kept (pinned by
-    /// `a_rescan_keeps_a_queue_whose_fingerprint_cannot_show_a_change`).
+    /// either side — no registration baseline, or the gathered stat `None`/absent
+    /// (unreadable): is the absence of **evidence**, never evidence of change —
+    /// the queue is kept (pinned by
+    /// `a_rescan_keeps_a_queue_whose_fingerprint_cannot_show_a_change`). A row
+    /// that entered the queue between the gather and the apply is never judged
+    /// at all — it is not in `DriftStats::queued_at_dispatch`, and no stat
+    /// gathered before its birth can ever speak for it (pinned there, KEEP 4).
+    /// The stats ride in with the catalog application as [`DriftStats`], gathered
+    /// off-thread on the reload's blocking legs (FINDINGS-07 [8]); this turn reads
+    /// only the map.
     ///
     /// Budget no-leak: a never-armed row books nothing (`reserves_vram` excludes
     /// `Idle`), so retirement cannot strand a reservation; what it must not strand
     /// is the queue place — `finish_queued_load` clears it, so a later finish of
     /// the predecessor can never arm a retired row (verified by the integration
     /// pins' spawn arithmetic).
-    fn invalidate_queued_loads(&mut self) {
-        let candidates: Vec<JobId> = self
-            .pending
-            .values()
-            .copied()
-            .filter(|job_id| {
-                self.jobs.get(job_id).is_some_and(|job| {
-                    job.kind == JobKind::Load && !job.terminal && job.state == SwapState::Idle
-                })
-            })
-            .collect();
+    fn invalidate_queued_loads(&mut self, drift: &DriftStats) {
+        let candidates = self.queued_load_candidates();
         for job_id in candidates {
+            if !drift.queued_at_dispatch.contains(&job_id) {
+                continue;
+            }
             let Some(job) = self.jobs.get(&job_id) else {
                 continue;
             };
@@ -1878,7 +1990,12 @@ impl ActorState {
             let reason = match self.catalog.iter().find(|m| m.name == model) {
                 None => Some("superseded by rescan (removed from the catalog)".to_string()),
                 Some(entry) => {
-                    let now = entry.file.as_deref().and_then(crate::model::fingerprint);
+                    let now = entry
+                        .file
+                        .as_deref()
+                        .and_then(|file| drift.stats.get(file))
+                        .copied()
+                        .flatten();
                     match (queued, now) {
                         (Some(then), Some(now)) if then != now => Some(format!(
                             "superseded by rescan ({} changed since queued \u{2014} re-queue to apply)",
@@ -1956,19 +2073,64 @@ impl ActorState {
                 // command against the old catalog until the result lands as
                 // `ActorMsg::CatalogLoaded`, which is also what resolves the
                 // waiter — so `/har/rescan` still means "new catalog applied".
+                // FINDINGS-07 [8] finishes the half: the marker/queue round used
+                // to stat its drift evidence inline on the apply turn; it now
+                // travels in the same message, stat'ed on this task's blocking
+                // legs (`drift_capture_files`/`queued_load_candidates` read only
+                // actor state here — never the filesystem).
+                // Accepted edge (sibling of 28P [P-2]): a harness write landing
+                // strictly between this dispatch's capture gather and the
+                // re-baseline note's processing reads as a change — the resident
+                // ambers once, and the next reload clears it.
                 let tx = self.tx.clone();
                 let dir = self.models_dir.clone();
                 let exe = self.cfg.llama_server_exe.clone();
                 let seq = self.next_reload;
                 self.next_reload += 1;
+                let capture_files = self.drift_capture_files();
+                let queued_at_dispatch: HashSet<JobId> =
+                    self.queued_load_candidates().into_iter().collect();
+                let queued_models = self.queued_models_for(&queued_at_dispatch);
                 tokio::spawn(async move {
+                    let captures =
+                        tokio::task::spawn_blocking(move || gather_drift_stats(&capture_files));
                     let (scan, binary) = scan_with_binary_check(dir, exe).await;
+                    let mut drift = captures.await.unwrap_or_else(|error| {
+                        tracing::error!(
+                            error = %error,
+                            "drift capture stat task failed; residents keep their verdicts"
+                        );
+                        DriftStats::default()
+                    });
+                    if let Ok(catalog) = &scan {
+                        let row_files: Vec<PathBuf> = catalog
+                            .models
+                            .iter()
+                            .filter(|entry| queued_models.contains(&entry.name))
+                            .filter_map(|entry| entry.file.clone())
+                            .collect();
+                        if !row_files.is_empty() {
+                            match tokio::task::spawn_blocking(move || {
+                                gather_drift_stats(&row_files)
+                            })
+                            .await
+                            {
+                                Ok(rows) => drift.stats.extend(rows.stats),
+                                Err(error) => tracing::error!(
+                                    error = %error,
+                                    "queued-row drift stat task failed; parked rows keep their place"
+                                ),
+                            }
+                        }
+                    }
+                    drift.queued_at_dispatch = queued_at_dispatch;
                     match scan {
                         Ok(catalog) => {
                             let _ = tx.send(ActorMsg::CatalogLoaded {
                                 catalog,
                                 seq,
                                 binary,
+                                drift,
                             });
                         }
                         Err(reason) => {
@@ -3428,10 +3590,11 @@ impl ActorState {
             launch_floor: entry.launch_floor_gb,
             load_timeout_s: entry.load_timeout_s,
             gate_target: None,
-            // The yaml as the catalog saw it, statted once per registration: the
-            // same one-stat-per-event discipline `apply_catalog` keeps (the stat
-            // rides a file the just-applied scan already read; adapters already
-            // stat config files synchronously on the actor at preflight).
+            // The yaml as the catalog saw it, statted inline once per
+            // registration on the park path: `apply_catalog` itself is now
+            // zero-fs (FINDINGS-07 [8]), so this is the reload flow's one
+            // surviving inline stat — it rides a file the just-applied scan
+            // already read, and is a future-offload candidate.
             queue_fingerprint: entry.file.as_deref().and_then(crate::model::fingerprint),
             profile: crate::engine::policy::engine_policy(&entry.engine)
                 .and_then(|row| row.profile_field)
@@ -5238,16 +5401,17 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::{
-        headline_fault, missing_binary_error, serve_model_warning, ActorMsg, ActorState, FitEntry,
-        Gibibytes, Job, JobId, JobKind, JobStatus, JobTimings, MeasuredAnchor, Occupant, Reply,
-        ResourceKind, ScanKind, Scheduler, Slot, SpawnTicket, SwapState,
+        gather_drift_stats, headline_fault, missing_binary_error, serve_model_warning, ActorMsg,
+        ActorState, DriftStats, FitEntry, Gibibytes, Job, JobId, JobKind, JobStatus, JobTimings,
+        MeasuredAnchor, Occupant, Reply, ResourceKind, ScanKind, Scheduler, Slot, SpawnTicket,
+        SwapState,
     };
     use crate::budget::LedgerOnlyWitness;
     use crate::config::CategoryId;
     use crate::engine::mock::MockAdapter;
     use crate::engine::EngineAdapter;
     use crate::model::ModelEntry;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
@@ -6390,7 +6554,11 @@ mod tests {
             missing_binary_error(&absent).is_some(),
             "the fixture binary really is absent"
         );
-        state.apply_catalog(crate::model::scan::Catalog::empty(), None);
+        state.apply_catalog(
+            crate::model::scan::Catalog::empty(),
+            None,
+            &DriftStats::default(),
+        );
         assert!(
             !state
                 .catalog_errors
@@ -6403,6 +6571,7 @@ mod tests {
         state.apply_catalog(
             crate::model::scan::Catalog::empty(),
             missing_binary_error(&absent),
+            &DriftStats::default(),
         );
         let report = state
             .catalog_errors
@@ -7478,28 +7647,27 @@ mod tests {
                 tx,
             )
         };
-        let queue_on = |state: &mut ActorState, entry: &ModelEntry| -> JobId {
+        let queue_on = |state: &mut ActorState, slot: usize, entry: &ModelEntry| -> JobId {
             state.slots = vec![Slot {
                 category: CategoryId::Work,
-                index: 0,
-                engine_port: 18_100,
+                index: slot,
+                engine_port: 18_100 + slot as u16,
                 occupant: None,
                 // The parked row does not own the slot: some other job is in
                 // flight on it, exactly as parking requires.
                 job: Some(JobId(9_999)),
             }];
-            let id = state.register_queued_load(0, entry, Vec::new());
-            state.pending.insert(0, id);
+            let id = state.register_queued_load(slot, entry, Vec::new());
+            state.pending.insert(slot, id);
             id
         };
         let apply = |state: &mut ActorState, models: Vec<ModelEntry>| {
-            state.apply_catalog(
-                crate::model::scan::Catalog {
-                    models,
-                    errors: Vec::new(),
-                },
-                None,
-            );
+            let catalog = crate::model::scan::Catalog {
+                models,
+                errors: Vec::new(),
+            };
+            let drift = drift_stats_for(state, &catalog);
+            state.apply_catalog(catalog, None, &drift);
         };
         let queued_alive = |state: &ActorState, id: JobId| {
             state.jobs.get(&id).is_some_and(|j| !j.terminal)
@@ -7510,7 +7678,7 @@ mod tests {
         // the queue (budget kept intact, place kept, row non-terminal).
         let entry = entry_on_disk("vram_gb: 4\n");
         let mut state = fresh_state();
-        let id = queue_on(&mut state, &entry);
+        let id = queue_on(&mut state, 0, &entry);
         apply(&mut state, vec![entry.clone()]);
         assert!(
             queued_alive(&state, id),
@@ -7522,7 +7690,7 @@ mod tests {
         // rescan-side fingerprint is not evidence.
         let entry = entry_on_disk("vram_gb: 4\n");
         let mut state = fresh_state();
-        let id = queue_on(&mut state, &entry);
+        let id = queue_on(&mut state, 0, &entry);
         std::fs::remove_file(&yaml).expect("delete after the scan read");
         apply(&mut state, vec![entry.clone()]);
         assert!(
@@ -7534,7 +7702,7 @@ mod tests {
         // baseline at all) — even readable-and-changed bytes now prove nothing.
         let entry = entry_on_disk("vram_gb: 4\n");
         let mut state = fresh_state();
-        let id = queue_on(&mut state, &entry);
+        let id = queue_on(&mut state, 0, &entry);
         state.jobs.get_mut(&id).expect("row").queue_fingerprint = None;
         std::fs::write(&yaml, "vram_gb: 400\n").expect("edit");
         apply(&mut state, vec![entry.clone()]);
@@ -7547,7 +7715,7 @@ mod tests {
         // the row and the queue place is released.
         let entry = entry_on_disk("vram_gb: 4\n");
         let mut state = fresh_state();
-        let id = queue_on(&mut state, &entry);
+        let id = queue_on(&mut state, 0, &entry);
         std::fs::write(&yaml, "vram_gb: 400\n").expect("edit");
         apply(&mut state, vec![entry]);
         assert!(
@@ -7571,7 +7739,7 @@ mod tests {
         // RETIRE: the model left the catalog.
         let entry = entry_on_disk("vram_gb: 4\n");
         let mut state = fresh_state();
-        let id = queue_on(&mut state, &entry);
+        let id = queue_on(&mut state, 0, &entry);
         apply(&mut state, Vec::new());
         assert!(
             state.jobs[&id].terminal,
@@ -7583,6 +7751,43 @@ mod tests {
                 .contains("superseded by rescan (removed from the catalog)")),
             "{:?}",
             state.jobs[&id].error
+        );
+
+        // KEEP 4: the dispatch-to-apply corner (FINDINGS-07 [8] fix round [3]):
+        // row A parked M at dispatch (its file gathered pre-edit), the scan
+        // held, an operator edit landed, and row B parked the same model before
+        // the scan landed. B's fingerprint is newer than any stat gathered
+        // before its birth — judging it could only invent "changed since
+        // queued" — so rows registered after the dispatch are kept
+        // unconditionally. Falsifier: drop the `queued_at_dispatch` gate and B
+        // lands in the (Some(newer), Some(older)) arm and retires.
+        let entry = entry_on_disk("vram_gb: 4\n");
+        let mut state = fresh_state();
+        let a = queue_on(&mut state, 0, &entry);
+        let gathered = drift_stats_for(
+            &state,
+            &crate::model::scan::Catalog {
+                models: vec![entry.clone()],
+                errors: Vec::new(),
+            },
+        );
+        let edited = entry_on_disk("vram_gb: 400\n");
+        let b = queue_on(&mut state, 1, &edited);
+        state.apply_catalog(
+            crate::model::scan::Catalog {
+                models: vec![edited],
+                errors: Vec::new(),
+            },
+            None,
+            &gathered,
+        );
+        assert!(
+            queued_alive(&state, b),
+            "a row registered after the reload was dispatched must survive it"
+        );
+        assert!(
+            queued_alive(&state, a),
+            "and the gathered evidence shows no change for the row it did see"
         );
     }
 
@@ -7656,17 +7861,37 @@ mod tests {
         entry
     }
 
+    /// Mirrors the off-actor gather a real reload performs: the resident capture
+    /// files plus the queued models' new-catalog entry files, stat'ed here on the
+    /// test thread (production stats on a blocking thread — FINDINGS-07 [8]).
+    fn drift_stats_for(state: &ActorState, catalog: &crate::model::scan::Catalog) -> DriftStats {
+        let queued_at_dispatch: HashSet<JobId> =
+            state.queued_load_candidates().into_iter().collect();
+        let queued = state.queued_models_for(&queued_at_dispatch);
+        let mut paths = state.drift_capture_files();
+        paths.extend(
+            catalog
+                .models
+                .iter()
+                .filter(|entry| queued.contains(&entry.name))
+                .filter_map(|entry| entry.file.clone()),
+        );
+        DriftStats {
+            queued_at_dispatch,
+            ..gather_drift_stats(&paths)
+        }
+    }
+
     /// The reload-turn rescan the pins drive: re-parse the file the operator (or the
     /// harness) just wrote and land it through `apply_catalog` — the only judge
     /// between install and the next launch.
     fn rescan(state: &mut ActorState, yaml: &std::path::Path, name: &str) {
-        state.apply_catalog(
-            crate::model::scan::Catalog {
-                models: vec![entry_from(yaml, name)],
-                errors: Vec::new(),
-            },
-            None,
-        );
+        let catalog = crate::model::scan::Catalog {
+            models: vec![entry_from(yaml, name)],
+            errors: Vec::new(),
+        };
+        let drift = drift_stats_for(state, &catalog);
+        state.apply_catalog(catalog, None, &drift);
     }
 
     /// The profile-layer variant of Axis 2 (slice 10c): a strata profile edited
@@ -7683,18 +7908,19 @@ mod tests {
         let profile = dir.join("p.json");
         std::fs::write(&profile, "v1\n").expect("seed profile");
         let capture = crate::model::fingerprint(&profile).expect("seed stat");
-        let (mut state, _yaml, _then) = resident_on_a_file();
+        let (mut state, yaml, _then) = resident_on_a_file();
         if let Some(occupant) = state.slots[0].occupant.as_mut() {
             occupant.spawn_profile = Some((profile.clone(), capture));
         }
-        state.refresh_stale_markers();
+        let both = || vec![profile.clone(), yaml.clone()];
+        state.refresh_stale_markers(&gather_drift_stats(&both()));
         assert_eq!(
             state.snapshot().slots[0].stale_config,
             Some(false),
             "an unchanged profile must not accuse"
         );
         std::fs::write(&profile, "v2\n").expect("edit profile");
-        state.refresh_stale_markers();
+        state.refresh_stale_markers(&gather_drift_stats(&both()));
         assert_eq!(
             state.snapshot().slots[0].stale_config,
             Some(true),
@@ -7709,14 +7935,14 @@ mod tests {
     #[test]
     fn a_missing_profile_capture_never_accuses() {
         let (mut state, yaml, _capture) = resident_on_a_file();
-        state.refresh_stale_markers();
+        state.refresh_stale_markers(&gather_drift_stats(std::slice::from_ref(&yaml)));
         assert_eq!(
             state.snapshot().slots[0].stale_config,
             Some(false),
             "no capture of either kind, no accusation"
         );
         std::fs::write(&yaml, "engine: mock\n").expect("edit yaml");
-        state.refresh_stale_markers();
+        state.refresh_stale_markers(&gather_drift_stats(std::slice::from_ref(&yaml)));
         assert_eq!(
             state.snapshot().slots[0].stale_config,
             Some(true),
@@ -8003,6 +8229,59 @@ mod tests {
         &source[..cut]
     }
 
+    /// FINDINGS-07 [8] structural net: the reload turn's drift rounds judge only
+    /// pre-gathered evidence. `apply_catalog` (the single writer's turn) and both
+    /// rounds it runs contain no filesystem token at all — every stat that moves
+    /// a `stale_config` verdict or a queued-row retirement is gathered off the
+    /// actor by `gather_drift_stats`, on the reload task's blocking legs, and
+    /// travels in as [`DriftStats`].
+    ///
+    /// Falsifier: restore the inline stat in `refresh_stale_markers` or
+    /// `invalidate_queued_loads` (any synonym spelling) and this is the test that
+    /// goes red first; the behavioural twins (supersede/amber after
+    /// `handle.reload()`) stay green either way because they pin semantics, not
+    /// threading — the same two-tier shape as the snapshot net above.
+    #[test]
+    fn the_drift_rounds_judge_only_pre_gathered_evidence() {
+        let source = include_str!("mod.rs");
+        for (head, tail) in [
+            ("fn apply_catalog(", "spawn_fit_warm"),
+            ("fn invalidate_queued_loads(", "finish_queued_load"),
+            ("fn refresh_stale_markers(", "occupant.stale_config = "),
+        ] {
+            let start = source
+                .find(head)
+                .unwrap_or_else(|| panic!("{head} is still in this file"));
+            let close = source[start..]
+                .find("\n    }\n")
+                .unwrap_or_else(|| panic!("{head} closes at column 4"));
+            let body = &source[start..start + close];
+            assert!(
+                body.contains(tail),
+                "the scan slice must reach {head}'s tail (early-close fragility)"
+            );
+            for banned in [
+                "fs::",
+                "fingerprint(",
+                "read_to_string(",
+                "metadata(",
+                "try_exists",
+                "read_dir",
+                ".exists()",
+                "is_file(",
+                "is_dir(",
+                "File::open",
+            ] {
+                assert!(
+                    !body.contains(banned),
+                    "`{head}` may only judge the gathered `DriftStats`; found \
+                     `{banned}` — the actor turn must never reach the filesystem \
+                     (FINDINGS-07 [8])"
+                );
+            }
+        }
+    }
+
     /// P-4 (FINDINGS-BATCH-2026-10-28P): the re-baseline table documented at
     /// [`ActorState::on_model_file_written`] claims a CLOSED set of legitimate model-
     /// yaml mutators — the measured persist (this file, its note riding the success
@@ -8149,6 +8428,7 @@ mod tests {
                 errors: Vec::new(),
             },
             None,
+            &DriftStats::default(),
         );
         assert!(
             state.catalog_errors.iter().any(|e| {
