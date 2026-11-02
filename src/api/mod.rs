@@ -2470,7 +2470,19 @@ async fn proxy(
         reason: format!("body must be JSON: {rejection}"),
     })?;
     let (model, port, serve_id) = ensure_target(&listener, &body).await?;
-    let path = uri.path().to_string();
+    // FINDINGS-06 [10]: forward the request target the client actually sent.
+    // `uri.path()` alone silently dropped the query string, so an engine-side
+    // `?api-key=` or engine-specific flag never arrived. `path_and_query()` is
+    // path + `?` + query (an empty `?` included); with no query present its bytes
+    // equal `path()`, so the path-join semantics of the URL below (routes match
+    // absolute paths starting with `/`; no double slash, no trailing-slash drift)
+    // are unchanged. `None` means authority- or asterisk-form (never POSTed to
+    // these routes); the `path()` fallback keeps the old behavior for that case.
+    let path = uri
+        .path_and_query()
+        .map(|path_and_query| path_and_query.as_str())
+        .unwrap_or_else(|| uri.path())
+        .to_string();
     // F-4 fix: rewrite to the engine's self-reported id when discovery found one;
     // the harness name is the fallback (llama engines ignore the field either way).
     body["model"] = Value::String(serve_id.unwrap_or_else(|| model.clone()));
@@ -2524,10 +2536,21 @@ async fn proxy(
             reason: format!("upstream status not representable: {error}"),
         })?;
     let mut response = Response::builder().status(status);
+    // Engine→client header pass-through. The body streams through `bytes_stream()`
+    // undecoded (reqwest is built without gzip/brotli/deflate/zstd), so the wire
+    // bytes ARE the engine's bytes and every header describing them must survive —
+    // `content-encoding` included (FINDINGS-06 [9]: stripping it labelled a
+    // compressed body as identity and the client could not decode it). Only headers
+    // that would LIE about the forwarded body are dropped, exactly as before:
+    // `transfer-encoding` and `content-length` (hyper re-frames this streamed body
+    // and recomputes them) and `connection` (hop-by-hop — the client's connection
+    // is its own business). Client→engine request headers are never copied at all
+    // (FINDINGS-06 "verified clean": the forward is `post(url).json(&body)` only),
+    // so there is no request-side encoding to strip and no token/host/cookie leak.
     for (name, value) in upstream.headers() {
         if matches!(
             name.as_str(),
-            "transfer-encoding" | "content-length" | "connection" | "content-encoding"
+            "transfer-encoding" | "content-length" | "connection"
         ) {
             continue;
         }

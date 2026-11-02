@@ -667,6 +667,97 @@ async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
 }
 
 #[tokio::test]
+async fn proxy_forwards_the_query_string_the_client_sent() {
+    // FINDINGS-06 [10]: the forward used `uri.path()`, which drops the query, so a
+    // client sending `?api-key=` or an engine-specific flag got a DIFFERENT request
+    // at the engine than the one it sent. The mock echoes the exact request target
+    // it received, so the assertion is about the wire, not about intent.
+    let (control, work, _, _, _runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+
+    let (status, body) = post_json(
+        &work,
+        "/v1/chat/completions?a=1&b=2",
+        r#"{"model":"qwen3","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["path"], "/v1/chat/completions?a=1&b=2",
+        "the query string is part of the request the client sent"
+    );
+
+    // An empty query is still a query: the bare `?` must survive the join.
+    let (status, body) = post_json(
+        &work,
+        "/v1/chat/completions?",
+        r#"{"model":"qwen3","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["path"], "/v1/chat/completions?");
+
+    // No query still forwards cleanly and byte-identically to the pinned target
+    // of `proxy_forwards_with_model_rewrite_and_streams_the_response` — the fix
+    // must not introduce a `?` or a double slash where the client sent none.
+    let (status, body) = post_json(
+        &work,
+        "/v1/chat/completions",
+        r#"{"model":"qwen3","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["path"], "/v1/chat/completions");
+}
+
+#[tokio::test]
+async fn proxy_passes_the_engines_content_encoding_through_verbatim() {
+    // FINDINGS-06 [9]: the strip list dropped `content-encoding` from a body the
+    // proxy never decodes (reqwest is built without gzip/brotli/deflate/zstd), so
+    // an engine that answers compressed handed the client gzip bytes labelled as
+    // identity — undecodable. The pass-through is honest now: header and bytes
+    // cross unchanged. Request-direction pass-through is structurally impossible
+    // and not claimed: the proxy parses, rewrites and re-serialises the JSON body
+    // and forwards no client headers (FINDINGS-06 "verified clean").
+    let (control, work, _, _, _runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+
+    let response = work
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"qwen3","mock_encoded_reply":true}"#))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip"),
+        "an undecoded body keeps the encoding the engine declared for it"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    assert_eq!(
+        bytes.as_ref(),
+        mock_runtime::ENCODED_BODY,
+        "the opaque encoded body must arrive byte-for-byte, not decoded or re-framed"
+    );
+}
+
+#[tokio::test]
 async fn proxy_rewrites_each_occupant_to_its_own_engine_id() {
     // FINDINGS-20 [6]: every mock engine used to report the one constant `mock-model`
     // at `/v1/models`, so every serve_id assertion in the suite compared the same

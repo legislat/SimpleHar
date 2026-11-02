@@ -340,11 +340,21 @@ async fn health(
     (status, Json(json!({ "status": "ok", "loaded": loaded })))
 }
 
+/// Exact bytes a `mock_encoded_reply: true` request answers with: opaque bytes
+/// labelled `content-encoding: gzip`. The proxy decodes nothing, so the pass-through
+/// contract demands these same bytes and that header reach the client untouched
+/// (FINDINGS-06 [9]).
+pub const ENCODED_BODY: &[u8] = b"\x1f\x8b\x08\x00opaque-not-really-gzip\x00\xff";
+
 /// Proxy echo: any other path answers 200 with the request shape, so proxy tests can
-/// assert what the harness forwarded (including the rewritten `model` field).
-/// A body carrying `"stream": true` is answered with the fixed SSE literal and a
-/// `text/event-stream` content-type, so the proxy's pass-through contract (byte-for-
-/// byte body + preserved content-type, FINDINGS-18 [4]) has something real to assert.
+/// assert what the harness forwarded (including the rewritten `model` field). The
+/// echoed `path` is the full request target INCLUDING the query string (FINDINGS-06
+/// [10]): the test asserts what the engine actually received, not what the proxy
+/// chose to reveal. A body carrying `"stream": true` is answered with the fixed SSE
+/// literal and a `text/event-stream` content-type, so the proxy's pass-through
+/// contract (byte-for-byte body + preserved content-type, FINDINGS-18 [4]) has
+/// something real to assert. A body carrying `"mock_encoded_reply": true` is answered
+/// with [`ENCODED_BODY`] under `content-encoding: gzip`.
 async fn echo(
     State(state): State<MockState>,
     uri: axum::http::Uri,
@@ -373,9 +383,28 @@ async fn echo(
         )
             .into_response();
     }
+    if body.as_ref().is_some_and(|Json(value)| {
+        value
+            .get("mock_encoded_reply")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }) {
+        return (
+            [
+                (axum::http::header::CONTENT_TYPE, "application/json"),
+                (axum::http::header::CONTENT_ENCODING, "gzip"),
+            ],
+            ENCODED_BODY,
+        )
+            .into_response();
+    }
+    let target = uri
+        .path_and_query()
+        .map(|path_and_query| path_and_query.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string());
     Json(json!({
         "echo": true,
-        "path": uri.path(),
+        "path": target,
         "body": body.map(|Json(value)| value).unwrap_or(serde_json::Value::Null),
     }))
     .into_response()
