@@ -22,7 +22,7 @@ use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderValue, StatusCode};
-use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -32,10 +32,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio_stream::StreamExt;
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
-/// Proxy request body ceiling kept from v3.3 (G5 clients send big prompts).
-const PROXY_BODY_LIMIT: usize = 1024 * 1024 * 1024;
+/// The largest request body the proxy accepts. A chat/embeddings request is text
+/// plus, at most, a few base64 images; 64 MiB is generous for that and keeps the
+/// buffered `Json<Value>` path from turning one POST into several GiB
+/// (FINDINGS-06 [7]).
+const PROXY_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// The largest body any `/har/*` control route accepts. Every control body is a
+/// small JSON object, so the proxy's ceiling must not be reachable from the control
+/// surface (FINDINGS-06 [7]).
+const CONTROL_BODY_LIMIT: usize = 64 * 1024;
+
+/// One value on the SSE bus. `Closed` is the terminal sentinel the pump publishes
+/// when it stops for any reason (scheduler gone, panic): every attached stream ends
+/// so the page falls back to polling instead of staying silently frozen behind
+/// keepalives (review 2026-11-02, MED).
+#[derive(Clone)]
+enum StateEvent {
+    /// No document has been published yet.
+    Empty,
+    /// A complete merged state document.
+    Doc(Arc<Value>),
+    /// The pump is gone; end every stream.
+    Closed,
+}
 
 /// Typed API error: the single place where the taxonomy maps to status codes (E1 fix).
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -456,6 +479,13 @@ pub struct ApiState {
     /// Pinned by `a_distinct_path_flood_costs_a_constant_number_of_lines`.
     guard_trace: Arc<Mutex<GuardTrace>>,
     proxy: reqwest::Client,
+    /// The latest SSE bus value, published once per scheduler push by
+    /// [`ApiState::ensure_state_pump`]. A `watch` channel is the coalescing bound:
+    /// a slow SSE client sees the latest value, never a backlog (FINDINGS-OPEN N1).
+    state_events: Arc<tokio::sync::watch::Sender<StateEvent>>,
+    /// One-shot guard for the state pump: the first SSE connection starts it, and
+    /// every later connection reuses it.
+    state_pump_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ApiState {
@@ -477,6 +507,7 @@ impl ApiState {
         };
         let control_addr = format!("{}:{}", display_host, config.control_category().public_port);
         let control_token = resolve_control_token(&config);
+        let (state_events, _) = tokio::sync::watch::channel(StateEvent::Empty);
         ApiState {
             control_addr,
             scheduler,
@@ -488,9 +519,16 @@ impl ApiState {
             control_token,
             guard_trace: Arc::new(Mutex::new(GuardTrace::default())),
             proxy: reqwest::Client::builder()
-                .timeout(Duration::from_secs(600))
+                // A total `timeout` covers the response body, so it cut a long SSE
+                // generation mid-stream after the 200 (FINDINGS-06 [6]). `read_timeout`
+                // is per-read: a live engine that keeps producing bytes is never
+                // reaped, while a stalled socket still fails in bounded time.
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(600))
                 .build()
-                .expect("invariant: plain-HTTP client with a timeout needs no configuration"),
+                .expect("invariant: plain-HTTP client with timeouts needs no configuration"),
+            state_events: Arc::new(state_events),
+            state_pump_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
         }
     }
@@ -500,6 +538,39 @@ impl ApiState {
     #[must_use]
     pub fn requires_token(&self) -> bool {
         self.control_token.is_some()
+    }
+
+    /// Starts the one state pump that builds the merged document once per scheduler
+    /// push and publishes it to every SSE client (FINDINGS-OPEN N1). Idempotent: the
+    /// first caller wins, and a caller with no Tokio runtime (a sync unit test) leaves
+    /// the flag unset so a later async caller can start it.
+    fn ensure_state_pump(self: &Arc<Self>) {
+        if self
+            .state_pump_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.state_pump_started.store(false, Ordering::Release);
+            return;
+        };
+        let state = Arc::clone(self);
+        handle.spawn(async move {
+            // Supervisor: a panic inside the pump must not leave every stream parked
+            // behind keepalives with no `har_state` ever landing again. Await the
+            // pump, log any exit, then publish the terminal sentinel so every client
+            // ends its stream and the page falls back to polling.
+            let pump = tokio::spawn(pump_state(Arc::clone(&state)));
+            match pump.await {
+                Ok(()) => tracing::warn!("state pump ended; SSE clients fall back to polling"),
+                Err(error) => {
+                    tracing::error!(%error, "state pump died; SSE clients fall back to polling");
+                }
+            }
+            let _ = state.state_events.send_replace(StateEvent::Closed);
+        });
     }
 
     /// Reports a guard refusal to the ring (FINDINGS2-0507 [3]) — the refusals that
@@ -1400,60 +1471,68 @@ fn container_reported_gb(scheduler: &SchedulerStatus) -> Option<f64> {
     (sum > 0.0).then_some(sum)
 }
 
+/// The pump body: one merged document per scheduler push, published to every SSE
+/// subscriber. Skipping the build while nobody is attached keeps an idle page from
+/// costing an actor round-trip per tick (review 2026-11-02, LOW).
+async fn pump_state(state: Arc<ApiState>) {
+    let mut pushes = state.scheduler.subscribe();
+    publish_state(&state).await;
+    loop {
+        match pushes.recv().await {
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                if state.state_events.receiver_count() > 0 {
+                    publish_state(&state).await;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Builds the merged document and publishes it; a build failure is logged, never
+/// silent, because the page's next paint is the only place the operator sees it.
+async fn publish_state(state: &ApiState) {
+    match merged_state(state).await {
+        Ok(doc) => {
+            let _ = state
+                .state_events
+                .send_replace(StateEvent::Doc(Arc::new(doc)));
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "state pump could not build the status document");
+        }
+    }
+}
+
 /// `GET /har/events` — one SSE stream: the current state immediately, then a push
 /// after every scheduler mutation (keepalives by the SSE layer); a dropped stream
 /// degrades to the page's polling fallback (Step 12 / Step 14).
-#[allow(clippy::type_complexity)]
+///
+/// The document is built ONCE per scheduler push by [`ApiState::ensure_state_pump`]
+/// and published through a `watch` channel; `WatchStream` is the coalescing bound, so
+/// a slow reader sees the latest value and never queues documents (FINDINGS-OPEN N1).
+/// The pump's `Closed` sentinel ends the stream, which is the page's cue to poll.
 async fn har_events(
     State(state): State<Arc<ApiState>>,
-) -> Sse<
-    KeepAliveStream<
-        tokio_stream::wrappers::UnboundedReceiverStream<Result<Event, std::convert::Infallible>>,
-    >,
-> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut pushes = state.scheduler.subscribe();
-        // The immediate snapshot: the page renders once without waiting for a change.
-        if let Ok(doc) = merged_state(&state).await {
-            if send_state(&tx, &doc).is_err() {
-                return;
-            }
-        }
-        loop {
-            match pushes.recv().await {
-                Ok(_) => {
-                    if let Ok(doc) = merged_state(&state).await {
-                        if send_state(&tx, &doc).is_err() {
-                            return; // subscriber gone
-                        }
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Missed pushes are fine: the next merge carries the full state.
-                    if let Ok(doc) = merged_state(&state).await {
-                        let _ = send_state(&tx, &doc);
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
-    });
-    Sse::new(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
-        .keep_alive(KeepAlive::default())
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    state.ensure_state_pump();
+    let rx = state.state_events.subscribe();
+    let stream = tokio_stream::wrappers::WatchStream::new(rx)
+        .take_while(|event| !matches!(event, StateEvent::Closed))
+        .filter_map(|event| match event {
+            StateEvent::Doc(doc) => Some(Ok(state_event(&doc))),
+            StateEvent::Empty | StateEvent::Closed => None,
+        });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Sends one `har_state` event; `Err` means the subscriber disconnected.
-fn send_state(
-    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, std::convert::Infallible>>,
-    doc: &Value,
-) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
-    let event = Event::default()
+/// One `har_state` event; a serialization failure is impossible for a `Value`, but
+/// the fallback keeps the stream alive rather than dropping the client.
+fn state_event(doc: &Value) -> Event {
+    Event::default()
         .event("har_state")
         .json_data(doc)
-        .unwrap_or_else(|_| Event::default().event("har_state").data("{}"));
-    tx.send(Ok(event))
-        .map_err(|_| tokio::sync::mpsc::error::SendError(()))
+        .unwrap_or_else(|_| Event::default().event("har_state").data("{}"))
 }
 
 /// Process-wide request-id counter (mixed with the boot epoch: unique per run).
@@ -1734,12 +1813,18 @@ async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
 /// `POST /har/config/default {"category": …, "model": name|null}` — set the
 /// category's default model (Step 11 fallback); validated against the catalog and
 /// persisted to `simplehar-se.json` atomically.
+///
+/// `model` is required: a string sets the default, `null` clears it, and an absent
+/// key is a caller mistake (400), never an implicit clear. The persisted value is the
+/// catalog entry's canonical `name`, not the caller's spelling: `catalog::resolve`
+/// accepts case-insensitive names and GGUF aliases, while the scheduler and the boot
+/// check compare `m.name == model` exactly (FINDINGS-06 [5]).
 async fn har_config_default(
     State(state): State<Arc<ApiState>>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(body) = body.map_err(|rejection| ApiError::BadRequest {
-        reason: format!("body must be JSON with `category` and optional `model`: {rejection}"),
+        reason: format!("body must be JSON with `category` and `model`: {rejection}"),
     })?;
     let Some(raw_category) = body.get("category").and_then(Value::as_str) else {
         return Err(ApiError::BadRequest {
@@ -1752,22 +1837,35 @@ async fn har_config_default(
     let category: CategoryId = raw_category.parse().map_err(|_| ApiError::BadRequest {
         reason: format!("unknown category `{raw_category}`"),
     })?;
-    let requested = body.get("model").and_then(Value::as_str);
-    if let Some(model) = requested {
-        let catalog = state.catalog().await?;
-        let entry = resolve_unique(model, &catalog, |query| ApiError::BadRequest {
-            reason: format!("unknown model `{query}`"),
-        })?;
-        if entry.category != category {
+    let requested = match body.get("model") {
+        None => {
             return Err(ApiError::BadRequest {
-                reason: format!(
-                    "model `{}` belongs to {}, not {}",
-                    entry.name, entry.category, category
-                ),
-            });
+                reason: "missing required field `model` (send null to clear)".to_string(),
+            })
         }
-    }
-    let (effective, persisted) = state.set_default_model(category, requested);
+        Some(Value::Null) => None,
+        Some(Value::String(model)) => {
+            let catalog = state.catalog().await?;
+            let entry = resolve_unique(model, &catalog, |query| ApiError::BadRequest {
+                reason: format!("unknown model `{query}`"),
+            })?;
+            if entry.category != category {
+                return Err(ApiError::BadRequest {
+                    reason: format!(
+                        "model `{}` belongs to {}, not {}",
+                        entry.name, entry.category, category
+                    ),
+                });
+            }
+            Some(entry.name.clone())
+        }
+        Some(_) => {
+            return Err(ApiError::BadRequest {
+                reason: "`model` must be a string or null".to_string(),
+            })
+        }
+    };
+    let (effective, persisted) = state.set_default_model(category, requested.as_deref());
     Ok(Json(json!({
         "status": "ok",
         "category": category,
@@ -2395,7 +2493,10 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
         .route("/har/models", get(har_models))
         .route("/har/config/default", post(har_config_default))
         .route("/har/config/logging", post(har_config_logging))
-        .route("/har/config/model", post(har_config_model));
+        .route("/har/config/model", post(har_config_model))
+        // `/har/*` bodies are small JSON objects; the proxy's ceiling must not be
+        // reachable from the control surface (FINDINGS-06 [7]).
+        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT));
     Router::new()
         .merge(category_router(Arc::clone(&api), control_category))
         .merge(
@@ -2415,7 +2516,8 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
             TraceLayer::new_for_http(),
             CompressionLayer::new(),
             // The control listener also carries its category's proxy surface, so the
-            // generous limit applies here too; `/har/*` bodies are tiny in practice.
+            // proxy ceiling applies to the merged router; the `/har/*` sub-router
+            // narrows it to CONTROL_BODY_LIMIT above.
             DefaultBodyLimit::max(PROXY_BODY_LIMIT),
         ))
 }
@@ -2906,6 +3008,41 @@ mod tests {
             Arc::new(crate::budget::LedgerOnlyWitness),
             boot,
         )
+    }
+
+    /// FINDINGS-OPEN N1: the state pump builds the merged document once and every
+    /// SSE subscriber reads the same published value. Falsifier: restore the
+    /// per-client `merged_state` loop and the second subscriber's value is a
+    /// different build (and the pump flag is never set).
+    #[tokio::test]
+    async fn the_state_pump_builds_once_and_publishes_to_every_subscriber() {
+        let state = Arc::new(live_state(BootTimings::default()));
+        state.ensure_state_pump();
+        let mut first = state.state_events.subscribe();
+        let second = state.state_events.subscribe();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while matches!(*first.borrow(), StateEvent::Empty) {
+            tokio::time::timeout_at(deadline, first.changed())
+                .await
+                .expect("the pump publishes within 5s")
+                .expect("the pump's sender is alive");
+        }
+        let doc = match &*first.borrow() {
+            StateEvent::Doc(doc) => Arc::clone(doc),
+            _ => panic!("the pump published a document"),
+        };
+        assert!(
+            doc.get("models").is_some(),
+            "the merged document carries the model table: {doc}"
+        );
+        assert!(
+            matches!(*second.borrow(), StateEvent::Doc(_)),
+            "a late subscriber reads the same published value, not a second build"
+        );
+        assert!(
+            state.state_pump_started.load(Ordering::Acquire),
+            "the one-shot pump flag is set"
+        );
     }
 
     /// Axis 2 (ruling 2026-10-29): the loaded row's two new facts are server-computed
@@ -4440,6 +4577,31 @@ mod tests {
         );
         let action = classify_send_failure(&error, port).expect("connect-class retries once");
         assert_eq!(action, RetryAction::Restart);
+    }
+
+    /// FINDINGS-06 [6]: a total `ClientBuilder::timeout` covers the response body, so
+    /// it cut a long SSE generation mid-stream after the 200. The production client
+    /// must carry a per-read deadline, not a total one. Falsifier: put `.timeout(...)`
+    /// back into the builder and this tripwire fails.
+    #[test]
+    fn the_proxy_client_has_no_total_deadline() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("proxy: reqwest::Client::builder()")
+            .expect("the proxy client builder is still in this file");
+        let end = source[start..]
+            .find(".build()")
+            .expect("the builder still finishes with build()")
+            + start;
+        let builder = &source[start..end];
+        assert!(
+            builder.contains(".read_timeout("),
+            "the proxy needs a per-read deadline: {builder}"
+        );
+        assert!(
+            !builder.contains(".timeout("),
+            "a total timeout covers the SSE body and truncates live generations: {builder}"
+        );
     }
 
     #[tokio::test]

@@ -847,6 +847,166 @@ async fn default_model_endpoint_validates_and_takes_effect() {
 }
 
 #[tokio::test]
+async fn default_model_persists_the_canonical_name_not_the_alias() {
+    // FINDINGS-06 [5]: `resolve` accepts case-insensitive names and GGUF aliases,
+    // but the scheduler and the boot check compare `m.name == model` exactly. The
+    // endpoint must persist the entry's canonical name, or the default it just
+    // accepted 404s on the first no-model request and after every restart.
+    let (control, work, _, _, _, modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    std::fs::write(
+        modelconf.join("qwen3.yaml"),
+        "name: qwen3\nengine: mock\ncategory: WORK\nvram_gb: 4\nmodel: F:/MODELS/Qwen3-0.6B-Q8_0.gguf\n",
+    )
+    .expect("seed alias row");
+    let (status, body) = post_json(&control, "/har/rescan", "{}").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"WORK","model":"Qwen3-0.6B-Q8_0"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["default_model"], "qwen3", "canonical name: {body}");
+
+    // The no-model fallback must load it: the scheduler resolves by exact name.
+    let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"messages":[]}"#).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["body"]["model"], "mock-model");
+
+    let on_disk: Value = serde_json::from_str(
+        &std::fs::read_to_string(modelconf.join(TEST_CONFIG_NAME)).expect("config file"),
+    )
+    .expect("valid json");
+    let work_cat = on_disk["categories"]
+        .as_array()
+        .expect("categories")
+        .iter()
+        .find(|cat| cat["id"] == "WORK")
+        .expect("WORK");
+    assert_eq!(
+        work_cat["default_model"], "qwen3",
+        "the persisted value is the canonical name, not the alias: {on_disk}"
+    );
+}
+
+#[tokio::test]
+async fn default_model_requires_the_model_key_and_rejects_wrong_types() {
+    // FINDINGS-07 [10]: absent, null and wrong-typed `model` all cleared the
+    // persisted default. Only `null` may clear; absent and wrong-typed are caller
+    // mistakes and must 400 without touching the file.
+    let (control, _, _, _, _, modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let (status, _) = post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"WORK","model":"qwen3"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let before = std::fs::read_to_string(modelconf.join(TEST_CONFIG_NAME)).expect("config");
+
+    for body in [
+        r#"{"category":"WORK"}"#,
+        r#"{"category":"WORK","model":123}"#,
+        r#"{"category":"WORK","model":true}"#,
+        r#"{"category":"WORK","model":["qwen3"]}"#,
+        r#"{"category":"WORK","model":{"name":"qwen3"}}"#,
+    ] {
+        let (status, reply) = post_json(&control, "/har/config/default", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "`{body}`: {reply}");
+        assert_eq!(
+            std::fs::read_to_string(modelconf.join(TEST_CONFIG_NAME)).expect("config"),
+            before,
+            "a refused body may not rewrite the config: `{body}`"
+        );
+    }
+
+    // `null` is the documented clear, and it still works.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"WORK","model":null}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body["default_model"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn control_bodies_are_capped_below_the_proxy_ceiling() {
+    // FINDINGS-06 [7]: the 1 GiB proxy ceiling was shared by
+    // `/har/*`, so a control POST could force a 1 GiB buffer. The control surface
+    // now has its own 64 KiB limit; a body over it is refused before any handler.
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
+    let oversized = "x".repeat(64 * 1024 + 1);
+    let body = format!(r#"{{"model":"{oversized}"}}"#);
+    let response = control
+        .clone()
+        .oneshot(
+            Request::post("/har/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the control limit must refuse the body before the handler: {text}"
+    );
+    assert!(
+        text.contains("length limit exceeded"),
+        "the refusal must name the limit, not a parse error: {text}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_bodies_are_capped_at_64_mib() {
+    // FINDINGS-06 [7]: the proxy ceiling was 1 GiB, and the body is buffered into a
+    // `Json<Value>` before any handler runs. The 64 MiB cap must be enforced by the
+    // extractor, not discovered after a multi-GiB parse. Falsifier: restore 1 GiB and
+    // this body parses far enough to answer a JSON error instead of the limit.
+    let (_, work, _, _, _, _) = app(AppConfig::default(), &[]);
+    let oversized = vec![b'x'; 64 * 1024 * 1024 + 1];
+    let response = work
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the proxy limit must refuse the body before the handler: {text}"
+    );
+    assert!(
+        text.contains("length limit exceeded"),
+        "the refusal must name the limit, not a JSON parse error: {text}"
+    );
+}
+
+#[tokio::test]
 async fn extended_logging_toggle_round_trips_and_validates() {
     let (control, _, _, _, _, _) = app(
         AppConfig::default(),
@@ -2423,8 +2583,8 @@ async fn timeout_class_is_502_and_never_restarts() {
     // produces a real reqwest timeout - the class that used to mean "engine
     // died" and reaped healthy engines. It must map to a typed 502 naming the
     // class, with no restart in sight. The production proxy client's 600 s
-    // deadline is hard-coded and not injectable without new public surface, so
-    // the end-to-end 600 s wait is out of scope; the classifier is the decision
+    // read timeout is hard-coded and not injectable without new public surface,
+    // so the end-to-end 600 s wait is out of scope; the classifier is the decision
     // site and is exercised with the real error value here.
     let hanging = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

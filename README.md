@@ -7,7 +7,7 @@ with a typed, single-writer scheduler, admits loads on the card's own reading
 (the *witness*) minus a reserve, with in-flight bookings — and **refuses, with
 reasons**, rather than overcommitting.
 
-Current release: **v1.0.1** — `cargo build --release` produces
+Current build: **v1.0.1** (release tag pending) — `cargo build --release` produces
 `target\release\simplehar-se.exe`, or use the shipped exe directly.
 
 ## Who this is for
@@ -401,7 +401,7 @@ per-category, Exit.
 | `POST /har/load` | `{model}` — loads into the model's own category (from its yaml) |
 | `POST /har/unload` | `{model}` \| `{category}` \| `{}` (all). Unloading a *loading* slot cancels that swap (cleanup still completes) |
 | `POST /har/rescan` | `{}` catalog rescan |
-| `POST /har/config/default` | `{category, model \| null}` — persists to the config file |
+| `POST /har/config/default` | `{category, model \| null}` — `model` is required; a string sets the default (stored as its canonical name), `null` clears it. Persists to the config file |
 | `POST /har/config/logging` | `{enabled: bool}` — toggles the verbose harness log |
 | `POST /har/config/model` | `{model, category?, cpu?}` — writes back to the model yaml |
 
