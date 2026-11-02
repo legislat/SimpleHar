@@ -241,10 +241,13 @@ pub(crate) fn args_hash(args: &[String]) -> u64 {
 
 /// Strict parser for `--fit-print` stdout: every non-blank line must match
 /// `NAME model ctx compute` with single spaces and three unsigned columns
-/// (CRLF tolerated). Any deviation — an empty answer, a word in a numeric
-/// column, a missing column — refuses the WHOLE output: there is no partial
-/// reading of a projection, and a parser that invents numbers is the exact
-/// failure class the whole ruling exists to retire.
+/// (CRLF and a TRAILING SPACE tolerated — the live 2026-11-02 capture proved
+/// llama-fit-params appends a space to every row, so a parser that refused it
+/// would refuse every real projection on this box). Any deviation — an empty
+/// answer, a word in a numeric column, a missing or fifth column — refuses
+/// the WHOLE output: there is no partial reading of a projection, and a
+/// parser that invents numbers is the exact failure class the whole ruling
+/// exists to retire.
 ///
 /// # Errors
 ///
@@ -253,7 +256,11 @@ pub(crate) fn parse_output(stdout: &str) -> Result<Vec<FitRow>, FitError> {
     let mut rows = Vec::new();
     for (index, line) in stdout.lines().enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.trim().is_empty() {
+        // Trailing whitespace is padding the probe emits, never a column;
+        // trimming the END only keeps the strict single-space contract for
+        // everything a real field could hide behind.
+        let line = line.trim_end();
+        if line.is_empty() {
             continue;
         }
         let bad = |reason: String| FitError::BadOutput {
@@ -350,9 +357,11 @@ mod tests {
             .collect()
     }
 
-    /// The exact captured stdout of the live 2026-11-01 probe (Search#40 §2):
-    /// the parse fixture and its 31 717 MiB device sum are pinned together.
-    const CAPTURED: &str = "CUDA0 21484 8853 1380\nHost 994 0 296\n";
+    /// The exact captured stdout of the live probe, trailing space per line
+    /// included (Search#40 §2 bytes, re-confirmed 2026-11-02 when the harness
+    /// refused every projection for exactly this space): the parse fixture and
+    /// its 31 717 MiB device sum are pinned together.
+    const CAPTURED: &str = "CUDA0 21484 8853 1380 \nHost 994 0 296 \n";
 
     fn constants(margin: f64, surcharge: Option<f64>) -> FitConstants {
         FitConstants {
@@ -382,7 +391,7 @@ mod tests {
         // (1000+100+100 + 2000+200+200 + 50) MiB = 3650 MiB over THREE devices.
         assert_eq!(gib, 3650.0 / 1024.0 + 1.5 * 3.0);
         let vision = book_gb(
-            &parse_output("CUDA0 21484 8853 1380\nHost 994 0 296\n").expect("device row"),
+            &parse_output(CAPTURED).expect("device row"),
             true,
             &constants(0.5, Some(1.25)),
         )
@@ -427,6 +436,24 @@ mod tests {
     fn crlf_answers_parse_like_lf_ones() {
         let rows = parse_output("CUDA0 1 2 3\r\n").expect("windows line endings");
         assert_eq!(rows[0].total_mib(), 6);
+    }
+
+    #[test]
+    fn the_live_probe_trailing_space_is_padding_not_a_fifth_column() {
+        // Byte-for-byte the line the harness refused on 2026-11-02, which kept
+        // every llama row on the estimate ladder: a real capture must parse.
+        let rows = parse_output("CUDA0 21484 8853 1380 \r\nHost 994 0 296 \r\n")
+            .expect("the live probe pads every row with a space");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].total_mib(),
+            31_717,
+            "the CUDA0 row is the whole device sum"
+        );
+        // A run of spaces INSIDE the row still breaks the strict contract,
+        // and a whitespace-only line stays blank rather than a phantom row.
+        assert!(parse_output("CUDA0  21484 8853 1380").is_err());
+        assert!(parse_output("   \nCUDA0 1 2 3\n").is_ok_and(|rows| rows.len() == 1));
     }
 
     #[test]
