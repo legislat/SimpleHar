@@ -1,28 +1,27 @@
 //! The ninfer engine adapter (DESIGN Step 7; port of the working v3.3 path).
 //!
 //! Ninfer engines are GPU containers living inside WSL. Since the template-adoption
-//! ruling (operator, 2026-10-31) the harness no longer launches operator-written
-//! scripts: a model that declares `ninfer_image` gets the canonical script below
-//! rendered from its yaml, staged content-addressed into the distro by
-//! [`crate::process`], and launched from the staged copy — so every ninfer start
-//! complies with what the harness can check and expect (`--restart no`,
-//! loopback-only publish, bounded logs, pre-reap). `ninfer_autostart` remains as the
-//! compatibility path for pre-template yamls (deprecated by ruling 18b: the scan
-//! warns every such row, removal rides a green Wave C): the operator's script runs
-//! verbatim under the same positional contract (`$1` profile, `$2` key|nokey, `$3`
-//! host-publish port). Because the container outlives the short-lived `wsl.exe`
-//! client, the spec carries the container name so the runtime reaps it with
-//! `docker rm -f` on release (v3.3 `Proc::Container` parity), and readiness chains
-//! `/health` then `/v1/models` (v3.3 `wait_ready`; SE's `Then` probes both, unlike
-//! v3.3's first-step-only unwrap).
+//! ruling (operator, 2026-10-31) the harness launches only its own script: a model
+//! that declares `ninfer_image` gets the canonical script below rendered from its
+//! yaml, staged content-addressed into the distro by [`crate::process`], and
+//! launched from the staged copy, so every ninfer start complies with what the
+//! harness can check and expect (`--restart no`, loopback-only publish, bounded
+//! logs, pre-reap). The legacy `ninfer_autostart` operator-script path was removed
+//! after a green Wave C (ruling 18b): a row that still declares it is refused at
+//! scan and at launch with [`legacy_removed_sentence`], never published. Because
+//! the container outlives the short-lived `wsl.exe` client, the spec carries the
+//! container name so the runtime reaps it with `docker rm -f` on release (v3.3
+//! `Proc::Container` parity), and readiness chains `/health` then `/v1/models`
+//! (v3.3 `wait_ready`; SE's `Then` probes both, unlike v3.3's first-step-only
+//! unwrap).
 //!
 //! Every ninfer model the catalog carries is managed: the operator's 2026-10-26
 //! call scrapped v3.3's `external: true` so the former bonsai servers are loaded
-//! and reaped here like any other. The port comes from the harness's slot plan but
-//! reaches the container only as the script's `$3` **offer** — whether the
-//! autostart script publishes there is the operator's contract, unverifiable from
-//! here (FINDINGS-10 [5]); the harness's own evidence is that its readiness probes
-//! answer on that port, nothing more.
+//! and reaped here like any other. The port comes from the harness's slot plan and
+//! reaches the container as the script's `$3` publish argument; the canonical
+//! script fails closed when it is absent (`PUBLISH="${3:?...}"`) and publishes
+//! exactly that number on loopback, so the harness's own evidence (its readiness
+//! probes answer on that port) describes what actually runs.
 
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
@@ -56,7 +55,7 @@ pub struct NinferAdapter {
 /// absolute path in the catalog but names a file the operator did not write. The
 /// rule is the character class rather than bash's expansion positions: an interior
 /// `~` (inert to the shell) is refused too, deliberately, so one charset is the
-/// whole story. Every autostart path in the live catalog is already absolute
+/// whole story. Every launch word the harness renders is already absolute
 /// (`/home/...`), and profile words never need it. What this rule still does NOT do
 /// is bound *which* absolute paths are admissible: the distro-side root allow-list
 /// is the ninfer `custody_exec_roots` cell of the [`crate::engine::policy`]
@@ -378,8 +377,8 @@ fn defaulted_word(model: &ModelEntry, key: &str, fallback: &str) -> Result<Strin
 }
 
 /// The first present `ninfer_profile_<built-in>` key — one this module's
-/// precedence can never read in EITHER launch mode, so both refuse it
-/// (review L-2: the legacy branch once ignored it silently).
+/// precedence can never read, so [`profile_override`] refuses it (review L-2:
+/// a branch once ignored it silently).
 fn dead_built_in_profile_key(raw: &BTreeMap<String, String>) -> Option<&'static str> {
     BUILT_IN_PROFILES
         .iter()
@@ -728,6 +727,22 @@ fn render_canonical(params: &NinferParams) -> Result<String, EngineError> {
     Ok(script)
 }
 
+/// The one migration sentence for the removed legacy `ninfer_autostart` launch
+/// path (ruling 18b removal, green Wave C). Every naming of the four required
+/// template keys lives here, so the scan and the adapter answer identically
+/// (the strata `superseded_sentence` precedent): one home, one voice.
+pub(crate) fn legacy_removed_sentence(script: &str) -> String {
+    format!(
+        "`ninfer_autostart` ({script}) names the legacy launch path, which is \
+         removed: the harness no longer runs operator-written scripts. Migrate the \
+         row to the harness-rendered template: declare `ninfer_image` (the \
+         container image), `ninfer_model_name` (the directory that holds the \
+         artifact), `ninfer_artifact` (the file inside it), and `ninfer_model_roots` \
+         (comma-separated absolute WSL model directories), then delete the \
+         `ninfer_autostart` line."
+    )
+}
+
 impl NinferAdapter {
     /// Creates the adapter with the config's WSL coordinates.
     pub fn new(wsl_distro: impl Into<String>, wsl_user: impl Into<String>) -> Self {
@@ -739,10 +754,10 @@ impl NinferAdapter {
         }
     }
 
-    /// The autostart argv exactly as v3.3 built it: shared WSL client prefix,
-    /// then bash, script, profile, key flag, and the port offered as `$3` — the
-    /// harness's slot-plan port, which the script decides whether to publish
-    /// (the header's offer/contract sentence; 10[5]).
+    /// The autostart argv on the v3.3 positional contract: shared WSL client
+    /// prefix, then bash, script, profile, key flag, and the harness slot-plan
+    /// port as `$3`, the publish number the canonical script honors and fails
+    /// closed without.
     fn argv(&self, script: &str, profile: &str, key: &str, port: u16) -> Vec<String> {
         let mut argv =
             crate::engine::wsl_prefix(&self.defaults.wsl_distro, &self.defaults.wsl_user);
@@ -783,6 +798,18 @@ impl EngineAdapter for NinferAdapter {
             model: model.name.clone(),
             field: field.to_string(),
         };
+        // Ruling 18b removal (green Wave C): the legacy operator-script path is
+        // gone. A row that still declares `ninfer_autostart` is refused here and
+        // at scan with one migration sentence. There is no fallback behind it,
+        // the harness never runs an operator file.
+        if let Some(script) = model
+            .raw
+            .get("ninfer_autostart")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            return Err(rejected(legacy_removed_sentence(script)));
+        }
         let container = model
             .raw
             .get("ninfer_container")
@@ -795,86 +822,20 @@ impl EngineAdapter for NinferAdapter {
                  [A-Za-z0-9._-] only, never a container-ID shape): {container}"
             )));
         }
-        let profile = model
-            .raw
-            .get("ninfer_profile")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_PROFILE.to_string());
-        if !valid_word(&profile) {
-            return Err(rejected(format!(
-                "ninfer_profile must be a plain word (no spaces or shell metacharacters): {profile}"
-            )));
-        }
-        // Dead built-in-name override lines are refused in EITHER launch mode:
-        // the template path refuses through `profile_override`, and the legacy
-        // path — which never resolves the override — must refuse too rather
-        // than pass `$1` and ignore the line silently (review L-2).
-        if let Some(dead) = dead_built_in_profile_key(&model.raw) {
-            return Err(rejected(format!(
-                "`ninfer_profile_{dead}` can never be read: `{dead}` is a built-in profile \
-                 and the built-in table wins; rename the profile to a custom name"
-            )));
-        }
-        let key = if model
-            .raw
-            .get("ninfer_key")
-            .map(String::as_str)
-            .is_some_and(crate::model::truthy)
-        {
-            "key"
-        } else {
-            "nokey"
-        };
-        // Two launch sources, one rule: whatever runs must be something the harness
-        // can check and expect (operator ruling 2026-10-31). `ninfer_image` selects
-        // the canonical template — the harness renders it, stages the bytes, and
-        // launches the staged copy. `ninfer_autostart` selects the operator's own
-        // script, verbatim: kept as the compatibility path for yamls written before
-        // the template (a legacy script's contract is the same positional argv), not
-        // as a way to bypass validation. Declaring both is a refusal, not a priority:
-        // a model either runs under the harness's word or the operator's, never in
-        // the ambiguous middle.
-        let autostart = model
-            .raw
-            .get("ninfer_autostart")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let template_mode = model
-            .raw
-            .get("ninfer_image")
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-        let (script_path, script) = match (template_mode, autostart) {
-            (true, Some(_)) => {
-                return Err(rejected(
-                    "`ninfer_image` (canonical template) and `ninfer_autostart` (operator \
-                     script) are mutually exclusive: a launch has exactly one source"
-                        .to_string(),
-                ))
-            }
-            (true, None) => {
-                let params = template_params(model, &container)?;
-                let script = render_canonical(&params)?;
-                let name = format!(
-                    "{container}-{:016x}.sh",
-                    crate::process::script_content_hash(&script)
-                );
-                (name, Some(script))
-            }
-            (false, Some(script)) => {
-                if !valid_word(&script) {
-                    return Err(rejected(format!(
-                        "ninfer_autostart must be a plain WSL path (no spaces, no shell \
-                         metacharacters, no leading `~`): {script}"
-                    )));
-                }
-                (script, None)
-            }
-            (false, None) => return Err(missing("ninfer_autostart")),
-        };
+        // The only launch source: whatever runs is the harness's own word. The
+        // canonical template renders from the row's yaml; the runtime stages the
+        // bytes and rewrites the script slot to the staged copy (operator ruling
+        // 2026-10-31). Every gate (the profile shape, the dead built-in-name
+        // override line, the serve-args surface) is `template_params`' and
+        // `profile_override`'s, so a refusal always names the exact key.
+        let params = template_params(model, &container)?;
+        let script = render_canonical(&params)?;
+        let script_path = format!(
+            "{container}-{:016x}.sh",
+            crate::process::script_content_hash(&script)
+        );
         Ok(LaunchSpec {
-            argv: self.argv(&script_path, &profile, key, port),
+            argv: self.argv(&script_path, &params.profile, &params.key, port),
             // The client's cwd is irrelevant: everything runs inside WSL.
             cwd: std::env::temp_dir(),
             env: BTreeMap::new(),
@@ -890,7 +851,7 @@ impl EngineAdapter for NinferAdapter {
                 }),
             ),
             container: Some(container.to_string()),
-            script,
+            script: Some(script),
             rendered_profile: None,
             custody: None,
         })
@@ -969,103 +930,40 @@ mod tests {
         // No username ships as a default, so the load has to explain the fix rather
         // than hand `wsl.exe` an empty `-u` and fail obscurely.
         let err = NinferAdapter::new("Ubuntu", "")
-            .spec(
-                &entry(&[
-                    ("ninfer_autostart", "/home/u/guide/ninfer-x/autostart.sh"),
-                    ("ninfer_container", "ninfer-x"),
-                ]),
-                18109,
-            )
+            .spec(&entry(&template_pairs()), 18109)
             .expect_err("a blank account cannot launch");
         assert!(err.to_string().contains("wsl_user"), "was: {err}");
     }
 
     #[test]
-    fn argv_matches_the_v33_positional_contract() {
-        let spec = NinferAdapter::new("Ubuntu", "ops")
-            .spec(
-                &entry(&[
-                    ("ninfer_autostart", "/home/u/guide/ninfer-x/autostart.sh"),
-                    ("ninfer_container", "ninfer-x"),
-                ]),
-                18109,
-            )
-            .expect("valid spec");
-        assert_eq!(
-            spec.argv,
-            vec![
-                "wsl.exe",
-                "-d",
-                "Ubuntu",
-                "-u",
-                "ops",
-                "--",
-                "bash",
-                "/home/u/guide/ninfer-x/autostart.sh",
-                "b",
-                "nokey",
-                "18109",
-            ]
-        );
-        assert_eq!(spec.log_name, "ninfer-test");
-        assert_eq!(spec.container.as_deref(), Some("ninfer-x"));
-        assert_eq!(
-            spec.readiness,
-            ReadinessSpec::Then(
-                Box::new(ReadinessSpec::Http {
-                    path: "/health".to_string(),
-                    expect_status: 200,
-                }),
-                Box::new(ReadinessSpec::Http {
-                    path: "/v1/models".to_string(),
-                    expect_status: 200,
-                }),
-            )
-        );
-    }
-
-    #[test]
     fn profile_and_key_flags_pass_through() {
+        let mut pairs = template_pairs();
+        pairs.push(("ninfer_profile", "a"));
+        pairs.push(("ninfer_key", "true"));
         let spec = NinferAdapter::new("U2", "usr")
-            .spec(
-                &entry(&[
-                    ("ninfer_autostart", "/s.sh"),
-                    ("ninfer_container", "c"),
-                    ("ninfer_profile", "a"),
-                    ("ninfer_key", "true"),
-                ]),
-                18110,
-            )
+            .spec(&entry(&pairs), 18110)
             .expect("valid spec");
-        assert_eq!(
-            spec.argv[2..],
-            ["U2", "-u", "usr", "--", "bash", "/s.sh", "a", "key", "18110"]
-        );
+        assert_eq!(&spec.argv[2..4], ["U2", "-u"]);
+        assert_eq!(&spec.argv[4..7], ["usr", "--", "bash"]);
+        assert!(spec.argv[7].starts_with("ninfer-x-") && spec.argv[7].ends_with(".sh"));
+        assert_eq!(&spec.argv[8..], ["a", "key", "18110"]);
     }
 
-    /// Pin of the `cpu_offload` engine scoping: the ninfer adapter reads only
-    /// `ninfer_autostart`/`ninfer_container`/`ninfer_profile`/`ninfer_key` — the
-    /// key is inert for this engine, so absent, `true` and `false` must produce a
-    /// byte-identical [`LaunchSpec`] (argv, env, readiness, cwd, container alike).
+    /// Pin of the `cpu_offload` engine scoping: the ninfer adapter reads no
+    /// offload key; the key is inert for this engine, so absent, `true` and
+    /// `false` must produce a byte-identical [`LaunchSpec`] (argv, env,
+    /// readiness, cwd, container, rendered script alike).
     /// Falsifier: if this adapter starts reading the key, the equality fails here.
     #[test]
     fn cpu_offload_changes_nothing_for_a_ninfer_launch() {
         let base = NinferAdapter::new("Ubuntu", "ops")
-            .spec(
-                &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", "c")]),
-                18109,
-            )
+            .spec(&entry(&template_pairs()), 18109)
             .expect("absent key");
         for value in ["true", "false"] {
+            let mut pairs = template_pairs();
+            pairs.push(("cpu_offload", value));
             let spec = NinferAdapter::new("Ubuntu", "ops")
-                .spec(
-                    &entry(&[
-                        ("ninfer_autostart", "/s.sh"),
-                        ("ninfer_container", "c"),
-                        ("cpu_offload", value),
-                    ]),
-                    18109,
-                )
+                .spec(&entry(&pairs), 18109)
                 .expect("an inert key never refuses a launch");
             assert_eq!(
                 spec, base,
@@ -1081,11 +979,13 @@ mod tests {
             .spec(&entry(&[("ninfer_container", "c")]), 18109)
             .expect_err("must refuse");
         match err {
-            EngineError::MissingField { field, .. } => assert_eq!(field, "ninfer_autostart"),
+            EngineError::MissingField { field, .. } => assert_eq!(field, "ninfer_image"),
             other => panic!("expected a MissingField refusal, got {other:?}"),
         }
+        let mut pairs = template_pairs();
+        pairs.retain(|(key, _)| *key != "ninfer_container");
         let err = NinferAdapter::new("Ubuntu", "ops")
-            .spec(&entry(&[("ninfer_autostart", "/s.sh")]), 18109)
+            .spec(&entry(&pairs), 18109)
             .expect_err("must refuse");
         match err {
             EngineError::MissingField { field, .. } => assert_eq!(field, "ninfer_container"),
@@ -1096,47 +996,37 @@ mod tests {
     /// FINDINGS2-0910 [6]: `~` is shell-active at a word start, so the login shell
     /// that re-tokenizes everything after `wsl.exe --` would expand `~root/x.sh` to
     /// `/root/x.sh` and `~/x.sh` to the wsl_user's home — a yaml word that reads
-    /// like an absolute path but names a file the operator never wrote. Both
-    /// autostart and profile words are held to the same rule; the live catalog's
-    /// paths are all absolute, so nothing legitimate depends on `~`.
+    /// like an absolute path but names a file the operator never wrote. The rule
+    /// is the character class, not a simulation of bash's expansion positions: an
+    /// interior `~` (inert to bash, legal as a filename) is refused too.
+    /// Deliberately stricter: one charset, no shell-context reasoning required of
+    /// the next reader. Every rendered launch word is already plain.
     #[test]
     fn tilde_expanding_words_are_refused() {
-        for script in ["~root/guide/x/autostart.sh", "~/autostart.sh", "~"] {
-            let reason = refused(&[("ninfer_autostart", script), ("ninfer_container", "c")]);
-            assert!(reason.contains("plain WSL path"), "{script}: {reason}");
+        for profile in ["~b", "~/b", "~"] {
+            let mut pairs = template_pairs();
+            pairs.push(("ninfer_profile", profile));
+            let reason = refused(&pairs);
+            assert!(reason.contains("ninfer_profile"), "{profile}: {reason}");
         }
-        let reason = refused(&[
-            ("ninfer_autostart", "/s.sh"),
-            ("ninfer_container", "c"),
-            ("ninfer_profile", "~b"),
-        ]);
-        assert!(reason.contains("ninfer_profile"), "{reason}");
-        // The rule is the character class, not a simulation of bash's expansion
-        // positions: an interior `~` (inert to bash, legal as a filename) is refused
-        // too. Deliberately stricter — one charset, no shell-context reasoning
-        // required of the next reader — and no live autostart path needs it.
-        let reason = refused(&[
-            ("ninfer_autostart", "/home/u/a~b/autostart.sh"),
-            ("ninfer_container", "c"),
-        ]);
-        assert!(reason.contains("plain WSL path"), "{reason}");
+        // The rule is the character class, not bash's expansion positions: an
+        // interior `~` (inert to bash, legal as a filename) is refused too.
+        let mut pairs = template_pairs();
+        pairs.push(("ninfer_model_name", "a~b"));
+        let reason = refused(&pairs);
+        assert!(reason.contains("ninfer_model_name"), "{reason}");
     }
 
     #[test]
     fn external_key_is_inert_now() {
         // Operator call 2026-10-26 scrapped `external: true`: a copied-back v3.3
         // yaml must be managed, not refused — the key carries no meaning here.
+        let mut pairs = template_pairs();
+        pairs.push(("external", "true"));
         let spec = NinferAdapter::new("Ubuntu", "ops")
-            .spec(
-                &entry(&[
-                    ("ninfer_autostart", "/s.sh"),
-                    ("ninfer_container", "c"),
-                    ("external", "true"),
-                ]),
-                18109,
-            )
+            .spec(&entry(&pairs), 18109)
             .expect("managed");
-        assert_eq!(spec.container.as_deref(), Some("c"));
+        assert_eq!(spec.container.as_deref(), Some("ninfer-x"));
     }
 
     /// The reason one hostile `raw` value earns, or a panic naming a value that was
@@ -1157,18 +1047,15 @@ mod tests {
         // The argv after `wsl.exe --` is re-tokenized by the login shell inside the
         // distro, so a yaml value is only safe as a plain word (security review,
         // 2026-10-26): option-shaped, spaced and metacharacter-bearing values die here.
-        for bad in ["-c", "/s.sh; id", "/s$(id).sh", "/s.sh|sh", "/a b.sh"] {
-            let reason = refused(&[("ninfer_autostart", bad), ("ninfer_container", "c")]);
-            assert!(reason.contains("plain WSL path"), "{bad}: {reason}");
-        }
-        let reason = refused(&[
-            ("ninfer_autostart", "/s.sh"),
-            ("ninfer_container", "c"),
-            ("ninfer_profile", "b; id"),
-        ]);
+        let mut pairs = template_pairs();
+        pairs.push(("ninfer_profile", "b; id"));
+        let reason = refused(&pairs);
         assert!(reason.contains("ninfer_profile"), "{reason}");
         for name in ["-v", "_x", "a b"] {
-            let reason = refused(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", name)]);
+            let mut pairs = template_pairs();
+            pairs.retain(|(key, _)| *key != "ninfer_container");
+            pairs.push(("ninfer_container", name));
+            let reason = refused(&pairs);
             assert!(reason.contains("docker name"), "{name}: {reason}");
         }
     }
@@ -1180,47 +1067,37 @@ mod tests {
         // the claim ledger use — before it can reach the pre-reap argv and delete an
         // unrelated container in the operator's distro.
         for name in ["1234abc", "beef", "deadbeef"] {
-            let reason = refused(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", name)]);
+            let mut pairs = template_pairs();
+            pairs.retain(|(key, _)| *key != "ninfer_container");
+            pairs.push(("ninfer_container", name));
+            let reason = refused(&pairs);
             assert!(reason.contains("docker name"), "{name}: {reason}");
         }
         assert_eq!(
             NinferAdapter::new("Ubuntu", "ops")
-                .spec(
-                    &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", "c")]),
-                    18109,
-                )
-                .expect("a short name is not an id shape")
+                .spec(&entry(&template_pairs()), 18109)
+                .expect("a valid name loads")
                 .container
                 .as_deref(),
-            Some("c"),
-            "a one-character hex name must still load: the load path stays intact"
+            Some("ninfer-x"),
+            "a valid docker name must still load: the load path stays intact"
         );
     }
 
     #[test]
     fn key_flag_uses_the_shared_truthy_table() {
         for value in ["true", "1", "yes", "on"] {
+            let mut pairs = template_pairs();
+            pairs.push(("ninfer_key", value));
             let spec = NinferAdapter::new("Ubuntu", "ops")
-                .spec(
-                    &entry(&[
-                        ("ninfer_autostart", "/s.sh"),
-                        ("ninfer_container", "c"),
-                        ("ninfer_key", value),
-                    ]),
-                    18109,
-                )
+                .spec(&entry(&pairs), 18109)
                 .expect("valid spec");
             assert_eq!(spec.argv[9], "key", "ninfer_key: {value}");
         }
+        let mut pairs = template_pairs();
+        pairs.push(("ninfer_key", "off"));
         let spec = NinferAdapter::new("Ubuntu", "ops")
-            .spec(
-                &entry(&[
-                    ("ninfer_autostart", "/s.sh"),
-                    ("ninfer_container", "c"),
-                    ("ninfer_key", "off"),
-                ]),
-                18109,
-            )
+            .spec(&entry(&pairs), 18109)
             .expect("valid spec");
         assert_eq!(spec.argv[9], "nokey");
     }
@@ -1301,31 +1178,6 @@ mod tests {
             assert!(reason.contains(dead), "{selected}/{dead}: {reason}");
             assert!(reason.contains("built-in"), "{selected}/{dead}: {reason}");
         }
-    }
-
-    /// Legacy rows refuse the dead built-in-name override too, even though the
-    /// legacy path never resolves an override (the README promises the refusal
-    /// at launch in EITHER mode; review L-2). Falsifier: a legacy branch that
-    /// accepts the line while only the template path refuses.
-    #[test]
-    fn legacy_mode_refuses_the_dead_built_in_override_key_too() {
-        let error = NinferAdapter::new("Ubuntu", "ops")
-            .spec(
-                &entry(&[
-                    ("ninfer_autostart", "/s.sh"),
-                    ("ninfer_container", "c"),
-                    (
-                        "ninfer_profile_b",
-                        "ctx=262144 kv=262144 conc=2 kv_dtype=int8",
-                    ),
-                ]),
-                18109,
-            )
-            .expect_err("a dead override key must refuse in legacy mode too");
-        assert!(
-            format!("{error}").contains("ninfer_profile_b"),
-            "the refusal must name the key: {error}"
-        );
     }
 
     /// The `ninfer_env` allow-list is a review gate, not a parse rule: the one
@@ -1665,12 +1517,39 @@ mod tests {
         }
     }
 
+    /// Ruling 18b removal: a row that declares `ninfer_autostart` is refused at
+    /// launch with the migration sentence, whatever else it declares - the
+    /// verbatim legacy shape and the pair with `ninfer_image`. Falsifier: the
+    /// removed legacy path launched the first row and refused the pair with a
+    /// different sentence, so both legs fail on the old code.
     #[test]
-    fn image_and_autostart_declared_together_is_a_refusal_not_a_priority() {
-        let mut pairs = template_pairs();
-        pairs.push(("ninfer_autostart", "/s.sh"));
-        let reason = refused(&pairs);
-        assert!(reason.contains("mutually exclusive"), "{reason}");
+    fn a_row_declaring_ninfer_autostart_is_refused_with_the_migration_sentence() {
+        for script in ["/opt/legacy.sh", "/opt/both.sh"] {
+            let mut pairs: Vec<(&str, &str)> = template_pairs();
+            pairs.push(("ninfer_autostart", script));
+            let reason = refused(&pairs);
+            assert!(reason.contains(script), "{reason}");
+            for needle in [
+                "ninfer_autostart",
+                "removed",
+                "ninfer_image",
+                "ninfer_model_name",
+                "ninfer_artifact",
+                "ninfer_model_roots",
+            ] {
+                assert!(reason.contains(needle), "{needle}: {reason}");
+            }
+        }
+        let err = NinferAdapter::new("Ubuntu", "ops")
+            .spec(
+                &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", "c")]),
+                18109,
+            )
+            .expect_err("the legacy path is removed: a verbatim legacy row never launches");
+        assert!(
+            format!("{err}").contains("removed"),
+            "the refusal says the path is gone: {err}"
+        );
     }
 
     #[test]
@@ -1697,26 +1576,6 @@ mod tests {
                 "the render embedded a literal key: {tail}"
             );
         }
-    }
-
-    /// The compatibility path: a yaml that predates the template still launches,
-    /// byte-identically to the pre-template contract, and carries no staged script —
-    /// the runtime runs the operator's file verbatim because that is what the yaml
-    /// declares. Falsifier: defaulting template mode on would break this pin.
-    #[test]
-    fn legacy_autostart_is_verbatim_script_none_and_argv_identical() {
-        let spec = NinferAdapter::new("Ubuntu", "ops")
-            .spec(
-                &entry(&[("ninfer_autostart", "/s.sh"), ("ninfer_container", "c")]),
-                18109,
-            )
-            .expect("legacy spec");
-        assert_eq!(
-            spec.script, None,
-            "no render: the operator's script runs verbatim"
-        );
-        assert_eq!(spec.argv[7], "/s.sh");
-        assert_eq!(&spec.argv[8..], &["b", "nokey", "18109"]);
     }
 }
 

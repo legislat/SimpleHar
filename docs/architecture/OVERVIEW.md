@@ -145,13 +145,16 @@ One harness process, one tokio runtime, plus OS-level children:
   Readiness needs `/health` 200 and the JSON `loaded` flag (strata answers
   200 while weights stream).
 - `ninfer` (`src/engine/ninfer.rs`): GPU container inside WSL2. Template
-  mode (row declares `ninfer_image`) renders the canonical autostart script
+  mode is the current and only mode: the row declares `ninfer_image`, and
+  the harness renders the canonical autostart script
   (`CANONICAL_NINFER_SCRIPT` in `engine/policy.rs`), stages it into the
   distro content-addressed with checksum verification, and launches the
   staged copy: `--restart no`, loopback-only publish
   (`--publish 127.0.0.1:...`), bounded container logs, name-scoped pre-reap.
-  The legacy `ninfer_autostart` path (operator script) is deprecated with a
-  scan warning; removal rides a green Wave C (ledger row 18). Unload reaps
+  The legacy `ninfer_autostart` path (operator script) is removed (row 18,
+  after a green Wave C): a row that declares it is refused at scan
+  (`model/scan.rs`) and at the adapter (`legacy_removed_sentence`) with the
+  migration message, never published. Unload reaps
   by container name; the claim ledger is `ownership::ContainerClaims`
   (`ninfer-claims.json`), and `ownership::boot_reap_decision` is the single
   boot-reclaim rule.

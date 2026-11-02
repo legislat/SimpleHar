@@ -106,10 +106,9 @@ The harness forces every llama engine to `--host 127.0.0.1`. It forces the
 same `--host 127.0.0.1` argv for strata engines. strata's server.py resolves
 that flag before any profile key, and the harness-rendered profile carries
 no `host` key at all. The canonical script the harness renders forces every
-template-mode ninfer container to a loopback-only publish
-(`--publish 127.0.0.1:...`). A **legacy** ninfer script publishes wherever
-its own `docker run` line says. Keep a legacy script on loopback unless you
-mean to publish.
+ninfer container to a loopback-only publish (`--publish 127.0.0.1:...`). The
+harness launches only its own rendered script, so no ninfer launch can publish
+elsewhere.
 
 Each public listener answers the OpenAI-style endpoints `/v1/models`
 (filtered by category), `/v1/chat/completions`, `/v1/completions`, and
@@ -223,16 +222,16 @@ edit never leaves a half-written model file in use.
 | `strata_uncensored` | Strict `true`/`false` rendered as the profile's `uncensored` switch. An explicit `false` is written intent and is different from absence. |
 | `strata_config` | **Superseded** (operator ruling 2026-11-02, row 19). A row that still declares it is refused at scan, with the migration sentence: run `simplehar-se import strata <profile.json>`, merge its emitted knob block into the row, and delete the `strata_config` line. A row that carries both `strata_exe` and `strata_config` meets the mutual-exclusion refusal; delete the `strata_config` line. |
 | `extra_args` | **Closed allow-list, not a denial list.** The harness splits the value on whitespace and appends a word to the argv only when it is a reviewed option: `--embedding`, `--embeddings`, `--pooling <mode>`, `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`, `--warmup`, `--no-warmup`. The value words a reviewed option consumes are appended too. A value may not be option-shaped, so it cannot smuggle another flag. **Anything else is refused with the launch**, and the message names the word. The model, host, port, gpu-layers, jinja, api-key, lora, and rpc options and every other option are not on the list, so their absence refuses them and there is nothing to dodge. The harness appends its forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` after these args, and they win. |
-| `ninfer_image` | Selects **template mode, the supported path**. Its presence means the harness renders the canonical autostart script from your yaml, stages it into the distro, verifies it by distro-side checksum, and launches exactly **that** script. Exactly one of `ninfer_image`/`ninfer_autostart` must be present. Its required companions are `ninfer_model_name` (the directory that holds the artifact), `ninfer_artifact` (the file inside it), and `ninfer_model_roots` (comma-separated absolute WSL directories, searched in order). Each must be a plain word, and the harness refuses a bad value and names the key. `ninfer_internal_port` (the port the container binds inside its own namespace) is optional and defaults to the SE internal number **8808**. That is the harness's 87xx family plus 100: clear of the manual 80xx world, the 87xx listeners, and the 181xx engine plan. It may not name a `protected_ports`, public-listener, or harness engine port. The manual/harness separation covers container-internal numbers too, so the harness refuses a row that borrows one at load, and the rescan names it. |
+| `ninfer_image` | **Required for ninfer**: selects **template mode, the only mode**. The harness renders the canonical autostart script from your yaml, stages it into the distro, verifies it by distro-side checksum, and launches exactly **that** script. Its required companions are `ninfer_model_name` (the directory that holds the artifact), `ninfer_artifact` (the file inside it), and `ninfer_model_roots` (comma-separated absolute WSL directories, searched in order). Each must be a plain word, and the harness refuses a bad value and names the key. `ninfer_internal_port` (the port the container binds inside its own namespace) is optional and defaults to the SE internal number **8808**. That is the harness's 87xx family plus 100: clear of the manual 80xx world, the 87xx listeners, and the 181xx engine plan. It may not name a `protected_ports`, public-listener, or harness engine port. The manual/harness separation covers container-internal numbers too, so the harness refuses a row that borrows one at load, and the rescan names it. |
 | `ninfer_serve_cmd` | The server command inside the container (default `ninfer-serve`). |
 | `ninfer_gpu_device` | Comma-separated device selector for `--gpus device=` (default `0`). |
 | `ninfer_serve_args` | Extra flags appended to the serve line, as shell-bare tokens. Both shipped engine parsers reject the `--flag=value` form, so write each option with a space and put the value in its own token, for example `--spec dflash2`. Option tokens must be long options that start with `--`. The canonical script reserves these options: `--host`, `--port`, `--api-key`, `--data-dir`, `--data-dir-permissions`, `--model`, `--model-id`, `--log-level`, `--log-dir`, `--uds`, `--ssl-keyfile`, `--ssl-certfile`, `--max-context`, `--kv-capacity`, `--max-concurrency`, `--kv-dtype`. The harness refuses each of them by name and by any abbreviation or extension of it, so `--max-cont` and `--host-context-mib` are refused too. Your args can therefore never resize what the cost estimate measured. |
 | `ninfer_model_id` | Optional OpenAI-style served id, passed as `--model-id`. |
 | `ninfer_env` | Extra container environment as `NAME=VALUE` tokens. This is an **allow-list**, not a parse rule. The only admissible pair today is `CUDA_MODULE_LOADING=EAGER\|LAZY`, the cold-start flag of the NInfer-all cards. The harness refuses an arbitrary name, such as `LD_PRELOAD` or `PATH`, by name. Growing the list needs a code review, never a yaml edit. |
-| `ninfer_key_file` | Template mode only: the place where `ninfer_key: true` reads the API key. The path is exactly `$HOME/.simplehar/keys/<file>.key` in the distro, a bare word with no traversal and no subdirectories. The script `cat`s it into `--api-key`, so an arbitrary path would let the yaml export any distro secret. Default: `$HOME/.simplehar/keys/<ninfer_container>.key`. A legacy script reads its own `$(dirname "$0")/.api_key` instead, and this key is not read there. |
-| `ninfer_autostart` | **Legacy path.** The path (inside WSL) of your own autostart script. The harness invokes it as `bash <script> <profile> <key\|nokey> <port>` via `wsl.exe`. It must be a plain absolute path: no spaces, no shell metacharacters, and no leading `~`. It is mutually exclusive with `ninfer_image`. Use the template instead: the harness cannot verify what a hand-written script does to your card or your network. |
+| `ninfer_key_file` | The place where `ninfer_key: true` reads the API key. The path is exactly `$HOME/.simplehar/keys/<file>.key` in the distro, a bare word with no traversal and no subdirectories. The script `cat`s it into `--api-key`, so an arbitrary path would let the yaml export any distro secret. Default: `$HOME/.simplehar/keys/<ninfer_container>.key`. |
+| `ninfer_autostart` | **Removed** (ruling 18b, after a green Wave C). The launch path for operator-written autostart scripts no longer exists. A row that declares it is refused at scan and at launch with the migration message, and is never published: declare `ninfer_image`, `ninfer_model_name`, `ninfer_artifact`, and `ninfer_model_roots` (template mode) and delete the `ninfer_autostart` line. |
 | `ninfer_container` | **Required for ninfer.** The container name. The harness reaps it with `docker rm -f` on unload, scoped strictly to the name this harness started (claim ledger: `ninfer-claims.json` beside the harness exe). The name must be docker-legal and must not look like a container ID (4+ hex chars). |
-| `ninfer_profile` | Template mode: one of the built-in VRAM profiles `a` to `e` (default `b`). The table is the operator's own: `a` 262k ctx/524k kv/2 conc, `b` 262k/262k/1, `c` 131k/131k/1, `d` 16k/32k/2 nvfp4, `e` 64k/64k/1. Or use a custom lowercase name, resolved by a `ninfer_profile_<name> = ctx=... kv=... conc=... kv_dtype=...` line. `kv_dtype` is one of `fp8`/`nvfp4`/`fp16`/`bf16`/`int8`/`rk8v4`, and `kv` must cover `ctx`. The override line applies to custom names only. The built-in table wins for `a` to `e`, so the harness refuses a `ninfer_profile_b`-style line at launch rather than silently ignoring it. Legacy mode: the value passes to your script verbatim as `$1`. |
+| `ninfer_profile` | Template mode: one of the built-in VRAM profiles `a` to `e` (default `b`). The table is the operator's own: `a` 262k ctx/524k kv/2 conc, `b` 262k/262k/1, `c` 131k/131k/1, `d` 16k/32k/2 nvfp4, `e` 64k/64k/1. Or use a custom lowercase name, resolved by a `ninfer_profile_<name> = ctx=... kv=... conc=... kv_dtype=...` line. `kv_dtype` is one of `fp8`/`nvfp4`/`fp16`/`bf16`/`int8`/`rk8v4`, and `kv` must cover `ctx`. The override line applies to custom names only. The built-in table wins for `a` to `e`, so the harness refuses a `ninfer_profile_b`-style line at launch rather than silently ignoring it. |
 | `ninfer_key` | A truthy value (`true`/`1`/`yes`/`on`) sends `key` as `$2`; in template mode the script `cat`s the `ninfer_key_file` into `--api-key`. Anything else sends `nokey`. |
 
 The harness renders strata rows; it never hands the row to the engine. At
@@ -287,12 +286,13 @@ import CLI is the one sanctioned reader.
 
 ### Ninfer engines
 
-Ninfer models (`engine: ninfer`) are GPU containers in WSL2. The harness
-launches them as a short-lived `wsl.exe` client. The container outlives the
-client, so unload reaps it by name (`docker rm -f <ninfer_container>`), and
-the release evidence is the port closing, not the client exit. Under
-**template mode** (`ninfer_image` present) the client runs the harness's own
-canonical script. The harness renders it from your yaml, stages it base64
+Ninfer models (`engine: ninfer`) are GPU containers in WSL2, and they run in
+**template mode, the only mode** (the row declares `ninfer_image`). The
+harness launches them as a short-lived
+`wsl.exe` client. The container outlives the client, so unload reaps it by
+name (`docker rm -f <ninfer_container>`), and the release evidence is the port
+closing, not the client exit. The client runs the harness's own canonical
+script. The harness renders it from your yaml, stages it base64
 through a stdin driver to
 `~/.simplehar/autostart/<container-slug>-<content-hash>.sh`, verifies it by
 checksum on the distro before and after the atomic publish, and prunes to
@@ -304,10 +304,8 @@ key, and serve args. The engine logs a JSON memory summary at startup into
 the container log. The harness reads it from the container's own logs and
 books it as the `engine_report` measured figure. A container that never
 logs one is measured from free memory instead and labelled `total_diff`:
-shown, never booked. Under **legacy mode** (`ninfer_autostart`) the client
-runs your script instead, as
-`bash <ninfer_autostart> <profile> <key|nokey> <assigned-port>`. Both modes
-then wait for `/health` 200 and then for `/v1/models` 200. The harness
+shown, never booked. The client then waits for `/health` 200 and then for
+`/v1/models` 200. The harness
 manages every ninfer model the catalog carries. It never registers or
 monitors servers you started manually; it only subtracts them from VRAM
 through the witness.
@@ -328,36 +326,35 @@ because reaping is by name.
 #### autostart.sh template
 
 The authoritative template is compiled into the harness
-(`CANONICAL_NINFER_SCRIPT`), and template mode renders and stages that
+(`CANONICAL_NINFER_SCRIPT`), and the launch renders and stages that
 template. You never edit it. A readable copy ships as
 [ninfer-autostart-template.sh](ninfer-autostart-template.sh) next to this
 README (and beside the exe in the release package). Read that one file to
-see exactly what a launch does, and start from it when you must write a
-**legacy** `ninfer_autostart` script. The legacy contract: the harness
-invokes your script inside WSL as
-`bash <script> <profile> <key|nokey> <port>`. `$1` selects a resource profile.
-`$2` toggles the service's API key. `$3` is the **host** port the harness assigned; map it to the
-container's internal port. The script exits once the container is starting,
-and the harness then polls `/health` and `/v1/models` itself. Keep the
-container name equal to the model's `ninfer_container`.
+see exactly what a launch does. The harness invokes the staged script inside
+WSL as `bash <staged-script> <profile> <key|nokey> <port>`: the profile and
+key choice are already rendered into the script, and `$3` is the **host**
+publish port the harness assigned. The script demands it: a missing `$3`
+fails the launch instead of borrowing another number. The script exits once
+the container is starting, and the
+harness then polls `/health` and `/v1/models` itself. The rendered container
+name is the model's `ninfer_container`.
 
 Notes:
 
-- `--publish 127.0.0.1:...` keeps the container loopback-only. Publishing
-  on all interfaces exposes an unauthenticated engine to your LAN. Do that
-  only with the `key` profile (and a real `.api_key` file), or not at all.
+- `--publish 127.0.0.1:...` keeps the container loopback-only. The rendered
+  launch never writes anything else; a wider publish would expose an
+  unauthenticated engine to your LAN, and only the `key` mode (with a real
+  key file under `$HOME/.simplehar/keys/`) would make that safe.
 - `--restart no` is not a preference. A `--restart` policy revives
   containers on WSL boot outside any harness decision, with no ledger entry
-  and no reap path (the NINFER-8004 incident). Template mode hard-codes it;
-  keep it in a legacy script.
+  and no reap path (the NINFER-8004 incident). The rendered script hard-codes
+  it.
 - R10 namespaces: the container's internal port is a **third namespace**,
   disjoint from the manual (`protected_ports`) and harness (listeners,
-  engine plan) sets. Keep your legacy script's `INTERNAL_PORT` clear of all
-  three; 8808 is the SE internal number. The harness validates the `$3`
-  offer it makes, but it never rewrites your script. The harness refuses a
-  legacy row that also declares `ninfer_internal_port` at load, for a
-  borrowed number, even though the script would ignore the key. So leave
-  that key unset on legacy rows.
+  engine plan) sets. The rendered launch binds `ninfer_internal_port`
+  (default **8808**, the SE internal number). The harness refuses a row that
+  borrows a protected, listener, or engine-plan number at load, and the
+  rescan names it.
 - The name-scoped `docker rm -f` before `docker run` makes the launch
   idempotent, and it complements the harness's orphan reconciliation.
 - The `--log-driver json-file --log-opt` pair bounds container logs.
@@ -365,9 +362,8 @@ Notes:
   the distro.
 - `serve_model` in the model yaml must match `--model-id`, or the harness
   records a served-id warning.
-- Run `chmod +x` on the script. The harness runs it with `bash`, so the
-  shebang is documentation, but the executable bit avoids surprises when
-  you test by hand.
+- The staged script needs no `chmod` for the harness: it is always run with
+  `bash`, so the shebang is documentation.
 
 ## Rescan
 
@@ -534,6 +530,6 @@ segment to load and unload models and to drive the GPUs. It exists for LAN
 boxes and warns loudly at boot. The default is loopback only. The token guards only
 the harness's own listeners. Engine ports have no harness auth, so the
 harness forces llama and strata engines to loopback regardless of
-`internal_host`, a template-mode ninfer publishes loopback-only, and only a
-legacy ninfer script that itself chooses to publish can put an
-unauthenticated engine on the segment.
+`internal_host`, and every ninfer launch publishes loopback-only: the
+harness runs only its own rendered script, and that script publishes on
+loopback alone.

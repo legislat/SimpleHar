@@ -1499,7 +1499,7 @@ async fn an_illegal_ninfer_container_name_is_refused_before_the_occupant_dies() 
                 "ninfer",
                 CategoryId::Work,
                 Some(8.0),
-                "ninfer_autostart: /opt/autostart.sh\nninfer_container: \"bad container\"",
+                "ninfer_image: ninfer:local\nninfer_container: \"bad container\"",
             ),
         ],
     );

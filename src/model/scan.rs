@@ -59,13 +59,6 @@ pub enum ScanKind {
     /// and ninfer key families — is scoped the same data-driven way, so a new
     /// row knob needs no new scan code.
     InertKey,
-    /// The row still rides the verbatim legacy `ninfer_autostart` launch path:
-    /// deprecated by ruling 18b (2026-11-01) and removed after a green Wave C.
-    /// Warn-only across the whole compat window: the row keeps publishing and
-    /// loading exactly as before — the scan only names it, so the operator
-    /// converges every card on the harness-rendered `ninfer_image` template
-    /// before the gated removal item lands.
-    Deprecated,
     /// A yaml file the scan refuses to publish (Fork C doctrine): it carried at
     /// least one problem line — then the `reason` names every offending line — or it
     /// parsed clean but yielded **no keys at all**, which the `reason` says outright
@@ -80,10 +73,11 @@ pub enum ScanKind {
     DuplicateName,
     /// The file claims a harness-owned surface and is **refused** (never published):
     /// an operator-extra word (`extra_args`, `ninfer_serve_args`) outside the engine
-    /// row's closed word surface, or a policy field (`host`, `port`, key) inside the
-    /// strata profile it points at — engine-side files decide nothing (22[1]), so
-    /// the refusal names the word/field and the mechanism that owns the decision
-    /// (chunk 10 slice 10c).
+    /// row's closed word surface, a policy field (`host`, `port`, key) inside the
+    /// strata profile it points at, or a ninfer row still declaring the removed
+    /// `ninfer_autostart` launch key (ruling 18b removal). Engine-side files
+    /// decide nothing (22[1]), so the refusal names the word/field and the
+    /// mechanism that owns the decision (chunk 10 slice 10c).
     PolicyRefused,
     /// Every pre-existing report shape: unreadable files or dirs, typed field
     /// rejects, duplicate containers, unresolved `default_model`s.
@@ -642,6 +636,25 @@ pub fn scan_dir(dir: &Path) -> Catalog {
         }
         match ModelEntry::from_flat(&map, &stem) {
             Ok(mut entry) => {
+                // Ruling 18b removal (green Wave C): the legacy `ninfer_autostart`
+                // launch path is gone. A ninfer row still declaring it is refused
+                // outright with the adapter's migration sentence (the strata
+                // `strata_config` precedent) and never published. The row must
+                // not ride a launch the harness no longer has.
+                if entry.engine == crate::ownership::NINFER_ENGINE {
+                    if let Some(script) = map
+                        .get("ninfer_autostart")
+                        .map(|v| v.trim())
+                        .filter(|v| !v.is_empty())
+                    {
+                        catalog.errors.push(ScanError {
+                            kind: ScanKind::PolicyRefused,
+                            file: file_name.clone(),
+                            reason: crate::engine::ninfer::legacy_removed_sentence(script),
+                        });
+                        continue;
+                    }
+                }
                 // One container name may back exactly one model: unload reaps by
                 // name, so a duplicate would let either model's release destroy
                 // the other's live engine (review, 2026-10-26).
@@ -790,34 +803,6 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 // warns and the entry publishes (ruling D stands).
                 for key in map.keys() {
                     if SILENT_KEYS.contains(&key.as_str()) {
-                        continue;
-                    }
-                    // Ruling 18b interim: a ninfer row still riding the verbatim
-                    // `ninfer_autostart` launch path is deprecated, not refused —
-                    // the compat window keeps it loadable until a green Wave C
-                    // lands the removal. A row that also declares `ninfer_image`
-                    // does not ride this path (spawn refuses the pair as an
-                    // ambiguous launch source), so only the verbatim shape earns
-                    // the deprecation notice.
-                    if key == "ninfer_autostart"
-                        && entry.engine == crate::ownership::NINFER_ENGINE
-                        && map
-                            .get("ninfer_autostart")
-                            .is_some_and(|value| !value.trim().is_empty())
-                        && !map
-                            .get("ninfer_image")
-                            .is_some_and(|value| !value.trim().is_empty())
-                    {
-                        catalog.errors.push(ScanError {
-                            kind: ScanKind::Deprecated,
-                            file: file_name.clone(),
-                            reason: format!(
-                                "model `{}` uses legacy `ninfer_autostart`: deprecated, will \
-                                 be removed after the next verification window; adopt the \
-                                 harness-rendered `ninfer_image` template",
-                                entry.name
-                            ),
-                        });
                         continue;
                     }
                     // `ninfer_profile_<name>` is the family of custom-profile
@@ -1628,17 +1613,17 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(
             dir.join("a.yaml"),
-            "engine: ninfer\nninfer_autostart: /s.sh\nninfer_container: shared\n",
+            "engine: ninfer\nninfer_image: ninfer:local\nninfer_container: shared\n",
         )
         .expect("write");
         std::fs::write(
             dir.join("b.yaml"),
-            "engine: ninfer\nninfer_autostart: /t.sh\nninfer_container: shared\n",
+            "engine: ninfer\nninfer_image: ninfer:local\nninfer_container: shared\n",
         )
         .expect("write");
         std::fs::write(
             dir.join("c.yaml"),
-            "engine: ninfer\nninfer_autostart: /u.sh\nninfer_container: other\n",
+            "engine: ninfer\nninfer_image: ninfer:local\nninfer_container: other\n",
         )
         .expect("write");
 
@@ -2341,21 +2326,27 @@ mod tests {
         );
     }
 
-    /// Ruling 18b interim: a verbatim legacy `ninfer_autostart` row is deprecated
-    /// but stays loadable across the compat window — the scan warns exactly one
-    /// `Deprecated` naming the row and the field, points at the template path, and
-    /// still publishes the entry; a modern `ninfer_image` row gets no such report.
-    /// Falsifier: making it a refusal shrinks `models.len()`; firing on the
-    /// template row or on both rows breaks the one-warn / silence pair.
+    /// Ruling 18b removal (green Wave C): a row that still declares the removed
+    /// legacy `ninfer_autostart` path is **refused** at scan and never published,
+    /// with the migration sentence naming every template key the row must adopt;
+    /// the pair with `ninfer_image` is refused too, and a modern template row
+    /// stays silent. Falsifier: the interim behavior published the legacy row with
+    /// a `Deprecated` warn, so `models.len()` and the refusal-kind checks fail on
+    /// the old code; a message missing one migration key fails its own loop.
     #[test]
-    fn a_legacy_autostart_row_warns_deprecated_and_still_publishes() {
-        let dir = crate::testutil::temp_dir("scan-deprecated");
+    fn a_legacy_autostart_row_is_refused_and_never_published() {
+        let dir = crate::testutil::temp_dir("scan-legacy-refused");
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(
             dir.join("legacy-row.yaml"),
             "engine: ninfer\nvram_gb: 20\nninfer_autostart: /opt/legacy.sh\nninfer_container: legacy-box\n",
         )
         .expect("write legacy");
+        std::fs::write(
+            dir.join("both-row.yaml"),
+            "engine: ninfer\nvram_gb: 20\nninfer_autostart: /opt/both.sh\nninfer_image: ninfer:local\nninfer_container: both-box\n",
+        )
+        .expect("write both");
         std::fs::write(
             dir.join("modern-row.yaml"),
             "engine: ninfer\nvram_gb: 20\nninfer_image: ninfer:local\nninfer_container: modern-box\n",
@@ -2364,33 +2355,38 @@ mod tests {
         let catalog = scan_dir(&dir);
         assert_eq!(
             catalog.models.len(),
-            2,
-            "warn not refuse: both rows scan into the catalog during the compat window: {:?}",
+            1,
+            "only the template row publishes: {:?}",
             catalog.errors
         );
-        let deprecated: Vec<&ScanError> = catalog
+        assert_eq!(catalog.models[0].name, "modern-row");
+        let refused: Vec<&ScanError> = catalog
             .errors
             .iter()
-            .filter(|e| e.kind == ScanKind::Deprecated)
+            .filter(|e| e.kind == ScanKind::PolicyRefused)
             .collect();
         assert_eq!(
-            deprecated.len(),
-            1,
-            "exactly one deprecation warn, for the one legacy row: {:?}",
+            refused.len(),
+            2,
+            "both the verbatim legacy row and the pair with `ninfer_image` are refused: {:?}",
             catalog.errors
         );
-        let warn = deprecated[0];
-        assert!(
-            warn.file.contains("legacy-row"),
-            "the warn carries the offending file: {warn:?}"
-        );
-        assert!(
-            warn.reason.contains("`legacy-row`")
-                && warn.reason.contains("legacy `ninfer_autostart`")
-                && warn.reason.contains("`ninfer_image`"),
-            "the warn names the row and the field and points at the template: {}",
-            warn.reason
-        );
+        for error in &refused {
+            for needle in [
+                "`ninfer_autostart`",
+                "removed",
+                "`ninfer_image`",
+                "`ninfer_model_name`",
+                "`ninfer_artifact`",
+                "`ninfer_model_roots`",
+            ] {
+                assert!(
+                    error.reason.contains(needle),
+                    "the refusal must name `{needle}`: {}",
+                    error.reason
+                );
+            }
+        }
         assert!(
             catalog
                 .errors
@@ -2648,7 +2644,7 @@ mod tests {
     fn a_fold_written_yaml_rescans_without_unknown_key_reports() {
         let written = "engine: ninfer\n\
                        name: served\n\
-                       ninfer_autostart: /opt/served.sh\n\
+                       ninfer_image: ninfer:local\n\
                        ninfer_container: ninfer-served\n\
                        vram_gb: 20\n\
                        measured_gb: 31.2\n\
@@ -2949,7 +2945,6 @@ mod tests {
             (ScanKind::EngineUnavailable, "engine_unavailable"),
             (ScanKind::UnknownKey, "unknown_key"),
             (ScanKind::InertKey, "inert_key"),
-            (ScanKind::Deprecated, "deprecated"),
             (ScanKind::InvalidYaml, "invalid_yaml"),
             (ScanKind::DuplicateName, "duplicate_name"),
             (ScanKind::PolicyRefused, "policy_refused"),

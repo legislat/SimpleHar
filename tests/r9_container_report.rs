@@ -133,16 +133,20 @@ impl EngineAdapter for ContainerMockAdapter {
     }
 }
 
-/// The same nine lines every ninfer row needs, spelled at the call site because
-/// `Spec` keeps its strings `'static` for the table-literal harness calls.
+/// The template-mode lines every ninfer row needs, spelled at the call site
+/// because `Spec` keeps its strings `'static` for the table-literal harness
+/// calls. The legacy `ninfer_autostart` key would refuse the row at scan
+/// (ruling 18b removal), so these rows are template rows by definition.
 macro_rules! ninfer_extra {
     ($name:literal, $container:literal, $extra:literal) => {
         concat!(
-            "ninfer_autostart: /opt/",
-            $name,
-            ".sh\nninfer_container: ",
+            "ninfer_container: ",
             $container,
-            "\n",
+            "\nninfer_image: ninfer:local\nninfer_model_name: ",
+            $name,
+            "-dir\nninfer_artifact: ",
+            $name,
+            ".ninfer\nninfer_model_roots: /mnt/d/Models\n",
             $extra
         )
     };
@@ -324,7 +328,7 @@ async fn a_declared_row_below_the_report_raises_the_next_admit() {
         "ninfer",
         CategoryId::Work,
         Some(8.0),
-        "ninfer_autostart: /opt/r9-declared.sh\nninfer_container: ninfer-declared\n",
+        ninfer_extra!("r9-declared", "ninfer-declared", ""),
     )]);
     runtime.set_container_report("ninfer-declared", &memory_summary(72, 312));
 

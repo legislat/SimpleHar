@@ -3516,18 +3516,12 @@ impl ActorState {
             .iter()
             .find(|(_, job)| job.model == model && job.spawned.as_ref() == Some(ticket))
             .and_then(|(_, job)| job.measured.clone());
+        // Ruling 15 demands every booked `engine_report` be launch-verifiable
+        // against a resolved profile. Since the ruling-18b legacy removal every
+        // ninfer spawn resolved its profile through `profile_override` (a row
+        // whose profile does not resolve never spawns), so the spawn anchor
+        // carries the certifying identity the fold below persists with.
         let profile = anchor.as_ref().and_then(|a| a.profile.clone());
-        if profile.is_none() {
-            // Ruling 15 demands every booked `engine_report` be launch-verifiable
-            // against a resolved profile. A legacy-autostart spawn never ran the
-            // override validation, so there is no certifying identity: the figure
-            // still persists (it is the engine's own bytes — the page should show
-            // them) but `read_measured`'s void now refuses to book it.
-            tracing::warn!(
-                model,
-                "engine report has no resolved profile stamp (legacy autostart?): it displays but will not book"
-            );
-        }
         self.fold(&FoldPlan {
             model: model.to_string(),
             ticket: ticket.clone(),
@@ -5817,7 +5811,7 @@ mod tests {
         let dir = crate::testutil::temp_dir("r5-e2e");
         std::fs::write(
             dir.join("r5-model.yaml"),
-            "name: r5-model\nengine: ninfer\ncategory: work\nvram_gb: 2\nninfer_autostart: /opt/r5.sh\nninfer_container: r5-e2e-a\n",
+            "name: r5-model\nengine: ninfer\ncategory: work\nvram_gb: 2\nninfer_image: ninfer:local\nninfer_container: r5-e2e-a\n",
         )
         .expect("seed ninfer yaml");
         let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
@@ -5872,7 +5866,7 @@ mod tests {
         );
         std::fs::write(
             dir.join("r5-model.yaml"),
-            "name: r5-model\nengine: ninfer\ncategory: work\nvram_gb: 2\nninfer_autostart: /opt/r5.sh\nninfer_container: r5-e2e-b\n",
+            "name: r5-model\nengine: ninfer\ncategory: work\nvram_gb: 2\nninfer_image: ninfer:local\nninfer_container: r5-e2e-b\n",
         )
         .expect("edit container name");
         handle.reload().await.expect("actor alive");

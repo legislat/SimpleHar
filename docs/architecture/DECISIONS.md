@@ -305,6 +305,13 @@ Unresolved questions live ONLY in `DECISIONS-PENDING.md`. This file only ever *g
   manual launches and survive the removal). Interim: a scan warning on any legacy row. With
   the   trigger met, the divergent path (fail-closed internal-port rule, its R9/log quirks,
   profile-gate differences) is deleted - one mechanism restored.
+  EXECUTED 2026-11-02 after green Wave C (`805c7d0`, TASK-DEBT-LEFTOVERS): scan
+  (`model/scan.rs`) and adapter (`ninfer::legacy_removed_sentence`) refuse a declaring row
+  with the migration sentence naming `ninfer_image`, `ninfer_model_name`, `ninfer_artifact`,
+  and `ninfer_model_roots`; the row never publishes. The legacy launch branch, its
+  internal-port consequence, the R9 profile-gate warn, and the stale display path are
+  deleted. Template mode is the only ninfer launch path. The operator's manual
+  `installation-guide/*/autostart.sh` scripts remain manual launches outside the harness.
 
 - RULED 2026-11-01 (operator approved Search#40): **llama books from `llama-fit-params
   --fit-print on`** - a new **Fit** cost class computed PRE-SPAWN from the engine's own
