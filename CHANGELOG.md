@@ -16,7 +16,7 @@ a Changelog. Versions follow Semantic Versioning.
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
-## Unreleased
+## v1.1.2 - 2026-11-03
 
 ### Fixed
 

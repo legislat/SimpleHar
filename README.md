@@ -12,7 +12,7 @@ review_trigger: behavior-change, release
 
 Windows tray harness for local LLM inference engines: one app, one GPU, many models.
 
-Current release: **v1.1.1**. Windows 10/11, one NVIDIA GPU, single user.
+Current release: **v1.1.2**. Windows 10/11, one NVIDIA GPU, single user.
 
 <!-- Screenshot: add docs/assets/control-page.png after scrubbing model names, paths, tokens, and LAN addresses. -->
 
@@ -59,7 +59,7 @@ You run local LLMs on one NVIDIA GPU. You want:
 
 ### Use the release package
 
-The v1.1.1 release package contains `simplehar-se.exe`, `simplehar-se.json`, `ModelConf/`,
+The v1.1.2 release package contains `simplehar-se.exe`, `simplehar-se.json`, `ModelConf/`,
 and `ninfer-autostart-template.sh`. Public release assets are not published on GitHub yet,
 so if you do not have the package, build from source below.
 
