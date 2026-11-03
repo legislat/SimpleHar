@@ -7,12 +7,16 @@
 #   3. The latest tag equals v<version>, unless -Prepare says this tree is
 #      actively preparing a new release; then the version must exceed the tag.
 #   4. CHANGELOG.md contains the version string.
-#   5. README.md names the latest tag.
+#   5. README.md names the latest tag, or the prepared version with -Prepare.
+#   6. No known stale phrase appears in current durable docs or source
+#      (archive paths excluded).
+#   7. `cargo doc --no-deps` is warning-free (skip with -SkipDoc).
 #
 # Exit 0 only when every check passes.
 
 param(
-  [switch]$Prepare
+  [switch]$Prepare,
+  [switch]$SkipDoc
 )
 
 $ErrorActionPreference = 'Continue'
@@ -45,8 +49,14 @@ Report ([bool]$version) ("Cargo.toml declares a version" + $(if ($version) { ": 
 
 # 2. Latest tag.
 $tag = $null
-$tagOut = git describe --tags --abbrev=0 2>$null
-if ($LASTEXITCODE -eq 0 -and $tagOut) { $tag = ("$tagOut").Trim() }
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+  Report $false "git not on PATH"
+} else {
+  $global:LASTEXITCODE = -1
+  $tagOut = git describe --tags --abbrev=0 2>$null
+  $tagCode = $LASTEXITCODE
+  if ($tagCode -eq 0 -and $tagOut) { $tag = ("$tagOut").Trim() }
+}
 Report ([bool]$tag) $(if ($tag) {
   "latest tag found: " + $tag
 } else {
@@ -71,10 +81,54 @@ $changelogOk = (Test-Path 'CHANGELOG.md') -and
   (Select-String -Path 'CHANGELOG.md' -Pattern $version -SimpleMatch -Quiet)
 Report $changelogOk ("CHANGELOG.md contains version " + $version)
 
-# 5. README release claim names the tag.
+# 5. README release claim names the tag, or the prepared version with -Prepare.
+$readmeTag = if ($Prepare) { "v" + $version } else { $tag }
 $readmeOk = (Test-Path 'README.md') -and
-  (Select-String -Path 'README.md' -Pattern $tag -SimpleMatch -Quiet)
-Report $readmeOk ("README.md names tag " + $tag)
+  (Select-String -Path 'README.md' -Pattern $readmeTag -SimpleMatch -Quiet)
+Report $readmeOk ("README.md names tag " + $readmeTag)
+
+# 6. Known stale phrases in current durable docs and source.
+$stalePhrases = @("there is no auth", "arrive with their own turns")
+$scanRoots = @("README.md", "AGENTS.md", "CONTRIBUTING.md", "docs/DOCS_README.md", "docs/process", "docs/architecture", "docs/reference", "docs/maintenance", "src", "tests")
+$scanFiles = @()
+foreach ($root in $scanRoots) {
+  if (Test-Path -LiteralPath $root) {
+    if ((Get-Item -LiteralPath $root).PSIsContainer) {
+      $scanFiles += (Get-ChildItem -LiteralPath $root -Recurse -File |
+        Where-Object { ($_.Extension -eq '.md' -or $_.Extension -eq '.rs') -and
+          $_.FullName -notmatch '\\archive\\' } |
+        ForEach-Object { $_.FullName })
+    } else {
+      $scanFiles += (Resolve-Path -LiteralPath $root).Path
+    }
+  }
+}
+$staleHits = @()
+foreach ($phrase in $stalePhrases) {
+  $hit = Select-String -Path $scanFiles -Pattern $phrase -SimpleMatch -List -ErrorAction SilentlyContinue
+  if ($hit) { $staleHits += ($phrase + " -> " + $hit.Path) }
+}
+$staleOk = ($staleHits.Count -eq 0)
+Report $staleOk ("no known stale phrase in current docs and source" +
+  $(if ($staleHits.Count -gt 0) { ": " + ($staleHits -join "; ") } else { "" }))
+
+# 7. cargo doc warnings.
+if (-not $SkipDoc) {
+  if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    Report $false "cargo not on PATH"
+  } else {
+    Write-Output "Running cargo doc --no-deps"
+    $global:LASTEXITCODE = -1
+    $docOutput = & cargo doc --no-deps 2>&1 | Out-String
+    $docCode = $LASTEXITCODE
+    $docOk = ($docCode -eq 0) -and ($docOutput -notmatch 'warning:')
+    Report $docOk "cargo doc --no-deps is warning-free"
+    if (-not $docOk) {
+      $warningCount = ([regex]::Matches($docOutput, 'warning:')).Count
+      Write-Output ("cargo doc warning count: " + $warningCount)
+    }
+  }
+}
 
 if ($script:allPass) {
   Write-Output "RELEASE CHECK PASS"

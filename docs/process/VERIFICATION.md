@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, reviewer, release-operator]
 source_of_truth_for: [gate, evidence]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: behavior-change, release
 ---
 
@@ -45,6 +45,16 @@ first, then the same change in the script.
 - A card verdict needs evidence from the freed window. A cardless session records a card
   leg as BLOCKED or NOT RUN, never as PASS.
 
+## Scheduled checks
+
+These checks are not part of the cardless gate. Run them on the named schedule:
+
+- Release and weekly: `scripts/check-onboarding.ps1` clones the repository to a temp
+  directory and verifies the durable onboarding path and its links.
+- Cycle start: `scripts/health-report.ps1` prints the read-only process health report.
+
+Record each run under `handoff/evidence/<YYYY-MM-DD>-<slug>/`.
+
 ## Evidence requirements
 
 Every gate claim needs dated evidence. Each evidence record names:
@@ -59,6 +69,11 @@ Rules:
 - No claim without a run. Never claim tested, formatted, or lint-free unless the check
   actually ran.
 - Report every check that did not run, and say why.
+- Name the gate evidence file `gate*.txt` inside its dated evidence directory.
+  `scripts/health-report.ps1` reads that name.
+- Record a flakiness re-run in the same file or in a separate `gate-rerun*.txt`.
+  The health report reads only the final verdict line, `GATE PASS (cardless)` or
+  `GATE FAIL (cardless)`. An earlier FAIL line with a final PASS reports PASS.
 - Never quote a count that the current run did not print. Counts live in evidence, not in
   durable documents. Durable documents must not embed test counts or DOM leg counts.
 

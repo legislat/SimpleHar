@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, operator]
 source_of_truth_for: [task lifecycle, task schema]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: behavior-change, release
 ---
 
@@ -173,6 +173,52 @@ A task is done only when all of these hold:
 - the task file and the queue row are current;
 - evidence is linked;
 - no unrelated change remains uncommitted.
+
+## First task walkthrough
+
+Use this walkthrough for your first task. It teaches the lifecycle by using it.
+
+1. Pick a small P3 documentation fix from `handoff/PENDING_CHECKLIST.md`.
+2. Copy the task template into `handoff/tasks/<TASK-ID>.md`. Fill every field. Set
+   readiness to `ready`.
+3. Add the one-line queue row to `handoff/PENDING_CHECKLIST.md`.
+4. Read the required documents from the reading matrix in `AGENTS.md` Section 5.
+5. Make the smallest change that meets the acceptance criteria. Do not touch unrelated
+   files.
+6. Run the cardless gate from `docs/process/VERIFICATION.md`. Record the dated evidence.
+7. Ask for a subagent review. Use the template below. The author does not review their
+   own work.
+8. Fix every review finding by a named commit or an accepted ruling. Update the task file.
+9. Check every acceptance criterion and the Definition of Done above.
+10. Move the task file to `handoff/archive/<YYYY-MM-DD>/` after the release that contains
+    it ships. Update the queue row.
+
+## Subagent brief template
+
+A brief fits on one screen plus links. It does not paste the full decision ledger or the
+doctrine card. Use this shape:
+
+````markdown
+# Subagent brief: <TASK-ID> - <title>
+
+## Scope
+<Files and modules in scope. State what not to touch.>
+
+## Reading matrix
+- `AGENTS.md` Section 5 row for this task type.
+- `docs/architecture/DOCTRINE.md` (the card, not the full ledger).
+- Relevant decision rows: <IDs and links>.
+- Task file: `handoff/tasks/<TASK-ID>.md`.
+
+## Evidence format
+<The command to run and the evidence path. Name the falsifier.>
+
+## Conflict rule
+Follow the conflict rules in `AGENTS.md` Section 3. On a conflict, stop, record it, and
+ask the operator. Never guess.
+````
+
+The brief links to `docs/process/HANDOFF.md`; it does not copy the protocol.
 
 ## Findings and tasks
 

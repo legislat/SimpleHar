@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, operator]
 source_of_truth_for: [handoff protocol]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: behavior-change, release, quarterly
 ---
 
@@ -98,6 +98,27 @@ Reconcile `git status` against the task file before the first edit.
 Ownership and subagent limits follow `AGENTS.md` Section 4. One active task per session.
 The owning session writes the queue row and the snapshot. Other sessions write only their
 own task file.
+
+## Backup and restore
+
+The live layer is local-only. Back it up to a separate physical drive or network share. Do
+not use the same physical device as the working tree.
+
+- Back up `HANDOFF.md`, `handoff/`, `ModelConf/`, and the active `simplehar-se.json`.
+- Exclude `target/`, `logs/`, build artifacts, and the frozen `archive/` and
+  `base-archive/` trees. The frozen trees are backed up once or preserved in Git history.
+- Cadence: at each handoff checkpoint: before ending a session, before a card window, and
+  before a release.
+- Retention: keep the 14 newest dated snapshots. At each checkpoint, prune older snapshots
+  only after the new backup succeeds.
+- Restore test: quarterly. Restore the newest retained snapshot to a temp directory. Run
+  `scripts/check-docs.mjs`, `scripts/check-instructions.mjs`, and `scripts/check-tasks.mjs`
+  on the restored tree. Verify `HANDOFF.md` and every task file have the required fields.
+  The test verifies the retained set. Record the evidence under
+  `handoff/evidence/<YYYY-MM-DD>-restore-test/`. Do not start an engine during the test.
+
+The live `HANDOFF.md` snapshot names the current backup medium and the latest backup path.
+The policy is the rule; the snapshot is the current fact.
 
 ## Snapshot template
 

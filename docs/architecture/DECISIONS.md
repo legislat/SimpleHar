@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [architect, agent]
 source_of_truth_for: [settled and deferred decisions]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: new-decision, release
 ---
 
@@ -496,3 +496,10 @@ recorded here so dated references to ARCHIVED still resolve:
 - **Accepted** RULED 2026-11-03 (priority): after release 1.1.0, Basalt is priority 1 and Berth
   borrows are priority 2. Neither starts before the release.
   | 2026-11-03 | `TASK-BASALT`, `TASK-BERTH-BORROWS`
+
+- **Accepted** RULED 2026-11-03 (BL-23): `handoff/FINDINGS-OPEN.md` is the single
+  technical-debt register. It carries open review findings and debt rows with severity,
+  owner, and target. Intake, triage, aging, and accepted-risk rules are in its header.
+  Deferred decisions live in this ledger; the register header owns the pointer rule. Aging
+  is reviewed at cycle start from task-file dates.
+  | 2026-11-03 | `TASK-DOCS-MAINTENANCE`

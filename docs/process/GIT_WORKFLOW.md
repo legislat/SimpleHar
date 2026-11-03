@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, reviewer, release-operator]
 source_of_truth_for: [git, release]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: behavior-change, release
 ---
 
@@ -94,21 +94,32 @@ Never run these operations to make a tree look clean.
 
 A release is a task with acceptance criteria. Run the steps in this order:
 
-1. The gate passes on the release commit (`docs/process/VERIFICATION.md`).
+1. The gate passes on the release commit (`docs/process/VERIFICATION.md`). Run
+   `scripts/check-onboarding.ps1` and require PASS; it is the release-scheduled onboarding
+   check that `docs/process/VERIFICATION.md` names.
 2. Bump the `Cargo.toml` version. The version must match the tag.
 3. Write the dated `CHANGELOG.md` entry. Use the Keep a Changelog structure and record
    user-visible changes only.
 4. Update the README release claim. It names the tag, never HEAD.
-5. Create the annotated tag.
-6. Push the commits and the tag. Each push needs operator approval.
-7. Build the artifact, record its hash, deploy it, and verify the boot.
-8. Keep and name the rollback artifact.
+5. Run `scripts/release-check.ps1 -Prepare` and require PASS. It checks the version, tag,
+   changelog, README claim, known stale phrases, and `cargo doc` warnings. In `-Prepare`
+   mode the README claim must name the version being prepared.
+6. Create the annotated tag.
+7. Run `scripts/release-check.ps1` without `-Prepare` and require PASS. It confirms the
+   tag equals the version.
+8. Push the commits and the tag. Each push needs operator approval.
+9. Build the artifact, record its hash, deploy it, and verify the boot.
+10. Keep and name the rollback artifact.
 
 Rules:
 
 - No tag without a changelog entry and a matching version.
 - Commits after a release are unreleased. The README release claim moves only with the
   next tag.
+- `scripts/release-check.ps1 -SkipDoc` skips only the `cargo doc` leg. While the DOC-WARN
+  row in `handoff/FINDINGS-OPEN.md` (local-only) is open, run both release checks with
+  `-SkipDoc` and record the DOC-WARN row as the accepted risk. Remove `-SkipDoc` when
+  DOC-WARN closes.
 
 ## Conflict resolution
 
