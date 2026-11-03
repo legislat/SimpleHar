@@ -1757,3 +1757,131 @@ async fn the_idle_sweep_skips_a_cross_slot_eviction_victim() {
     assert_eq!(runtime.server_count(), 1, "only the admitted load is live");
     assert_eq!(runtime.spawn_count(), 3, "rp-doomed, canary, work-55");
 }
+
+#[tokio::test]
+async fn a_stale_victim_never_aborts_the_reap_of_the_own_spawn() {
+    // R2-20-06: `reap_should_continue` (src/scheduler/spawn.rs) pinned the
+    // predicate as a unit, but its wiring in `spawn_kill_confirm` - warn and
+    // CONTINUE in the kill loop, warn and BREAK the one target in the confirm
+    // loop - ran only when the runtime answers `SpawnError::StaleTicket`, and
+    // `MockRuntime` could not produce that answer: its kill and release_confirmed
+    // keyed on the port alone. The integration path was unreachable, so an
+    // inversion that aborts the whole two-target reap on the first stale target -
+    // stranding the job's own live engine on the card, the chunk-2 (2026-10-27)
+    // orphan this predicate exists to prevent - kept every mock-based suite green.
+    // Here the AUX victim is parked as a superseded generation: its kill AND its
+    // release confirm are refused, the release still records and the load still
+    // spawns, then the spawn fails readiness and the same job's reap must walk
+    // past the stale victim to kill and confirm its OWN engine. An abort-on-stale
+    // turns the swap error into a release timeout (the release would never
+    // complete), and a later-aborting reap leaves the failed job's engine live -
+    // both go RED below.
+    let witness = FakeWitness::with(vec![sample(72.0, 30.0)]);
+    let runtime = MockRuntime::new();
+    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+    adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+    // The doomed WORK engine: it spawns, but never reports ready - the failing
+    // load is what drives the reap over both targets.
+    adapters.insert("mock-never".to_string(), Arc::new(MockAdapter));
+    let mut cfg = AppConfig {
+        settle_timeout_s: 5,
+        load_timeout_s: 1,
+        ..AppConfig::default()
+    };
+    cfg.category_mut(CategoryId::Aux)
+        .expect("default config has AUX")
+        .max_models = 1;
+    let handle = Scheduler::start(
+        cfg,
+        write_modelconf(&[
+            ("aux30", "mock", CategoryId::Aux, 30.0),
+            ("work60", "mock-never", CategoryId::Work, 60.0),
+        ]),
+        adapters,
+        Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
+        Arc::new(witness.clone()),
+    );
+    let Reply::Loaded(victim) = handle
+        .swap("aux30", CategoryId::Aux)
+        .await
+        .expect("the victim loads")
+    else {
+        panic!("expected Loaded");
+    };
+    // The seam: every ticket naming this port is now a superseded generation -
+    // kill and confirm are refused as `StaleTicket`, exactly what the real table
+    // answers for a port a newer spawn owns (`process_runtime` pins that side).
+    runtime.stale_kill_of(victim.port);
+
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work60", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work60" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    // The stale refusal means that process is ALREADY gone - that is the release
+    // evidence - so the card owes the victim's bytes to the gate the spawn waits
+    // on: hand them over, exactly as the hand-staged gate pins above do.
+    witness.set_used(0.0);
+
+    let error = loading
+        .await
+        .expect("task alive")
+        .expect_err("the engine never becomes ready");
+    let message = error.to_string();
+    assert!(
+        message.contains("ready"),
+        "the job must fail on its OWN readiness error - a release timeout here \
+         means the stale victim aborted the release loop instead of being \
+         walked past: {message}"
+    );
+    assert!(
+        !message.contains("release timeout") && !message.contains("settle timeout"),
+        "the release and settle steps ran through the stale target (warn and \
+         break), they never stalled on it: {message}"
+    );
+
+    let status = handle.status().await.expect("actor alive");
+    let job = job_row(&status, "work60");
+    assert!(job.terminal, "{job:?}");
+    assert_eq!(
+        job.state,
+        simplehar_se::scheduler::SwapState::Idle,
+        "the failure still walked Failed -> Reap -> Idle: {job:?}"
+    );
+    assert_eq!(
+        job.victims_released,
+        vec!["aux30".to_string()],
+        "the release completed THROUGH the stale refusal (warn and break), the \
+         ledger records the eviction as released, not the job as stuck: {:?}",
+        job.victims_released
+    );
+    assert_eq!(runtime.spawn_count(), 2, "victim, then the job's own spawn");
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "R2-20-06 falsifier: the reap must walk past the stale victim to the \
+         engine this job itself started and prove it gone - aborting on the \
+         stale target would strand that engine live on the card and leave this \
+         count at 2 (the chunk-2 orphan)"
+    );
+    assert!(
+        !runtime.is_dead(victim.port).await,
+        "the stale refusal kept its half of the bargain: a ticket never forces \
+         the port of the generation that superseded it"
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Aux),
+        None,
+        "the victim's slot cleared"
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Work),
+        None,
+        "a failed load installs nothing"
+    );
+}

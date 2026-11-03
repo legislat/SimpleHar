@@ -1037,6 +1037,135 @@ async fn crash_retry_re_resolves_by_name_after_the_id_rewrite() {
 }
 
 #[tokio::test]
+async fn crash_retry_re_sends_the_successor_discovered_id() {
+    // R2-18-04: the leg above cannot tell the NEW engine's id from the DEAD
+    // engine's - both `dies-once` generations used to answer the same constant
+    // `mock-model` - so a retry that kept the pre-restart `serve_id` instead of
+    // re-deriving it (src/api/mod.rs `ensure_named` → `new_serve_id`) stayed
+    // green, the FINDINGS-20 [6] shared-id blindness surviving in exactly this
+    // test. Here the corpse reports `engine-gen1` and the successor `engine-gen2`
+    // (the mock's per-spawn id sequence, R2-18-04's `MockGenerationIdAdapter`):
+    // forwarding the corpse's id now goes RED, and the retried wire must carry
+    // the SUCCESSOR's self-reported id.
+    let adapters: Vec<(&str, Arc<dyn EngineAdapter>)> = vec![(
+        "mock-dies-once",
+        Arc::new(mock_runtime::MockGenerationIdAdapter {
+            engine: "mock-dies-once",
+            ids: "engine-gen1|engine-gen2",
+        }),
+    )];
+    let (control, work, _, _, runtime, _modelconf) = build_app(
+        AppConfig::default(),
+        &[("qwen3", "mock-dies-once", CategoryId::Work, Some(4.0))],
+        &adapters,
+    );
+    let (load_status, load_body) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(
+        load_status,
+        StatusCode::OK,
+        "the first load must succeed before anything is killed: {load_body}"
+    );
+    assert_eq!(runtime.spawn_count(), 1, "one engine started");
+    let (_, loaded) = get_json(&control, "/har/status").await;
+    let port = u16::try_from(
+        loaded["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["model"] == "qwen3")
+            .and_then(|slot| slot["port"].as_u64())
+            .expect("the serving slot reports its engine port"),
+    )
+    .expect("port fits u16");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !runtime.is_dead(port).await && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(runtime.is_dead(port).await, "the engine must really die");
+
+    let (status, body) = post_json(
+        &work,
+        "/v1/chat/completions",
+        r#"{"model":"qwen3","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "crash-retry must answer: {body}");
+    assert_eq!(body["echo"], true, "the restarted engine answered");
+    assert_eq!(
+        body["body"]["model"].as_str(),
+        Some("engine-gen2"),
+        "the retried request must carry the SUCCESSOR's discovered id; `engine-gen1` \
+         here is the dead engine's id re-sent - the exact R2-18-04 regression: {body}"
+    );
+    assert_eq!(runtime.spawn_count(), 2, "exactly one restart");
+    assert_eq!(runtime.server_count(), 1, "the corpse is gone");
+}
+
+#[tokio::test]
+async fn crash_retry_falls_back_to_the_harness_name_when_the_successor_is_silent() {
+    // R2-18-04, the other half: when the successor discovers NOTHING at
+    // `/v1/models`, the retried request must carry the documented harness-name
+    // fallback (the same `serve_id.unwrap_or_else` the first forward uses) - never
+    // the DEAD engine's id. The corpse therefore reports a real id
+    // (`engine-gen1`) that differs from the name: a retry reusing the first
+    // attempt's `serve_id` sends `engine-gen1` and goes RED here, which is exactly
+    // the harm the shared-constant id could never show.
+    let adapters: Vec<(&str, Arc<dyn EngineAdapter>)> = vec![(
+        "mock-dies-once",
+        Arc::new(mock_runtime::MockGenerationIdAdapter {
+            engine: "mock-dies-once",
+            ids: "engine-gen1|none",
+        }),
+    )];
+    let (control, work, _, _, runtime, _modelconf) = build_app(
+        AppConfig::default(),
+        &[("qwen3", "mock-dies-once", CategoryId::Work, Some(4.0))],
+        &adapters,
+    );
+    let (load_status, load_body) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(
+        load_status,
+        StatusCode::OK,
+        "a silent-later engine loads fine now: {load_body}"
+    );
+    assert_eq!(runtime.spawn_count(), 1, "one engine started");
+    let (_, loaded) = get_json(&control, "/har/status").await;
+    let port = u16::try_from(
+        loaded["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["model"] == "qwen3")
+            .and_then(|slot| slot["port"].as_u64())
+            .expect("the serving slot reports its engine port"),
+    )
+    .expect("port fits u16");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !runtime.is_dead(port).await && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(runtime.is_dead(port).await, "the engine must really die");
+
+    let (status, body) = post_json(
+        &work,
+        "/v1/chat/completions",
+        r#"{"model":"qwen3","messages":[]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "crash-retry must answer: {body}");
+    assert_eq!(body["echo"], true, "the restarted engine answered");
+    assert_eq!(
+        body["body"]["model"].as_str(),
+        Some("qwen3"),
+        "a successor that discovers nothing means the HARNESS NAME on the retried \
+         wire; `engine-gen1` here forwards the dead engine's id over a live engine - \
+         the R2-18-04 regression: {body}"
+    );
+    assert_eq!(runtime.spawn_count(), 2, "exactly one restart");
+    assert_eq!(runtime.server_count(), 1, "the corpse is gone");
+}
+
+#[tokio::test]
 async fn no_model_fallback_serves_the_loaded_occupant() {
     let (control, work, _, _, _, _modelconf) = app(
         AppConfig::default(),
@@ -3789,17 +3918,44 @@ async fn retagging_an_unloaded_aux_model_leaves_the_loaded_aux_occupant_alive() 
     // FINDINGS-07 [1], second half: the collateral unload fired on the CATEGORY CHANGE,
     // not on the model being loaded, so retagging a third AUX model that was never
     // loaded wiped the AUX occupants that were serving "for nothing".
-    let (control, _, _, aux_router, runtime, _) = app(
+    // R2-18-03: the old blind 150 ms sleep is gone. aux1 is a `mock-hold-kill`
+    // engine whose kill is held BY TARGET (`hold_kill_of`), so a collateral
+    // `unload(AUX)` can neither succeed (that engine cannot die) nor slip past an
+    // unmeasured window unnoticed: its kill parks on the runtime gate forever
+    // (this test never releases it) and stands in `held_kills()` as permanent,
+    // observable evidence of the wrong kill. The settle is positive: `slot_freed`
+    // answers only once the actor has processed the retag's follow-up command, and
+    // the `/har/rescan` round-trip drains the single-writer actor once more.
+    let adapters: Vec<(&str, Arc<dyn EngineAdapter>)> =
+        vec![("mock-hold-kill", Arc::new(MockAdapter))];
+    let (control, _, _, aux_router, runtime, _) = build_app(
         aux_slots(2),
         &[
-            ("aux1", "mock", CategoryId::Aux, Some(3.0)),
+            ("aux1", "mock-hold-kill", CategoryId::Aux, Some(3.0)),
             ("aux2", "mock", CategoryId::Aux, Some(3.0)),
             ("aux3", "mock", CategoryId::Aux, Some(3.0)),
         ],
+        &adapters,
     );
     let (status, body) = post_json(&control, "/har/load", r#"{"model":"aux1"}"#).await;
     assert_eq!(status, StatusCode::OK, "load aux1: {body}");
     assert_eq!(await_server_count(&runtime, 1).await, 1, "one occupant");
+
+    let (_, loaded) = get_json(&control, "/har/status").await;
+    let aux1_port = u16::try_from(
+        loaded["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["model"] == "aux1")
+            .and_then(|slot| slot["port"].as_u64())
+            .expect("the loaded AUX reports its engine port"),
+    )
+    .expect("port fits u16");
+    // Hold the ONE thing a wrong retag could kill: by-target holding means the
+    // fake's parking cannot be re-armed or dodged by a change in how many kills
+    // the product issues (the FINDINGS-19 [4] seam).
+    runtime.hold_kill_of(aux1_port);
 
     let (status, body) = post_json(
         &control,
@@ -3810,8 +3966,34 @@ async fn retagging_an_unloaded_aux_model_leaves_the_loaded_aux_occupant_alive() 
     assert_eq!(status, StatusCode::OK, "a retag never 500s: {body}");
     assert_eq!(body["status"], "edited");
     assert_eq!(body["category"], "WORK");
+    // The positive settle signal, R2-18-03: `slot_freed` is the actor's reply to
+    // the retag's follow-up command (`unload_model` - the idempotent Done the
+    // actor guarantees for a never-loaded model), so the retag path is proven
+    // PROCESSED, not merely posted. The broken FINDINGS-07 [1] branch answered its
+    // `unload(old_category)` at this same point.
+    assert_eq!(
+        body["slot_freed"],
+        serde_json::json!(true),
+        "the retag's follow-up ran through the actor, so the retag path is proven \
+         processed before the negative below: {body}"
+    );
 
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // One more full round-trip through the single-writer actor: its reply cannot
+    // arrive before the actor has dequeued every command the retag queued ahead of
+    // it, and the awaits around it give a collateral unload's spawned kill task
+    // its polls. No timed sleep stands in for that ordering.
+    let (status, body) = post_json(&control, "/har/rescan", r#"{}"#).await;
+    assert_eq!(status, StatusCode::OK, "rescan round-trip: {body}");
+
+    // The negative is now structural, not timed: had the retag collateral-unloaded
+    // AUX, aux1's kill would have parked on the held gate and stayed there - so
+    // this proves an arrival would be detected, whenever it comes.
+    assert!(
+        runtime.held_kills().is_empty(),
+        "R2-18-03 falsifier: a collateral `unload(AUX)` issued a kill of the loaded \
+         aux1 and it is parked on the held gate: {:?}",
+        runtime.held_kills()
+    );
     let (_, loaded) = get_json(&control, "/har/status").await;
     let slots = loaded["slots"].as_array().expect("slots");
     assert!(
@@ -3834,6 +4016,13 @@ async fn retagging_an_unloaded_aux_model_leaves_the_loaded_aux_occupant_alive() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "aux1 is still answering: {body}");
+    // The permanent evidence one last time: the legs above gave the wrong kill -
+    // had the product issued one - every remaining poll; none arrived and parked.
+    assert!(
+        runtime.held_kills().is_empty(),
+        "no kill of aux1 ever arrived to park on the held gate: {:?}",
+        runtime.held_kills()
+    );
 }
 
 /// The boot config with `WORK`'s default pointed at `model`, the shape the retag

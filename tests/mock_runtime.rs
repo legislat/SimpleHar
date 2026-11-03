@@ -14,7 +14,15 @@
 //! observable recovering on a later resolve — FINDINGS-06 [8]). The id an engine
 //! reports at
 //! `/v1/models` comes from `spec.env["MOCK_MODEL_ID"]` (default `mock-model`), so a
-//! test can give each engine a DISTINCT identity via [`MockIdAdapter`].
+//! test can give each engine a DISTINCT identity via [`MockIdAdapter`]. A row may
+//! instead carry `MOCK_SPAWN_IDS` (a `|`-separated id list): this runtime then
+//! consumes ONE entry per spawn of that row (the last entry repeats), so the two
+//! generations of a `mock-dies-once` crash-retry report DIFFERENT ids — or `none`,
+//! which makes that generation silent (R2-18-04, [`MockGenerationIdAdapter`]).
+//! [`MockRuntime::stale_kill_of`] marks a port superseded: every `kill` and
+//! `release_confirmed` naming that port answers `SpawnError::StaleTicket` (the
+//! fake reports the next generation as the owner) and never acts on the ticket,
+//! the state the scheduler's continue-on-stale reap arm needs (R2-20-06).
 
 use async_trait::async_trait;
 use axum::extract::State;
@@ -179,6 +187,19 @@ pub struct MockRuntime {
     /// assert this SET (which kills the product really issued and left unproven)
     /// instead of trusting the fake's budget arithmetic (FINDINGS-19 [4]).
     parked: Arc<Mutex<Vec<(u16, u64)>>>,
+    /// R2-20-06 fake seam: ports whose table entry reads as SUPERSEDED — a newer
+    /// generation owns them, so every `kill` and `release_confirmed` naming such
+    /// a port answers `SpawnError::StaleTicket` and the fake never acts on the
+    /// ticket (exactly what the real runtime refuses for, so a successor is never
+    /// killed or confirmed away with a stale ticket). Without this the scheduler's
+    /// continue-on-stale reap wiring is unreachable for any mock-based suite
+    /// (R2-20 [6]). See [`MockRuntime::stale_kill_of`].
+    stale_ports: Arc<Mutex<BTreeSet<u16>>>,
+    /// R2-18-04 fake seam: how many `MOCK_SPAWN_IDS` generations each id sequence
+    /// has already served, keyed by the sequence itself. First spawn of a sequence
+    /// reports entry 0, next spawn entry 1, the last entry repeats; rows without
+    /// the key never touch the map, so every pre-existing behavior is unchanged.
+    spawn_id_taken: Arc<Mutex<HashMap<String, usize>>>,
     /// R9 fake seam: canned `docker logs` text per container name, returned by
     /// [`EngineRuntime::container_report`] (tests seed the startup `MemorySummary`).
     container_reports: Arc<Mutex<HashMap<String, String>>>,
@@ -216,6 +237,8 @@ impl MockRuntime {
             kill_holds: Arc::new(AtomicUsize::new(usize::MAX)),
             hold_ports: Arc::new(Mutex::new(BTreeSet::new())),
             parked: Arc::new(Mutex::new(Vec::new())),
+            stale_ports: Arc::new(Mutex::new(BTreeSet::new())),
+            spawn_id_taken: Arc::new(Mutex::new(HashMap::new())),
             container_reports: Arc::new(Mutex::new(HashMap::new())),
             saved_container_logs: Arc::new(Mutex::new(Vec::new())),
             publish_evidence: Arc::new(Mutex::new(HashMap::new())),
@@ -297,6 +320,23 @@ impl MockRuntime {
     #[allow(dead_code)]
     pub fn held_kills(&self) -> Vec<(u16, u64)> {
         self.parked.lock().expect("parked kills lock").clone()
+    }
+
+    /// R2-20-06 seam: declare every ticket that names `port` stale — the fake
+    /// answers `SpawnError::StaleTicket` to its `kill` AND its `release_confirmed`
+    /// and never acts on the entry, exactly what the real table does for a port a
+    /// newer generation owns (`process_runtime` pins the runtime side). Marking
+    /// persists, like a real supersession: the ticket never becomes valid again.
+    /// This is the only way this fake can reach the scheduler's continue-on-stale
+    /// reap arms (`reap_should_continue` and its two wiring sites in
+    /// `spawn_kill_confirm`), whose inversion — aborting the reap on a stale
+    /// target — would otherwise keep every mock-based suite green.
+    #[allow(dead_code)] // binaries that never fake a stale ticket still compile this module
+    pub fn stale_kill_of(&self, port: u16) {
+        self.stale_ports
+            .lock()
+            .expect("stale ports lock")
+            .insert(port);
     }
 
     /// Number of live engines (leak-check helper for F-1 / F-6). Used by the
@@ -468,13 +508,51 @@ impl EngineRuntime for MockRuntime {
             .map(String::as_str)
             .unwrap_or("mock");
         let mode = mode_for(engine);
-        let model_id = spec.env.get("MOCK_MODEL_ID").cloned();
-        let discover_failures = Arc::new(AtomicU32::new(
-            spec.env
-                .get("MOCK_DISCOVERY_FAILURES")
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0),
-        ));
+        // R2-18-04: a row may carry `MOCK_SPAWN_IDS` - a `|`-separated id list
+        // this runtime consumes ONE entry per spawn of that row (last entry
+        // repeats), so the generations of a `mock-dies-once` crash-retry report
+        // DIFFERENT ids, or `none` for a generation that discovers nothing. A
+        // fixed per-row id hid exactly this: the corpse and its replacement
+        // answered the same `mock-model`, so a crash-retry that kept forwarding
+        // the DEAD engine's id stayed green (the FINDINGS-20 [6] blindness). A
+        // row without the key keeps the historical behavior untouched.
+        let (model_id, discover_failures) = match spec.env.get("MOCK_SPAWN_IDS") {
+            Some(sequence) => {
+                let taken = {
+                    let mut map = self.spawn_id_taken.lock().expect("spawn id lock");
+                    let slot = map.entry(sequence.clone()).or_insert(0usize);
+                    let index = *slot;
+                    *slot += 1;
+                    index
+                };
+                let ids: Vec<&str> = sequence.split('|').collect();
+                let id = ids[taken.min(ids.len() - 1)];
+                if id == "none" {
+                    // The silent generation: `/v1/models` never reports, so the
+                    // harness must fall back to the name it was given.
+                    (None, Arc::new(AtomicU32::new(u32::MAX)))
+                } else {
+                    (
+                        Some(id.to_string()),
+                        Arc::new(AtomicU32::new(
+                            spec.env
+                                .get("MOCK_DISCOVERY_FAILURES")
+                                .and_then(|n| n.parse().ok())
+                                .unwrap_or(0),
+                        )),
+                    )
+                }
+            }
+            None => (
+                spec.env.get("MOCK_MODEL_ID").cloned(),
+                Arc::new(AtomicU32::new(
+                    spec.env
+                        .get("MOCK_DISCOVERY_FAILURES")
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0),
+                )),
+            ),
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| SpawnError::SpawnFailed {
@@ -525,6 +603,22 @@ impl EngineRuntime for MockRuntime {
     }
 
     async fn kill(&self, ticket: &SpawnTicket) -> Result<(), SpawnError> {
+        // R2-20-06 seam: a port the test declared superseded refuses every ticket
+        // naming it (see [`MockRuntime::stale_kill_of`]) - the kill would land on
+        // a newer generation this ticket does not own, so it is refused, not forced.
+        if self
+            .stale_ports
+            .lock()
+            .expect("stale ports lock")
+            .contains(&ticket.port)
+        {
+            return Err(SpawnError::StaleTicket {
+                port: ticket.port,
+                expected: ticket.generation,
+                // The successor generation the table now carries for this port.
+                found: ticket.generation + 1,
+            });
+        }
         let holdkill = self
             .servers
             .lock()
@@ -595,6 +689,22 @@ impl EngineRuntime for MockRuntime {
         // that was already dead. `is_dead` keeps that TCP check for the tests that want
         // the port-level claim — and the death paths now await the drop BEFORE the
         // entry disappears, so the two claims cannot disagree (FINDINGS-20 [7]).
+        // R2-20-06 seam: a superseded port confirms NOTHING to any ticket naming
+        // it - `Ok(true)` here would talk a successor's live engine away (the
+        // real-side invariant `process_runtime` pins) - the answer is the same typed
+        // `StaleTicket` the kill refuses with.
+        if self
+            .stale_ports
+            .lock()
+            .expect("stale ports lock")
+            .contains(&ticket.port)
+        {
+            return Err(SpawnError::StaleTicket {
+                port: ticket.port,
+                expected: ticket.generation,
+                found: ticket.generation + 1,
+            });
+        }
         let live = self
             .servers
             .lock()
@@ -693,6 +803,41 @@ impl EngineAdapter for MockLateIdAdapter {
             .insert("MOCK_MODEL_ID".to_string(), self.serve_id.to_string());
         spec.env
             .insert("MOCK_DISCOVERY_FAILURES".to_string(), "1".to_string());
+        Ok(spec)
+    }
+}
+
+/// A `MockAdapter` under a `mock-dies-once` engine id whose two generations carry
+/// distinct `/v1/models` identities (R2-18-04): the corpse reports the first entry
+/// of `ids` and the crash-retry successor the second - or, with the entry `none`,
+/// it discovers nothing, so the harness-name fallback becomes observable. The
+/// entries ride [`MockRuntime`]'s `MOCK_SPAWN_IDS` per-spawn sequence, one entry
+/// consumed per spawn of the row. Before this every `dies-once` generation shared
+/// one constant id, so the crash-retry's re-resolved request could not be pinned
+/// to the SUCCESSOR's discovery: a proxy that kept the pre-restart `serve_id` -
+/// including forwarding a dead engine's id when the successor stays silent - stayed
+/// green (the FINDINGS-20 [6] blindness, surviving in the crash-retry test).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // binaries that never script a crash-retry id pair still compile this module
+pub struct MockGenerationIdAdapter {
+    /// The `engine:` id the yaml must carry to select this adapter. It must name
+    /// a `mock-dies-once` engine: the per-generation ids ride that mode's
+    /// corpse-then-replacement shape.
+    pub engine: &'static str,
+    /// The `|`-separated per-generation id list (e.g. `gen-a|gen-b`, or
+    /// `gen-a|none` for a silent successor).
+    pub ids: &'static str,
+}
+
+impl EngineAdapter for MockGenerationIdAdapter {
+    fn engine_id(&self) -> &str {
+        self.engine
+    }
+
+    fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
+        let mut spec = simplehar_se::engine::mock::MockAdapter.spec(model, port)?;
+        spec.env
+            .insert("MOCK_SPAWN_IDS".to_string(), self.ids.to_string());
         Ok(spec)
     }
 }
