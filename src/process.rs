@@ -442,6 +442,12 @@ struct EngineProc {
     /// (chunk 10 slice 10b); `release_confirmed` may only clear the entry
     /// bearing this token, never one a later launch wrote under the same pid.
     custody_token: Option<u64>,
+    /// The verdict of `kill`'s one-shot container reap duty (R2-08-02): a
+    /// container-backed entry may only end its table slot and ownership claim
+    /// on a *confirmed* `docker rm -f` — a refusing port alone does not prove
+    /// the detached container is gone. Process engines never reap and never
+    /// set this, so their release evidence stays exactly the G12 pair.
+    reap_confirmed: bool,
 }
 
 /// Owned Job Object handle. `Send` because the runtime owns it exclusively: it is
@@ -486,12 +492,57 @@ pub struct ProcessRuntime {
     /// minted (FINDINGS2-0910 [3]) — is reachable without a wedged Win32 API.
     #[cfg(test)]
     fail_job_after_spawn: bool,
+    /// Test seam: parks this runtime's `release_confirmed` pollers in the gap
+    /// between the TCP probe and the final generation re-check of the table
+    /// lock (see [`ReleaseGate`]).
+    #[cfg(test)]
+    release_gate: Option<Arc<ReleaseGate>>,
+    /// Test seam: scripts the verdicts `kill`'s container reap duty reports
+    /// (see [`ReapSeam`]).
+    #[cfg(test)]
+    reap_seam: Option<Arc<ReapSeam>>,
     /// Test seam (R5): the R5 reconcile probe goes through this docker door
     /// instead of `wsl.exe`, so pins can script `docker ps` and read back the
     /// docker verbs the reconcile actually asked for — the vocabulary bound the
     /// report-only doctrine promises.
     #[cfg(test)]
     docker_probe: Option<DockerProbeSeam>,
+}
+
+/// Test seam (R2-08-01 pin): a two-way gate that parks a `release_confirmed`
+/// poller in the await gap between reading the table verdict and re-judging it
+/// under the final table lock — the window in which a concurrent same-ticket
+/// poller plus the scheduler's Dispose->Spawn gate used to be able to install
+/// a successor that the parked poller then removed unguarded. A pin holds one
+/// poller at the gate, installs the successor, and releases it, making the
+/// interleaving deterministic instead of timing-dependent. Inert in
+/// production: no field value exists there, so no await is ever inserted.
+#[cfg(test)]
+#[derive(Default)]
+struct ReleaseGate {
+    /// Notified by `release_confirmed` when it reaches the gap.
+    arrived: tokio::sync::Notify,
+    /// Notified by the test to let the parked poller re-judge and finish.
+    departed: tokio::sync::Notify,
+}
+
+/// Recorded reap-verdict seam for the REV7 pins (test-only): one scripted
+/// verdict per `kill`-carried container reap, plus the names it was asked to
+/// reap. `kill` consumes the script front-first and falls through to the real
+/// [`reap_container`] once exhausted, so a pin that scripts nothing keeps the
+/// real (coordinate-refusing) path untouched. Parallel in spirit to
+/// `docker_probe`, but narrower: it replaces only the WSL/docker call inside
+/// the reap duty, so the duty rule, the claim gate, the generation guard, and
+/// the entry recording under test stay the production ones (REV7-03 lets a
+/// pin drive `kill` writing BOTH verdicts onto `reap_confirmed`).
+#[cfg(test)]
+#[derive(Default)]
+struct ReapSeam {
+    /// One verdict per scripted reap, consumed front-first.
+    scripted: Mutex<std::collections::VecDeque<bool>>,
+    /// The container name each scripted verdict answered for, in order. A
+    /// passive `release_confirmed` poll must never extend this list (REV7-01).
+    asked: Mutex<Vec<String>>,
 }
 
 /// Recorded docker-probe seam for the R5 pins (test-only): a canned `docker ps`
@@ -571,11 +622,20 @@ fn published_elsewhere_evidence(container: &str, offered: u16, text: &str) -> Op
     ))
 }
 
-/// Whether this kill must reap a container: only a not-yet-terminated engine
-/// carries the reap duty; re-kills (cancel/retry paths) must not re-run
-/// `docker rm` for someone else's container (review, 2026-10-26).
-fn should_reap(terminated: bool, container: Option<&String>) -> Option<String> {
-    if terminated {
+/// Whether this kill must reap a container. A CONFIRMED reap retires the duty
+/// for good: a re-kill never re-runs `docker rm` for someone else's container
+/// (review, 2026-10-26). An UNCONFIRMED reap keeps the duty alive (REV7-01):
+/// the entry is still ours and the container may still hold the card, so the
+/// next explicit kill carries the retry. Only `kill` reaches this rule --
+/// `release_confirmed` polls are passive and never reap -- and every attempt
+/// stays gated by the (port, generation) verdict and the claim ledger
+/// ([`reap_action`]), so a re-arm can never address an unclaimed name.
+fn should_reap(
+    terminated: bool,
+    reap_confirmed: bool,
+    container: Option<&String>,
+) -> Option<String> {
+    if terminated && reap_confirmed {
         return None;
     }
     container.cloned()
@@ -594,7 +654,7 @@ enum ReapAction {
     Reap(String),
     /// The duty fell to this kill but no claim backs the name: leave the container.
     SkipUnclaimed(String),
-    /// Nothing to do (no container, or a re-kill that already carried the duty).
+    /// Nothing to do (no container, or a re-kill whose reap already confirmed).
     None,
 }
 
@@ -636,8 +696,10 @@ fn excerpt(bytes: &[u8]) -> String {
 ///
 /// # Returns
 ///
-/// `true` only when docker confirmed the removal — the boot reclaim drops the
-/// ownership claim for a name only on that evidence, so a failed reap stays
+/// `true` only when docker confirmed the removal — both ownership paths drop
+/// the claim for a name only on that evidence: the boot reclaim, and (since
+/// R2-08-02) the live release, whose `kill` records the verdict on the entry
+/// and whose `release_confirmed` demands it, so a failed reap stays
 /// reclaimable at the next boot instead of silently orphaning.
 async fn reap_container(distro: &str, user: &str, name: &str) -> bool {
     if user.trim().is_empty() || distro.trim().is_empty() {
@@ -1332,6 +1394,10 @@ impl ProcessRuntime {
             #[cfg(test)]
             fail_job_after_spawn: false,
             #[cfg(test)]
+            release_gate: None,
+            #[cfg(test)]
+            reap_seam: None,
+            #[cfg(test)]
             docker_probe: None,
         }
     }
@@ -1403,6 +1469,29 @@ impl ProcessRuntime {
         self
     }
 
+    /// Parks this runtime's `release_confirmed` pollers in the await gap
+    /// before the final generation re-check. Test-only; see [`ReleaseGate`].
+    #[cfg(test)]
+    #[must_use]
+    fn with_release_gate(mut self, gate: Arc<ReleaseGate>) -> Self {
+        self.release_gate = Some(gate);
+        self
+    }
+
+    /// Scripts this runtime's `kill`-carried container reap verdicts (the
+    /// seam also reports the names each scripted verdict answered for).
+    /// Test-only; see [`ReapSeam`].
+    #[cfg(test)]
+    #[must_use]
+    fn with_reap_seam(mut self, verdicts: &[bool]) -> (Self, Arc<ReapSeam>) {
+        let seam = Arc::new(ReapSeam {
+            scripted: Mutex::new(verdicts.iter().copied().collect()),
+            asked: Mutex::new(Vec::new()),
+        });
+        self.reap_seam = Some(Arc::clone(&seam));
+        (self, seam)
+    }
+
     /// Creates the kill-on-close job for a freshly spawned child. The `#[cfg(test)]`
     /// seam exists so the post-spawn failure path (which must retract a claim) can be
     /// reached without a wedged Win32 API.
@@ -1446,6 +1535,31 @@ impl ProcessRuntime {
                 .expect("custody sidecar lock")
                 .forget(pid, token);
         }
+    }
+
+    /// Runs this kill's reap duty: the scripted verdict while the REV7 test
+    /// seam ([`ReapSeam`]) still holds one for it, the real `docker rm -f`
+    /// otherwise. The seam replaces only the WSL/docker call, so the duty
+    /// rule, the claim gate, the generation guard, and the entry recording
+    /// stay the production paths; a runtime without a seam, or once the
+    /// script is exhausted, runs [`reap_container`] exactly as before.
+    async fn run_reap_duty(&self, name: &str) -> bool {
+        #[cfg(test)]
+        if let Some(seam) = &self.reap_seam {
+            let scripted = seam
+                .scripted
+                .lock()
+                .expect("reap verdict seam lock")
+                .pop_front();
+            if let Some(verdict) = scripted {
+                seam.asked
+                    .lock()
+                    .expect("reap verdict seam lock")
+                    .push(name.to_string());
+                return verdict;
+            }
+        }
+        reap_container(&self.wsl_distro, &self.wsl_user, name).await
     }
 
     /// Boot reconcile (deploy review, 2026-10-26; scoped by chunk 10 [1], 2026-10-27):
@@ -1818,6 +1932,7 @@ impl EngineRuntime for ProcessRuntime {
                     argv: spec.argv.clone(),
                     pid,
                     custody_token,
+                    reap_confirmed: false,
                 },
             );
         }
@@ -1850,9 +1965,16 @@ impl EngineRuntime for ProcessRuntime {
             // Safety: the job handle is valid (created in spawn, closed by Drop)
             // and terminating a job is safe from any thread.
             unsafe { terminate_job(engine.job.0) };
-            // Only the first kill carries the reap duty; re-kills (cancel,
+            // A confirmed reap retires the duty forever: re-kills (cancel,
             // release-retry) must not re-run `docker rm` (review, 2026-10-26).
-            let duty = should_reap(engine.terminated, engine.container.as_ref());
+            // An UNCONFIRMED reap re-arms on the next explicit kill (REV7-01),
+            // so a failed `docker rm` cannot burn the slot until boot; the
+            // ledger and the generation verdict keep every retry scoped.
+            let duty = should_reap(
+                engine.terminated,
+                engine.reap_confirmed,
+                engine.container.as_ref(),
+            );
             engine.terminated = true;
             let _ = engine.child.start_kill();
             duty
@@ -1872,7 +1994,22 @@ impl EngineRuntime for ProcessRuntime {
         };
         match action {
             ReapAction::Reap(name) => {
-                reap_container(&self.wsl_distro, &self.wsl_user, &name).await;
+                let reaped = self.run_reap_duty(&name).await;
+                // R2-08-02: the reap verdict is the evidence `release_confirmed`
+                // needs before it may end the claim, so it rides on the entry.
+                // Generation-guarded: a successor that inherited this port
+                // while docker deliberated owns the entry now, and no reap of
+                // the retired lifetime may speak for it.
+                if let Some(engine) = self
+                    .engines
+                    .lock()
+                    .expect("engine table lock")
+                    .get_mut(&ticket.port)
+                {
+                    if engine.generation == ticket.generation {
+                        engine.reap_confirmed = reaped;
+                    }
+                }
             }
             ReapAction::SkipUnclaimed(name) => tracing::warn!(
                 container = %name,
@@ -1921,34 +2058,134 @@ impl EngineRuntime for ProcessRuntime {
         let port_closed = tokio::net::TcpStream::connect(("127.0.0.1", ticket.port))
             .await
             .is_err();
+        // R2-08-01 pin seam (test-only, inert in production): park this task in
+        // the await gap between reading the verdict and re-judging it under the
+        // final table lock — the window this function must survive.
+        #[cfg(test)]
+        if let Some(gate) = &self.release_gate {
+            gate.arrived.notify_one();
+            gate.departed.notified().await;
+        }
         if release_ready(is_container, exited, port_closed) {
-            let removed = self
-                .engines
-                .lock()
-                .expect("engine table lock")
-                .remove(&ticket.port);
-            if let Some(engine) = removed {
-                if let (true, Some(name)) = (is_container, engine.container.as_ref()) {
-                    // G12 evidence held: the container is gone, so its ownership claim
-                    // ends — a later hand-started container reusing the name can never
-                    // inherit a claim this harness no longer needs.
-                    self.claims
-                        .lock()
-                        .expect("container claim ledger lock")
-                        .unclaim(name);
-                }
-                // The custody entry ends with the same evidence: token-guarded, so
-                // a release can never erase a later launch's record written under
-                // the same pid (slice 10b).
-                self.forget_custody(engine.pid, engine.custody_token);
-                // `engine` drops here: `JobHandle::drop` closes the
-                // handle exactly once.
+            // The verdict above was read under the lock, but the lock was
+            // dropped for the TCP await. Two live jobs can poll the SAME victim
+            // ticket (the eviction job's victim and a same-slot reload's own
+            // reaper — board REV6-03); a sibling poller that completed its
+            // removal in this window lets the Dispose->Spawn gate insert the
+            // successor before this line runs. Re-judge under the final lock
+            // (R2-08-01): only the entry still bearing OUR generation may be
+            // removed, and — R2-08-02 — a container entry only on its recorded
+            // reap verdict. The bookkeeping below then uses the REMOVED entry,
+            // never a capture from before the gap.
+            enum ReleaseOutcome {
+                /// Our entry, ours to end: its ownership records ride with it.
+                Removed(Box<EngineProc>),
+                /// A sibling poller already removed our entry, or a newer
+                /// spawn inherited the port: the release of OUR child is
+                /// proven, and whoever holds the entry now is a different
+                /// lifetime this retired ticket may not touch.
+                Superseded,
+                /// Our entry, but its container reap was never confirmed while
+                /// the ledger still holds the claim: the container may still
+                /// hold the card, so entry and claim stay (see the return
+                /// contract of [`reap_container`]). Carries the held entry's
+                /// container name (REV7-04: it is always present here).
+                ReapUnconfirmed(String),
             }
-            tracing::info!(
-                port = ticket.port,
-                "release confirmed: engine gone, port closed"
-            );
-            return Ok(true);
+            let outcome = {
+                let mut engines = self.engines.lock().expect("engine table lock");
+                match table_verdict(
+                    engines.get(&ticket.port).map(|entry| entry.generation),
+                    ticket.generation,
+                ) {
+                    TableVerdict::Unowned | TableVerdict::Stale { .. } => {
+                        ReleaseOutcome::Superseded
+                    }
+                    TableVerdict::Ours => {
+                        // REV7-04: one lookup for the held entry. REV7-02: a
+                        // container entry holds the release only while the
+                        // ledger still backs it with a claim AND its reap has
+                        // not confirmed. With no claim there is no ownership
+                        // evidence left to preserve (boot reclaim already
+                        // refuses the name), so the plain G12 pair decides and
+                        // the SkipUnclaimed shape must not burn the slot until
+                        // boot; REV7-01's explicit re-kill is the live retry.
+                        let entry = engines
+                            .get(&ticket.port)
+                            .expect("invariant: the verdict above just read Ours for this port");
+                        let unconfirmed_name = match entry.container.as_deref() {
+                            Some(name) if !entry.reap_confirmed => Some(name.to_string()),
+                            _ => None,
+                        };
+                        let reap_held = unconfirmed_name.as_deref().is_some_and(|name| {
+                            self.claims
+                                .lock()
+                                .expect("container claim ledger lock")
+                                .contains(name)
+                        });
+                        match unconfirmed_name {
+                            Some(name) if reap_held => ReleaseOutcome::ReapUnconfirmed(name),
+                            _ => ReleaseOutcome::Removed(Box::new(
+                                engines.remove(&ticket.port).expect(
+                                    "invariant: the verdict above just read Ours for this port",
+                                ),
+                            )),
+                        }
+                    }
+                }
+            };
+            match outcome {
+                ReleaseOutcome::Removed(engine) => {
+                    if let Some(name) = engine.container.as_ref() {
+                        // G12 evidence held AND `kill`'s `docker rm -f`
+                        // confirmed the removal: the container is gone, so its
+                        // ownership claim ends -- a later hand-started
+                        // container reusing the name can never inherit a claim
+                        // this harness no longer needs. An entry the ledger
+                        // does not hold (the SkipUnclaimed shape, REV7-02)
+                        // gets nothing written to its name: `unclaim` persists
+                        // only a claim it actually removes.
+                        self.claims
+                            .lock()
+                            .expect("container claim ledger lock")
+                            .unclaim(name);
+                    }
+                    // The custody entry ends with the same evidence, on the
+                    // REMOVED entry's own pid and token: token-guarded, so a
+                    // release can never erase a later launch's record written
+                    // under the same pid (slice 10b) — and a ticket that
+                    // removed nothing clears nobody's record (R2-08-01).
+                    self.forget_custody(engine.pid, engine.custody_token);
+                    // `engine` drops here: `JobHandle::drop` closes the
+                    // handle exactly once.
+                    tracing::info!(
+                        port = ticket.port,
+                        "release confirmed: engine gone, port closed"
+                    );
+                    return Ok(true);
+                }
+                ReleaseOutcome::Superseded => {
+                    tracing::info!(
+                        port = ticket.port,
+                        "release confirmed for the retired ticket; whoever holds the port now is untouched"
+                    );
+                    return Ok(true);
+                }
+                ReleaseOutcome::ReapUnconfirmed(container) => {
+                    // R2-08-02: for a detached container the client's exit and
+                    // a refusing port prove nothing about the container itself
+                    // — `kill`'s `docker rm -f` is that evidence, and it
+                    // failed. Stay unconfirmed: the release timeout keeps the
+                    // claim, and the next boot reclaim — which keeps it too
+                    // until docker confirms — stays the path with authority
+                    // over a possibly-live container.
+                    tracing::debug!(
+                        port = ticket.port,
+                        container = %container,
+                        "release held: the container reap was not confirmed; keeping the ownership claim, an explicit re-kill re-arms the duty (REV7-01)"
+                    );
+                }
+            }
         }
         tokio::time::sleep(RELEASE_POLL).await;
         Ok(false)
@@ -2700,16 +2937,21 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_kill_carries_the_reap_duty() {
+    fn the_reap_duty_retires_only_on_a_confirmed_reap() {
         let name = "ninfer-x".to_string();
-        assert_eq!(should_reap(false, Some(&name)), Some(name.clone()));
+        assert_eq!(should_reap(false, false, Some(&name)), Some(name.clone()));
         assert_eq!(
-            should_reap(true, Some(&name)),
+            should_reap(true, true, Some(&name)),
             None,
-            "re-kill must not re-rm"
+            "a re-kill must not re-rm a confirmed-gone container (review, 2026-10-26)"
         );
         assert_eq!(
-            should_reap(false, None),
+            should_reap(true, false, Some(&name)),
+            Some(name),
+            "REV7-01: an unconfirmed reap re-arms the duty for the next explicit kill"
+        );
+        assert_eq!(
+            should_reap(false, false, None),
             None,
             "process engines reap nothing"
         );
@@ -3470,6 +3712,421 @@ mod tests {
         assert!(
             crate::custody::CustodyLedger::load(&sidecar).is_empty(),
             "including on disk, where the boot sweep reads it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-08-01 (HIGH): two live jobs can park two pollers on the SAME victim
+    /// ticket (the eviction job's victim and a same-slot reload's own reaper).
+    /// The old code read the table verdict under the lock, dropped the lock for
+    /// the TCP await, then removed `engines[port]` unguarded: a poller that
+    /// woke inside that gap deleted the SUCCESSOR the Dispose->Spawn gate had
+    /// already inserted — closing its job object (the kernel then took its
+    /// tree, the mechanism the replace-path comment itself names), unclaiming
+    /// its container on the retired ticket's `is_container` capture together
+    /// with the REMOVED entry's name, and forgetting its custody record on a
+    /// token that matched because the entry WAS the successor's own.
+    ///
+    /// Determinism: the [`ReleaseGate`] seam parks one poller in the exact
+    /// await gap; the successor is installed while it stands there, so the
+    /// interleaving is ordered by the gate, never by wall-clock luck. The seam
+    /// adds no production await (the field does not exist outside `cfg(test)`).
+    /// On the unguarded removal every ownership assertion below is red.
+    #[tokio::test]
+    async fn a_blocked_release_poller_may_not_remove_the_successor_that_took_its_port() {
+        let dir = crate::testutil::temp_dir("release-race");
+        let ledger = dir.join("ninfer-claims.json");
+        let sidecar = dir.join("strata-custody.json");
+        let gate = Arc::new(ReleaseGate::default());
+        let runtime = ProcessRuntime::new()
+            .with_claims_ledger(&ledger)
+            .with_custody_ledger(&sidecar)
+            .with_release_gate(Arc::clone(&gate));
+        let port = 18_296;
+        let old = container_ticket(port, "se-race-old");
+        runtime
+            .spawn(
+                &client_spec("cmd.exe", &["/c", "exit 0"], "se-race-old"),
+                old.clone(),
+            )
+            .await
+            .expect("cmd.exe starts as a stand-in client");
+        runtime
+            .kill(&old)
+            .await
+            .expect("kill of the tracked engine");
+
+        let poller = {
+            let runtime = runtime.clone();
+            let ticket = old.clone();
+            tokio::spawn(async move { runtime.release_confirmed(&ticket).await })
+        };
+        gate.arrived.notified().await;
+
+        // The Dispose->Spawn gate: the release a FIRST poller proved let the
+        // successor into the same port while this parked poller still sat in
+        // its await gap. The successor is container-backed under a DIFFERENT
+        // name (the stolen-claim shape) and custodied (the stolen-record shape).
+        let successor = SpawnTicket {
+            generation: 2,
+            ..container_ticket(port, "se-race-new")
+        };
+        runtime
+            .spawn(
+                &custodied_spec(
+                    "cmd.exe",
+                    &["/c", "ping", "-n", "30", "127.0.0.1"],
+                    "se-race-new",
+                ),
+                successor.clone(),
+            )
+            .await
+            .expect("the successor client starts");
+
+        gate.departed.notify_one();
+        assert_eq!(
+            poller.await.expect("the parked poller ran to completion"),
+            Ok(true),
+            "the old lifetime's release stays confirmed for the retired ticket: \
+             its child was killed and the port refused"
+        );
+
+        // And nothing of the successor's ownership evidence was touched:
+        // entry (job object), claim, and custody record all belong to the
+        // newer generation now (DOCTRINE 5: a stale ticket is refused, never
+        // honoured — extended to the removal, not just the verdict read).
+        {
+            let mut engines = runtime.engines.lock().expect("engine table lock");
+            let entry = engines
+                .get_mut(&port)
+                .expect("the successor keeps its table entry");
+            assert_eq!(
+                entry.generation, 2,
+                "the removal may never take the successor's slot"
+            );
+            assert!(
+                !entry.terminated,
+                "a retired ticket's poller may not speak for the successor's lifetime"
+            );
+            assert_eq!(entry.container.as_deref(), Some("se-race-new"));
+            assert!(
+                entry.child.try_wait().expect("child status").is_none(),
+                "the successor's job object stays open: dropping the entry would have let KILL_ON_JOB_CLOSE take its tree"
+            );
+        }
+        assert!(
+            runtime.claimed("se-race-new"),
+            "the successor's container claim is not the retired ticket's to end"
+        );
+        assert!(
+            runtime.claimed("se-race-old"),
+            "the retired ticket's own claim stays for the boot reclaim: no removal ran here either"
+        );
+        let entries = runtime.custody_entries();
+        assert_eq!(entries.len(), 1, "the successor's custody record survives");
+        assert_eq!(entries[0].port, port, "and it is the successor's entry");
+
+        runtime.kill(&successor).await.expect("cleanup kill");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-08-02 (MEDIUM): a detached container's client exit and a refusing
+    /// port are NOT release evidence — `kill`'s `docker rm -f` is. Here the
+    /// reap cannot run (blank WSL coordinates make [`reap_container`] refuse
+    /// and report false — the stub the pin asked for, with no `wsl.exe` and no
+    /// docker ever invoked), so the kill records a failed reap and the release
+    /// must stay unconfirmed indefinitely: the release timeout keeps the claim,
+    /// and the next boot reclaim — which keeps it until docker confirms — stays
+    /// the path with authority. Unclaiming on port refusal alone would strand a
+    /// possibly-live container that boot reclaim then refuses forever as
+    /// `SKIP_UNCLAIMED`, because this harness destroyed the evidence itself.
+    /// The control at the end (reap verdict recorded as confirmed) keeps the
+    /// pin from being satisfied by a release path that never unclaims at all.
+    /// (The seam pins `an_explicit_rekill_rearms_only_an_unconfirmed_container_reap`
+    /// and `a_kill_with_a_confirmed_reap_releases_the_container_slot` now drive
+    /// `kill` writing that verdict itself (REV7-03), so this direct write is a
+    /// belt, not the only coverage of the true side.)
+    #[tokio::test]
+    async fn an_unconfirmed_container_reap_holds_the_release_of_its_port() {
+        let dir = crate::testutil::temp_dir("release-reap-held");
+        let ledger = dir.join("ninfer-claims.json");
+        let runtime = ProcessRuntime::new().with_claims_ledger(&ledger);
+        let port = 18_297;
+        let ticket = container_ticket(port, "se-unreaped");
+        runtime
+            .spawn(
+                &client_spec(
+                    "cmd.exe",
+                    &["/c", "ping", "-n", "30", "127.0.0.1"],
+                    "se-unreaped",
+                ),
+                ticket.clone(),
+            )
+            .await
+            .expect("cmd.exe starts as a stand-in client");
+        runtime
+            .kill(&ticket)
+            .await
+            .expect("kill of the tracked engine");
+        for poll in 0..5 {
+            assert!(
+                !runtime
+                    .release_confirmed(&ticket)
+                    .await
+                    .expect("evidence check runs"),
+                "poll {poll}: the client exited and the port refuses, but the reap failed — \
+                 unclaiming here would strand a live container boot reclaim will not touch"
+            );
+        }
+        assert!(
+            runtime.claimed("se-unreaped"),
+            "the claim must ride to the release timeout and the next boot reclaim"
+        );
+        assert_eq!(
+            runtime.engine_count(),
+            1,
+            "the entry stays so the port still resolves to us"
+        );
+
+        // Control: the same evidence with the reap verdict recorded as
+        // confirmed (the bit `kill` writes on a docker success — written here
+        // directly, because a PASSING `docker rm -f` would mean invoking the
+        // operator's real WSL, which a cardless test must never do) confirms
+        // the release and ends the claim, exactly as before the fix.
+        {
+            let mut engines = runtime.engines.lock().expect("engine table lock");
+            engines
+                .get_mut(&port)
+                .expect("the entry stayed")
+                .reap_confirmed = true;
+        }
+        assert!(
+            runtime
+                .release_confirmed(&ticket)
+                .await
+                .expect("evidence check runs"),
+            "port refused + reap confirmed is the same evidence the boot path demands"
+        );
+        assert!(
+            !runtime.claimed("se-unreaped"),
+            "a confirmed reap ends the claim as it always did"
+        );
+        assert_eq!(
+            runtime.engine_count(),
+            0,
+            "and the confirmed release cleans the table"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the reap seam answered so far (REV7 pins): one name per scripted,
+    /// `kill`-carried reap. A passive `release_confirmed` poll must never
+    /// extend this list, and a duty the rule retired must not consume a
+    /// scripted verdict either.
+    fn reap_asked(seam: &ReapSeam) -> Vec<String> {
+        seam.asked.lock().expect("reap verdict seam lock").clone()
+    }
+
+    /// REV7-01 (MEDIUM) + REV7-03: a failed `docker rm -f` used to retire the
+    /// reap duty with `terminated`, so the port, the slot, and the claim could
+    /// stay burned until the next boot. Now an UNCONFIRMED reap re-arms on an
+    /// explicit re-kill only. The scripted seam drives `kill` through BOTH
+    /// verdicts (false at the first kill, true at the re-kill, a third verdict
+    /// left unconsumed on purpose), so the whole arc -- hold, passive polls
+    /// that never retry, re-arm, retirement on confirmation, release with the
+    /// claim ended -- runs against the production duty, claim, and generation
+    /// logic without ever invoking WSL.
+    #[tokio::test]
+    async fn an_explicit_rekill_rearms_only_an_unconfirmed_container_reap() {
+        let dir = crate::testutil::temp_dir("release-rearm");
+        let ledger = dir.join("ninfer-claims.json");
+        let (runtime, seam) = ProcessRuntime::new()
+            .with_claims_ledger(&ledger)
+            .with_reap_seam(&[false, true, true]);
+        let port = 18_298;
+        let t = container_ticket(port, "se-rearm");
+        runtime
+            .spawn(
+                &client_spec(
+                    "cmd.exe",
+                    &["/c", "ping", "-n", "30", "127.0.0.1"],
+                    "se-rearm",
+                ),
+                t.clone(),
+            )
+            .await
+            .expect("cmd.exe starts as a stand-in client");
+        runtime
+            .kill(&t)
+            .await
+            .expect("the first kill carries the reap duty");
+        assert_eq!(
+            reap_asked(&seam),
+            vec!["se-rearm".to_string()],
+            "the first kill's duty ran once, and the seam reports it failed"
+        );
+        for poll in 0..3 {
+            assert!(
+                !runtime
+                    .release_confirmed(&t)
+                    .await
+                    .expect("evidence check runs"),
+                "poll {poll}: the unconfirmed reap holds the release (R2-08-02)"
+            );
+        }
+        assert_eq!(
+            reap_asked(&seam),
+            vec!["se-rearm".to_string()],
+            "REV7-01: a passive release poll must never retry the reap"
+        );
+        assert!(
+            runtime.claimed("se-rearm"),
+            "the claim rides on through the hold"
+        );
+
+        runtime
+            .kill(&t)
+            .await
+            .expect("an explicit re-kill re-arms the unconfirmed duty");
+        assert_eq!(
+            reap_asked(&seam),
+            vec!["se-rearm".to_string(); 2],
+            "the re-kill ran the reap again"
+        );
+        runtime
+            .kill(&t)
+            .await
+            .expect("the third kill meets a CONFIRMED reap");
+        assert_eq!(
+            reap_asked(&seam),
+            vec!["se-rearm".to_string(); 2],
+            "a confirmed reap retires the duty forever (review, 2026-10-26): the third scripted verdict stayed unconsumed"
+        );
+
+        assert!(
+            runtime
+                .release_confirmed(&t)
+                .await
+                .expect("evidence check runs"),
+            "kill recorded the re-kill's confirmed verdict: the same evidence now releases"
+        );
+        assert!(
+            !runtime.claimed("se-rearm"),
+            "the confirmed release ends the claim the failed reap had kept"
+        );
+        assert_eq!(runtime.engine_count(), 0, "and the slot is free again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REV7-03: the `reap_confirmed == true` side used to be reachable only
+    /// from a test hand-write. The seam makes `kill` itself record a
+    /// docker-confirmed reap (still without WSL), and the very next passive
+    /// poll releases, ends the claim, and clears the table -- the proof that
+    /// the true side rides on `kill`, not on a test poking the field.
+    #[tokio::test]
+    async fn a_kill_with_a_confirmed_reap_releases_the_container_slot() {
+        let dir = crate::testutil::temp_dir("release-confirmed");
+        let ledger = dir.join("ninfer-claims.json");
+        let (runtime, seam) = ProcessRuntime::new()
+            .with_claims_ledger(&ledger)
+            .with_reap_seam(&[true]);
+        let port = 18_299;
+        let t = container_ticket(port, "se-confirmed");
+        runtime
+            .spawn(
+                &client_spec(
+                    "cmd.exe",
+                    &["/c", "ping", "-n", "30", "127.0.0.1"],
+                    "se-confirmed",
+                ),
+                t.clone(),
+            )
+            .await
+            .expect("cmd.exe starts as a stand-in client");
+        runtime
+            .kill(&t)
+            .await
+            .expect("the kill's scripted reap reports docker-confirmed");
+        assert_eq!(
+            reap_asked(&seam),
+            vec!["se-confirmed".to_string()],
+            "kill carried the duty for exactly this name"
+        );
+        assert!(
+            runtime
+                .release_confirmed(&t)
+                .await
+                .expect("evidence check runs"),
+            "kill wrote the true verdict: the first poll must confirm"
+        );
+        assert!(
+            !runtime.claimed("se-confirmed"),
+            "a kill-confirmed reap ends the claim as before"
+        );
+        assert_eq!(runtime.engine_count(), 0, "and the release clears the slot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REV7-02 (LOW, decision: release-eligible): the SkipUnclaimed shape --
+    /// the duty fell to a kill but the ledger no longer holds the name -- has
+    /// NO ownership evidence left to preserve, and boot reclaim already
+    /// refuses the name, so holding the release forever would burn the slot
+    /// with nothing protected. The plain G12 pair decides instead. The
+    /// scripted verdict must stay unconsumed: an unclaimed entry never reaches
+    /// `docker rm`, and nothing is written to an unheld name. Recovery for the
+    /// rare self-inflicted missing claim is the R5 stranded report naming it
+    /// -- report-only by ruling.
+    #[tokio::test]
+    async fn an_unclaimed_container_slot_releases_on_plain_port_evidence() {
+        let dir = crate::testutil::temp_dir("release-noclaim");
+        let ledger = dir.join("ninfer-claims.json");
+        let (runtime, seam) = ProcessRuntime::new()
+            .with_claims_ledger(&ledger)
+            .with_reap_seam(&[true]);
+        let port = 18_300;
+        let t = container_ticket(port, "se-noclaim");
+        runtime
+            .spawn(
+                &client_spec(
+                    "cmd.exe",
+                    &["/c", "ping", "-n", "30", "127.0.0.1"],
+                    "se-noclaim",
+                ),
+                t.clone(),
+            )
+            .await
+            .expect("cmd.exe starts as a stand-in client");
+        // Present the SkipUnclaimed shape: the claim ledger lost the name
+        // between spawn and kill -- the state a cleared or corrupted ledger
+        // file loads as.
+        runtime
+            .claims
+            .lock()
+            .expect("container claim ledger lock")
+            .unclaim("se-noclaim");
+        runtime
+            .kill(&t)
+            .await
+            .expect("the kill owes the duty but the ledger refuses the authority");
+        assert!(
+            reap_asked(&seam).is_empty(),
+            "an unclaimed entry must never reach docker rm"
+        );
+        assert!(
+            runtime
+                .release_confirmed(&t)
+                .await
+                .expect("evidence check runs"),
+            "with no claim there is no ownership evidence to preserve: the G12 pair releases"
+        );
+        assert_eq!(
+            runtime.engine_count(),
+            0,
+            "the slot is not burned until boot (REV7-02)"
+        );
+        assert!(
+            !ContainerClaims::load(&ledger).contains("se-noclaim"),
+            "and the release wrote nothing for a name the ledger never held"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
