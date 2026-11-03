@@ -181,42 +181,12 @@ this crate (`Cargo.toml`); otherwise skip it. Nothing here is a reason to introd
 - `tower` middleware (timeouts, tracing, compression) for resilience and observability.
 - Offload CPU-bound work to `tokio::task::spawn_blocking` so the reactor stays free.
 
-### Web or WASM front end (for example `dioxus`)
+### Web front end (Pico CSS + vanilla JavaScript)
 
-- Deep computation stays in Rust (the WASM binary or the server process), never in
-  JavaScript.
-- Pico CSS plus vanilla JavaScript; no jQuery or component frameworks such as React.
+- No jQuery or component frameworks such as React.
 - Speed and HID guidelines first; adaptive light/dark theme with a toggle.
 - Modern typography with real heading and body fonts; never ship Pico defaults unchanged, a
   separate CSS file tailored to the app's semantics is preferred.
-- Rebuild the WASM binary whenever underlying Rust changes.
 
-### Terminal UI (`ratatui` / `crossterm`)
-
-- Intuitive mouse controls; account for scroll offsets in click hit-testing.
-
-### Data frames (for example `polars`)
-
-- Use `polars` for tabular work; when printing a frame do not also print its count and
-  schema; ingest small row subsets, not whole frames.
-
-### Python / PyO3 (`maturin`, `uv`)
-
-- Build with `maturin`, never `cargo build --features python`; manage the environment with
-  `uv` and a gitignored `.venv`; add `ipykernel`/`ipywidgets` for notebooks outside package
-  requirements.
-- Python style: type hints on every signature, single responsibility, at most 5 params,
-  early returns, no mutable default arguments, `T | None` for nullables, no `Any` unless
-  unavoidable, `mypy` clean.
-
-### Dropped or re-scoped from the previous AGENTS.md
-
-- Standing mandates to use `ratatui`/`crossterm`, `polars`, `dioxus`/WASM, PyO3/`maturin`,
-  and `uv`: dropped as mandates because nothing here uses those stacks; retained only as
-  the conditional appendix blocks above.
-- `indicatif`: dropped outright; this crate has no CLI progress UI, so no appendix block is
-  warranted.
-- `secrecy`: dropped as a named-crate mandate; its intent folded into the Security section
-  as an env/`.env` rule.
-- "Unit tests for all new functions": rescoped to behavior and risk to match the
-  integration-heavy style, keeping the falsifier and no-disabled-tests rules.
+Unused stacks are not mandates. Add a conditional block only when that stack exists in
+`Cargo.toml`.

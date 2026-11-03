@@ -176,6 +176,7 @@ it never applies silent defaults.
 | `engines.llama.fit_margin_gb` / `engines.llama.mmproj_surcharge_gb` / `engines.llama.fit_probe_timeout_s` | unset | Calibration constants for the projection. The margin is added per active GPU. The surcharge applies to vision rows. The timeout is the probe deadline. While the two figures are unset the probe stays silent and rows fall back down the cost ladder. Set them once from a calibrated card window. |
 | `modelconf_dir` | `<exe dir>\ModelConf` | Catalog directory. |
 | `tray_enabled` | `true` | Tray icon at boot. |
+| `allow_mock_engine` | `false` | Test-only. When true, boot registers the mock engine adapter and warns that it is not for production. A row with `engine: mock` is refused when the grant is false. |
 
 ## Model files: `ModelConf/*.yaml`
 

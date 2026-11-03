@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent, architect]
 source_of_truth_for: [documentation routing]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: release, quarterly, new-decision
 ---
 
@@ -33,9 +33,8 @@ this file is the table of contents; other documents link to it.
 | Find a trap | `handoff/GOTCHAS.md` (local-only) |
 | See what changed | [CHANGELOG.md](../CHANGELOG.md) |
 
-Paths in plain text do not exist yet (planned in the approved target
-structure, `docs/audit/TARGET_STRUCTURE.md`) or are local-only. Markdown
-links point only at existing files.
+Paths in plain text do not exist yet (they are planned) or are local-only.
+Markdown links point only at existing files.
 
 ## 2. Layers: durable, live, evidence, archive
 
@@ -62,8 +61,6 @@ durable and belongs in this tree.
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Human contributor pointer | active |
 | [CHANGELOG.md](../CHANGELOG.md) | Dated release history | active |
 | [DESIGN.md](../DESIGN.md) | Historical design record; never a current spec | historical |
-| [GIT_RULES.md](../GIT_RULES.md) | Deprecated redirect to `docs/process/GIT_WORKFLOW.md` | deprecated |
-| [AUX-RULES.md](../AUX-RULES.md) | Deprecated redirect to the process documents | deprecated |
 
 ### docs/process/
 
@@ -82,9 +79,8 @@ durable and belongs in this tree.
 | File | Owns | Status |
 |---|---|---|
 | [DOCTRINE.md](architecture/DOCTRINE.md) | One-page binding invariants; every agent must carry it | active |
-| [DECISIONS.md](architecture/DECISIONS.md) | Full ruling ledger: LOCKED / DEFERRED / ARCHIVED (single home; `handoff/DECISIONS.md` is a pointer stub) | active |
+| [DECISIONS.md](architecture/DECISIONS.md) | Full ruling ledger: LOCKED / DEFERRED / DELIVERED / DATED RULINGS (single home) | active |
 | [OVERVIEW.md](architecture/OVERVIEW.md) | Current architecture, modules, data flow | active |
-| `ADR/` | Long-form decisions only, on demand | planned |
 
 ### docs/reference/ (planned)
 
@@ -93,20 +89,14 @@ knobs), `TROUBLESHOOTING.md` (user-facing failures). These split out of the
 README when a section passes roughly 150 lines. Until then the README owns
 their content.
 
-### docs/audit/ (this audit and successors)
+### docs/maintenance/ (maintenance and audit archive)
 
-| File | Owns |
+| Item | Owns |
 |---|---|
-| [AUDIT_REPORT.md](audit/AUDIT_REPORT.md) | Findings of the 2026-11-02 documentation and process audit |
-| [TARGET_STRUCTURE.md](audit/TARGET_STRUCTURE.md) | Approved target structure and maintenance rules |
-| [IMPLEMENTATION_PLAN.md](audit/IMPLEMENTATION_PLAN.md) | Migration phases and scopes |
-| [PROCESS_IMPROVEMENTS.md](audit/PROCESS_IMPROVEMENTS.md) | Process improvement detail |
-| [DOCUMENTATION_BACKLOG.md](audit/DOCUMENTATION_BACKLOG.md) | Remaining doc work rows |
-
-### docs/research/ (optional)
-
-Scrubbed research reports, promoted from `handoff/research/` on selection.
-Empty today.
+| [maintenance/README.md](maintenance/README.md) | Maintenance and audit archive policy |
+| `maintenance/archive/2026-11-documentation-cleanup/` | Completed 2026-11 documentation cleanup: inventory, reference audit, plan, final report |
+| `maintenance/archive/2026-11-documentation-governance/` | 2026-11-02 documentation and process audit, archived |
+| `maintenance/archive/` | Completed initiatives; historical, non-authoritative |
 
 ## 4. Documentation language
 
@@ -123,8 +113,8 @@ style.
 - Front matter: every durable file starts with `title`, `owner`, `status`,
   `audience`, `source_of_truth_for`, `last_reviewed`, `review_trigger`. A
   document without an owner is a defect. The operator owns every durable
-  document. Audit snapshots in `docs/audit/` are exempt; they record a dated
-  audit and keep their own status table.
+  document. Audit snapshots under `docs/maintenance/` are exempt; they
+  record a dated audit and keep their own status table.
 - Same-change rule: a change that alters behavior updates every affected
   durable document in the same change, or states why none is affected.
 - Contradiction rule: a contradiction is a stop-the-line event. Record it as
@@ -136,8 +126,10 @@ style.
 - Quarterly review: every durable document is reviewed each quarter; update
   its `last_reviewed`. New decisions and new engines trigger immediate review
   of the affected overview.
-- Archive rule: a superseded durable document moves to an archive with a
-  status banner, never silently deleted. `archive/` and `base-archive/` are
+- Archive rule: a superseded durable project document moves to
+  `docs/archive/` with a status banner, never silently deleted. A completed
+  maintenance initiative moves to `docs/maintenance/archive/`. Both are
+  non-authoritative historical records. `archive/` and `base-archive/` are
   frozen and are never read for current behavior.
 - No duplication: one fact, one home; every other mention is a pointer. A
   labeled summary that links to the source is allowed; copying a command

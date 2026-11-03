@@ -1,5 +1,5 @@
 // Documentation checker for durable docs. Node, no external dependencies.
-// Rules (docs/audit/TARGET_STRUCTURE.md sections 8 and 9, docs/DOCS_README.md 5 and 6):
+// Rules (docs/DOCS_README.md sections 5 and 6):
 //   1. Front matter with the seven required keys.
 //   2. Relative Markdown links resolve to existing files.
 //   3. No author-specific absolute Windows drive paths in durable docs. Documented
@@ -8,8 +8,8 @@
 //   4. No duplicate H1.
 //   5. Every durable doc is listed in docs/DOCS_README.md by filename or path.
 //   6. No literal DRAFT in a doc whose front matter status is active.
-// Exempt: DESIGN.md (historical), docs/audit/* (audit snapshots), handoff/* (local),
-// archive/ and base-archive/ (frozen).
+// Not scanned: DESIGN.md (historical), docs/maintenance/* (maintenance artifacts),
+// handoff/* (local), archive/ and base-archive/ (frozen).
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";

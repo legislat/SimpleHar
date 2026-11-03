@@ -57,6 +57,10 @@ Rules win over lower numbers.
 8. `DESIGN.md`: historical rationale only; never a current spec.
 9. Code and tests: behavioral truth.
 
+Code and tests are behavioral truth. If code contradicts a higher document, the
+contradiction is a defect to fix in the same change. It is not permission to
+follow the document blindly.
+
 Conflict rules:
 
 - Two documents at the same level that disagree are a defect. Stop, record it, and ask

@@ -8,11 +8,11 @@ last_reviewed: 2026-11-02
 review_trigger: release
 ---
 
-# SimpleHar SE — Design Decomposition (rewrite)
+# SimpleHar SE - Design Decomposition (rewrite)
 
 > **HISTORICAL DESIGN RECORD.** This file preserves the design decomposition as
 > written and its dated addenda; it is not the spec of record. The current
-> architecture will live in `docs/architecture/OVERVIEW.md`; binding decisions
+> architecture lives in `docs/architecture/OVERVIEW.md`; binding decisions
 > live in `docs/architecture/DECISIONS.md`. Do not use this file as the current
 > spec.
 
@@ -28,9 +28,9 @@ reference only. It is git-ignored and is not built.
 
 ## 0. Goals
 
-G1 is the operator's statement, verbatim. G2-G9 are proposed from the v3.3 record
+G1 is the operator's statement, verbatim. G2-G9 were proposed from the v3.3 record
 (`PLAN.md` §1-§21, FIX LOG, and findings F-1..F-7 from the 2026-10-23 NO-GO test run) and
-are **DRAFT** until confirmed.
+were confirmed during the design; they are kept here as the design-time record.
 
 | # | Goal | Success test |
 |---|------|--------------|
