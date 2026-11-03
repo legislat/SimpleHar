@@ -32,7 +32,7 @@ use crate::engine::{EngineAdapter, EngineRuntime, LaunchSpec, Probe, SpawnError,
 use crate::model::scan::{Catalog, ScanError, ScanKind};
 use crate::model::ModelEntry;
 use crate::ownership::{ResourceKind, SpawnTicket};
-use fit::{FitEntry, FIT_VALIDATE_SLACK_GIB};
+use fit::FitEntry;
 use jobs::{Job, Victim, Waiter};
 use measured::{serve_model_warning, FoldPlan, MeasuredAnchor, MeasuredData, Reading, SamplerCtx};
 use serde::Serialize;
@@ -43,6 +43,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+
+#[cfg(test)]
+use fit::FIT_VALIDATE_SLACK_GIB;
 
 /// Pause between readiness attempts; a fallback, never the mechanism (§0.3).
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
@@ -2531,74 +2534,6 @@ impl ActorState {
                 .flatten(),
             fold_range: true,
         });
-    }
-
-    /// The session cross-check's tolerance: `fit_margin_gb` plus
-    /// [`FIT_VALIDATE_SLACK_GIB`]. An absent or non-finite margin means NO
-    /// defined tolerance ([`None`] - the row never validates, silently, the
-    /// same degradation an unavailable reading gets). Split out of
-    /// [`Self::maybe_validate_fit`] so the composition carries a direct test
-    /// pin (TASK-R11-FIT: tolerance = margin + slack, default slack 2.0).
-    fn fit_validation_tolerance(margin_gb: Option<f64>) -> Option<f64> {
-        margin_gb
-            .filter(|margin| margin.is_finite())
-            .map(|margin| margin + FIT_VALIDATE_SLACK_GIB)
-    }
-
-    /// R11 session cross-check (rule 2026-11-01, display-only, never a gate
-    /// input): when a witness reading has survived every fold gate for a
-    /// Fit-booked load, compare it against the projection that booked the
-    /// spawn. The tolerance is [`Self::fit_validation_tolerance`] -
-    /// `fit_margin_gb` + [`FIT_VALIDATE_SLACK_GIB`]; an uncalibrated margin
-    /// (constant absent) is NO defined tolerance, hence never-validated,
-    /// degrading silently like an unavailable reading. A hit
-    /// stamps the model under the current fit epoch; the stamp is in-memory
-    /// only, retires with the epoch (a rescan re-stamps it away), and a
-    /// calculator swap clears the map. The first refusal at an epoch warns
-    /// once — the numbers the operator needs if the projection was wrong —
-    /// and a later reading that lands inside tolerance still stamps. Returns
-    /// whether the verdict map changed, so the caller publishes only when the
-    /// page gained something to read.
-    fn maybe_validate_fit(&mut self, model: &str, anchor: &MeasuredAnchor, observed: f64) -> bool {
-        let Some(fit) = anchor.fit_gb else {
-            return false;
-        };
-        let Some(tolerance) = Self::fit_validation_tolerance(
-            self.cfg.llama_fit().and_then(|llama| llama.fit_margin_gb),
-        ) else {
-            return false;
-        };
-        let gen = self.fit_gen();
-        let seen = self.fit_stamps.get(model).copied();
-        if seen == Some((gen, true)) {
-            return false;
-        }
-        if (observed - fit).abs() > tolerance {
-            if seen == Some((gen, false)) {
-                return false;
-            }
-            tracing::warn!(
-                model,
-                observed,
-                fit_gb = fit,
-                tolerance,
-                "witness cross-check kept the Fit row amber: the live reading sits \
-                 outside the projection's session tolerance"
-            );
-            self.fit_stamps.insert(model.to_string(), (gen, false));
-            return true;
-        }
-        if seen == Some((gen, false)) {
-            tracing::warn!(
-                model,
-                observed,
-                fit_gb = fit,
-                "a later witness reading fell back inside the Fit projection's session \
-                 tolerance: the row turns green for the session"
-            );
-        }
-        self.fit_stamps.insert(model.to_string(), (gen, true));
-        true
     }
 
     /// Folds the container's one-shot startup `MemorySummary` figure (R9): the
