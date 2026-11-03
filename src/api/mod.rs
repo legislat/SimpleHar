@@ -950,8 +950,12 @@ async fn health() -> Json<Value> {
 /// The final `PathBuf::from(CONFIG_FILE)` is a last resort for a process that cannot
 /// resolve its own executable path: `boot_config` always stamps `source_path`, so this is
 /// reached in practice only by a hand-built `AppConfig`. It used to name `simplehar.json`,
-/// the older app's file, which SE promises never to write and never reads — a latent
-/// hazard in a nearly unreachable branch, not a live bug (README review, 2026-10-27).
+/// the older app's file. SE never writes the legacy file unless the operator explicitly
+/// selects it as `SIMPLEHAR_CONFIG` (ruling 2026-11-03, `TASK-DEBT-LEFTOVERS`):
+/// auto-discovery and migration only read it, and boot warns once about the
+/// rollback-strand hazard when the operator selects it (`main.rs::boot_config`). The
+/// fallback itself must therefore name [`crate::config::CONFIG_FILE`] — naming the
+/// legacy file here would write a file boot never loads (README review, 2026-10-27).
 fn config_write_path(config: &AppConfig) -> std::path::PathBuf {
     config
         .source_path
@@ -2995,7 +2999,7 @@ mod tests {
     }
 
     #[test]
-    fn config_write_path_follows_boot_and_never_the_legacy_file() {
+    fn config_write_path_follows_boot_and_never_the_legacy_file_on_fallback() {
         // Write-back must land where boot reads. Comparing the WHOLE path is what makes
         // this bite: every fallback branch ends in CONFIG_FILE, so a filename-only
         // assertion would pass even if the default directory moved under it.
@@ -3012,7 +3016,8 @@ mod tests {
         assert_ne!(
             config_write_path(&no_source).file_name(),
             Some(std::ffi::OsStr::new(crate::config::LEGACY_CONFIG_FILE)),
-            "SE never writes the older app's config file"
+            "on the fallback, SE never writes the older app's config file (an explicit \
+             SIMPLEHAR_CONFIG selection at that name is the operator-instruction exception)"
         );
 
         let loaded = std::path::PathBuf::from(r"C:\Configs\lan.json");
@@ -3024,6 +3029,22 @@ mod tests {
             config_write_path(&stamped),
             loaded,
             "the file boot actually loaded always wins"
+        );
+
+        // The ruling's exception leg (2026-11-03, `TASK-DEBT-LEFTOVERS`): when the
+        // operator explicitly stamps a legacy-named path, it IS the write target —
+        // config file is king. Boot warns about the strand; the API writes where boot
+        // read. `main.rs::boot_config` pins the warn; this pins the follow-the-stamp.
+        let legacy = std::path::PathBuf::from(r"C:\Configs\simplehar.json");
+        let explicit_legacy = AppConfig {
+            source_path: Some(legacy.clone()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            config_write_path(&explicit_legacy),
+            legacy,
+            "an explicit SIMPLEHAR_CONFIG selection is honored as the write target, \
+             even at the legacy name"
         );
     }
 

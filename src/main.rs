@@ -1,5 +1,7 @@
-//! Entry point: boot order per DESIGN §0.2 — config first, listeners bound before any
-//! engine work (there is none: preload is scrapped), zero engine spawns at boot.
+//! Entry point: boot order per DESIGN §0.2 — single-instance guard, then config
+//! (the guard is acquired before any file is touched: fail fast), listeners bound
+//! before any engine work (there is none: preload is scrapped), zero engine spawns
+//! at boot.
 
 use simplehar_se::api::{category_router, control_router, ApiState, BootMsStamp};
 use simplehar_se::budget::VramWitness;
@@ -74,9 +76,40 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
                 reason: format!("no configuration file at {}", path.display()),
             }]);
         }
+        // REV6-01 (ruling 2026-11-03, `TASK-DEBT-LEFTOVERS`): a legacy-named selection
+        // is honoured — config file is king — but the hazard must reach the log before
+        // the first page edit makes it real: every write-back rewrites this v3.3 file,
+        // and that can strand the rollback exe it was meant to protect.
+        if path
+            .file_name()
+            .is_some_and(|name| name == config::LEGACY_CONFIG_FILE)
+        {
+            tracing::warn!(
+                file = %path.display(),
+                "SIMPLEHAR_CONFIG selects the legacy config name: every config \
+                 write-back rewrites this file, and v3.3 reads `protected_ports` and \
+                 may exit on its own port-namespace check — the rollback exe can be \
+                 stranded; keep an untouched copy if a rollback is planned"
+            );
+        }
     }
     let mut config = match &path {
-        Some(path) if path.exists() => AppConfig::load(path).map_err(|e| vec![e])?,
+        Some(path) if path.exists() => {
+            // R2-14-01: the fatal line must name the file this boot actually read.
+            // `AppConfig::parse` names the schema root (`CONFIG_FILE`) because a bare
+            // parse call knows no file; here the path is known, so re-stamp the field
+            // with it — an operator typo in a `SIMPLEHAR_CONFIG` file must not send a
+            // hunt to the healthy default beside the exe. `parse` itself stays as-is.
+            AppConfig::load(path).map_err(|error| {
+                let reason = match error {
+                    ConfigError::Invalid { reason, .. } => reason,
+                };
+                vec![ConfigError::Invalid {
+                    field: path.display().to_string(),
+                    reason,
+                }]
+            })?
+        }
         _ => {
             tracing::info!("no {} found; using built-in defaults", config::CONFIG_FILE);
             AppConfig::default()
@@ -85,11 +118,30 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
     // Stamp where the config came from (or where it will live) so `default_model`
     // write-back targets the same file boot read — a `SIMPLEHAR_CONFIG` run must not
     // persist defaults into a file it never loads (operator finding, 2026-10-26).
+    // REV6-04: remember the file that was actually read — a semantic refusal must
+    // name it in the fatal output too, the way the parse arm already does.
+    let loaded_file = path.as_ref().filter(|p| p.exists()).cloned();
     config.source_path = path;
     let errors = config.validate();
     if errors.is_empty() {
         Ok(config)
     } else {
+        // REV6-04: field carries the file this boot read, the dotted key moves into
+        // the reason — same re-stamp shape as the R2-14-01 parse arm. Built-in
+        // defaults (no file read) keep the bare keys.
+        let errors = match &loaded_file {
+            Some(path) => errors
+                .into_iter()
+                .map(|error| {
+                    let ConfigError::Invalid { field, reason } = error;
+                    ConfigError::Invalid {
+                        field: path.display().to_string(),
+                        reason: format!("{field}: {reason}"),
+                    }
+                })
+                .collect(),
+            None => errors,
+        };
         Err(errors)
     }
 }
@@ -634,6 +686,11 @@ async fn supervise_listener(
                 if let Err(error) = axum::serve(listener, router.clone()).await {
                     tracing::error!(%addr, category = %category.id, error = %error,
                         "listener stopped; attempting rebind");
+                    // R2-14-02: publish the outage BEFORE the retry sleep, exactly as
+                    // the bind-failure arm does — the port is dead now, and the
+                    // registry must not stay stale-Serving (tray green over a dead
+                    // port, G11; doctrine 17) for the whole retry window.
+                    listeners.mark_down(category.id, format!("listener {addr} stopped: {error}"));
                 }
             }
             Err(error) => {
@@ -1133,6 +1190,158 @@ mod tests {
             boot_config(Some(path.display().to_string())).expect("a present file must load");
         assert_eq!(loaded.vram_total_gb, 42.0, "the file's value must survive");
         assert_eq!(loaded.source_path, Some(path));
+    }
+
+    #[test]
+    fn invalid_env_named_config_names_the_file_that_failed() {
+        // R2-14-01: a fatal invalid-config boot exits before the `boot configuration
+        // config=<path>` line ever runs, so the fatal error is the only failure output
+        // — it must name the file this boot loaded, not `simplehar-se.json` it never
+        // read. Falsifier: revert the `boot_config` path re-stamp and both asserts fail.
+        let dir = simplehar_se::testutil::temp_dir("env-invalid");
+        let path = dir.join("custom-name.json");
+        std::fs::write(&path, r#"{"wrok_port": 9}"#).expect("invalid config file");
+        let errors = boot_config(Some(path.display().to_string()))
+            .expect_err("a present-but-invalid env file must be fatal");
+        let text = error_text(&errors);
+        assert!(
+            text.contains(&path.display().to_string()),
+            "the fatal error must name the file this boot loaded: {text}"
+        );
+        assert!(
+            !text.contains(config::CONFIG_FILE),
+            "the report must not name the default file this boot never read: {text}"
+        );
+    }
+
+    #[test]
+    fn legacy_named_file_is_a_write_target_only_when_explicitly_selected() {
+        // R2-14-04: the claim is "SE never writes the legacy file unless the operator
+        // explicitly selects it". Both legs pinned at the boot decision: `source_path`
+        // is exactly what `api::config_write_path` writes back to (pinned by the
+        // api-side test), so what boot stamps IS the write target (doctrine 1).
+        let dir = simplehar_se::testutil::temp_dir("env-legacy-name");
+        let explicit = dir.join(config::LEGACY_CONFIG_FILE);
+        std::fs::write(&explicit, r#"{"vram_total_gb": 24.0}"#).expect("legacy-named config");
+        let loaded = boot_config(Some(explicit.display().to_string()))
+            .expect("an explicit env path is an instruction, even at the legacy name");
+        assert_eq!(loaded.vram_total_gb, 24.0, "the selected file must load");
+        assert_eq!(
+            loaded.source_path,
+            Some(explicit),
+            "an explicitly selected legacy-named file is `source_path`, hence the \
+             write-back target — config file is king"
+        );
+
+        // Fallback leg: with no env and no file beside the exe, boot stamps the SE
+        // name — never the legacy name. Guarded like `missing_default_config_still_defaults`:
+        // a stray config beside the test exe is not the case under test.
+        let Some(default) = config::default_config_path() else {
+            return;
+        };
+        if default.exists() || default.with_file_name(config::LEGACY_CONFIG_FILE).exists() {
+            return;
+        }
+        let fallback = boot_config(None).expect("unset env with no file must boot defaults");
+        assert_eq!(
+            fallback.source_path.as_deref(),
+            Some(default.as_path()),
+            "fallback boot stamps the beside-the-exe default"
+        );
+        assert_ne!(
+            fallback
+                .source_path
+                .as_ref()
+                .and_then(|path| path.file_name()),
+            Some(std::ffi::OsStr::new(config::LEGACY_CONFIG_FILE)),
+            "fallback boot never stamps the legacy name, so write-back never writes it"
+        );
+    }
+
+    /// REV6-01 pin: an explicitly selected legacy-named config must warn on the log
+    /// before the first write-back can strand the v3.3 rollback exe. The capture
+    /// subscriber is scoped to this test thread (`with_default`; `boot_config` is
+    /// synchronous and same-thread) and writes to an in-memory buffer — no console,
+    /// no global subscriber, no file sink. Falsifier: delete the warn arm in
+    /// `boot_config` and the first assertion fails on an empty capture.
+    #[test]
+    fn explicit_legacy_named_config_warns_about_the_rollback_strand() {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("capture lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Buffer {
+            type Writer = Writer;
+            fn make_writer(&'w self) -> Self::Writer {
+                Writer(Arc::clone(&self.0))
+            }
+        }
+        fn capture(config_path: &std::path::Path) -> String {
+            let buffer = Buffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buffer.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                boot_config(Some(config_path.display().to_string()))
+                    .expect("an explicit env selection boots")
+            });
+            let captured =
+                String::from_utf8_lossy(&buffer.0.lock().expect("capture lock")).into_owned();
+            captured
+        }
+
+        let dir = simplehar_se::testutil::temp_dir("env-legacy-warn");
+        let legacy = dir.join(config::LEGACY_CONFIG_FILE);
+        std::fs::write(&legacy, "{}").expect("legacy-named config");
+        let text = capture(&legacy);
+        assert!(
+            text.contains("WARN")
+                && text.contains("legacy")
+                && text.contains(&legacy.display().to_string())
+                && text.contains("rollback")
+                && text.contains("protected_ports"),
+            "the legacy-named selection must warn about the rollback-strand hazard, \
+             naming the selected file; captured: {text}"
+        );
+
+        // The other side of the pin: a differently-named selection warns nothing.
+        let other = dir.join("custom-name.json");
+        std::fs::write(&other, "{}").expect("custom-named config");
+        let text = capture(&other);
+        assert!(
+            !text.contains("WARN"),
+            "a non-legacy selection has no hazard to warn about; captured: {text}"
+        );
+    }
+
+    #[test]
+    fn semantically_invalid_env_config_names_the_file_and_the_key() {
+        // REV6-04: a present env file that parses but fails validation must also name
+        // the loaded file in the fatal output — the shape-error arm alone was not
+        // enough. Falsifier: revert the validate re-stamp and the first assert fails.
+        let dir = simplehar_se::testutil::temp_dir("env-invalid-semantic");
+        let path = dir.join("custom-name.json");
+        std::fs::write(&path, r#"{"load_timeout_s": 0}"#).expect("config file");
+        let errors = boot_config(Some(path.display().to_string()))
+            .expect_err("a zero load deadline refuses the boot");
+        let text = error_text(&errors);
+        assert!(
+            text.contains(&path.display().to_string()),
+            "the fatal error must name the loaded file: {text}"
+        );
+        assert!(
+            text.contains("load_timeout_s"),
+            "and still name the offending key: {text}"
+        );
     }
 
     #[test]

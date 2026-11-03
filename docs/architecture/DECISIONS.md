@@ -423,3 +423,15 @@ Unresolved questions live ONLY in `DECISIONS-PENDING.md`. This file only ever *g
   holder_released_cost)`, while the observed term keeps the full release cost. The
   shipped test that pinned the inflated skip is renamed and re-pinned at 55 < 56.
   | 2026-11-03 | `TASK-DEBT-LEFTOVERS`
+
+- RULED 2026-11-03 (R2-14-04/REV6-02): the legacy `simplehar.json` read-only rule
+  scopes to auto-discovery and migration only. An explicit `SIMPLEHAR_CONFIG` path is
+  an operator instruction and the config write-back target even when it carries the
+  legacy name (config file is king). Boot honors the selection and warns once: every
+  write-back rewrites the v3.3 file, and v3.3 reads `protected_ports` and may exit on
+  its own port-namespace check (the rollback-strand hazard). Pins: the `boot_config`
+  warn, `main.rs` tests `explicit_legacy_named_config_warns_about_the_rollback_strand`
+  and `legacy_named_file_is_a_write_target_only_when_explicitly_selected`, and
+  `api::tests::config_write_path_follows_boot_and_never_the_legacy_file_on_fallback`
+  (fallback never legacy; stamped explicit selection wins).
+  | 2026-11-03 | `TASK-DEBT-LEFTOVERS`

@@ -1141,3 +1141,129 @@ async fn the_release_loop_stops_only_when_the_single_counted_credit_covers_the_g
     );
     assert_eq!(runtime.spawn_count(), 4, "holder, aux_a, aux_b, work56");
 }
+
+#[tokio::test]
+async fn a_swap_of_a_model_committed_to_eviction_never_answers_already() {
+    // R2-02-01: while a WORK load evicts the AUX resident with the kill held, a
+    // swap of that same model into AUX answered `Already` — a success receipt
+    // for an engine the harness had already committed to kill, which the
+    // in-flight eviction then empties. The fix falls through to the queue and
+    // replace path, so the swap becomes a real load with a real receipt.
+    // Red on the old `Already`: no ledger row is ever registered and the swap
+    // answers before the first status poll, so the Dispose-row wait below
+    // times out. Green on the fix: a live row of the doomed model in `Dispose`
+    // (its own release, also held), no reply while any release is unproven,
+    // and a `Loaded` naming a freshly spawned live engine.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0)]);
+    let (handle, runtime) = harness_rt(
+        1,
+        &[
+            // The victim's engine parks every kill of its port (`hold_kill_of`).
+            ("doom20", "mock-hold-kill", CategoryId::Aux, 20.0),
+            ("work55", "mock", CategoryId::Work, 55.0),
+        ],
+        Arc::new(witness.clone()),
+        15,
+    );
+    let Reply::Loaded(doomed) = handle
+        .swap("doom20", CategoryId::Aux)
+        .await
+        .expect("the victim loads")
+    else {
+        panic!("expected Loaded");
+    };
+    // The card tracks the ledger: the victim holds its 20 GiB.
+    witness.set_used(20.0);
+    // Park EVERY kill of the doomed engine by TARGET (`hold_kill_of`, FINDINGS-19
+    // [4]): both pending reaps carry its ticket — the eviction's kill and the
+    // reload's own same-slot reap — so the fake's parking never depends on how
+    // many kills the product happens to issue, and a reap change (dedup,
+    // re-order) cannot silently re-arm or disarm this scenario. Every receipt
+    // stays pending as a state the test holds, never a race against the release
+    // deadline.
+    runtime.hold_kill_of(doomed.port);
+
+    let evicting = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work55", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work55" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        model_of(&status, CategoryId::Aux).as_deref(),
+        Some("doom20"),
+        "the victim is still installed while its release is unproven"
+    );
+    assert!(
+        runtime
+            .held_kills()
+            .iter()
+            .any(|(port, _)| *port == doomed.port),
+        "the eviction's kill of the doomed engine is the held one"
+    );
+
+    // The double-click: load the doomed model into its own category mid-dispose.
+    let reswap = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("doom20", CategoryId::Aux).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "doom20" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    assert!(
+        !reswap.is_finished(),
+        "a doomed engine must not earn any receipt while its release is unproven"
+    );
+    assert_eq!(
+        model_of(
+            &handle.status().await.expect("actor alive"),
+            CategoryId::Aux
+        )
+        .as_deref(),
+        Some("doom20"),
+        "the slot never claims empty before the release is proven (DOCTRINE 5)"
+    );
+
+    // Land both releases and give the card back the victim's bytes.
+    witness.set_used(0.0);
+    runtime.release_held_kills();
+    let reply = reswap.await.expect("task alive").expect("reload answers");
+    let Reply::Loaded(receipt) = reply else {
+        panic!("the swap must end in a receipt for a real engine, got {reply:?}")
+    };
+    assert_eq!(receipt.model, "doom20");
+    let Reply::Loaded(work) = evicting.await.expect("task alive").expect("work loads") else {
+        panic!("expected Loaded");
+    };
+    assert_eq!(work.model, "work55");
+
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        model_of(&status, CategoryId::Aux).as_deref(),
+        Some("doom20"),
+        "the reload served: the receipt describes a real engine"
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Work).as_deref(),
+        Some("work55")
+    );
+    assert!(runtime.is_dead(doomed.port).await, "the doomed engine died");
+    assert!(
+        !runtime.is_dead(receipt.port).await,
+        "the receipt's port answers"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        2,
+        "one live engine per serving model, none left over"
+    );
+    assert_eq!(runtime.spawn_count(), 3, "doom20, work55, doom20 again");
+}

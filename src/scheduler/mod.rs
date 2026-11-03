@@ -2140,6 +2140,23 @@ impl ActorState {
         }
     }
 
+    /// Whether `ticket` names an engine a live job has already committed to
+    /// release: its ticket is that job's `victim` or one of its queued `victims`
+    /// (R2-02-01). The occupant stays installed until that release is confirmed
+    /// ([`ActorState::clear_released_victim_slot`] is the window's close), so an
+    /// `Already` receipt for it would promise a slot the harness has already
+    /// decided to empty. A terminal job is not a commitment: its unconfirmed
+    /// victim stays installed on purpose (G12) and a later swap or restart
+    /// re-owns the ticket, so `Already` for it is the point-in-time truth.
+    /// `O(slots x live jobs)` against the ledger; both counts are tiny.
+    fn is_committed_release_target(&self, ticket: &SpawnTicket) -> bool {
+        self.jobs.iter().any(|(_, job)| {
+            !job.terminal
+                && (job.victim.as_ref().is_some_and(|v| &v.ticket == ticket)
+                    || job.victims.iter().any(|v| &v.ticket == ticket))
+        })
+    }
+
     fn on_swap(&mut self, model: String, category: CategoryId, reply: Waiter) {
         let Some(entry) = self.catalog.iter().find(|m| m.name == model).cloned() else {
             let _ = reply.send(Err(SchedulerError::UnknownModel(model)));
@@ -2156,6 +2173,24 @@ impl ActorState {
         for &s in &slots {
             if let (Some(occupant), None) = (&self.slots[s].occupant, self.slots[s].job) {
                 if occupant.model == model {
+                    // R2-02-01: an occupant a live job has committed to kill is
+                    // not "already serving" — the eviction in flight empties
+                    // this slot, so `Already` would be a success receipt for an
+                    // engine the harness has decided to destroy (DOCTRINE 3:
+                    // never a receipt for the outcome it undid). Fall through:
+                    // the queue and replace path below takes this slot's real
+                    // place and the reply describes a real engine.
+                    if self.is_committed_release_target(&occupant.ticket) {
+                        tracing::info!(
+                            %model,
+                            ?category,
+                            port = occupant.port,
+                            slot = self.slots[s].index,
+                            "swap of an occupant committed to eviction: not answering \
+                             Already, taking a real queue place instead"
+                        );
+                        continue;
+                    }
                     // FINDINGS-06 [8]: an occupant that installed with no id is
                     // not sentenced to it — every resolve re-runs discovery
                     // (contract on [`ActorState::install`]). The reply itself

@@ -285,8 +285,11 @@ fn default_categories() -> Vec<CategoryConfig> {
 /// when it clashes with its port bases (deploy review, 2026-10-26).
 pub const CONFIG_FILE: &str = "simplehar-se.json";
 
-/// v3.3's config name. Read once, to migrate; **never** written by SE, so the
-/// rollback path keeps the file it expects.
+/// v3.3's config name. Read to migrate. SE never writes the legacy file unless the
+/// operator explicitly selects it as `SIMPLEHAR_CONFIG` — an explicit path is an
+/// instruction and config file is king, so write-back follows the selected file
+/// (R2-14-04). Every auto-discovered boot leaves it untouched, so the rollback path
+/// keeps the file it expects.
 pub const LEGACY_CONFIG_FILE: &str = "simplehar.json";
 
 /// Where [`CONFIG_FILE`] lives when nothing points elsewhere: beside the executable.

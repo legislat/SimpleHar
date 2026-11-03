@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: agent
 source_of_truth_for: [binding product invariants]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: new-decision, release
 ---
 
@@ -18,7 +18,9 @@ non-ASCII punctuation in quotes is replaced with ASCII equivalents only.
 
 1. **Config file is king.** "Config file is king (read and write-back target
    `AppConfig.source_path`, `SIMPLEHAR_CONFIG`-aware; SE's own
-   `simplehar-se.json`, legacy read-only, one shared
+   `simplehar-se.json`, legacy read-only (auto-discovery and migration only; an
+   explicitly selected `SIMPLEHAR_CONFIG` path is an operator instruction and the
+   write target, ruling 2026-11-03), one shared
    `config::default_config_path()`)." `SIMPLEHAR_TOKEN` beats the file value.
    Consequence: page edits persist to the file boot read; an invalid file
    fails boot and is never silently defaulted.

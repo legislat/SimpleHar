@@ -40,8 +40,8 @@ tables live in `README.md`.
 
 One harness process, one tokio runtime, plus OS-level children:
 
-- `src/main.rs` - entry point. Boot order: config first, single-instance
-  guard, listeners bound before any engine work, zero engine spawns at boot
+- `src/main.rs` - entry point. Boot order: single-instance guard, then config,
+  listeners bound before any engine work, zero engine spawns at boot
   (`process::SingleInstanceGuard::acquire` rejects a second instance).
 - Scheduler actor - `src/scheduler/mod.rs` (`Scheduler`, `SchedulerHandle`).
   One task owns all slot and budget state; callers send
