@@ -18,6 +18,10 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## v1.1.1 - 2026-11-03
 
+Commit: `405505e` (release prep). Artifact: `simplehar-se.exe`, SHA256
+`E0B06DFF692B7AEF4406920DE805607B1BA81343FA0D9E449768FB3A828CB8C2`, built
+2026-11-03 and staged at `C:\Inference\SimpleHar-SE_release_v1.1.1`.
+
 ### Added
 
 - Basalt engine support: direct Python server launch with a harness-rendered
