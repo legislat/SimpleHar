@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, maintainer]
 source_of_truth_for: [release history]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: release
 ---
 
@@ -15,6 +15,16 @@ a Changelog. Versions follow Semantic Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
+
+## Unreleased
+
+### Changed
+
+- Split the scheduler's `ActorState` method clusters into child modules:
+  `admission`, `catalog`, `commands`, `events`, `fit`, `measured`, `occupant`,
+  `spawn`, and `status`. The actor loop, command channel, and state owner stay in
+  `scheduler/mod.rs`. This completes Phase 1 and Phase 2 of the cohesion split;
+  the API split remains deferred. No behavior changes.
 
 ## v1.1.0 - 2026-11-03
 

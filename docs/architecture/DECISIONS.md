@@ -470,11 +470,11 @@ recorded here so dated references to ARCHIVED still resolve:
   visible without adding live kill authority.
   | 2026-11-03 | `TASK-DEBT-LEFTOVERS`
 
-- **Accepted** RULED 2026-11-03 (N3): approve the scheduler cohesion split in principle. Phase 1
+- **Implemented** RULED 2026-11-03 (N3): approve the scheduler cohesion split in principle. Phase 1
   (free-cluster relocation) runs after the chunked R2 review and after release 1.1.0,
   in a dedicated no-scheduler-edits window. Phase 2 (split `impl ActorState`) runs only
-  after a green wave-verify. Phase 3 (API split) is deferred. Single-writer semantics
-  stay LOCKED; pure moves only; cardless gate after each module.
+  after a green wave-verify. Phase 3 (API split) is deferred. Phase 1 and Phase 2 are
+  complete. Single-writer semantics stay LOCKED; pure moves only; cardless gate after each module.
   | 2026-11-03 | `TASK-N3-SPLIT`
 
 - **Accepted** RULED 2026-11-03 (N7): approve dependency hygiene. Remove the unused `reqwest`

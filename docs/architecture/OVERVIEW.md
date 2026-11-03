@@ -4,14 +4,14 @@ owner: operator
 status: active
 audience: [contributor, agent, architect]
 source_of_truth_for: [current architecture]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-03
 review_trigger: behavior-change, release, new-decision
 ---
 
 # OVERVIEW.md
 
 Up: `docs/DOCS_README.md`. This file describes the architecture as shipped,
-verified against `src/` and `Cargo.toml` on 2026-11-02. Binding rules live in
+verified against `src/` and `Cargo.toml` on 2026-11-03. Binding rules live in
 `docs/architecture/DOCTRINE.md`; rulings and rationale live in
 `docs/architecture/DECISIONS.md`. This file summarizes and links; it does not
 duplicate either ledger. User-facing setup lives in `README.md`; the config,
@@ -48,7 +48,9 @@ One harness process, one tokio runtime, plus OS-level children:
   `scheduler::vocab::Command` values and hold a oneshot waiter. The actor
   never performs engine I/O inline: each step runs as a spawned task whose
   result returns as an event, so status and cancel calls never queue behind
-  a load.
+  a load. The actor loop, command channel, and state owner stay in `mod.rs`;
+  the method clusters live in child modules (`admission`, `catalog`,
+  `commands`, `events`, `fit`, `measured`, `occupant`, `spawn`, `status`).
 - HTTP tasks - per-category public listeners plus one control listener, all
   served from `src/api/mod.rs` over axum routers (`api::ApiState`).
 - Engine children - spawned by `src/process.rs` (`ProcessRuntime`). Each
@@ -231,7 +233,7 @@ One harness process, one tokio runtime, plus OS-level children:
 | `src/config/` | typed `simplehar-se.json` schema, validation, `port_claim`, first-run probes (`firstrun.rs`) |
 | `src/model/` | typed yaml rows (`mod.rs`), Fork-C scan (`scan.rs`), byte-preserving write-back (`writeback.rs`) |
 | `src/catalog.rs` | model identity and alias resolution |
-| `src/scheduler/` | single-writer actor and job state machine (`mod.rs`, `vocab.rs`) |
+| `src/scheduler/` | single-writer actor and job state machine (`mod.rs`, `vocab.rs`, method-cluster child modules) |
 | `src/budget.rs` | admission arithmetic, `AdmissionError`, witnesses' types |
 | `src/witness.rs` | NVML witness with `nvidia-smi` fallback, TTL caches |
 | `src/engine/` | adapters (`llama.rs`, `strata.rs`, `ninfer.rs`, `mock.rs`), `EnginePolicy` table (`policy.rs`), Fit probe (`fit.rs`) |
