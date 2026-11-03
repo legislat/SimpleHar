@@ -35,18 +35,18 @@ it never applies silent defaults.
 |---|---|---|
 | `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN. Set `control_token` first; see the Security note in `README.md`. |
 | `control_token` | *unset* | When set, every route except the page assets requires it, on `X-Har-Token` or `Authorization: Bearer`. `SIMPLEHAR_TOKEN` overrides it and keeps the secret out of the file. |
-| `categories` | four defaults | Per-category `id`, `public_port`, `max_models` (1-6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), and `engine_ports`. An omitted `evictable_by` and an empty list mean the same: nobody may evict that category. Boot names every non-WORK category left with no evictor. |
+| `categories` | four defaults | Per-category `id`, `public_port`, `max_models` (1-6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), and `engine_ports` (empty = automatic plan; a non-empty list must name exactly `max_models` ports). An omitted `evictable_by` and an empty list mean the same: nobody may evict that category. Boot names every non-WORK category left with no evictor. |
 | `vram_total_gb` | `72.0` | Admission ceiling. First start normally **detects it** (NVML total, floored to 0.1 GiB). This default survives only a failed card probe. Every boot warns when the stored value and the card disagree beyond `witness_tolerance_gb`. It never repairs the value. |
 | `vram_reserve_gb` | `2.0` | A margin that admission never uses. |
 | `witness_tolerance_gb` | `2.0` | Tolerance band for driver lag after a kill. A load may spawn up to this far under the gate. The band absorbs the lag between a confirmed release and the card reading catching up. It is also the settle allowance. |
 | `greedy_launch_min_free_gb` | `4.0` | Launch floor for `cost: greedy` models without their own `launch_only_with_at_least_vram_free`. |
-| `load_timeout_s` | `120` | Readiness deadline per load. A model can override it with the `load_timeout:` yaml key. |
+| `load_timeout_s` | `120` | Readiness deadline per load. Range 1-86400 seconds; boot refuses a value outside it. A model can override it with the `load_timeout:` yaml key. |
 | `measured_sample_s` | `60` | Seconds between witness samples while a model serves. |
-| `release_timeout_s` | `60` | Kill-confirmation deadline. |
-| `settle_timeout_s` | `30` | Memory-settle deadline after release. |
+| `release_timeout_s` | `60` | Kill-confirmation deadline. Range 1-86400 seconds; boot refuses a value outside it. |
+| `settle_timeout_s` | `30` | Memory-settle deadline after release. Range 1-86400 seconds; boot refuses a value outside it. |
 | `protected_ports` | small reserved set | Ports the harness must never bind or touch. Extend the set to cover servers you run manually outside this app. |
 | `wsl_distro` / `wsl_user` | `Ubuntu` / *(set for ninfer)* | WSL coordinates for ninfer containers. |
-| `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary. First start prefers a `llama-server.exe` found on PATH (absolute entries only) and records the winner in the created file. |
+| `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary. Boot refuses a blank value; omit the key to keep the default. First start prefers a `llama-server.exe` found on PATH (absolute entries only) and records the winner in the created file. |
 | `engines.strata.python` / `engines.strata.cwd` | documented defaults | Interpreter and working directory for strata launches. The per-model `strata_python`/`strata_cwd` keys still override this section. |
 | `engines.llama.fit_probe` | `false` | When true, the harness asks the engine's own `llama-fit-params` calculator (a sibling of `llama_server_exe`) before spawn how much a llama row will need. The harness projects every llama row after boot and rescan, off the hot path. |
 | `engines.llama.fit_margin_gb` / `engines.llama.mmproj_surcharge_gb` / `engines.llama.fit_probe_timeout_s` | unset | Calibration constants for the projection. The margin is added per active GPU. The surcharge applies to vision rows. The timeout is the probe deadline. While the two figures are unset the probe stays silent and rows fall back down the cost ladder. Set them once from a calibrated card window. |
@@ -72,13 +72,18 @@ Each entry in `categories` declares one category. The keys:
 - `idle_timeout_s`: idle timeout in seconds; `0` means never.
 - `control`: marks the control listener, which hosts the control page and
   the `/har/*` routes. Exactly one category carries it.
-- `engine_ports`: the per-slot engine port plan the harness assigns.
+- `engine_ports`: the per-slot engine port plan the harness assigns. An empty
+  list keeps the automatic plan. A non-empty list must name exactly
+  `max_models` ports, one per slot. Boot refuses another length and names the
+  required and the given port count.
 
 Every value is declarative.
 
 ## Port plan
 
 The harness assigns engine ports per slot, sequentially from 18109. The
+automatic plan walks the canonical category order (WORK, RP, AUX, EMB), not
+the order of `categories` in the file. The
 default four single-slot categories use `18109`-`18112`. With six AUX slots
 the plan reaches `18117`.
 

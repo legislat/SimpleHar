@@ -1,7 +1,8 @@
 //! Model identity and alias resolution (DESIGN Step 10).
 //!
 //! The harness name (`name:`) is canonical. Accepted aliases, kept from v3.3 (G5):
-//! the GGUF file name with or without extension, the full path, all case-insensitive.
+//! the GGUF file name with or without extension, all case-insensitive. A query
+//! with a directory component equals no alias, so a full path resolves `None`.
 
 use crate::model::ModelEntry;
 use std::path::Path;
@@ -189,6 +190,19 @@ mod tests {
     fn unknown_model_resolves_to_none() {
         let models = catalog();
         assert!(matches!(resolve("not-a-model", &models), Resolution::None));
+    }
+
+    /// R2-11-04 pin: the header promises only the file name and its stem as
+    /// aliases, so a query carrying any directory component equals neither alias
+    /// and resolves `None` (the v3.3 full-path alias is not kept).
+    /// Falsifier: implement a full-path alias arm and this resolves Found.
+    #[test]
+    fn a_full_path_query_is_not_an_alias() {
+        let models = catalog();
+        assert!(matches!(
+            resolve("F:/MODELS/qwen3-0.6b.gguf", &models),
+            Resolution::None
+        ));
     }
 
     #[test]

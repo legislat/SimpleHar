@@ -1180,9 +1180,10 @@ mod tests {
     }
 
     /// R2-09-03 (FINDINGS-09 [3]): `Path::new("llama-server.exe").parent()` is
-    /// `Some("")`, so the old fallback fired only for the blank config (known
-    /// row R2-11-06) and a bare `llama_server_exe` handed an empty working
-    /// directory to the spawn instead of the documented current dir.
+    /// `Some("")`, so the old fallback fired only for the blank config (the
+    /// historical R2-11-06 shape, now refused at boot) and a bare
+    /// `llama_server_exe` handed an empty working directory to the spawn instead
+    /// of the documented current dir.
     #[test]
     fn a_bare_or_blank_exe_name_falls_back_to_the_documented_dot_cwd() {
         let bare = LlamaAdapter::new(PathBuf::from("llama-server.exe"))

@@ -220,9 +220,13 @@ pub struct CategoryConfig {
     /// category and refused to boot (found by the live restart test, 2026-10-26).
     #[serde(default)]
     pub control: bool,
-    /// Internal engine ports for this category's slots (loopback only). When empty
-    /// or short, ports are assigned sequentially from 18109 in category order
-    /// (HANDOFF §3 port plan: WORK 18109, RP 18110, AUX 18111.., EMB next).
+    /// This category's internal engine ports for its slots (loopback only). An
+    /// empty list keeps the automatic plan: ports assigned sequentially from
+    /// 18109 in canonical category order (HANDOFF §3 port plan: WORK 18109,
+    /// RP 18110, AUX 18111.., EMB next). A non-empty list must name exactly
+    /// `max_models` ports, one per slot; another length is refused by
+    /// [`AppConfig::validate`] (R2-11-02), so a hand-written plan is never
+    /// silently discarded for a length typo.
     #[serde(default)]
     pub engine_ports: Vec<u16>,
 }
@@ -642,14 +646,24 @@ impl AppConfig {
 
     /// Resolves the internal engine port per slot (Step 8/11 port plan).
     ///
-    /// Categories with an explicit `engine_ports` of the right length keep theirs;
-    /// the rest are allocated sequentially from [`ENGINE_PORT_BASE`] in category
-    /// order. Validation checks the resolved plan for collisions.
+    /// Walks [`CategoryId::all`] in canonical order, never the file order of
+    /// `categories` (R2-11-03): WORK holds 18109 whatever order the hand-written
+    /// array uses, and a category absent from the file is skipped (`validate`
+    /// reports missing categories separately). A category with a non-empty
+    /// `engine_ports` keeps them — `validate` refuses every other length
+    /// (R2-11-02) — and the rest are allocated sequentially from
+    /// [`ENGINE_PORT_BASE`]. Each present category advances the cursor by
+    /// `max_models`, explicit or not. Validation checks the resolved plan for
+    /// collisions.
     pub fn effective_engine_ports(&self) -> BTreeMap<CategoryId, Vec<u16>> {
         let mut cursor = ENGINE_PORT_BASE;
         let mut plan = BTreeMap::new();
-        for category in &self.categories {
-            let explicit_ok = category.engine_ports.len() == category.max_models;
+        for id in CategoryId::all() {
+            let Some(category) = self.categories.iter().find(|c| c.id == id) else {
+                continue;
+            };
+            let explicit_ok = !category.engine_ports.is_empty()
+                && category.engine_ports.len() == category.max_models;
             let ports: Vec<u16> = if explicit_ok {
                 category.engine_ports.clone()
             } else {
@@ -658,7 +672,7 @@ impl AppConfig {
                     .collect()
             };
             cursor = cursor.saturating_add(category.max_models as u16);
-            plan.insert(category.id, ports);
+            plan.insert(id, ports);
         }
         plan
     }
@@ -808,6 +822,23 @@ impl AppConfig {
                 }
             }
         }
+        // R2-11-06: the same present-but-blank doctrine for the engine binary. A
+        // blank exe booted clean and failed every llama load later at spawn with
+        // an OS error naming `""`, where boot could have named the key.
+        if self
+            .llama_server_exe
+            .as_os_str()
+            .to_string_lossy()
+            .trim()
+            .is_empty()
+        {
+            errors.push(ConfigError::Invalid {
+                field: "llama_server_exe".to_string(),
+                reason: "must name a non-blank path; omit the key to keep the documented \
+                         default"
+                    .to_string(),
+            });
+        }
         // R11 Fit calibration: every figure that feeds a VRAM booking must be
         // finite and non-negative (the `parse_gib` doctrine — a NaN comparison
         // is false, and a negative margin would shrink bookings below the
@@ -868,6 +899,20 @@ impl AppConfig {
                         reason: "must name a non-empty model".to_string(),
                     });
                 }
+            }
+            // R2-11-02: a non-empty explicit plan must name one port per slot.
+            // A length typo used to discard the whole hand-picked plan at boot
+            // and fail at spawn with a bind conflict; now it fails at boot.
+            if !cat.engine_ports.is_empty() && cat.engine_ports.len() != cat.max_models {
+                errors.push(ConfigError::Invalid {
+                    field: format!("categories.{}.engine_ports", cat.id),
+                    reason: format!(
+                        "must name exactly {} port(s), one per slot, got {}; an empty \
+                         list keeps the automatic plan",
+                        cat.max_models,
+                        cat.engine_ports.len()
+                    ),
+                });
             }
         }
         for id in CategoryId::all() {
@@ -987,21 +1032,25 @@ impl AppConfig {
                         .to_string(),
             });
         }
-        if self.release_timeout_s == 0 {
+        if self.release_timeout_s == 0 || self.release_timeout_s > 86_400 {
             errors.push(ConfigError::Invalid {
                 field: "release_timeout_s".to_string(),
-                reason: "must be positive (G12 release-confirmation deadline, §0.3): a zero \
+                reason: "must be 1..=86400 (G12 release-confirmation deadline, §0.3): a zero \
                          timeout kills the victim and then fails its own confirmation, so the \
-                         dead model stays installed and the new load never spawns"
+                         dead model stays installed and the new load never spawns, while one \
+                         mistyped digit past a day parks the job in `Dispose` forever if the \
+                         release evidence never arrives"
                     .to_string(),
             });
         }
-        if self.settle_timeout_s == 0 {
+        if self.settle_timeout_s == 0 || self.settle_timeout_s > 86_400 {
             errors.push(ConfigError::Invalid {
                 field: "settle_timeout_s".to_string(),
-                reason: "must be positive (G12 memory-settle deadline after a confirmed release, \
-                         §0.3): a zero timeout is the same loss one step later, once the \
-                         eviction has already run"
+                reason: "must be 1..=86400 (G12 memory-settle deadline after a confirmed \
+                         release, §0.3): a zero timeout is the same loss one step later, once \
+                         the eviction has already run, while one mistyped digit past a day \
+                         parks the job past the settle gate forever if the memory never \
+                         settles"
                     .to_string(),
             });
         }
@@ -1754,6 +1803,32 @@ mod tests {
         );
     }
 
+    /// R2-11-06: a present-but-blank engine binary is the same mistake the other
+    /// path fields refuse at boot — absent means the documented default, blank
+    /// is a typo that would fail every llama load later at spawn with an OS
+    /// error naming `""`.
+    /// Falsifier: drop the validate() check and both blank spellings boot clean.
+    #[test]
+    fn a_blank_llama_server_exe_is_refused_at_boot() {
+        for blank in [
+            r#"{"llama_server_exe": ""}"#,
+            r#"{"llama_server_exe": "   "}"#,
+        ] {
+            let config = AppConfig::parse(blank).expect("parses as json");
+            assert!(
+                fails_with(&config, "llama_server_exe"),
+                "a blank exe path must name its key at boot, not at spawn: {:?}",
+                config.validate()
+            );
+        }
+        let absent = AppConfig::parse("{}").expect("defaults parse");
+        assert!(
+            absent.validate().is_empty(),
+            "an absent key keeps the documented default: {:?}",
+            absent.validate()
+        );
+    }
+
     /// R11 inertness, pinned: the default config probes NOTHING. The probe
     /// only exists when the operator writes `fit_probe: true`, and even then
     /// the calibration constants stay unset (a warning at use time, never a
@@ -2023,6 +2098,35 @@ mod tests {
         assert!(legal.validate().is_empty(), "1 s is legal, however tight");
     }
 
+    /// R2-11-05: the `load_timeout_s` ceiling rationale (one mistyped digit parks
+    /// the job forever) applies verbatim to both dispose deadlines, and the
+    /// scheduler uses the raw value.
+    /// Falsifier: revert either bound to `== 0` and the 86_401 leg goes green.
+    #[test]
+    fn release_and_settle_timeouts_are_bounded_at_one_day() {
+        let day = AppConfig::parse("{\"release_timeout_s\": 86400, \"settle_timeout_s\": 86400}")
+            .expect("parses");
+        assert!(day.validate().is_empty(), "86_400 is the inclusive ceiling");
+        let over = AppConfig::parse("{\"release_timeout_s\": 86401}")
+            .expect("parses")
+            .validate();
+        assert!(
+            over.iter().any(|e| {
+                e.to_string().contains("release_timeout_s") && e.to_string().contains("1..=86400")
+            }),
+            "one mistyped digit must not park a job in Dispose for years: {over:?}"
+        );
+        let over = AppConfig::parse("{\"settle_timeout_s\": 86401}")
+            .expect("parses")
+            .validate();
+        assert!(
+            over.iter().any(|e| {
+                e.to_string().contains("settle_timeout_s") && e.to_string().contains("1..=86400")
+            }),
+            "the settle deadline carries the same ceiling: {over:?}"
+        );
+    }
+
     #[test]
     fn load_timeout_is_bounded_below_and_at_one_day() {
         // FINDINGS-11 [6]: the per-model `load_timeout` key already carries this ceiling
@@ -2073,6 +2177,71 @@ mod tests {
             }),
             "an ephemeral engine port must fail the boot: {errors:?}"
         );
+    }
+
+    /// R2-11-02: a non-empty explicit plan whose length differs from `max_models`
+    /// used to be discarded whole at boot — the operator's hand-picked ports gone,
+    /// every slot back on the auto range, failure only at spawn. Now the boot
+    /// names the field and both counts; an empty list still keeps the plan.
+    /// Falsifier: drop the length check and both mismatch legs validate clean.
+    #[test]
+    fn a_non_empty_engine_ports_list_must_name_one_port_per_slot() {
+        let short = parse_mutated(|root| {
+            root["categories"][2]["max_models"] = serde_json::json!(3);
+            root["categories"][2]["engine_ports"] = serde_json::json!([20_500, 20_501]);
+        })
+        .expect("parses");
+        let errors = short.validate();
+        assert!(
+            errors.iter().any(|e| {
+                let text = e.to_string();
+                text.contains("categories.AUX.engine_ports")
+                    && text.contains("exactly 3")
+                    && text.contains("got 2")
+            }),
+            "a short explicit plan must name the field and the required/got counts: {errors:?}"
+        );
+        let long = parse_mutated(|root| {
+            root["categories"][0]["engine_ports"] = serde_json::json!([20_500, 20_501]);
+        })
+        .expect("parses");
+        let errors = long.validate();
+        assert!(
+            errors.iter().any(|e| {
+                let text = e.to_string();
+                text.contains("categories.WORK.engine_ports")
+                    && text.contains("exactly 1")
+                    && text.contains("got 2")
+            }),
+            "a long explicit plan is the same typo: {errors:?}"
+        );
+        // Empty means the automatic plan, and an exact-length list stays legal.
+        let empty =
+            parse_mutated(|root| root["categories"][2]["engine_ports"] = serde_json::json!([]))
+                .expect("`[]` parses");
+        assert!(empty.validate().is_empty(), "{:?}", empty.validate());
+        let exact = parse_mutated(|root| {
+            root["categories"][2]["engine_ports"] = serde_json::json!([20_500])
+        })
+        .expect("exact length parses");
+        assert!(exact.validate().is_empty(), "{:?}", exact.validate());
+    }
+
+    /// R2-11-03: the plan is a per-category contract (WORK 18109, RP 18110,
+    /// AUX 18111, EMB 18112), so it must follow the canonical category order,
+    /// not the order of the hand-written `categories` array.
+    /// Falsifier: iterate `self.categories` and the reversed file hands WORK
+    /// EMB's documented number.
+    #[test]
+    fn engine_ports_follow_canonical_order_not_file_order() {
+        let mut cfg = AppConfig::default();
+        cfg.categories.reverse();
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        let plan = cfg.effective_engine_ports();
+        assert_eq!(plan[&CategoryId::Work], vec![18_109]);
+        assert_eq!(plan[&CategoryId::Rp], vec![18_110]);
+        assert_eq!(plan[&CategoryId::Aux], vec![18_111]);
+        assert_eq!(plan[&CategoryId::Emb], vec![18_112]);
     }
 
     /// The serializer the config write-back uses (`api::persist_default_model`):

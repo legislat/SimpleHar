@@ -26,6 +26,15 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
   `scheduler/mod.rs`. This completes Phase 1 and Phase 2 of the cohesion split;
   the API split remains deferred. No behavior changes.
 
+### Fixed
+
+- Boot refuses a non-empty `engine_ports` list whose length differs from
+  `max_models` and names the required and given counts. Automatic ports now
+  follow canonical WORK, RP, AUX, EMB order, not file order.
+- Boot refuses `release_timeout_s` and `settle_timeout_s` above 86400 seconds,
+  and refuses a blank `llama_server_exe`.
+- The catalog documentation no longer claims full-path aliases.
+
 ## v1.1.0 - 2026-11-03
 
 Commit: `f6c6381` (release prep). Artifact: `simplehar-se.exe`, SHA256
