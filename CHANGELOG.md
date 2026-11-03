@@ -18,6 +18,10 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## v1.1.2 - 2026-11-03
 
+Commit: `2583faf` (release prep). Artifact: `simplehar-se.exe`, SHA256
+`24F38CAE27E203D4A240F4341E3D0AB41E2D023D3511AE9F3CFF597E9628A425`, built
+2026-11-03 and staged at `C:\Inference\SimpleHar-SE_release_v1.1.2`.
+
 ### Fixed
 
 - The Basalt child receives `USERPROFILE` and `HOME` so its Python server can
