@@ -33,6 +33,8 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
   follow canonical WORK, RP, AUX, EMB order, not file order.
 - Boot refuses `release_timeout_s` and `settle_timeout_s` above 86400 seconds,
   and refuses a blank `llama_server_exe`.
+- The idle sweep no longer starts a second unload behind a cross-slot eviction
+  victim; the ledger names one cause of death.
 - The catalog documentation no longer claims full-path aliases.
 
 ## v1.1.0 - 2026-11-03

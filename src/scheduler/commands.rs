@@ -415,6 +415,10 @@ impl ActorState {
     /// The idle sweep (Step 5, tick-driven): every occupied, job-free slot whose
     /// category has `idle_timeout_s > 0` and whose model has been unused for the
     /// threshold starts an unload. WORK defaults to 0 (never idles); config is king.
+    /// An occupant a live job has already committed to release is skipped: a
+    /// cross-slot victim's slot stays job-free while that release runs, and a
+    /// second unload behind it would name two causes of death for one model
+    /// (R2-20-01).
     pub(super) fn on_tick(&mut self) {
         let now = Instant::now();
         let due: Vec<usize> = self
@@ -425,6 +429,12 @@ impl ActorState {
                 let (Some(occupant), None) = (&slot.occupant, slot.job) else {
                     return false;
                 };
+                // R2-20-01 (same window [`ActorState::is_committed_release_target`]
+                // guards in `on_swap`, R2-02-01): the sweep's `job.is_none()` spare
+                // never covers a cross-slot victim, so consult the commitment.
+                if self.is_committed_release_target(&occupant.ticket) {
+                    return false;
+                }
                 let Some(timeout) = self
                     .cfg
                     .categories

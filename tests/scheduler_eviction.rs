@@ -152,6 +152,45 @@ fn harness_rt_dir(
     (handle, runtime, dir)
 }
 
+/// [`harness_rt_dir`] plus the idle-sweep opt-ins the eviction fixtures never
+/// needed: RP and AUX `idle_timeout_s` for the R2-20-01 cross-slot-victim test.
+/// The other categories keep the never-idle default, so only those two slots can
+/// ever be swept.
+fn harness_rt_idle(
+    aux_slots: usize,
+    specs: &[Spec],
+    witness: Arc<dyn VramWitness>,
+    settle_timeout_s: u64,
+    rp_idle_s: u64,
+    aux_idle_s: u64,
+) -> (SchedulerHandle, MockRuntime) {
+    let runtime = MockRuntime::new();
+    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+    adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+    adapters.insert("mock-hold-kill".to_string(), Arc::new(MockAdapter));
+    let mut cfg = AppConfig {
+        settle_timeout_s,
+        ..AppConfig::default()
+    };
+    cfg.category_mut(CategoryId::Aux)
+        .expect("default config has AUX")
+        .max_models = aux_slots;
+    cfg.category_mut(CategoryId::Aux)
+        .expect("default config has AUX")
+        .idle_timeout_s = aux_idle_s;
+    cfg.category_mut(CategoryId::Rp)
+        .expect("default config has RP")
+        .idle_timeout_s = rp_idle_s;
+    let handle = Scheduler::start(
+        cfg,
+        write_modelconf(specs),
+        adapters,
+        Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
+        witness,
+    );
+    (handle, runtime)
+}
+
 /// Polls status until `cond` holds (used by suites sharing this harness shape;
 /// some binaries may not call it).
 #[allow(dead_code)]
@@ -1518,4 +1557,203 @@ async fn a_swap_of_a_model_committed_to_eviction_never_answers_already() {
         "one live engine per serving model, none left over"
     );
     assert_eq!(runtime.spawn_count(), 3, "doom20, work55, doom20 again");
+}
+
+#[tokio::test]
+async fn the_idle_sweep_skips_a_cross_slot_eviction_victim() {
+    // R2-20-01: the idle sweep's only spare is `slot.job`, which a cross-slot
+    // victim slot never carries. With RP opted into `idle_timeout_s = 1`, a
+    // WORK load evicts the RP resident and that kill parks in `Dispose`
+    // (`hold_kill_of`), the 2 s tick started a second unload for the doomed
+    // model: a contradictory `"idle timeout"` ledger row beside the eviction's
+    // `victims_released`, plus two kill+confirm loops on one ticket.
+    // Falsifier: delete the `is_committed_release_target` skip in `on_tick`
+    // (src/scheduler/commands.rs) and the first sweep pass past the 1 s
+    // threshold creates an Unload row naming `rp-doomed` while its eviction
+    // kill is still parked — the asserts below go red on the spot.
+    // The AUX `canary` (idle 1 s as well) is the proof the sweep really fired:
+    // the sweep runs on a real `Instant` with no time hook, so its one
+    // observable event is what it did to a slot it may lawfully take. That
+    // pass necessarily found the older doomed occupant equally due, because
+    // both idle clocks stop at the same poll: the touches run until the
+    // eviction parks.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0)]);
+    let (handle, runtime) = harness_rt_idle(
+        1,
+        &[
+            // The doomed RP resident: instant ready, every kill of its port parks.
+            ("rp-doomed", "mock-hold-kill", CategoryId::Rp, 20.0),
+            // The sweep canary: an ordinary AUX resident that idles out and
+            // thereby signals the tick.
+            ("canary", "mock", CategoryId::Aux, 4.0),
+            // Card 72, reserve 2: 24 booked -> 46 free, the 55 load is 9 short,
+            // and only the RP 20 covers it — the planner never queues the 4.
+            ("work-55", "mock", CategoryId::Work, 55.0),
+        ],
+        Arc::new(witness.clone()),
+        15,
+        1, // RP idles after 1 s of silence: the sweep under test
+        1, // AUX idles after 1 s: the canary's clock
+    );
+    let Reply::Loaded(doomed) = handle
+        .swap("rp-doomed", CategoryId::Rp)
+        .await
+        .expect("the doomed resident loads")
+    else {
+        panic!("expected Loaded");
+    };
+    witness.set_used(20.0);
+    handle
+        .swap("canary", CategoryId::Aux)
+        .await
+        .expect("the canary loads");
+    witness.set_used(24.0);
+    runtime.hold_kill_of(doomed.port);
+
+    let evicting = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work-55", CategoryId::Work).await })
+    };
+
+    // Park the eviction: WORK reaches `Dispose` and its kill of the doomed
+    // port parks in the fake. Both idle clocks are reset on every poll until
+    // the commitment lands, so the sweep can never lawfully be the first to
+    // act on the doomed slot before this scenario holds.
+    let park_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        handle.touch("rp-doomed");
+        handle.touch("canary");
+        let status = handle.status().await.expect("actor alive");
+        assert!(
+            !status
+                .jobs
+                .iter()
+                .any(|job| job.kind == simplehar_se::scheduler::JobKind::Unload
+                    && job.model == "rp-doomed"),
+            "the doomed model may never earn an Unload row: {:?}",
+            status.jobs
+        );
+        let parked = status.jobs.iter().any(|job| {
+            job.model == "work-55" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        }) && runtime
+            .held_kills()
+            .iter()
+            .any(|(port, _)| *port == doomed.port);
+        if parked {
+            break;
+        }
+        assert!(
+            Instant::now() < park_deadline,
+            "the eviction never parked its kill in Dispose; last status: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Stop touching: both idle clocks now run. Wait for the sweep to take the
+    // canary — the signal that a 2 s tick fired past the 1 s threshold. While
+    // waiting, demand the doomed model earns no sweep row and stays installed
+    // behind the parked eviction (DOCTRINE 5).
+    let sweep_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = handle.status().await.expect("actor alive");
+        assert!(
+            !status
+                .jobs
+                .iter()
+                .any(|job| job.kind == simplehar_se::scheduler::JobKind::Unload
+                    && job.model == "rp-doomed"),
+            "R2-20-01 falsifier: the idle sweep started its own unload of the \
+             doomed model while the eviction's kill of that same engine was \
+             parked: {:?}",
+            status.jobs
+        );
+        assert_eq!(
+            model_of(&status, CategoryId::Rp).as_deref(),
+            Some("rp-doomed"),
+            "the victim stays installed while its release is unproven"
+        );
+        if status.jobs.iter().any(|job| {
+            job.kind == simplehar_se::scheduler::JobKind::Unload
+                && job.model == "canary"
+                && job.outcome.as_deref() == Some("idle timeout")
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < sweep_deadline,
+            "the sweep never unloaded the idle canary, so no sweep pass is \
+             proven; last status: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let status = handle.status().await.expect("actor alive");
+    assert!(
+        runtime
+            .held_kills()
+            .iter()
+            .any(|(port, _)| *port == doomed.port),
+        "the eviction's kill is still parked at the sweep pass: the skip had a \
+         live eviction to honor, not an already-landed release"
+    );
+    assert!(
+        job_row(&status, "work-55").victims_released.is_empty(),
+        "nothing is proven released while the kill is parked: {:?}",
+        job_row(&status, "work-55").victims_released
+    );
+
+    // Land the parked kill: the eviction alone must empty the slot and admit.
+    witness.set_used(0.0);
+    runtime.release_held_kills();
+    let Reply::Loaded(work) = evicting
+        .await
+        .expect("task alive")
+        .expect("the parked eviction completes after the kill lands")
+    else {
+        panic!("expected Loaded");
+    };
+    assert_eq!(work.model, "work-55");
+
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        job_row(&status, "work-55").victims_released,
+        vec!["rp-doomed".to_string()],
+        "the eviction is the one and only cause of death"
+    );
+    assert!(
+        !status
+            .jobs
+            .iter()
+            .any(|job| job.kind == simplehar_se::scheduler::JobKind::Unload
+                && job.model == "rp-doomed"),
+        "no Unload job or ledger row ever named the doomed model: {:?}",
+        status.jobs
+    );
+    for job in status
+        .jobs
+        .iter()
+        .filter(|job| job.outcome.as_deref() == Some("idle timeout"))
+    {
+        assert_eq!(
+            job.model, "canary",
+            "the sweep's only idle-timeout row is the canary's, never the \
+             eviction victim's: {job:?}"
+        );
+    }
+    assert!(runtime.is_dead(doomed.port).await, "the doomed engine died");
+    assert_eq!(
+        model_of(&status, CategoryId::Rp),
+        None,
+        "the RP slot emptied through the eviction only"
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Aux),
+        None,
+        "the canary idled out"
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Work).as_deref(),
+        Some("work-55")
+    );
+    assert_eq!(runtime.server_count(), 1, "only the admitted load is live");
+    assert_eq!(runtime.spawn_count(), 3, "rp-doomed, canary, work-55");
 }
