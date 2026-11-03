@@ -28,8 +28,14 @@ html[data-theme="light"] {
   --sh-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
+/* Fonts (R2-16-01, 2026-11-03): the page is self-contained — it never fetches a
+ * font from a CDN. An external stylesheet would block first paint on an offline
+ * or firewalled control host and send the operator's IP to a third party on
+ * every page view. These are the local/system stacks: every family here ships
+ * with the OS, so first paint needs no network. The old "Inter"/"Sora" primary
+ * families existed only on the CDN and left with its links. */
 body {
-  font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 0.92rem;
 }
 
@@ -42,7 +48,7 @@ body > main.container {
 }
 
 h1, h2, h3, .sh-title {
-  font-family: "Sora", "Inter", system-ui, sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   letter-spacing: -0.01em;
 }
 

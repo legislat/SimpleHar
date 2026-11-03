@@ -870,10 +870,16 @@ function render() {
           type: "checkbox",
           "aria-label": "extended logging",
           ...(status.extended_logging ? { checked: "" } : {}),
+          // A refused logging write must flash AND re-read (R2-16-02): no
+          // `har_state` push follows a config-only write (FINDINGS-16 [3]), so
+          // only the re-read can return the checkbox to the server's
+          // `extended_logging`. Same shape as the six other mutating controls.
           onchange: (event) =>
-            postJson("/har/config/logging", { enabled: event.target.checked }).catch(
-              (error) => flashError(error),
-            ),
+            postJson("/har/config/logging", { enabled: event.target.checked })
+              .catch((error) => {
+                flashError(error);
+                refresh();
+              }),
         }),
         text("Extended Logging"),
       ),

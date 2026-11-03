@@ -155,10 +155,35 @@ globalThis.findAll = findAll;
 globalThis.fixtures = fixtures;
 
 const appSrc = readFileSync(APP, "utf8");
+// R2-16-01 static legs read the page assets from the repo's own src/webui: the
+// page is a repo file, and the [appJs] override swaps only the logic bundle.
+globalThis.servedPage = {
+  app: appSrc,
+  index: readFileSync(join(HERE, "..", "..", "src", "webui", "index.html"), "utf8"),
+  css: readFileSync(join(HERE, "..", "..", "src", "webui", "style.css"), "utf8"),
+  pico: readFileSync(join(HERE, "..", "..", "src", "webui", "pico.min.css"), "utf8"),
+};
 const driver = `
 ;(async () => {
   const results = [];
   const check = (name, ok, extra) => results.push([name, !!ok, extra ?? ""]);
+  // ---- R2-16-01: the page is self-contained — no font CDN (static leg) ----
+  {
+    const page = globalThis.servedPage;
+    const hit = Object.keys(page).filter(function (k) {
+      return /fonts\.googleapis|fonts\.gstatic/.test(page[k]);
+    });
+    check("no Google Fonts reference in any served asset",
+      hit.length === 0, "hits in " + hit.join(","));
+    check("the page loads no stylesheet from off-harness",
+      !/<link[^>]+href=["']https?:/i.test(page.index),
+      (page.index.match(/<link[^>]*>/gi) || []).join(" "));
+    check("style.css keeps a documented system font stack",
+      /font-family:[^;]*system-ui[^;]*sans-serif/.test(page.css) &&
+        !/font-family:[^;]*"(Inter|Sora)"/.test(page.css) &&
+        page.css.indexOf("R2-16-01") >= 0,
+      (page.css.match(/font-family:[^;]+/g) || []).join(" | "));
+  }
   await refresh();
   const main = document.getElementById("sh-main");
   const header = document.getElementById("sh-header");
@@ -850,6 +875,53 @@ const driver = `
   check("accepted Set default re-reads the server",
     globalThis.statusFetches > beforeAccepted && flashBox.hidden !== false,
     beforeAccepted + " -> " + globalThis.statusFetches + " flash=" + JSON.stringify(flashBox.textContent));
+
+  // ---- R2-16-02: a refused Extended Logging flip re-reads and unflips ----
+  // The POST is refused (token, restart, cross-site). No har_state push follows
+  // a config-only write ([3]), so only the handler's own refresh can bring the
+  // checkbox back to the server's extended_logging. The live doc moved under
+  // the flip here (the WORK default retagged from another tab — the same race
+  // the Clear-default comment names), and that is what makes the re-read
+  // repaint: the box must then re-render from the re-read value.
+  {
+    const sd = fixtures["/har/status"];
+    const originalExtLog = sd.extended_logging;
+    const originalWorkDefault = sd.categories[0].default_model;
+    sd.extended_logging = false;
+    applyState({ ...sd, models: fixtures["/har/models"].data });
+    const extBox = findAll(document.getElementById("sh-main"), "input")
+      .find((i) => i.attrs["aria-label"] === "extended logging");
+    check("refusal leg starts with the box off per the server",
+      !!extBox && extBox.attrs.checked === undefined && !extBox.checked,
+      extBox ? JSON.stringify(extBox.attrs) : "missing");
+    quietFlash();
+    globalThis.failNextPost = "harness refused the logging change";
+    const beforeExt = globalThis.statusFetches;
+    extBox.checked = true; // a browser flips the box before the change fires
+    extBox.dispatch("change", { target: extBox });
+    sd.categories[0].default_model = "r2-16-02-race-retag";
+    await flush();
+    check("refused Extended Logging flashes the server's reason",
+      flashBox.hidden === false &&
+        String(flashBox.textContent) === "harness refused the logging change",
+      JSON.stringify(flashBox.textContent));
+    check("refused Extended Logging re-reads the server",
+      globalThis.statusFetches > beforeExt, beforeExt + " -> " + globalThis.statusFetches);
+    const afterExt = findAll(document.getElementById("sh-main"), "input")
+      .find((i) => i.attrs["aria-label"] === "extended logging");
+    check("refused Extended Logging unflips to the server value",
+      !!afterExt && afterExt !== extBox &&
+        afterExt.attrs.checked === undefined && !afterExt.checked,
+      afterExt
+        ? "checked=" + JSON.stringify(afterExt.checked) +
+            " attrs=" + JSON.stringify(afterExt.attrs)
+        : "missing");
+    globalThis.failNextPost = null;
+    sd.categories[0].default_model = originalWorkDefault;
+    sd.extended_logging = originalExtLog;
+    quietFlash();
+    await refresh();
+  }
 
   // ---- FINDINGS-16 [2]: a stored-but-wrong token must not re-prompt per tick ----
   const tokenControl = document.getElementById("sh-token-toggle");

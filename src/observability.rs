@@ -42,9 +42,11 @@ pub const HARNESS_LOG_PREFIX: &str = "harness-";
 const HARNESS_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Harness log files kept in `logs/`, the live one included — one boot holds several
-/// once it rolls, so this counts files, not boots. Independent of `LOG_FILE_CAP` on
-/// purpose: a swap-heavy session burns the engine budget, and the log that explains a
-/// refusal must not be evicted by the next 50 spawns.
+/// once it rolls, so this counts files, not boots. Enforced at boot
+/// (`attach_file_sink`) and again after every rotation (`rotate_sink`), so a long boot
+/// cannot roll past the budget. Independent of `LOG_FILE_CAP` on purpose: a swap-heavy
+/// session burns the engine budget, and the log that explains a refusal must not be
+/// evicted by the next 50 spawns.
 pub const HARNESS_LOG_CAP: usize = 10;
 
 /// Runtime extended-logging switch (the page's "Extended Logging" checkbox,
@@ -292,6 +294,13 @@ pub fn attach_file_sink(dir: &Path) -> std::io::Result<PathBuf> {
 /// `FILE_SHARE_DELETE`, so Windows refuses to rename a log whose handle this process
 /// still holds. The closed generation stays on disk under the boot's own budget, which
 /// also means an incident sitting on the size boundary does not lose its earlier half.
+///
+/// A successful roll then re-prunes the budget (R2-15-01): [`HARNESS_LOG_CAP`] used to
+/// be enforced only at boot, so a request-flooded or swap-heavy boot rolled generation
+/// after generation with nothing capping `logs/` until the next boot. The prune keeps
+/// the newest `HARNESS_LOG_CAP - 1` files and the live file is newest-by-mtime, so it
+/// is never a prune target; if an mtime tie ever made it one, the delete fails on the
+/// open handle (no `FILE_SHARE_DELETE`) and `prune_harness_log_files` tolerates that.
 fn rotate_sink(sink: &mut FileSink) -> std::io::Result<()> {
     let next_generation = sink.generation.saturating_add(1);
     let next = sink.base.with_extension(format!("log.{next_generation}"));
@@ -302,6 +311,11 @@ fn rotate_sink(sink: &mut FileSink) -> std::io::Result<()> {
     sink.path = next;
     sink.written = 0;
     sink.generation = next_generation;
+    // After the mutation, so the previous generation's handle is already dropped and
+    // the prune can delete the closed file when it targets it.
+    if let Some(dir) = sink.base.parent() {
+        crate::process::prune_harness_log_files(dir, HARNESS_LOG_CAP.saturating_sub(1));
+    }
     Ok(())
 }
 
@@ -354,6 +368,13 @@ fn roll_budget() -> u64 {
 /// bytes reach the kernel before this returns and survive a process kill. No
 /// `BufWriter` (it would hold the tail the whole design exists to keep) and no
 /// per-line `sync_all` (power loss is not the failure mode being defended).
+///
+/// The sink lock is taken with `try_lock` (R2-15-02): a `write_all` that stalls
+/// instead of failing — a paused share, an AV filter, a hibernated disk — would
+/// otherwise park every thread that emits, HTTP serving included, behind one wedged
+/// handle. On contention the append is skipped (the ring already holds the event)
+/// and counted with [`note_write_failure`]; every uncontended path still writes the
+/// same bytes with the same single `write_all`.
 fn write_entry(entry: &LogEntry) {
     let Some(cell) = FILE_SINK.get() else {
         return; // no sink attached: tests, and any boot that never called `init`
@@ -369,7 +390,14 @@ fn write_entry(entry: &LogEntry) {
         }
     };
     let outcome = {
-        let mut guard = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = match cell.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                note_write_failure();
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
         let Some(sink) = guard.as_mut() else {
             return;
         };
@@ -783,6 +811,39 @@ mod tests {
         );
     }
 
+    /// Names of the harness log files currently in `dir`, for budget pins.
+    fn harness_log_file_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read logs dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(HARNESS_LOG_PREFIX))
+            .collect()
+    }
+
+    /// R2-15-01: the budget is a bound, not a boot-time snapshot — every roll re-prunes
+    /// `logs/`. Falsifier: drop the `prune_harness_log_files` call from `rotate_sink`
+    /// and the 12 rolls below leave 13 harness logs in the dir, past the cap of 10.
+    #[test]
+    fn every_rotation_prunes_the_harness_log_budget() {
+        let sink = SinkGuard::attach("logcap");
+        let dir = sink.path.parent().expect("logs dir");
+        for roll in 1..=12 {
+            rotate_sink_for_test().expect("roll forward");
+            let names = harness_log_file_names(dir);
+            assert!(
+                names.len() <= HARNESS_LOG_CAP,
+                "after {roll} rolls logs/ holds {} harness logs, past the cap: {names:?}",
+                names.len(),
+            );
+            let live = file_sink_path_for_test().expect("live sink path");
+            assert!(
+                live.exists(),
+                "the prune spares the live generation it must never delete: {names:?}"
+            );
+        }
+    }
+
     /// A roll that cannot happen must lose no events, must not be retried for the rest
     /// of the boot, and must not resurrect when the blocker later disappears — so a
     /// dead disk costs one syscall per event, not a create plus a write. Here the next
@@ -861,6 +922,42 @@ mod tests {
             "the reset is real, not a tautology"
         );
         assert!(!write_failure_reported_for_test());
+    }
+
+    /// R2-15-02: a stalled `write_all` must not become a rendezvous for every emitter.
+    /// While this thread holds the sink lock, another thread's `write_entry` returns
+    /// promptly, skips the append (the ring already holds the event), and counts the
+    /// loss. Falsifier: restore `lock()` and the recv below times out because the
+    /// emitter queues behind this guard.
+    #[test]
+    fn a_contended_sink_lock_skips_the_append_and_counts_the_loss() {
+        let sink = SinkGuard::attach("logbusy");
+        reset_write_failures_for_test();
+        write_entry(&LogEntry::now("INFO", "test", "line before the hold"));
+        let guard = file_sink().lock().expect("sink lock held for the pin");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            write_entry(&LogEntry::now("INFO", "test", "line while held"));
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a contended sink lock must not block the emitting thread");
+        assert_eq!(
+            log_write_failures(),
+            1,
+            "the skipped append is one counted loss, not silence"
+        );
+        drop(guard);
+        let lines = std::fs::read_to_string(&sink.path).expect("file");
+        assert!(
+            lines.contains("line before the hold"),
+            "the uncontended path still writes the same bytes: {lines}"
+        );
+        assert!(
+            !lines.contains("line while held"),
+            "the contended append is skipped, not queued and written late: {lines}"
+        );
+        reset_write_failures_for_test();
     }
 
     /// With no sink attached — every lib test, and any boot whose `init` never ran —
