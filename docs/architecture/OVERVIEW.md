@@ -14,8 +14,8 @@ Up: `docs/DOCS_README.md`. This file describes the architecture as shipped,
 verified against `src/` and `Cargo.toml` on 2026-11-02. Binding rules live in
 `docs/architecture/DOCTRINE.md`; rulings and rationale live in
 `docs/architecture/DECISIONS.md`. This file summarizes and links; it does not
-duplicate either ledger. User-facing setup and the full HTTP and model-schema
-tables live in `README.md`.
+duplicate either ledger. User-facing setup lives in `README.md`; the config,
+model, and API reference tables live in `docs/reference/`.
 
 ## 1. System context
 
@@ -211,7 +211,7 @@ One harness process, one tokio runtime, plus OS-level children:
   SSE included.
 - Control listener: `/har/status`, `/har/events` (SSE), `/har/jobs`,
   `/har/log`, `/har/models`, `POST /har/load`, `/har/unload`, `/har/rescan`,
-  and the config write endpoints (full table in `README.md`).
+  and the config write endpoints (full table in `docs/reference/API.md`).
 - Request guards run in fixed order (DOCTRINE item 7): Host/Origin/content-
   type refusals (`403`, `415`) precede the token check (`401`); only the
   page assets are unauthenticated; `GET /health` is token-gated. Error codes
@@ -279,7 +279,9 @@ belongs to an operator-run window.
 
 - Binding invariants: `docs/architecture/DOCTRINE.md`.
 - Rulings and rationale: `docs/architecture/DECISIONS.md`.
-- User-facing behavior, config keys, HTTP table: `README.md`.
+- User-facing behavior and quick start: `README.md`. Config keys:
+  `docs/reference/CONFIG.md`. HTTP table: `docs/reference/API.md`. Model
+  schema: `docs/reference/MODELS.md`.
 - Historical design record (not a current spec): `DESIGN.md`.
 - Coding and documentation standards: `docs/process/ENGINEERING.md`.
 
@@ -287,8 +289,9 @@ belongs to an operator-run window.
 
 Claims here were checked against `src/` and `Cargo.toml`. Two classes are
 Unverified in this repository because the code lives outside it: the strata
-server's flag precedence over profile keys (documented in `README.md`), and
-engine-side log formats the ninfer parser reads (documented in `README.md`,
-exercised by tests against captured fixtures). Machine-local facts (live
+server's flag precedence over profile keys (documented in
+`docs/reference/MODELS.md`), and engine-side log formats the ninfer parser
+reads (documented in `docs/reference/MODELS.md`, exercised by tests against
+captured fixtures). Machine-local facts (live
 services, protected ports, card windows) live in `HANDOFF.md` and are out
 of scope for a durable document.

@@ -52,8 +52,8 @@ Rules win over lower numbers.
 4. `docs/process/*`: scoped how-to rules (engineering, verification, git, tasks, handoff, review).
 5. Task file: scope, non-goals, acceptance criteria for this task.
 6. `docs/architecture/DECISIONS.md`: full ruling ledger; resolves ambiguity.
-7. `docs/architecture/OVERVIEW.md`, `README.md`, `docs/reference/*` (planned; README
-   owns the content until the reference split) - current descriptive truth.
+7. `docs/architecture/OVERVIEW.md`, `README.md`, `docs/reference/*` - current
+   descriptive truth.
 8. `DESIGN.md`: historical rationale only; never a current spec.
 9. Code and tests: behavioral truth.
 
@@ -108,7 +108,7 @@ Subagent and ownership rules:
 |---|---|---|
 | Routine code change | this file, `ENGINEERING.md`, `VERIFICATION.md`, task file | `DESIGN.md`, full `DECISIONS.md` |
 | Scheduler / admission / swap | above plus `DOCTRINE.md`, `OVERVIEW.md`, relevant decisions, `GOTCHAS.md` | `DESIGN.md` history |
-| Engine adapter | above plus `MODELS.md` (planned; README model table for now), engine-specific decisions, `GOTCHAS.md` | unrelated architecture |
+| Engine adapter | above plus `docs/reference/MODELS.md`, engine-specific decisions, `GOTCHAS.md` | unrelated architecture |
 | Review | this file, `REVIEW.md`, task file, `GOTCHAS.md`, code under review | full design history |
 | Release | `GIT_WORKFLOW.md`, `VERIFICATION.md`, `CHANGELOG.md`, `README.md` | task-level detail |
 | Handoff | `docs/process/HANDOFF.md`, `HANDOFF.md`, active task file | everything else |

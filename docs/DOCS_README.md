@@ -56,7 +56,7 @@ durable and belongs in this tree.
 
 | File | Owns | Status |
 |---|---|---|
-| [README.md](../README.md) | Product overview, quick start, user-facing config and API tables | active |
+| [README.md](../README.md) | Product overview, quick start, safety, navigation | active |
 | [AGENTS.md](../AGENTS.md) | Agent entry point: precedence, autonomy, routing | active |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Human contributor pointer | active |
 | [CHANGELOG.md](../CHANGELOG.md) | Dated release history | active |
@@ -82,12 +82,15 @@ durable and belongs in this tree.
 | [DECISIONS.md](architecture/DECISIONS.md) | Full ruling ledger: LOCKED / DEFERRED / DELIVERED / DATED RULINGS (single home) | active |
 | [OVERVIEW.md](architecture/OVERVIEW.md) | Current architecture, modules, data flow | active |
 
-### docs/reference/ (planned)
+### docs/reference/
 
-`API.md` (complete HTTP contract), `MODELS.md` (ModelConf schema and engine
-knobs), `TROUBLESHOOTING.md` (user-facing failures). These split out of the
-README when a section passes roughly 150 lines. Until then the README owns
-their content.
+| File | Owns | Status |
+|---|---|---|
+| [CONFIG.md](reference/CONFIG.md) | Harness config keys and eviction rules | active |
+| [MODELS.md](reference/MODELS.md) | ModelConf schema and engine-specific model keys | active |
+| [API.md](reference/API.md) | HTTP control API contract, error codes, memory provenance | active |
+| [OPERATIONS.md](reference/OPERATIONS.md) | Autostart, file layout, upgrade, uninstall, backup, log retention | active |
+| [TROUBLESHOOTING.md](reference/TROUBLESHOOTING.md) | Failure diagnosis | active |
 
 ### docs/maintenance/ (maintenance and audit archive)
 
