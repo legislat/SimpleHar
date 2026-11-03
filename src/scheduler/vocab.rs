@@ -25,7 +25,16 @@ pub enum Command {
     Swap { model: String, category: CategoryId },
     /// Kill the occupant of `model`'s slot (dead engine) and load it fresh —
     /// the T10.1 crash-retry primitive: reap + reload in one command.
-    Restart { model: String, category: CategoryId },
+    /// `port` is the engine port the caller's forward refused to connect on:
+    /// the identity of the corpse it witnessed (R2-06-01). A `Restart` naming a
+    /// port the slot no longer serves describes a crash a previous retry already
+    /// recovered, and the actor must answer it against the live successor rather
+    /// than reap it.
+    Restart {
+        model: String,
+        category: CategoryId,
+        port: u16,
+    },
     /// Cooperative cancel: observed inside the current step, then cleanup completes
     /// (Step 3 — never a dropped task).
     Cancel { job: JobId },

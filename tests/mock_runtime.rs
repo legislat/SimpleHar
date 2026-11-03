@@ -354,7 +354,11 @@ pub const ENCODED_BODY: &[u8] = b"\x1f\x8b\x08\x00opaque-not-really-gzip\x00\xff
 /// literal and a `text/event-stream` content-type, so the proxy's pass-through
 /// contract (byte-for-byte body + preserved content-type, FINDINGS-18 [4]) has
 /// something real to assert. A body carrying `"mock_encoded_reply": true` is answered
-/// with [`ENCODED_BODY`] under `content-encoding: gzip`.
+/// with [`ENCODED_BODY`] under `content-encoding: gzip`. A body carrying
+/// `"mock_hop_by_hop": true` is answered with one of every hop-by-hop response
+/// header (plus a `connection` value naming one more) beside an ordinary marker
+/// header, so the proxy's engine→client strip list has a real emitter to pin
+/// against (R2-06-02).
 async fn echo(
     State(state): State<MockState>,
     uri: axum::http::Uri,
@@ -395,6 +399,32 @@ async fn echo(
                 (axum::http::header::CONTENT_ENCODING, "gzip"),
             ],
             ENCODED_BODY,
+        )
+            .into_response();
+    }
+    // R2-06-02 test support: an engine replying with one of every RFC 9110
+    // hop-by-hop response header, a `connection` value enumerating a further
+    // header name, and one ordinary header that must survive the harness strip.
+    if body.as_ref().is_some_and(|Json(value)| {
+        value
+            .get("mock_hop_by_hop")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }) {
+        return (
+            [
+                ("content-type", "application/json"),
+                ("x-engine-marker", "kept"),
+                ("keep-alive", "timeout=5"),
+                ("upgrade", "websocket"),
+                ("te", "trailers"),
+                ("trailer", "X-Checksum"),
+                ("proxy-authenticate", "Basic realm=\"hop\""),
+                ("proxy-authorization", "Basic aG9wOnNlbnRyeQ=="),
+                ("connection", "keep-alive, X-Hop-Named"),
+                ("x-hop-named", "must-not-reach-the-client"),
+            ],
+            r#"{"hop_by_hop":true}"#,
         )
             .into_response();
     }

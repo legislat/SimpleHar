@@ -95,6 +95,7 @@ fn harness5_witness(
     for engine in [
         "mock-slow",
         "mock-dies",
+        "mock-dies-once",
         "mock-never",
         "mock-hold-kill",
         "mock-hold-never",
@@ -2111,8 +2112,15 @@ async fn restart_during_a_frozen_swap_cancels_the_swap_and_keeps_the_occupant() 
     let victim = serve_and_submit_frozen_swap(&handle).await;
 
     let client = handle.clone();
-    let restarting =
-        tokio::spawn(async move { client.restart(HOLD_MODEL, CategoryId::Work).await });
+    // The restart names the live occupant's port (R2-06-01): this is the honest
+    // crash-retry shape, the caller witnessed exactly this engine. The slot
+    // carries a job here, so the port never reaches the successor check.
+    let victim_port = victim.port;
+    let restarting = tokio::spawn(async move {
+        client
+            .restart(HOLD_MODEL, CategoryId::Work, victim_port)
+            .await
+    });
 
     wait_until(&handle, 10, |s| {
         s.jobs
@@ -2155,6 +2163,81 @@ async fn restart_during_a_frozen_swap_cancels_the_swap_and_keeps_the_occupant() 
         matches!(answer, Err(SchedulerError::Cancelled(_))),
         "the queued restart is answered against the kept occupant, got {answer:?}"
     );
+}
+
+#[tokio::test]
+async fn a_late_restart_never_evicts_the_successor_the_first_retry_installed() {
+    // R2-06-01: request A refuses on the corpse's port, restarts, and the reload
+    // installs successor S. Request B — whose own send also refused on the corpse
+    // earlier — dispatches its Restart after S is Installed. The old `on_restart`
+    // found the slot by (model, category) alone and booked the healthy successor as
+    // the victim of an already-recovered crash, evicting S's clients mid-generation.
+    // The refused port the proxy now transmits tells the two generations apart.
+    let (handle, runtime) = harness(
+        config(10),
+        &[("dies", "mock-dies-once", CategoryId::Work, Some(4.0))],
+    );
+    let Reply::Loaded(first) = handle
+        .swap("dies", CategoryId::Work)
+        .await
+        .expect("first load")
+    else {
+        panic!("expected Loaded for the first load")
+    };
+
+    // Wait past the mock-dies-once self-death (scheduled 1.5 s after spawn): the
+    // corpse is real, and the slot still names it as the occupant.
+    tokio::time::sleep(Duration::from_millis(1_700)).await;
+
+    // Request A's restart: the port matches the occupant, so the standard
+    // reap + reload runs and a successor is Installed.
+    let Reply::Loaded(second) = handle
+        .restart("dies", CategoryId::Work, first.port)
+        .await
+        .expect("the first restart reloads")
+    else {
+        panic!("expected Loaded for the first restart")
+    };
+    assert_eq!(runtime.spawn_count(), 2, "the first retry really reloaded");
+
+    // Port-reuse residual (documented in `on_restart`): if the allocator handed the
+    // successor the corpse's exact port, no port-only check can tell the generations
+    // apart — that corner stays open by design. The proxy can only ever have
+    // witnessed the corpse's port, so here B names a port the successor provably
+    // does not serve, which is exactly the case a real second refuse carries.
+    let corpse_port = if second.port == first.port {
+        first.port.wrapping_add(1)
+    } else {
+        first.port
+    };
+
+    // Request B's late restart: same model, the corpse's port, successor Installed.
+    let reply = handle
+        .restart("dies", CategoryId::Work, corpse_port)
+        .await
+        .expect("the late restart is answered");
+    assert!(
+        matches!(&reply, Reply::Already { port, .. } if *port == second.port),
+        "the late Restart must be answered `Already` against the live successor, \
+         not reload a third time: {reply:?}"
+    );
+    assert_eq!(
+        runtime.spawn_count(),
+        2,
+        "the late Restart may not spawn a third engine for an already-recovered crash"
+    );
+    assert_eq!(runtime.server_count(), 1, "one live engine — the successor");
+    assert!(
+        !runtime.is_dead(second.port).await,
+        "the successor keeps serving; its clients keep their engine"
+    );
+    let status = handle.status().await.expect("actor alive");
+    let slot = status
+        .slots
+        .iter()
+        .find(|s| s.model.as_deref() == Some("dies"))
+        .expect("the successor stays installed");
+    assert_eq!(slot.port, Some(second.port), "the successor keeps its port");
 }
 
 #[tokio::test]

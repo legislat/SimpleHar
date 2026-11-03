@@ -430,7 +430,11 @@ impl SchedulerHandle {
     }
 
     /// Restarts `model` in `category`: kills the (dead) occupant and loads it
-    /// fresh — the T10.1 crash-retry primitive.
+    /// fresh — the T10.1 crash-retry primitive. `failed_port` is the engine port
+    /// the caller's request refused to connect on (the proxy knows it): the
+    /// identity of the corpse. A Restart naming a port the slot no longer serves
+    /// describes a crash a previous retry already recovered, and is answered
+    /// against the live occupant instead of reaping it (R2-06-01).
     ///
     /// # Errors
     ///
@@ -439,10 +443,12 @@ impl SchedulerHandle {
         &self,
         model: &str,
         category: CategoryId,
+        failed_port: u16,
     ) -> Result<Reply, SchedulerError> {
         self.call(Command::Restart {
             model: model.to_string(),
             category,
+            port: failed_port,
         })
         .await
     }
@@ -2060,8 +2066,12 @@ impl ActorState {
                 self.on_unload_all(reply);
                 self.publish();
             }
-            Command::Restart { model, category } => {
-                self.on_restart(model, category, reply);
+            Command::Restart {
+                model,
+                category,
+                port,
+            } => {
+                self.on_restart(model, category, port, reply);
                 self.publish();
             }
             Command::Reload => {
@@ -2290,7 +2300,20 @@ impl ActorState {
     /// T10.1 crash-retry primitive: kill the (dead) occupant of `model`'s slot and
     /// load it fresh. Reuses the standard replacement path — the dead occupant
     /// becomes the victim, so release + settle + spawn all run normally.
-    fn on_restart(&mut self, model: String, category: CategoryId, reply: Waiter) {
+    ///
+    /// R2-06-01: `failed_port` is the engine the caller's forward refused on — the
+    /// corpse it witnessed. A second `Restart` for the same model can arrive after
+    /// the first retry already reloaded it and installed a successor: when the
+    /// occupant serves a port other than the refused one, it is a different, live
+    /// generation, and `begin_load` would book it as the victim of a crash that is
+    /// already recovered (evicting the successor mid-generation). Answer that
+    /// command through the plain swap path — which replies `Already` for the
+    /// successor, or queues honestly when a release of it is already committed.
+    /// Residual: a port allocator that hands the successor the corpse's exact port
+    /// is indistinguishable from a restart of the very generation that died, and
+    /// the reload proceeds; closing that corner needs port + generation identity,
+    /// which the command does not carry.
+    fn on_restart(&mut self, model: String, category: CategoryId, failed_port: u16, reply: Waiter) {
         let Some(entry) = self.catalog.iter().find(|m| m.name == model).cloned() else {
             let _ = reply.send(Err(SchedulerError::UnknownModel(model)));
             return;
@@ -2301,7 +2324,27 @@ impl ActorState {
                 && s.occupant.as_ref().is_some_and(|o| o.model == model)
         });
         match slot {
-            Some(slot) => self.begin_load(slot, entry, vec![reply]),
+            Some(slot) => {
+                let occupant_port = self.slots[slot]
+                    .occupant
+                    .as_ref()
+                    .expect("invariant: the matched slot has an occupant")
+                    .port;
+                if occupant_port != failed_port {
+                    tracing::info!(
+                        %model,
+                        ?category,
+                        failed_port,
+                        port = occupant_port,
+                        "crash-retry for a port the slot no longer serves: a previous \
+                         retry already reloaded this model; answering the swap, not \
+                         reaping the successor"
+                    );
+                    self.on_swap(model, category, reply);
+                } else {
+                    self.begin_load(slot, entry, vec![reply]);
+                }
+            }
             None => {
                 // Already reaped (idle sweep) or never loaded: a plain load covers it.
                 self.on_swap(model, category, reply);

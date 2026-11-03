@@ -152,8 +152,11 @@ async fn restart_after_death_installs_a_new_engine() {
 
     // Wait past the mock's 300 ms self-death window.
     tokio::time::sleep(Duration::from_millis(500)).await;
+    // The restart names the refused port — the corpse the caller witnessed
+    // (R2-06-01): the slot occupant is still exactly that generation, so the
+    // reap + reload path runs.
     let reply = handle
-        .restart("dies", CategoryId::Work)
+        .restart("dies", CategoryId::Work, first.port)
         .await
         .expect("restart succeeds");
     let Reply::Loaded(second) = reply else {
@@ -206,7 +209,9 @@ async fn restart_of_a_missing_model_falls_back_to_a_plain_load() {
         &[("phantom", "mock", CategoryId::Work, 4.0, None)],
     );
     let reply = handle
-        .restart("phantom", CategoryId::Work)
+        // No prior forward happened, so there is no corpse port to name; any
+        // value takes the same "no occupant" arm (R2-06-01 added the port).
+        .restart("phantom", CategoryId::Work, 0)
         .await
         .expect("restart ok");
     assert!(matches!(reply, Reply::Loaded(_)));

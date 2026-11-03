@@ -812,6 +812,81 @@ async fn proxy_passes_the_engines_content_encoding_through_verbatim() {
 }
 
 #[tokio::test]
+async fn proxy_strips_the_engines_hop_by_hop_response_headers() {
+    // R2-06-02: the engine→client pass-through used to drop only
+    // `transfer-encoding`, `content-length` and `connection`, forwarding the rest
+    // of the RFC 9110 §7.6.1 hop-by-hop set: a survived `trailer:` advertises a
+    // trailer this harness never re-frames, `upgrade:` a protocol switch it never
+    // relays, and a header named by the (dropped) `connection` value is forwarded
+    // while the header that made it hop-by-hop is not — a pair that contradicts
+    // itself. The strip list now covers all of it. Falsifier: revert to the
+    // three-name `matches!` arm and every absent-header leg below fails with the
+    // engine's value present.
+    let (control, work, _, _, _runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+
+    let response = work
+        .clone()
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("host", "127.0.0.1:8708")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"qwen3","mock_hop_by_hop":true}"#))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::OK);
+    for hop_by_hop in [
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "te",
+        "trailer",
+        "proxy-authenticate",
+        "proxy-authorization",
+        // Enumerated by the engine's `connection: keep-alive, X-Hop-Named` value:
+        // the `connection` header that makes a name hop-by-hop never crosses, so
+        // neither may the names it enumerates.
+        "x-hop-named",
+    ] {
+        assert!(
+            response.headers().get(hop_by_hop).is_none(),
+            "`{hop_by_hop}` belongs to the engine↔harness hop and may not reach \
+             the client: {:?}",
+            response.headers()
+        );
+    }
+    assert_eq!(
+        response
+            .headers()
+            .get("x-engine-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("kept"),
+        "an ordinary end-to-end header must still pass through"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "the body-describing header survives (FINDINGS-06 [9] posture unchanged)"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    assert_eq!(
+        String::from_utf8_lossy(&bytes),
+        r#"{"hop_by_hop":true}"#,
+        "stripping headers must not touch the body"
+    );
+}
+
+#[tokio::test]
 async fn proxy_rewrites_each_occupant_to_its_own_engine_id() {
     // FINDINGS-20 [6]: every mock engine used to report the one constant `mock-model`
     // at `/v1/models`, so every serve_id assertion in the suite compared the same

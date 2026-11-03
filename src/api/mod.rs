@@ -455,7 +455,9 @@ const GUARD_TRACKED_PATHS_PER_CLASS: usize = 8;
 /// How much of an attacker-chosen path the evidence keeps, in chars. The path is
 /// attacker-chosen, so the stored key and the logged field are capped together: a flood
 /// of kilobyte-long paths must not become an allocation channel, and a key must agree
-/// with the line printed for it.
+/// with the line printed for it. The logged refusal `method` and `reason` share this cap (R2-05-02):
+/// its text is built from the attacker's own path, `Host` or `Origin`, and one line may
+/// not become attacker-sized (hyper's head bound alone is ~408 KiB per request).
 const GUARD_TRACKED_PATH_CHARS: usize = 96;
 
 /// The path as the guard evidence stores and prints it.
@@ -464,6 +466,21 @@ fn tracked_path(path: &str) -> String {
         return path.to_string();
     }
     let kept: String = path.chars().take(GUARD_TRACKED_PATH_CHARS - 3).collect();
+    format!("{kept}...")
+}
+
+/// The `reason` as the guard evidence prints it (R2-05-02): capped exactly like
+/// [`tracked_path`], because the message embeds the attacker-chosen path, `Host` or
+/// `Origin` — the 500-line ring and the log file must not become an attacker-sized
+/// allocation channel. The client wire body keeps the full text on purpose: it is the
+/// caller's own data, never the operator's post-mortem channel. Extended Logging
+/// prints the raw path by its declared purpose and stays uncapped.
+fn tracked_reason(reason: &ApiError) -> String {
+    let text = reason.to_string();
+    if text.chars().count() <= GUARD_TRACKED_PATH_CHARS {
+        return text;
+    }
+    let kept: String = text.chars().take(GUARD_TRACKED_PATH_CHARS - 3).collect();
     format!("{kept}...")
 }
 
@@ -626,10 +643,13 @@ impl ApiState {
     ///   either, only the class's single fold line (FINDINGS-BATCH-2026-10-28M [2]).
     ///
     /// The window re-arms on the next successful *command* — a 2xx that is not one of
-    /// [`ROUTINE_POLL_PATHS`], because the page's 2 s polls would otherwise re-arm a
-    /// flood into a line every tick — and Extended Logging (the switch whose doc promises
-    /// "the full request ring") reports every refusal outright and keeps no state at all.
-    /// Never logged: the token, in any form (15[9] posture).
+    /// [`ROUTINE_POLL_PATHS`] and not a [`PUBLIC_PATHS`] page or asset (R2-05-01),
+    /// because the page's 2 s polls would otherwise re-arm a flood into a line every
+    /// tick and a free public-page 200 would otherwise re-arm it at request rate — and
+    /// Extended Logging (the switch whose doc promises "the full request ring") reports
+    /// every refusal outright and keeps no state at all.
+    /// Never logged: the token, in any form (15[9] posture); the non-extended
+    /// `reason` field is capped to [`GUARD_TRACKED_PATH_CHARS`] (R2-05-02).
     fn note_guard_refusal(
         &self,
         reason: &ApiError,
@@ -694,16 +714,16 @@ impl ApiState {
         match action {
             Action::Report => tracing::warn!(
                 %request_id,
-                method = %method,
+                method = %tracked_path(method.as_str()),
                 path = %tracked,
                 status = status.as_u16(),
                 refusal = class.label(),
-                reason = %reason,
+                reason = %tracked_reason(reason),
                 "guard refused"
             ),
             Action::Fold(paths) => tracing::warn!(
                 %request_id,
-                method = %method,
+                method = %tracked_path(method.as_str()),
                 status = status.as_u16(),
                 refusal = class.label(),
                 tracked = GUARD_TRACKED_PATHS_PER_CLASS,
@@ -1929,7 +1949,13 @@ pub async fn guard(
     // them (operator, 2026-10-26).
     let routine_poll =
         method == axum::http::Method::GET && ROUTINE_POLL_PATHS.contains(&path.as_str());
-    if response.status().is_success() && !routine_poll {
+    // R2-05-01: a public page or asset is not a command. All five `PUBLIC_PATHS`
+    // answer 200 without a token in every posture, so counting them as a re-arm
+    // let an attacker alternate refused POSTs with free `GET /` packets and turn
+    // the ring over at request rate — the exact eviction flood the cardinality
+    // cap was built to end (FINDINGS-BATCH-2026-10-28M [2]). Only a success on a
+    // path that needed something of the harness (a command) re-arms the window.
+    if response.status().is_success() && !routine_poll && !PUBLIC_PATHS.contains(&path.as_str()) {
         // A real command succeeded: whatever the guard refused since the last one gets
         // one line now, and the refusals become reportable again.
         state.note_guard_recovery(&request_id);
@@ -2749,10 +2775,13 @@ async fn proxy(
                     error = %error,
                     "engine unreachable mid-request; restarting once (T10.1)"
                 );
+                // The refused `port` rides the command (R2-06-01): the actor tells
+                // the corpse this request witnessed from a successor a previous
+                // retry already installed, and never reaps the healthy generation.
                 listener
                     .api
                     .scheduler
-                    .restart(&model, listener.category)
+                    .restart(&model, listener.category, port)
                     .await
                     .map_err(ApiError::from)?;
                 // Re-resolve from the NAME, never from `body`: `body["model"]` holds the
@@ -2776,18 +2805,41 @@ async fn proxy(
     // undecoded (reqwest is built without gzip/brotli/deflate/zstd), so the wire
     // bytes ARE the engine's bytes and every header describing them must survive —
     // `content-encoding` included (FINDINGS-06 [9]: stripping it labelled a
-    // compressed body as identity and the client could not decode it). Only headers
-    // that would LIE about the forwarded body are dropped, exactly as before:
-    // `transfer-encoding` and `content-length` (hyper re-frames this streamed body
-    // and recomputes them) and `connection` (hop-by-hop — the client's connection
-    // is its own business). Client→engine request headers are never copied at all
+    // compressed body as identity and the client could not decode it). Dropped are
+    // the headers that would LIE about the forwarded body — `transfer-encoding` and
+    // `content-length` (hyper re-frames this streamed body and recomputes them) —
+    // and the RFC 9110 §7.6.1 hop-by-hop set, which belongs to the engine↔harness
+    // hop only (R2-06-02): `connection` itself, the six registered hop-by-hop names
+    // (`keep-alive`, `upgrade`, `te`, `trailer`, `proxy-authenticate`,
+    // `proxy-authorization`), and every header NAME enumerated by the engine's
+    // `connection` value — forwarding a header the dropped `connection` made
+    // hop-by-hop would advertise a trailer or protocol switch this harness never
+    // re-frames or relays. Client→engine request headers are never copied at all
     // (FINDINGS-06 "verified clean": the forward is `post(url).json(&body)` only),
     // so there is no request-side encoding to strip and no token/host/cookie leak.
+    let connection_named: Vec<String> = upstream
+        .headers()
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
     for (name, value) in upstream.headers() {
         if matches!(
             name.as_str(),
-            "transfer-encoding" | "content-length" | "connection"
-        ) {
+            "transfer-encoding"
+                | "content-length"
+                | "connection"
+                | "keep-alive"
+                | "upgrade"
+                | "te"
+                | "trailer"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+        ) || connection_named.iter().any(|n| n.as_str() == name.as_str())
+        {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -4597,6 +4649,242 @@ mod tests {
         assert!(
             stored.ends_with("...") && reported.contains(&stored),
             "the line names the same elided path the map keys on: {reported}"
+        );
+    }
+
+    /// R2-05-01: the window re-armed on ANY unauthenticated success, and the five
+    /// `PUBLIC_PATHS` answer 200 without a token in both postures — so an attacker
+    /// alternating refused POSTs with free `GET /` packets got one `guard refused`
+    /// line plus one `guard refusals cleared` line per two packets, turning the ring
+    /// over at request rate: the exact eviction flood the cardinality cap
+    /// (FINDINGS-BATCH-2026-10-28M [2]) was built to end. A page or asset is not a
+    /// command. Falsifier: drop the `PUBLIC_PATHS` leg of the guard's re-arm
+    /// condition and the origin-line count fails with one line per packet, the
+    /// fold tally never accumulates, and the no-cleared-lines leg fails with a
+    /// summary per interleave.
+    #[tokio::test]
+    async fn a_public_page_success_never_rearms_the_refusal_window() {
+        crate::observability::set_extended_logging(false);
+        // Live actor: the closing leg needs a successful command that really answers.
+        let api = Arc::new(live_state(BootTimings::default()));
+        warm_guard_reporting_callsites().await;
+        let session = crate::tray::testlog::Session::start();
+
+        let flood = 3 * GUARD_TRACKED_PATHS_PER_CLASS;
+        for index in 0..flood {
+            let refused = control_router(Arc::clone(&api))
+                .oneshot(
+                    Request::post(format!("/bogus/{index}"))
+                        .header("host", "127.0.0.1:8708")
+                        .header("origin", "http://evil.example")
+                        .header("content-type", "application/json")
+                        .body(Body::empty())
+                        .expect("probe request"),
+                )
+                .await
+                .expect("in-process probe");
+            assert_eq!(
+                refused.status(),
+                StatusCode::FORBIDDEN,
+                "a foreign Origin is refused before the token, on any path"
+            );
+            // The attacker's free re-arm packet: the public page answers 200 with
+            // no token in every posture.
+            let page = control_router(Arc::clone(&api))
+                .oneshot(
+                    Request::get("/")
+                        .header("host", "127.0.0.1:8708")
+                        .body(Body::empty())
+                        .expect("page request"),
+                )
+                .await
+                .expect("in-process page read");
+            assert_eq!(page.status(), StatusCode::OK);
+        }
+        let lines = session.stop();
+        let origin_lines = lines
+            .iter()
+            .filter(|line| line.contains("guard refused") && line.contains("refusal=\"origin\""))
+            .count();
+        assert_eq!(
+            origin_lines, GUARD_TRACKED_PATHS_PER_CLASS,
+            "the attacker chose {flood} distinct paths and {flood} free page 200s; the \
+             ring may still only pay for the tracked cap: {lines:?}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("guard refusal window full"))
+                .count(),
+            1,
+            "the overflow collapses to the class's single fold line: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("guard refusals cleared")),
+            "a public page is not a command: no window may close and re-arm mid-flood: \
+             {lines:?}"
+        );
+        assert_eq!(
+            refused_lines(&lines),
+            GUARD_TRACKED_PATHS_PER_CLASS,
+            "the whole interleaved flood costs the cap, not one line per packet: \
+             {lines:?}"
+        );
+        assert_eq!(
+            api.guard_folds()
+                .into_iter()
+                .filter(|(class, _)| class == "origin")
+                .collect::<Vec<_>>(),
+            vec![(
+                "origin".to_string(),
+                (flood - GUARD_TRACKED_PATHS_PER_CLASS) as u64
+            )],
+            "the collapsed paths keep counting across the page interleaves: {:?}",
+            api.guard_folds()
+        );
+
+        // A real command still closes the window exactly once and re-arms it.
+        let recovery = crate::tray::testlog::Session::start();
+        let health = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::get("/health")
+                    .header("host", "127.0.0.1:8708")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("in-process health read");
+        assert_eq!(health.status(), StatusCode::OK);
+        let closed = recovery.stop();
+        let cleared = closed
+            .iter()
+            .filter(|line| line.contains("guard refusals cleared"))
+            .collect::<Vec<_>>();
+        assert_eq!(cleared.len(), 1, "exactly one summary line: {closed:?}");
+        assert!(
+            cleared[0].contains(&format!(
+                "origin: +{} further paths folded",
+                flood - GUARD_TRACKED_PATHS_PER_CLASS
+            )),
+            "the real command publishes the whole collapse the pages hid: {}",
+            cleared[0]
+        );
+        assert!(api.guard_report().is_empty() && api.guard_folds().is_empty());
+    }
+
+    /// The `reason` field value of a captured `guard refused` line. The test
+    /// capture renders `%value` fields raw (unquoted) in BTreeMap name order, so
+    /// the value runs from `reason=` to the next field, ` refusal=`.
+    fn captured_reason(line: &str) -> &str {
+        let start = line
+            .find("reason=")
+            .expect("the report line carries its reason")
+            + "reason=".len();
+        let rest = &line[start..];
+        let end = rest
+            .find(" refusal=")
+            .expect("the reason field is followed by refusal");
+        &rest[..end]
+    }
+
+    /// R2-05-02: the logged refusal `reason` embedded the attacker's own path,
+    /// `Host` or `Origin` at full size — hyper's head bound alone lets one request
+    /// carry ~408 KiB of them into each of the 500 ring lines — while the
+    /// `GUARD_TRACKED_PATH_CHARS` doc says the line and the key are capped
+    /// together. Falsifier: pass `reason = %reason` uncapped and the length leg
+    /// fails with a several-hundred-char value on both classes. The client wire
+    /// body keeps the caller's own full path on purpose.
+    #[tokio::test]
+    async fn a_guard_refusal_line_carries_a_reason_capped_to_the_tracked_width() {
+        crate::observability::set_extended_logging(false);
+        const OFFERED: &str = "sekrit-never-in-the-ring";
+        let api = Arc::new(ApiState::new(
+            AppConfig {
+                control_token: Some(OFFERED.to_string()),
+                ..AppConfig::default()
+            },
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        ));
+        warm_guard_reporting_callsites().await;
+        let session = crate::tray::testlog::Session::start();
+
+        // Token class: a kilobyte-long path refused 401 before route membership.
+        let long_path = format!("/long/{}", "p".repeat(4 * GUARD_TRACKED_PATH_CHARS));
+        let response = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::post(long_path.as_str())
+                    .header("host", "127.0.0.1:8708")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .expect("probe request"),
+            )
+            .await
+            .expect("in-process probe");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("refusal body");
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            body.contains(&long_path),
+            "the client wire body keeps the caller's own full path — only the \
+             operator-facing line is capped: {body}"
+        );
+
+        // Host class: an oversized `Host` header on an ordinary path.
+        let huge_host = format!(
+            "{}.evil.test:8708",
+            "h".repeat(4 * GUARD_TRACKED_PATH_CHARS)
+        );
+        let response = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::post("/har/rescan")
+                    .header("host", huge_host.as_str())
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .expect("probe request"),
+            )
+            .await
+            .expect("in-process probe");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let lines = session.stop();
+        let refused: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("guard refused"))
+            .collect();
+        assert_eq!(
+            refused.len(),
+            2,
+            "one token line and one host line, both attacker-sized on the old code: \
+             {lines:?}"
+        );
+        for line in &refused {
+            let reason = captured_reason(line);
+            assert!(
+                reason.chars().count() <= GUARD_TRACKED_PATH_CHARS,
+                "the ring/file `reason` field may not carry an attacker-sized value \
+                 ({} chars): {reason}",
+                reason.chars().count()
+            );
+            assert!(
+                reason.ends_with("..."),
+                "a hyper-sized input must show the elision, not a silent truncation: \
+                 {reason}"
+            );
+        }
+        let token_line = refused
+            .iter()
+            .find(|line| line.contains("refusal=\"token\""))
+            .expect("the token class reports");
+        assert!(
+            captured_reason(token_line).starts_with("unauthorized:"),
+            "the cap keeps the class prefix the operator reads: {token_line}"
         );
     }
 
