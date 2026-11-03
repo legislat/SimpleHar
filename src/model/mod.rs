@@ -227,8 +227,10 @@ pub struct ModelEntry {
     pub raw: BTreeMap<String, String>,
 }
 
-/// v3.3-compatible boolean-ish reading of a flat yaml value. Exact parity with the
-/// baseline `truthy` table is pinned by a unit test when the scan milestone ports it.
+/// v3.3-compatible boolean-ish reading of a flat yaml value: `1|true|yes|on`,
+/// ASCII case-insensitive, whitespace-trimmed; anything else is false. Exact
+/// parity with the baseline `truthy` table is pinned by the unit test
+/// `truthy_pins_the_v3_3_boolean_table` in this module.
 pub(crate) fn truthy(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -806,6 +808,32 @@ mod tests {
         assert_eq!(entry.category, CategoryId::Work);
         assert_eq!(entry.engine, "llama");
         assert_eq!(entry.model_ref.as_deref(), Some("F:/m.gguf"));
+    }
+
+    /// The v3.3 boolean truth table pinned in its own home (R2-12-01): the four
+    /// accepted words hold under ASCII case mixing and surrounding whitespace,
+    /// and everything else — `0`/`false`/`no`/`off`, mixed-case negatives, empty,
+    /// blank, inner whitespace, arbitrary text — reads false, never a guess.
+    /// Falsifier: accepting any rejected word, or refusing any accepted spelling,
+    /// fails here before a drift of the alias shared by `is_embedding_model`,
+    /// the `strata_*` flags and `ninfer_key` can reach a launch.
+    #[test]
+    fn truthy_pins_the_v3_3_boolean_table() {
+        for value in ["1", "true", "yes", "on"] {
+            assert!(truthy(value), "{value} must read true");
+        }
+        for value in ["TRUE", "True", "tRuE", "yEs", "YES", "ON", "On"] {
+            assert!(truthy(value), "{value} must read true (ASCII case folds)");
+        }
+        for value in [" 1 ", "\ttrue\n", "  yes", "on  ", "\ton\n"] {
+            assert!(truthy(value), "{value} must read true (edges trim)");
+        }
+        for value in [
+            "0", "false", "no", "off", "False", "NO", "Off", "", "   ", "\t\n", "truthy", "2",
+            "ye", "onn", "y es", "tr ue", "+1", "1.0", "on/off",
+        ] {
+            assert!(!truthy(value), "{value} must read false");
+        }
     }
 
     /// Full `extra_args` enforcement (slice 10c): a hostile operator-extra

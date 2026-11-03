@@ -203,6 +203,10 @@ pub struct CategoryConfig {
     #[serde(default = "one")]
     pub max_models: usize,
     /// Categories whose loads may evict occupants of this one (Step 6 hard filter).
+    /// An omitted key and an explicit `[]` are the same posture here: nobody may
+    /// evict this category. The schema cannot tell the two spellings apart, so a
+    /// non-WORK entry that lands on the empty list is named by a boot warning
+    /// ([`AppConfig::evictable_by_warnings`], R2-11-01); the behavior is unchanged.
     #[serde(default)]
     pub evictable_by: Vec<CategoryId>,
     /// Idle auto-unload threshold in seconds; 0 disables (Step 5: WORK defaults
@@ -603,6 +607,11 @@ impl AppConfig {
 
     /// Loads a config from `path`.
     ///
+    /// Boot's file-read path (`main.rs::boot_config`). The only boot-time signal a
+    /// hand-written `categories` entry gets for a silently empty `evictable_by` is
+    /// [`AppConfig::evictable_by_warnings`], logged here per entry (R2-11-01): the
+    /// boot honours the posture, it does not hide it.
+    ///
     /// # Errors
     ///
     /// - [`ConfigError::Invalid`] if the file cannot be read or parsed. A *missing* file
@@ -612,7 +621,13 @@ impl AppConfig {
             field: CONFIG_FILE.to_string(),
             reason: format!("cannot read {}: {e}", path.display()),
         })?;
-        AppConfig::parse(&text)
+        let config = AppConfig::parse(&text)?;
+        // R2-11-01: an invulnerable category may boot — the operator's file is
+        // king — but never silently: name it before the first refusal it causes.
+        for warning in config.evictable_by_warnings() {
+            tracing::warn!("{warning}");
+        }
+        Ok(config)
     }
 
     /// Mutable access to one category definition, if present.
@@ -1044,6 +1059,38 @@ impl AppConfig {
             });
         }
         errors
+    }
+
+    /// Boot warnings for eviction privileges a written entry left empty (R2-11-01).
+    ///
+    /// The categories carry the whole safety policy and the file is hand-edited
+    /// (module doc, D1), but `#[serde(default)]` yields the same `Vec` for an
+    /// omitted `evictable_by` key and for an explicit `[]` — the schema cannot tell
+    /// the two spellings apart, so neither can this decision: every warning names
+    /// both, the category, and the consequence (a load needing that category's VRAM
+    /// is refused by everyone). WORK is exempt: being evicted by nobody is its
+    /// published posture (README matrix, [`CategoryConfig::four_defaults`]), so a
+    /// WORK warning would fire on every default boot and accuse the documented
+    /// value. Pure and side-effect-free: [`AppConfig::load`] logs each entry at
+    /// boot, and `validate()` stays silent — it also runs on every write-back
+    /// re-check, where a recurring warning would only train the operator to
+    /// ignore the log. The warning changes no behavior: an empty list still means
+    /// exactly what it means today.
+    #[must_use]
+    pub fn evictable_by_warnings(&self) -> Vec<String> {
+        self.categories
+            .iter()
+            .filter(|cat| cat.id != CategoryId::Work && cat.evictable_by.is_empty())
+            .map(|cat| {
+                format!(
+                    "category {id}: `evictable_by` is empty (key omitted or `[]`), so nobody \
+                     may evict {id} occupants and every load that needs their VRAM is refused; \
+                     name the evicting categories on this entry (e.g. `\"evictable_by\": \
+                     [\"WORK\"]`) unless an invulnerable category was the intent",
+                    id = cat.id,
+                )
+            })
+            .collect()
     }
 }
 
@@ -1779,6 +1826,75 @@ mod tests {
         // accepts, so the write-back round trip cannot strand the operator's file.
         let exact = parse_mutated(|_| {}).expect("exact field names must parse");
         assert!(exact.validate().is_empty(), "{:?}", exact.validate());
+    }
+
+    /// R2-11-01 pin: the omission route of the D1 posture. `#[serde(default)]` gives
+    /// the same `Vec` for an omitted `evictable_by` key and for an explicit `[]`, so
+    /// the schema cannot tell the two spellings apart — the boot decision therefore
+    /// fires on the effective empty list and the text names both spellings, the
+    /// category, and the consequence. Behavior stays: the file still validates and
+    /// the list stays empty. WORK stays silent: "evicted by nobody" is its published
+    /// posture, so a WORK warning would fire on every default boot.
+    /// Falsifier: drop the filter and the omitted/explicit cases go silent; drop the
+    /// WORK exemption and the shipped-config case fails.
+    #[test]
+    fn an_empty_evictable_by_is_named_at_boot_for_both_spellings() {
+        // The shipped posture: WORK empty by design, RP/AUX/EMB populated.
+        let shipped = AppConfig::parse("{}").expect("defaults parse");
+        assert!(shipped.validate().is_empty());
+        assert!(
+            shipped.evictable_by_warnings().is_empty(),
+            "WORK's documented empty list must not warn, and neither may a populated one: {:?}",
+            shipped.evictable_by_warnings()
+        );
+
+        // The finding's route: a hand-written RP entry that omits the key.
+        let mut omitted = parse_mutated(|root| {
+            let _ = root["categories"][1]
+                .as_object_mut()
+                .expect("RP entry is an object")
+                .remove("evictable_by");
+        })
+        .expect("an absent evictable_by key parses to the serde default");
+        assert!(
+            omitted
+                .category_mut(CategoryId::Rp)
+                .expect("RP present")
+                .evictable_by
+                .is_empty(),
+            "behavior unchanged: absent still means nobody evicts"
+        );
+        assert!(
+            omitted.validate().is_empty(),
+            "a warning is not a refusal: {:?}",
+            omitted.validate()
+        );
+        let warnings = omitted.evictable_by_warnings();
+        assert_eq!(warnings.len(), 1, "one named warning for RP: {warnings:?}");
+        assert!(
+            warnings[0].contains("RP"),
+            "the warning must name the category: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("omitted") && warnings[0].contains("[]"),
+            "omitted and explicit empty are indistinguishable, so the text must cover both: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("refused"),
+            "the consequence must be named: {}",
+            warnings[0]
+        );
+
+        // The explicit `[]` spelling reaches the same effective posture and the
+        // same decision.
+        let explicit =
+            parse_mutated(|root| root["categories"][2]["evictable_by"] = serde_json::json!([]))
+                .expect("`[]` parses");
+        let warnings = explicit.evictable_by_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("AUX"), "{warnings:?}");
     }
 
     #[test]
