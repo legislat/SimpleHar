@@ -143,7 +143,7 @@ C:\Inference\SimpleHar-SE
 | Purpose | Conventional GitHub entry point for humans |
 | Owner | Operator |
 | Audience | Human contributors |
-| Expected content | Ten-line orientation; link to `docs/README.md`, `docs/process/TASKS.md`, `docs/process/GIT_WORKFLOW.md`; how to run the gate; how to request review |
+| Expected content | Ten-line orientation; link to `docs/DOCS_README.md`, `docs/process/TASKS.md`, `docs/process/GIT_WORKFLOW.md`; how to run the gate; how to request review |
 | Source of truth for | Nothing; it is a pointer |
 | Replaces | None (new) |
 
@@ -170,7 +170,7 @@ C:\Inference\SimpleHar-SE
 | Replaces | Current `DESIGN.md` role as "spec of record" |
 | Must not contain | Current behavior claims without a status banner; new decisions |
 
-### 4.2 `docs/README.md`
+### 4.2 `docs/DOCS_README.md`
 
 | Field | Value |
 |---|---|
@@ -413,8 +413,8 @@ Each topic has exactly one authoritative home. Everything else is a link.
 
 | Topic | Authoritative home | Pointers from |
 |---|---|---|
-| Product overview | `README.md` | `AGENTS.md`, `CONTRIBUTING.md`, `docs/README.md` |
-| Agent behavior | `AGENTS.md` | `docs/README.md` |
+| Product overview | `README.md` | `AGENTS.md`, `CONTRIBUTING.md`, `docs/DOCS_README.md` |
+| Agent behavior | `AGENTS.md` | `docs/DOCS_README.md` |
 | Coding standards | `docs/process/ENGINEERING.md` | `AGENTS.md` |
 | Gate | `docs/process/VERIFICATION.md` + `scripts/gate.ps1` | `AGENTS.md`, `TASKS.md`, `REVIEW.md`, `CHANGELOG.md` process |
 | Git/release | `docs/process/GIT_WORKFLOW.md` | `AGENTS.md`, `CONTRIBUTING.md` |
@@ -664,10 +664,10 @@ review_trigger: behavior-change | release | quarterly | adr
 ```
 
 2. Every file has a one-line "Up:" link to its parent index.
-3. `docs/README.md` is the only table of contents. Other docs link to it, not to each other's sections, unless the link is semantic.
+3. `docs/DOCS_README.md` is the only table of contents. Other docs link to it, not to each other's sections, unless the link is semantic.
 4. Stable filenames; no dates except in ADR IDs and evidence directories.
 5. Relative links only; no absolute machine paths.
-6. No orphan documents: every durable file is listed in `docs/README.md`.
+6. No orphan documents: every durable file is listed in `docs/DOCS_README.md`.
 7. Root files are entry points, not detail stores.
 8. Use headings with unique, linkable names.
 9. Prefer tables for routing, status, and comparisons.

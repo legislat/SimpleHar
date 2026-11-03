@@ -10,7 +10,7 @@ review_trigger: behavior-change, release, quarterly
 
 # HANDOFF.md
 
-Up: `docs/README.md`. This file is the single home of the handoff protocol. It
+Up: `docs/DOCS_README.md`. This file is the single home of the handoff protocol. It
 contains the protocol only. It holds no live state.
 
 The root `HANDOFF.md` is the live snapshot. It stays local-only and gitignored.

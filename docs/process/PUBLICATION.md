@@ -10,7 +10,7 @@ review_trigger: release, quarterly
 
 # PUBLICATION.md
 
-Up: `docs/README.md`. This file is the single home of the publication scrub
+Up: `docs/DOCS_README.md`. This file is the single home of the publication scrub
 rules. It prevents leaks when durable content is extracted from local
 artifacts. Local artifacts contain machine paths, ports, key-file names,
 container names, and incident logs.

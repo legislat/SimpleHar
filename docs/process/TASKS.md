@@ -10,7 +10,7 @@ review_trigger: behavior-change, release
 
 # TASKS.md
 
-Up: `docs/README.md`. This file is the single home of the task lifecycle and schema. The
+Up: `docs/DOCS_README.md`. This file is the single home of the task lifecycle and schema. The
 gate lives in `docs/process/VERIFICATION.md`. The review method lives in
 `docs/process/REVIEW.md`. This file points to both and never repeats them.
 

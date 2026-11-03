@@ -10,7 +10,7 @@ review_trigger: behavior-change, release, quarterly
 
 # ENGINEERING.md
 
-Up: `docs/README.md`. The detailed coding, testing, documentation, security, and platform
+Up: `docs/DOCS_README.md`. The detailed coding, testing, documentation, security, and platform
 standards for this crate. Gate commands live in `docs/process/VERIFICATION.md`; review
 method lives in `docs/process/REVIEW.md`. This file points to them and does not repeat them.
 

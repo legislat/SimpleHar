@@ -302,7 +302,7 @@ Severity definitions: **Critical** = blocks reproducibility or produces a wrong 
 - **Description.** There is no docs index, no ownership field, no status field, no "last reviewed" date, and no statement of what each document is the source of truth for. Information type to location must be inferred.
 - **Evidence.** Root tree; `AGENTS.md:5-9` map is incomplete; `HANDOFF.md:7` is the only routing statement and only covers session start; no `docs/` directory before this audit; no front matter in any document.
 - **Consequences.** Contributors and agents duplicate information or put it in the wrong ledger. Stale documents are indistinguishable from current ones. The single-home rule cannot be enforced because there is no declared home map.
-- **Remediation.** Create `docs/README.md` with a routing table and add front matter (`owner`, `status`, `audience`, `source_of_truth_for`, `last_reviewed`). Add a documentation check that validates required fields and links.
+- **Remediation.** Create `docs/DOCS_README.md` with a routing table and add front matter (`owner`, `status`, `audience`, `source_of_truth_for`, `last_reviewed`). Add a documentation check that validates required fields and links.
 
 #### DOC-05 - Medium - Release and "current build" claims are ambiguous; no changelog
 

@@ -156,4 +156,4 @@ Pointers only. The named file owns the content.
 | Binding invariants | `docs/architecture/DOCTRINE.md` |
 | Full decision ledger | `docs/architecture/DECISIONS.md` |
 | Current architecture | `docs/architecture/OVERVIEW.md` |
-| Documentation map | `docs/README.md` |
+| Documentation map | `docs/DOCS_README.md` |

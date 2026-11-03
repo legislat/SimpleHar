@@ -1,12 +1,12 @@
 // Documentation checker for durable docs. Node, no external dependencies.
-// Rules (docs/audit/TARGET_STRUCTURE.md sections 8 and 9, docs/README.md 5 and 6):
+// Rules (docs/audit/TARGET_STRUCTURE.md sections 8 and 9, docs/DOCS_README.md 5 and 6):
 //   1. Front matter with the seven required keys.
 //   2. Relative Markdown links resolve to existing files.
 //   3. No author-specific absolute Windows drive paths in durable docs. Documented
 //      product defaults in README/reference and exact quoted decisions are allowed.
 //      (fail inside code fences too, except for those documented defaults).
 //   4. No duplicate H1.
-//   5. Every durable doc is listed in docs/README.md by filename or path.
+//   5. Every durable doc is listed in docs/DOCS_README.md by filename or path.
 //   6. No literal DRAFT in a doc whose front matter status is active.
 // Exempt: DESIGN.md (historical), docs/audit/* (audit snapshots), handoff/* (local),
 // archive/ and base-archive/ (frozen).
@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
-const INDEX = "docs/README.md";
+const INDEX = "docs/DOCS_README.md";
 const REQUIRED_KEYS = [
   "title", "owner", "status", "audience",
   "source_of_truth_for", "last_reviewed", "review_trigger",

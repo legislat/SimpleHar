@@ -10,7 +10,7 @@ review_trigger: behavior-change, release, new-decision
 
 # OVERVIEW.md
 
-Up: `docs/README.md`. This file describes the architecture as shipped,
+Up: `docs/DOCS_README.md`. This file describes the architecture as shipped,
 verified against `src/` and `Cargo.toml` on 2026-11-02. Binding rules live in
 `docs/architecture/DOCTRINE.md`; rulings and rationale live in
 `docs/architecture/DECISIONS.md`. This file summarizes and links; it does not

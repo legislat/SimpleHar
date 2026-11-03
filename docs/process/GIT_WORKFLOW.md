@@ -10,7 +10,7 @@ review_trigger: behavior-change, release
 
 # GIT_WORKFLOW.md
 
-Up: `docs/README.md`. This file is the single home of Git and release practice. The gate
+Up: `docs/DOCS_README.md`. This file is the single home of Git and release practice. The gate
 lives in `docs/process/VERIFICATION.md`; this file points to it and never repeats it.
 Decision D6 approves the narrative commit style recorded here.
 

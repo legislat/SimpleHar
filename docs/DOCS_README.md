@@ -8,7 +8,7 @@ last_reviewed: 2026-11-02
 review_trigger: release, quarterly, new-decision
 ---
 
-# docs/README.md
+# docs/DOCS_README.md
 
 The map of the documentation system: what exists, what each file owns, and
 where new text belongs. Every durable file is listed here (no orphans). Only

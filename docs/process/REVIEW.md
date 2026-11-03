@@ -10,7 +10,7 @@ review_trigger: behavior-change, release, quarterly
 
 # REVIEW.md
 
-Up: `docs/README.md`. This file is the single home of review method and finding
+Up: `docs/DOCS_README.md`. This file is the single home of review method and finding
 closure. The gate lives in `docs/process/VERIFICATION.md`; this file never
 repeats it.
 

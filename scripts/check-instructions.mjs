@@ -104,7 +104,7 @@ if (!existsSync(join(ROOT, VERIFICATION))) {
 }
 
 const scanSet = [
-  "README.md", "AGENTS.md", "CONTRIBUTING.md", "CHANGELOG.md", "docs/README.md",
+  "README.md", "AGENTS.md", "CONTRIBUTING.md", "CHANGELOG.md", "docs/DOCS_README.md",
   ...listFiles("docs/process"),
   ...listFiles("docs/architecture"),
   ...listFiles("docs/reference"),

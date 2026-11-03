@@ -154,11 +154,11 @@ Objective: establish the durable tree, move durable knowledge out of the live la
 | Field | Value |
 |---|---|
 | Priority | P1 |
-| Description | Create `docs/README.md`, `docs/process/`, `docs/architecture/`, `docs/reference/`, `docs/audit/` (exists). Add the routing table and the layer model. Add front matter to every new doc. Do not move content yet. |
+| Description | Create `docs/DOCS_README.md`, `docs/process/`, `docs/architecture/`, `docs/reference/`, `docs/audit/` (exists). Add the routing table and the layer model. Add front matter to every new doc. Do not move content yet. |
 | Dependencies | D1, P1-04 |
-| Affected files | `docs/README.md`, directory structure, `README.md` contributor link, `AGENTS.md` map, `CONTRIBUTING.md` |
+| Affected files | `docs/DOCS_README.md`, directory structure, `README.md` contributor link, `AGENTS.md` map, `CONTRIBUTING.md` |
 | Expected outcome | Every information type has a declared home; a new contributor can navigate. |
-| Acceptance criteria | Routing table covers all durable topics. Every new doc has front matter. No path in `docs/README.md` is broken. |
+| Acceptance criteria | Routing table covers all durable topics. Every new doc has front matter. No path in `docs/DOCS_README.md` is broken. |
 | Risks | Creating empty scaffolding. Mitigate: create only directories that receive content in this phase. |
 
 ### P2-02 - Extract engineering standards from `AGENTS.md`
@@ -226,9 +226,9 @@ Objective: establish the durable tree, move durable knowledge out of the live la
 | Field | Value |
 |---|---|
 | Priority | P2 |
-| Description | Add front matter to every durable doc; add the same-change rule, contradiction rule, release review, quarterly review, archive rule, and anti-duplication audit to `docs/README.md` or a dedicated `docs/process/DOCUMENTATION.md` (only if it does not duplicate `TARGET_STRUCTURE.md`). |
+| Description | Add front matter to every durable doc; add the same-change rule, contradiction rule, release review, quarterly review, archive rule, and anti-duplication audit to `docs/DOCS_README.md` or a dedicated `docs/process/DOCUMENTATION.md` (only if it does not duplicate `TARGET_STRUCTURE.md`). |
 | Dependencies | P2-01..P2-05 |
-| Affected files | All durable docs, `docs/README.md`, `CONTRIBUTING.md` |
+| Affected files | All durable docs, `docs/DOCS_README.md`, `CONTRIBUTING.md` |
 | Expected outcome | Every document has an owner, status, audience, source-of-truth declaration, and review date. |
 | Acceptance criteria | Front matter present on 100% of durable docs. No orphan docs. The maintenance rules are stated once. |
 | Risks | Bureaucratic overhead. Mitigate: four required fields only; automation checks them. |
@@ -393,7 +393,7 @@ Objective: make the invariants mechanical where practical. Automation supplement
 | Priority | P1 |
 | Description | Implement `scripts/check-docs.mjs` with no external dependencies: front matter, relative links, referenced paths, duplicate H1, `DRAFT` on released docs, absolute machine paths, index coverage, duplicate gate blocks. |
 | Dependencies | P2-01, P2-07, P4-01 |
-| Affected files | `scripts/check-docs.mjs`, `docs/README.md`, CI workflow |
+| Affected files | `scripts/check-docs.mjs`, `docs/DOCS_README.md`, CI workflow |
 | Expected outcome | Documentation rot is caught mechanically. |
 | Acceptance criteria | The checker passes on the migrated tree; it fails on a missing link, missing front matter, absolute path, and orphan doc (test with fixtures); it runs in CI. |
 | Risks | False positives on intentional examples. Mitigate: allowlist code blocks and explicit `planned:` paths. |
@@ -443,7 +443,7 @@ Objective: make the invariants mechanical where practical. Automation supplement
 | Dependencies | D1, P2-01, P4-02 |
 | Affected files | `scripts/check-fresh-clone.ps1`, CI workflow |
 | Expected outcome | The exact failure found by this audit cannot recur silently. |
-| Acceptance criteria | The check passes on a clone with only tracked files; it fails if `AGENTS.md`, `docs/README.md`, or the process docs are missing. |
+| Acceptance criteria | The check passes on a clone with only tracked files; it fails if `AGENTS.md`, `docs/DOCS_README.md`, or the process docs are missing. |
 | Risks | Slow clone in CI. Mitigate: shallow clone; run on release and weekly, not every push. |
 
 ### P4-07 - Freshness and process metrics
@@ -557,7 +557,7 @@ Recommended rollout:
 
 The plan is complete when:
 
-1. A fresh clone contains `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, `docs/README.md`, `docs/process/*`, `docs/architecture/DOCTRINE.md`, `docs/architecture/DECISIONS.md`, `docs/architecture/OVERVIEW.md`, and `CHANGELOG.md`.
+1. A fresh clone contains `README.md`, `AGENTS.md`, `CONTRIBUTING.md`, `docs/DOCS_README.md`, `docs/process/*`, `docs/architecture/DOCTRINE.md`, `docs/architecture/DECISIONS.md`, `docs/architecture/OVERVIEW.md`, and `CHANGELOG.md`.
 2. An agent given only the clone can follow `AGENTS.md` to the queue, understand doctrine, run the gate, and produce a compliant commit.
 3. An active task can be handed to another agent using only `HANDOFF.md`, the queue row, and the task file.
 4. No durable document contains a machine path, a gate command copy, a test count, or a claim contradicted by code.

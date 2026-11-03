@@ -16,7 +16,7 @@ This file is a pointer. It owns no rules. Read `README.md` for the product.
 
 | Topic | File |
 |---|---|
-| Documentation map | `docs/README.md` |
+| Documentation map | `docs/DOCS_README.md` |
 | Task lifecycle and templates | `docs/process/TASKS.md` |
 | Coding standards | `docs/process/ENGINEERING.md` |
 | Gate and evidence | `docs/process/VERIFICATION.md` |

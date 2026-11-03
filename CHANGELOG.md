@@ -10,7 +10,7 @@ review_trigger: release
 
 # Changelog
 
-Up: `docs/README.md`. Release history of SimpleHar SE. The format follows Keep
+Up: `docs/DOCS_README.md`. Release history of SimpleHar SE. The format follows Keep
 a Changelog. Versions follow Semantic Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.

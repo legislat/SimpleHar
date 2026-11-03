@@ -10,7 +10,7 @@ review_trigger: new-decision, release
 
 # DOCTRINE.md
 
-Up: `docs/README.md`. This is the one-page binding invariant card every agent
+Up: `docs/DOCS_README.md`. This is the one-page binding invariant card every agent
 must carry. Each item states one rule and its consequence. Do not soften a
 rule. Do not invent a ruling here. Full rationale and tombstones live in
 `docs/architecture/DECISIONS.md`. Quoted clauses keep the operator wording;

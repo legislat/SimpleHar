@@ -10,7 +10,7 @@ review_trigger: behavior-change, release
 
 # VERIFICATION.md
 
-Up: `docs/README.md`. This file is the single home of the verification gate and the
+Up: `docs/DOCS_README.md`. This file is the single home of the verification gate and the
 evidence rules. No other document lists gate commands. Every other document links here.
 
 ## The cardless gate

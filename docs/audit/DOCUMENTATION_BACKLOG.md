@@ -95,7 +95,7 @@ Priorities: **P0** = false or dangerous instructions / release blocker; **P1** =
 - **Priority:** P1
 - **Category:** docs
 - **Related audit:** DOC-04, GOV-01
-- **Description:** Create `docs/README.md` with the routing table and durable/live/evidence/archive model. Add required front matter (`title`, `owner`, `status`, `audience`, `source_of_truth_for`, `last_reviewed`, `review_trigger`) to every durable doc. Add `CONTRIBUTING.md`.
+- **Description:** Create `docs/DOCS_README.md` with the routing table and durable/live/evidence/archive model. Add required front matter (`title`, `owner`, `status`, `audience`, `source_of_truth_for`, `last_reviewed`, `review_trigger`) to every durable doc. Add `CONTRIBUTING.md`.
 - **Definition of Done:** Every durable doc is listed and has front matter. No orphan docs. A fresh reader can find any information type in one hop. `CONTRIBUTING.md` is a short pointer, not a duplicate.
 
 ### BL-11 - Extract engineering standards from `AGENTS.md`
@@ -264,7 +264,7 @@ Priorities: **P0** = false or dangerous instructions / release blocker; **P1** =
 - **Category:** onboarding
 - **Related audit:** GOV-01, DOC-04
 - **Description:** Clone to a temp directory and verify that the durable onboarding path exists and links resolve.
-- **Definition of Done:** It passes on a clone containing only tracked files. It fails if `AGENTS.md`, `docs/README.md`, or process docs are missing. It runs on release and weekly, not every push.
+- **Definition of Done:** It passes on a clone containing only tracked files. It fails if `AGENTS.md`, `docs/DOCS_README.md`, or process docs are missing. It runs on release and weekly, not every push.
 
 ### BL-31 - Add a process health report
 

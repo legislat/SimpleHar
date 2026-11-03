@@ -397,7 +397,7 @@ Documents have no owner, status, audience, or review trigger. Stale claims survi
 
 **A. Front matter** for every durable doc: title, owner, status, audience, source-of-truth topics, last reviewed, review trigger.
 
-**B. Routing table** in `docs/README.md`; every doc is listed; no orphans.
+**B. Routing table** in `docs/DOCS_README.md`; every doc is listed; no orphans.
 
 **C. Same-change rule.** A behavior change updates affected docs in the same commit or records why no doc is affected.
 
@@ -552,7 +552,7 @@ It prints the counts and exits non-zero on failure. `VERIFICATION.md` describes 
 - No duplicate H1.
 - No `DRAFT` status on a released document.
 - No absolute machine paths in durable docs.
-- Every doc is listed in `docs/README.md`.
+- Every doc is listed in `docs/DOCS_README.md`.
 - No duplicated gate command block.
 
 **C. Template validator.** `scripts/check-tasks.mjs` validates active task files and queue rows against the schema: required fields, valid class/priority/readiness, acceptance criteria non-empty, evidence link present for closed tasks.
@@ -745,7 +745,7 @@ A new contributor clones 57 files and a README. There is no `CONTRIBUTING.md`, n
 ```text
 README.md
  -> CONTRIBUTING.md
- -> docs/README.md
+ -> docs/DOCS_README.md
  -> docs/process/TASKS.md
  -> docs/architecture/OVERVIEW.md
  -> docs/process/VERIFICATION.md
@@ -781,7 +781,7 @@ Do not implement all sections at once. The dependency order is:
 
 1. **Decide the owner questions** (tracked vs local, DESIGN status, worktree model, commit style, CI).
 2. **Fix false documentation** (README strata, code comments, DESIGN banner). This is independent and high value.
-3. **Create the durable core** (`AGENTS.md` routing, `DOCTRINE.md`, `VERIFICATION.md`, `GIT_WORKFLOW.md`, `TASKS.md`, `HANDOFF.md`, `docs/README.md`).
+3. **Create the durable core** (`AGENTS.md` routing, `DOCTRINE.md`, `VERIFICATION.md`, `GIT_WORKFLOW.md`, `TASKS.md`, `HANDOFF.md`, `docs/DOCS_README.md`).
 4. **Migrate live ledgers** (task files, queue index, decisions move).
 5. **Add automation** (gate script, docs checker, task checker, CI).
 6. **Adopt the workflow** for one cycle and measure.
