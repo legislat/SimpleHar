@@ -2789,14 +2789,48 @@ pub enum RetryAction {
     Restart,
 }
 
+/// What the two reqwest error flags say about a failed forward.
+///
+/// Kept separate from `reqwest::Error` so the both-flags pair (R2-18-06) is
+/// testable through a direct table; the timeout-first rule decides the real
+/// pair, not a synthetic error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendFailureClass {
+    /// The engine was live and slow, or its backlog never answered: 502, never a reap.
+    Timeout,
+    /// The port refused or reset before any response head: the death class.
+    Connect,
+    /// Any other send error: a plain forward failure.
+    Other,
+}
+
+/// Decides the class from reqwest's two error flags.
+///
+/// `is_timeout()` is judged before `is_connect()` (R2-18-06): an error that
+/// reports both — a connect timeout against a live listener whose backlog
+/// blackholes SYNs — describes a live engine, and reaping it is the harm
+/// FINDINGS-06 [2] closed. A connect-only failure (refused/reset) is the only
+/// restart class.
+fn classify_send_failure_flags(is_timeout: bool, is_connect: bool) -> SendFailureClass {
+    if is_timeout {
+        SendFailureClass::Timeout
+    } else if is_connect {
+        SendFailureClass::Connect
+    } else {
+        SendFailureClass::Other
+    }
+}
+
 /// Classifies a `send()` failure for the crash-retry arm (FINDINGS-06 [2]).
 ///
 /// Restart-and-retry ONLY when the request never got a response AND the engine is
-/// not listening — reqwest's `is_connect()` (refused/reset before response head).
-/// A timeout (`is_timeout()`) is a live-but-slow engine (long non-streamed
+/// not listening — reqwest's `is_connect()` alone (refused/reset before response
+/// head). A timeout (`is_timeout()`) is a live-but-slow engine (long non-streamed
 /// generation, huge prefill): reaping it would discard a healthy KV cache and
 /// re-forward the same slow request, so it answers `502` naming the class
-/// instead. Any other send error is likewise never treated as death.
+/// instead. The timeout flag is judged first (R2-18-06), so an error reporting
+/// both flags stays the timeout class and never reaps. Any other send error is
+/// likewise never treated as death.
 ///
 /// # Arguments
 ///
@@ -2805,20 +2839,20 @@ pub enum RetryAction {
 ///
 /// # Errors
 ///
-/// [`ApiError::Upstream`] for every non-connect class.
+/// [`ApiError::Upstream`] for every class except a connect-only failure.
 ///
 /// Public only so the integration suite can feed it real reqwest error values;
 /// the proxy loop is its sole caller in production code.
 pub fn classify_send_failure(error: &reqwest::Error, port: u16) -> Result<RetryAction, ApiError> {
-    if error.is_connect() {
-        return Ok(RetryAction::Restart);
+    match classify_send_failure_flags(error.is_timeout(), error.is_connect()) {
+        SendFailureClass::Timeout => Err(ApiError::Upstream {
+            reason: format!("engine on :{port} timed out; not restarting a live engine"),
+        }),
+        SendFailureClass::Connect => Ok(RetryAction::Restart),
+        SendFailureClass::Other => Err(ApiError::Upstream {
+            reason: format!("forward failed: {error}"),
+        }),
     }
-    let reason = if error.is_timeout() {
-        format!("engine on :{port} timed out; not restarting a live engine")
-    } else {
-        format!("forward failed: {error}")
-    };
-    Err(ApiError::Upstream { reason })
 }
 
 /// Ensures `model` is serving in `category`; returns its engine port and the
@@ -2886,11 +2920,12 @@ async fn proxy(
     body["model"] = Value::String(serve_id.unwrap_or_else(|| model.clone()));
 
     // T10.1: a connection-level failure (engine died before any response) triggers
-    // exactly one reap + reload + retry. Only `is_connect()` classifies as death
-    // (FINDINGS-06 [2]): a timeout means a live engine is still thinking, and
-    // reaping it discards a healthy KV cache. A genuine upstream HTTP status is
-    // never retried (A9), and a death mid-stream surfaces in the body stream,
-    // past this loop.
+    // exactly one reap + reload + retry. Only a connect-only failure classifies as
+    // death (FINDINGS-06 [2], R2-18-06): a timeout — even one whose error also
+    // reports `is_connect()` — means a live engine is still thinking, and reaping
+    // it discards a healthy KV cache. A genuine upstream HTTP status is never
+    // retried (A9), and a death mid-stream surfaces in the body stream, past this
+    // loop.
     let mut port = port;
     let mut attempts = 0;
     let upstream = loop {
@@ -5923,6 +5958,32 @@ mod tests {
             "reason must name the class and the refusal to reap: {reason}"
         );
         drop(listener);
+    }
+
+    #[test]
+    fn timeout_precedes_connect_when_both_flags_are_true() {
+        // R2-18-06 falsifier: the both-true row is RED under the old
+        // connect-first order. The table pins the decision on the flags alone.
+        assert_eq!(
+            classify_send_failure_flags(false, false),
+            SendFailureClass::Other,
+            "neither flag must stay a plain forward failure"
+        );
+        assert_eq!(
+            classify_send_failure_flags(true, false),
+            SendFailureClass::Timeout,
+            "timeout-only must be the 502 class"
+        );
+        assert_eq!(
+            classify_send_failure_flags(false, true),
+            SendFailureClass::Connect,
+            "connect-only (refused/reset) must stay the restart class"
+        );
+        assert_eq!(
+            classify_send_failure_flags(true, true),
+            SendFailureClass::Timeout,
+            "both flags must be the timeout class, never a reap"
+        );
     }
 
     #[tokio::test]

@@ -3733,13 +3733,18 @@ async fn no_model_fallback_prefers_the_most_recently_proxied_occupant() {
 
 #[tokio::test]
 async fn timeout_class_is_502_and_never_restarts() {
-    // FINDINGS-06 [2] classifier half: a server that ACCEPTS but never answers
-    // produces a real reqwest timeout - the class that used to mean "engine
-    // died" and reaped healthy engines. It must map to a typed 502 naming the
-    // class, with no restart in sight. The production proxy client's 600 s
-    // read timeout is hard-coded and not injectable without new public surface,
-    // so the end-to-end 600 s wait is out of scope; the classifier is the decision
-    // site and is exercised with the real error value here.
+    // FINDINGS-06 [2] classifier half: this leg feeds a READ timeout - the
+    // client's response deadline expiring on a socket that was accepted but
+    // never answered (`is_timeout()` true, `is_connect()` false), the class
+    // that used to mean "engine died" and reaped healthy engines. It must map
+    // to a typed 502 naming the class, with no restart in sight. This leg does
+    // not claim the both-flags shape; the unit table
+    // `timeout_precedes_connect_when_both_flags_are_true` (src/api/mod.rs)
+    // pins that case, where the classifier judges timeout before connect. The
+    // production proxy client's 600 s read timeout is hard-coded and not
+    // injectable without new public surface, so the end-to-end 600 s wait is
+    // out of scope; the classifier is the decision site and is exercised with
+    // the real error value here.
     let hanging = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("hang server binds");
