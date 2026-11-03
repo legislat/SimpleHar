@@ -146,7 +146,9 @@ harness launches `python -m serve.server` in `basalt_cwd`. It never uses the
 source-tree launcher. The row names the three executed paths: the
 interpreter (`basalt_python`), the source root (`basalt_cwd`), and the
 engine binary (`basalt_exe`). `serve_model` is the served alias: it is
-passed as `--alias` and verified at readiness.
+passed as `--alias` and verified at readiness. The child receives
+`USERPROFILE` and `HOME` from the harness for Basalt's model cache; no
+other parent environment passes.
 
 The harness renders the profile itself. The JSON carries one `server`
 object with three figures only: the `alias`, the absolute `.basalt` model

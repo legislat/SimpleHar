@@ -346,6 +346,20 @@ fn render_profile(row: &BasaltRow) -> String {
         .expect("invariant: a string/number map serializes")
 }
 
+/// The Python child needs a home directory for Basalt's model cache. The
+/// harness scrubs the parent environment, so pass the user home through the
+/// launch spec; `Path.home()` cannot resolve without it (release v1.1.1
+/// manual-test failure).
+fn python_home_env() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let home = home.to_string_lossy().into_owned();
+        env.insert("USERPROFILE".to_string(), home.clone());
+        env.insert("HOME".to_string(), home);
+    }
+    env
+}
+
 /// Basalt adapter: argv from data, `/health` `loaded != false` **and** the
 /// exact served id on `/v1/models`.
 #[derive(Debug, Clone, Default)]
@@ -378,7 +392,7 @@ impl EngineAdapter for BasaltAdapter {
         Ok(LaunchSpec {
             argv,
             cwd: v.cwd,
-            env: BTreeMap::new(),
+            env: python_home_env(),
             log_name: model.name.clone(),
             readiness: ReadinessSpec::Then(
                 Box::new(ReadinessSpec::HttpFlag {
@@ -579,7 +593,22 @@ mod tests {
                 }),
             )
         );
-        assert!(spec.env.is_empty());
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+        if let Some(home) = home {
+            let home = home.to_string_lossy();
+            assert_eq!(
+                spec.env.get("USERPROFILE").map(String::as_str),
+                Some(home.as_ref()),
+                "the Python child needs USERPROFILE for the Basalt cache"
+            );
+            assert_eq!(
+                spec.env.get("HOME").map(String::as_str),
+                Some(home.as_ref()),
+                "the Python child needs HOME for Path.home"
+            );
+        } else {
+            assert!(spec.env.is_empty());
+        }
         assert_eq!(spec.log_name, "basalt-test");
         assert_eq!(spec.container, None);
         assert_eq!(spec.script, None);
