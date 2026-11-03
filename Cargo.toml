@@ -8,8 +8,20 @@ license = "Apache-2.0"
 [dependencies]
 # HTTP framework: async handlers returning Result<Response, ApiError> (AGENTS.md convention).
 axum = "0.8"
-# Async runtime; full features for signal handling, fs, process, rt-multi-thread.
-tokio = { version = "1", features = ["full"] }
+# Async runtime; the minimal explicit feature set the crate uses (TASK-N7-DEPS):
+# rt (via rt-multi-thread) + macros (#[tokio::main]/select!/join!), signal (ctrl_c),
+# fs, process, sync, time, net, io-util (AsyncRead/WriteExt).
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "fs",
+    "process",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+] }
 # HTTP layers: tracing, compression, timeouts (AGENTS.md observability rule).
 tower-http = { version = "0.6", features = ["trace", "compression-gzip", "timeout"] }
 # Structured logging; no println!/eprintln! on production paths (AGENTS.md).
@@ -24,7 +36,7 @@ serde_json = "1"
 async-trait = "0.1"
 # HTTP client: engine readiness probes now (mock engine), proxy surface later (Step 11).
 # `stream` enables byte-for-byte SSE pass-through.
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 # Tray icon + menu (Step 15): the only GUI dependency; no Qt/egui.
 tray-icon = "0.21"
 # Win32: tray message pump (Step 15) and Job Objects + single-instance mutex (Step 8).
