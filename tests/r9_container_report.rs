@@ -426,6 +426,102 @@ async fn a_report_for_a_non_ninfer_engine_is_ignored() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The trust-site half of a live scheduler, with the registered `ninfer` adapter
+/// installing `container` on the spec: the only way to hand the sampler a
+/// container-backed ninfer job whose name the spawn path could never have accepted
+/// (the real `NinferAdapter::spec` validates the name before anything spawns).
+/// The yaml spells a spawn-legal container and full template row so the scan
+/// publishes it; the fake adapter supplies the spec name under test.
+struct TrustHarness {
+    handle: SchedulerHandle,
+    runtime: MockRuntime,
+    dir: PathBuf,
+}
+
+fn trust_harness(container: &'static str) -> TrustHarness {
+    let dir = simplehar_se::testutil::temp_dir("r9-trust");
+    std::fs::write(
+        dir.join("r9-trust.yaml"),
+        "name: r9-trust\nengine: ninfer\ncategory: Work\nvram_gb: 20\n\
+         ninfer_container: r9-trust-c\nninfer_image: ninfer:local\n\
+         ninfer_model_name: r9-trust-dir\nninfer_artifact: r9-trust.ninfer\n\
+         ninfer_model_roots: /mnt/d/Models\n",
+    )
+    .expect("model yaml");
+    let runtime = MockRuntime::new();
+    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+    adapters.insert(
+        "ninfer".to_string(),
+        Arc::new(ContainerMockAdapter {
+            engine: "ninfer",
+            container,
+        }) as Arc<dyn EngineAdapter>,
+    );
+    let handle = Scheduler::start(
+        AppConfig {
+            load_timeout_s: 5,
+            ..AppConfig::default()
+        },
+        dir.clone(),
+        adapters,
+        Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
+        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+    );
+    TrustHarness {
+        handle,
+        runtime,
+        dir,
+    }
+}
+
+/// The sampler's trust-site name-shape gate (review-wave leftover): a container's
+/// self-reserved figure books only when its name passes the very rule the spawn
+/// path applies (`valid_container_name` — the validator the adapter spec, the
+/// pre-reap, the boot reclaim, and `ProcessRuntime::container_report` all share).
+/// The ID-shaped leg is the dangerous case (docker resolves such a name as a
+/// container-ID prefix), and the valid leg pins the gate does not silence a
+/// legitimate report — the documented reason the strict claim gate stayed out of
+/// the report path is not an excuse to over-gate. Falsifier: deleting the sampler
+/// gate lands the ID-named leg's seeded summary on the row and fails the second
+/// assert; tightening it to a claim-ledger check drops the valid leg's booking.
+#[tokio::test]
+async fn self_reported_memory_books_only_for_a_spawn_legal_name() {
+    let ok = trust_harness("r9-trust-ok");
+    ok.runtime
+        .set_container_report("r9-trust-ok", &memory_summary(72, 312));
+    expect_loaded(
+        ok.handle
+            .swap("r9-trust", CategoryId::Work)
+            .await
+            .expect("load"),
+        "r9-trust",
+    );
+    await_yaml(
+        &ok.dir.join("r9-trust.yaml"),
+        &["measured_gb: 31.2", "measured_attribution: engine_report"],
+    )
+    .await;
+
+    let bad = trust_harness("deadbeef");
+    bad.runtime
+        .set_container_report("deadbeef", &memory_summary(72, 312));
+    expect_loaded(
+        bad.handle
+            .swap("r9-trust", CategoryId::Work)
+            .await
+            .expect("load"),
+        "r9-trust",
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let text = std::fs::read_to_string(bad.dir.join("r9-trust.yaml")).expect("seed yaml");
+    assert!(
+        !text.contains("measured_gb") && !text.contains("measured_attribution"),
+        "a name this harness could never have spawned must not book its self-report:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&ok.dir);
+    let _ = std::fs::remove_dir_all(&bad.dir);
+}
+
 /// The failure leg of the forensic contract (GOTCHAS `[proc]`: an engine log dies
 /// with `docker rm -f`): a load that never reaches readiness must still put the
 /// container's bytes on the Windows side, and the in-flight snapshot mark must

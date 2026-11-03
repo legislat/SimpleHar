@@ -2633,6 +2633,25 @@ impl ActorState {
         if ctx.engine != crate::ownership::NINFER_ENGINE {
             return None;
         }
+        // The trust-site ownership gate (review-wave leftover): a container's
+        // self-reserved figure books only when its name passes the very rule the
+        // spawn path applies — [`crate::ownership::valid_container_name`], the one
+        // validator the adapter spec, the pre-reap, the boot reclaim, and
+        // `ProcessRuntime::container_report` all read, so no path can accept a name
+        // another refuses. `ProcessRuntime` already refuses to fetch a hostile name;
+        // this is the trust layer's own defense for any runtime implementation that
+        // answers with bytes for a name this harness could never have spawned (an
+        // ID-shaped name is the dangerous one: docker resolves it as a container-ID
+        // prefix). Refusing here falls back to the witness stand-in, so the serve is
+        // never harmed — only the self-reported booking is withheld.
+        if !crate::ownership::valid_container_name(container) {
+            tracing::warn!(
+                model = %ctx.model,
+                container,
+                "container report ignored: not a name this harness may address"
+            );
+            return None;
+        }
         let text = runtime.container_report(container).await?;
         runtime.save_container_log(&ctx.model, &text).await;
         let report = crate::engine::ninfer::parse_startup_memory(&text)?;

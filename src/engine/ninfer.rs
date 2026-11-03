@@ -118,22 +118,35 @@ const ALLOWED_ENV_VARS: [(&str, &[&str]); 1] = [("CUDA_MODULE_LOADING", &["EAGER
 /// missing publish argument could host-publish the internal number itself.
 pub const DEFAULT_INTERNAL_PORT: &str = "8808";
 
-/// The internal port a ninfer row will bind, resolved exactly as
-/// [`template_params`] resolves it (yaml key, else [`DEFAULT_INTERNAL_PORT`]),
-/// for the scheduler-side namespace check. `None` for non-ninfer rows and for
-/// ninfer rows whose key does not parse — those die at spawn naming the key, so
-/// the check must not invent a number for them.
+/// THE one resolution of a ninfer row's internal port: the yaml key's value,
+/// else [`DEFAULT_INTERNAL_PORT`], validated as a port number. `Err` returns the
+/// raw text so the refusal can name it exactly as the operator spelled it. The
+/// spawn render ([`template_params`]) and the gate's namespace check
+/// ([`declared_internal_port`]) read the port only through here — the review
+/// wave's duplicate (two copies of key + default + range) could drift, and one
+/// authority is what keeps the page's claim and the container's bind the same
+/// number forever.
+fn resolve_internal_port(entry: &ModelEntry) -> Result<String, String> {
+    let raw = optional_param(entry, "ninfer_internal_port")
+        .unwrap_or_else(|| DEFAULT_INTERNAL_PORT.to_string());
+    if valid_number(&raw, 1, 65_535) {
+        Ok(raw)
+    } else {
+        Err(raw)
+    }
+}
+
+/// The internal port a ninfer row will bind, answered by the same
+/// [`resolve_internal_port`] authority the spawn render uses, for the
+/// scheduler-side namespace check. `None` for non-ninfer rows and for ninfer
+/// rows whose key does not parse — those die at spawn naming the key, so the
+/// check must not invent a number for them.
 #[must_use]
 pub fn declared_internal_port(entry: &ModelEntry) -> Option<u16> {
     if entry.engine != NINFER_ENGINE {
         return None;
     }
-    let raw = optional_param(entry, "ninfer_internal_port")
-        .unwrap_or_else(|| DEFAULT_INTERNAL_PORT.to_string());
-    if !valid_number(&raw, 1, 65_535) {
-        return None;
-    }
-    raw.parse().ok()
+    resolve_internal_port(entry).ok()?.parse().ok()
 }
 
 /// The identity an `engine_report` figure is comparable to: the selected profile
@@ -526,14 +539,18 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
     // Optional since R10 (operator 2026-11-01: "8003-8005 are manual only"):
     // the container's inside is its own namespace, so the default is the SE
     // internal number rather than any borrowed manual one, and
-    // `AppConfig::port_claim` refuses manual/harness numbers at the gate.
-    let port = optional_param(model, "ninfer_internal_port")
-        .unwrap_or_else(|| DEFAULT_INTERNAL_PORT.to_string());
-    if !valid_number(&port, 1, 65_535) {
-        return Err(rejected(format!(
-            "`ninfer_internal_port` must be a port number: {port}"
-        )));
-    }
+    // `AppConfig::port_claim` refuses manual/harness numbers at the gate. The
+    // number comes from `resolve_internal_port`, the same authority the gate
+    // reads; the raw text survives validation only to keep the refusal and the
+    // rendered `PORT=` byte-for-byte what the operator wrote.
+    let port = match resolve_internal_port(model) {
+        Ok(raw) => raw,
+        Err(raw) => {
+            return Err(rejected(format!(
+                "`ninfer_internal_port` must be a port number: {raw}"
+            )))
+        }
+    };
     let roots_line = required_param(model, "ninfer_model_roots")?;
     let model_roots: Vec<String> = roots_line
         .split(',')
@@ -1325,6 +1342,58 @@ mod tests {
             declared_internal_port(&entry(&broken)),
             None,
             "an unparseable row has no number to claim: spawn refuses it naming the key"
+        );
+    }
+
+    /// The review-wave duplicate, closed by one authority (`resolve_internal_port`):
+    /// what the canonical script renders and what the gate reports are the SAME
+    /// resolution for every row shape — a declared number, the default, and a
+    /// broken row — so a future edit to key, default, or range cannot move the
+    /// render without moving the gate. Falsifier: re-forking the resolution so the
+    /// two sites read different cells or defaults lands a `PORT=` the gate never
+    /// claims (or the reverse) and fails the agreement asserts.
+    #[test]
+    fn the_render_and_the_gate_read_one_internal_port_resolution() {
+        let rendered_port = |pairs: &[(&'static str, &'static str)]| {
+            NinferAdapter::new("Ubuntu", "ops")
+                .spec(&entry(pairs), 18109)
+                .expect("template renders")
+                .script
+                .expect("template renders a script")
+        };
+        // Declared number: the script carries it and the gate reports it.
+        let declared = rendered_port(&template_pairs());
+        assert!(
+            declared.contains("PORT=\"8090\""),
+            "the render substitutes the declared number: {declared}"
+        );
+        assert_eq!(
+            declared_internal_port(&entry(&template_pairs())),
+            Some(8090),
+            "the gate reads the number the render carries"
+        );
+        // No key: both sites answer the SE internal default.
+        let mut no_key = template_pairs();
+        no_key.retain(|(key, _)| *key != "ninfer_internal_port");
+        let script = rendered_port(&no_key);
+        assert!(script.contains("PORT=\"8808\""), "{script}");
+        assert_eq!(
+            declared_internal_port(&entry(&no_key)),
+            Some(8808),
+            "the default is ONE constant, not two copies"
+        );
+        // Broken key: the gate invents nothing and the spawn refuses naming the
+        // exact key — the shared resolution answers Err for both.
+        let mut broken = template_pairs();
+        broken.retain(|(key, _)| *key != "ninfer_internal_port");
+        broken.push(("ninfer_internal_port", "80a4"));
+        assert_eq!(declared_internal_port(&entry(&broken)), None);
+        let reason = refused(&broken);
+        assert!(
+            reason.contains("ninfer_internal_port")
+                && reason.contains("must be a port number")
+                && reason.contains("80a4"),
+            "the refusal must keep naming key and raw text: {reason}"
         );
     }
 
