@@ -16,13 +16,13 @@ a Changelog. Versions follow Semantic Versioning.
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
-## Unreleased
+## v1.1.1 - 2026-11-03
 
 ### Added
 
 - Basalt engine support: direct Python server launch with a harness-rendered
   server profile, `/health` loaded and `/v1/models` alias readiness, declared
-  `vram_gb` booking, and job-object release. The operator card run remains.
+  `vram_gb` booking, and job-object release. The operator card run passed.
 
 ### Changed
 
@@ -41,6 +41,8 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
   and refuses a blank `llama_server_exe`.
 - The idle sweep no longer starts a second unload behind a cross-slot eviction
   victim; the ledger names one cause of death.
+- A send timeout is classified before a connect failure, so a slow live engine
+  is not reaped; connect-only failures still restart once.
 - The catalog documentation no longer claims full-path aliases.
 
 ## v1.1.0 - 2026-11-03
