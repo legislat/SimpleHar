@@ -1984,6 +1984,118 @@ async fn a_parked_load_is_answered_when_its_predecessor_keeps_the_occupant() {
 }
 
 #[tokio::test]
+async fn unload_drops_a_parked_load_from_the_slot_it_targets() {
+    // R2-19-02: the `unload_slots` arm that drops a load PARKED on a targeted slot
+    // (src/scheduler/mod.rs "unloaded by request before it started") had no test in
+    // any file; the sibling `finish`-time strand-arm is pinned twice above, this one
+    // never. Remove the arm and FINDINGS-02 [3] reopens twice over: the parked
+    // waiter hangs (it is answered by nothing else on this path), and the row keeps
+    // the slot's queue place, so it fires on the slot's LATER finish (`finish` ->
+    // `pending.remove` -> `start_pending`) - the load the operator explicitly
+    // abandoned starts after the unload the operator explicitly asked for. Red on
+    // the removed arm: the `jobs_cancelled` fact reads 0 and the parked waiter is
+    // never answered with the unload's Cancelled (the 8 s below trips).
+    let (handle, runtime) = parked_swap_harness();
+    let victim = serve_and_submit_frozen_swap(&handle).await;
+    // Hold the victim's kills BY TARGET (FINDINGS-19 [4]) BEFORE parking: parking
+    // PARKED_MODEL supersede-cancels the frozen swap, and that cancel's reap of the
+    // victim parks on the hold, so the parked row genuinely holds the slot's queue
+    // place while the operator's unload lands.
+    runtime.hold_kill_of(victim.port);
+    let client = handle.clone();
+    let parked = tokio::spawn(async move { client.swap(PARKED_MODEL, CategoryId::Work).await });
+    wait_until(&handle, 5, |s| is_queued(s, PARKED_MODEL)).await;
+
+    // The desired slot set: `on_unload` targets every slot of the category; this
+    // fixture has the one WORK slot. It commits to unload (occupied, carrying a
+    // job), and the command's only cancel fact is the parked row - the swap already
+    // carries `CancelRequested` from the park's supersede, so re-cancelling it is no
+    // new fact (FINDINGS-09 [1]).
+    assert!(
+        matches!(
+            handle
+                .unload(CategoryId::Work)
+                .await
+                .expect("unload accepted"),
+            Reply::Unloaded {
+                unloading: 1,
+                jobs_cancelled: 1
+            }
+        ),
+        "the unload must drop the parked row and commit the occupied slot"
+    );
+
+    // The parked caller is answered here and now, while the kill is still parked -
+    // not when the slot finally frees. With the arm the answer is this Cancelled;
+    // without it the waiter never answers at all.
+    let answer = tokio::time::timeout(Duration::from_secs(8), parked)
+        .await
+        .expect("the unload that dropped the parked load must answer its waiter")
+        .expect("the parked load's task must not panic");
+    let error = answer.expect_err("a load dropped by unload cannot report a load");
+    assert!(
+        matches!(error, SchedulerError::Cancelled(_)),
+        "the parked load must be told it was cancelled, got {error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("unloaded by request before it started"),
+        "the answer must name the unload that dropped it: {error}"
+    );
+
+    let status = handle.status().await.expect("actor alive");
+    let parked_row = status
+        .jobs
+        .iter()
+        .find(|j| j.model == PARKED_MODEL)
+        .expect("the parked load keeps its ledger row");
+    assert!(parked_row.terminal, "{parked_row:?}");
+    assert_eq!(
+        parked_row.outcome.as_deref(),
+        Some("cancelled"),
+        "{parked_row:?}"
+    );
+    assert!(
+        parked_row
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unloaded by request before it started"),
+        "the row records why the queued load was dropped: {parked_row:?}"
+    );
+    assert!(
+        !parked_row.is_fault,
+        "an operator's unload is not a fault: {parked_row:?}"
+    );
+    assert!(
+        !is_queued(&status, PARKED_MODEL),
+        "the unload must have taken the slot's queue place"
+    );
+
+    // Land the parked reap: the swap terminalizes with the victim's release proven,
+    // the slot frees - and the abandoned load must NOT resurrect. Its queue place is
+    // gone, so `finish` finds no pending row to arm: the spawn count is the proof
+    // against the double-spawn half of FINDINGS-02 [3].
+    runtime.release_held_kills();
+    wait_until(&handle, 10, |s| {
+        s.jobs.iter().all(|j| j.terminal)
+            && slot_model(s, CategoryId::Work).iter().all(Option::is_none)
+    })
+    .await;
+    assert_eq!(
+        runtime.spawn_count(),
+        1,
+        "only the resident ever spawned: a dropped parked load must never fire late"
+    );
+    assert_eq!(runtime.server_count(), 0, "the freed card holds no engine");
+    assert!(
+        runtime.is_dead(victim.port).await,
+        "the victim's parked release landed"
+    );
+}
+
+#[tokio::test]
 async fn a_parked_load_has_a_queued_ledger_row_before_it_starts() {
     // FINDINGS-02 [3], the ledger half: `/har/jobs` is what F-5 exists to make honest,
     // and a parked load used to have no row at all while its request hung. The row it
@@ -2097,6 +2209,78 @@ async fn a_parked_load_that_starts_runs_on_the_row_it_queued_with() {
         "the Loaded receipt carries the parked row's id, not a fresh one"
     );
     assert_eq!(b_rows[0].state, SwapState::Serving, "{:?}", b_rows[0]);
+}
+
+#[tokio::test]
+async fn cancel_names_a_stale_job_id_and_answers_done_for_a_terminal_row() {
+    // R2-19-05: the two outer arms of `on_cancel` were never exercised anywhere -
+    // every cancel site in the suite targets a live job. `/har/jobs` offers Cancel
+    // on rows that may have just terminalized and the page reloads across
+    // restarts, so a stale id must get the TYPED `UnknownJob` (the API maps it to
+    // HTTP 404): answering `Done` for a job that never existed is a silent lie.
+    // The terminal row is the other arm: nothing left to cancel is honestly
+    // `Done`, and the row must stay exactly as it was - no re-open, no rewrite.
+    let (handle, _runtime) = harness(
+        config(10),
+        &[("model-a", "mock", CategoryId::Work, Some(4.0))],
+    );
+    handle
+        .swap("model-a", CategoryId::Work)
+        .await
+        .expect("model-a loads");
+    let status = handle.status().await.expect("actor alive");
+    let row_id = job_of(&status, "model-a");
+    let row = status
+        .jobs
+        .iter()
+        .find(|j| j.id == row_id)
+        .expect("invariant: job_of returned an existing row");
+    assert!(row.terminal, "premise: the load row is already terminal");
+    assert_eq!(row.outcome.as_deref(), Some("loaded"), "{row:?}");
+
+    // Stale id: the typed refusal, naming the id the client asked about.
+    let error = handle
+        .cancel(JobId(999_999))
+        .await
+        .expect_err("a never-registered id cannot cancel anything");
+    assert!(
+        matches!(error, SchedulerError::UnknownJob(JobId(999_999))),
+        "a stale id must answer typed UnknownJob, got {error}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "unknown job job-999999",
+        "and name the id"
+    );
+
+    // Terminal row: accepted as `Done`, the ledger untouched - the post-terminal
+    // cancel is a no-op with a receipt, never a fresh job or a re-opened row.
+    assert_eq!(
+        handle.cancel(row_id).await.expect("actor alive"),
+        Reply::Done,
+        "a terminal row owes no work: the arm answers Done"
+    );
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        status.jobs.len(),
+        1,
+        "neither cancel may create a ledger row: {:?}",
+        status.jobs
+    );
+    let row = status
+        .jobs
+        .iter()
+        .find(|j| j.id == row_id)
+        .expect("the terminal row is kept");
+    assert!(
+        row.terminal,
+        "a post-terminal cancel must not re-open the row: {row:?}"
+    );
+    assert_eq!(
+        row.outcome.as_deref(),
+        Some("loaded"),
+        "and must not rewrite its outcome: {row:?}"
+    );
 }
 
 #[tokio::test]
@@ -2335,6 +2519,108 @@ async fn the_idle_sweep_never_starts_an_unload_behind_an_in_flight_job() {
         runtime.spawn_count(),
         1,
         "and nothing was spawned or respawned"
+    );
+}
+
+#[tokio::test]
+async fn the_idle_sweep_tick_fires_while_a_swapping_slot_is_spared() {
+    // R2-19-04, the positive half the guard pin above cannot give itself: its whole
+    // window is also satisfied by a runtime in which the sweep never ticked once
+    // (no fake clock, no tick counter in the status). This test runs the SAME
+    // harness shape with one extra opt-in slot and makes the sweep show its work
+    // inside the same window it must spare the swapping slot: an idle, occupied,
+    // job-free AUX slot must land an `idle timeout` row - that row is the tick's
+    // receipt - and only with that receipt can "no idle-timeout row for HOLD_MODEL"
+    // be read as the guard acting rather than the guard idle. Red on an inverted
+    // `slot.job` filter in `on_tick` (the sweep unloads the WORK slot too); red on
+    // a sweep that never runs (the AUX receipt never lands).
+    let mut cfg = AppConfig {
+        release_timeout_s: 2,
+        ..config(10)
+    };
+    cfg.category_mut(CategoryId::Work)
+        .expect("default config has WORK")
+        .idle_timeout_s = 1;
+    let aux = cfg
+        .category_mut(CategoryId::Aux)
+        .expect("default config has AUX");
+    aux.max_models = 1;
+    aux.idle_timeout_s = 1;
+    let witness = GatedWitness::new(2); // samples: the resident load and the AUX load
+    let (handle, runtime) = harness5_witness(
+        cfg,
+        &[
+            (
+                HOLD_MODEL,
+                "mock-hold-kill",
+                CategoryId::Work,
+                Some(4.0),
+                "",
+            ),
+            (INCOMING_MODEL, "mock", CategoryId::Work, Some(4.0), ""),
+            ("aux-idle", "mock", CategoryId::Aux, Some(4.0), ""),
+        ],
+        Arc::new(witness),
+    );
+    serve_hold_model(&handle).await;
+    handle
+        .swap("aux-idle", CategoryId::Aux)
+        .await
+        .expect("the AUX resident loads");
+    submit_and_vanish(&handle, INCOMING_MODEL, CategoryId::Work).await;
+    wait_until(&handle, 5, |s| {
+        s.jobs
+            .iter()
+            .any(|j| j.model == INCOMING_MODEL && j.state == SwapState::Admit)
+    })
+    .await;
+
+    // The same window as the guard pin: past two sweep ticks (IDLE_TICK is 2 s)
+    // with both occupants aged well over the 1 s threshold. The AUX slot has no
+    // job, so the sweep must fire there; the WORK slot carries the frozen swap,
+    // so the guard must spare it.
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    wait_until(&handle, 5, |s| {
+        s.jobs.iter().any(|j| {
+            j.kind == JobKind::Unload
+                && j.model == "aux-idle"
+                && j.outcome.as_deref() == Some("idle timeout")
+        })
+    })
+    .await;
+    let status = handle.status().await.expect("actor alive");
+    assert!(
+        status
+            .jobs
+            .iter()
+            .any(|j| j.kind == JobKind::Unload && j.model == "aux-idle"),
+        "the tick's receipt: the idle AUX slot's unload row: {:?}",
+        status.jobs
+    );
+    // With the tick proven inside this window, the negatives below are the guard
+    // acting, not the sweep sleeping.
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![Some(HOLD_MODEL.to_string())],
+        "the swapping slot stayed spared while the sweep worked next door"
+    );
+    assert!(
+        !status
+            .jobs
+            .iter()
+            .any(|j| j.kind == JobKind::Unload && j.model == HOLD_MODEL),
+        "and never started one for it: {:?}",
+        status.jobs
+    );
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "only the spared WORK engine still answers"
+    );
+    assert_eq!(
+        runtime.spawn_count(),
+        2,
+        "holder and aux-idle, nothing else"
     );
 }
 

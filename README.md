@@ -159,7 +159,7 @@ it never applies silent defaults.
 |---|---|---|
 | `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN. Set `control_token` first; see Security. |
 | `control_token` | *unset* | When set, every route except the page assets requires it, on `X-Har-Token` or `Authorization: Bearer`. `SIMPLEHAR_TOKEN` overrides it and keeps the secret out of the file. |
-| `categories` | four defaults | Per-category `id`, `public_port`, `max_models` (1-6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), and `engine_ports`. |
+| `categories` | four defaults | Per-category `id`, `public_port`, `max_models` (1-6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), and `engine_ports`. An omitted `evictable_by` and an empty list mean the same: nobody may evict that category. Boot names every non-WORK category left with no evictor. |
 | `vram_total_gb` | `72.0` | Admission ceiling. First start normally **detects it** (NVML total, floored to 0.1 GiB). This default survives only a failed card probe. Every boot warns when the stored value and the card disagree beyond `witness_tolerance_gb`. |
 | `vram_reserve_gb` | `2.0` | A margin that admission never uses. |
 | `witness_tolerance_gb` | `2.0` | Tolerance band for driver lag after a kill. A load may spawn up to this far under the gate. The band absorbs the lag between a confirmed release and the card reading catching up. It is also the settle allowance. |
@@ -202,9 +202,9 @@ edit never leaves a half-written model file in use.
 | `vram_gb` | Declared admission cost in GiB. `fixed` falls back to `file size x 1.15 + 2`. `exact` refuses without it. |
 | `cost` | `fixed` (default): the declared size binds admission. `greedy`: the model offloads to RAM/SSD; the size never refuses, but a launch floor is mandatory. `exact`: an engine-computed number, required and binding. |
 | `launch_only_with_at_least_vram_free` | GiB. The harness refuses the load **before spawn** unless free VRAM reaches this floor. The reserve is deducted. Free VRAM that meets the floor counts only what the harness itself can make free: its own releasable residents. Foreign occupancy never counts toward the floor. When no release the harness can perform would reach the floor, the refusal says so: "No releases allow for the VRAM floor. Check foreign residents." This is the thrash guard for large and greedy quants. Greedy models without this key inherit `greedy_launch_min_free_gb`. Set `0` on a model to opt out. |
-| `cpu_offload` | `true`/`1`/`on` forces `-ngl 0` (**llama only**). Other engines report an `inert_key` hint, and the page offers no CPU control for them. |
+| `cpu_offload` | `true`/`1`/`yes`/`on` forces `-ngl 0` (**llama only**). Other engines report an `inert_key` hint, and the page offers no CPU control for them. |
 | `serve_model` | The expected engine-reported id. A mismatch records a warning; the harness never trusts it. |
-| `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served: `measured_gb` is the high end and `measured_gb_min` the low end. The harness writes them back after a load. When `vram_gb` is absent, admission books `measured_gb`. The `measured_attribution` stamp decides whose number it is, and only these attributions book: `engine_report` (the container's own startup reservation) and `per_process` (the witness attributed the bytes to this engine's process). A `total_diff` figure (a free-memory delta) displays but never books. An **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure, whatever the provenance, because it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes. The identity is the profile name, plus the resolved `kv` for an override line. An edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, because the reservation follows the KV pool. |
+| `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served: `measured_gb` is the high end and `measured_gb_min` the low end. The harness writes them back after a load. When `vram_gb` is absent, admission books `measured_gb`. The `measured_attribution` stamp decides whose number it is, and only these attributions book: `engine_report` (the container's own startup reservation) and `per_process` (the witness attributed the bytes to this engine's process). A `total_diff` figure (a free-memory delta) displays but never books. An **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure, whatever the provenance, because it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes. The identity is the profile name, plus the resolved `kv` for an override line. An edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, because the reservation follows the KV pool. The write-back also records `measured_offload`, the `cpu_offload` state the pair was taken under; a later flip voids the pair. |
 | `is_embedding_model` | A truthy value forces category `EMB`. It conflicts with another explicit category. |
 | `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. |
 | `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. |
@@ -245,7 +245,9 @@ The harness keeps unknown keys for reference and reports them as
 to the harness and are inert: the bind is forced to loopback, and the port
 comes from the category config. `fit_gb` is the exception: it is the engine
 calculator's projection slot (see below). The harness ignores and strips a
-hand-written value and never books it.
+hand-written value and never books it. Two reserved keys are stripped
+silently, with no warning: `bak` is the forensic backup key, and a retired
+`external:` line is consumed and stripped.
 
 **Cost sources** decide which number binds admission, and the strongest
 source wins. The sources are an `engine_report` (the ninfer container's own
@@ -398,8 +400,10 @@ updates over SSE and degrades to polling. The theme is adaptive
 
 ## Tray
 
-The tray has four states: green means loaded, yellow means a swap is in
-flight, gray means idle, and **red means a listener is down**. The menu
+The tray has five states: green means loaded, yellow means a swap is in
+flight, gray means idle, amber means no verdict yet (a listener is pending
+past boot grace, or the harness could not read the scheduler), and **red
+means a listener is down**. The amber reason rides in the tooltip. The menu
 offers Open Web UI, Unload All or per-category unload, and Exit.
 
 ## HTTP control API (control listener, 8708)
@@ -513,8 +517,9 @@ Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" 
   file is never quieter than `INFO`, whatever `SIMPLEHAR_LOG` asks for, and
   it rolls to a new generation at 8 MiB. The last 10 harness log files
   survive, rolled generations included. Engine children keep
-  `logs/<model>-<epoch>.log`, pruned to 50 on a separate budget the harness
-  log can neither consume nor add to. `GET /har/log` reads the in-memory
+  `logs/<model>-<epoch>.log`. Per model, the newest five launches' client
+  captures and container snapshots survive; the harness log budget is
+  separate and can neither consume nor add to that per-model budget. `GET /har/log` reads the in-memory
   ring. A non-zero `log_write_failures` at `/har/status` means the file
   sink died, and this boot leaves an incomplete artifact.
 

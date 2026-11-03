@@ -714,6 +714,17 @@ fn harness_ext(
     witness: Arc<dyn VramWitness>,
     settle_timeout_s: u64,
 ) -> SchedulerHandle {
+    harness_ext_rt(specs, witness, settle_timeout_s).0
+}
+
+/// `harness_ext` with the runtime returned, for tests that must count what was
+/// really spawned and killed (a refusal "before any kill" is only falsifiable by
+/// the kill count, not by the slot state alone).
+fn harness_ext_rt(
+    specs: &[(&str, &[&str])],
+    witness: Arc<dyn VramWitness>,
+    settle_timeout_s: u64,
+) -> (SchedulerHandle, MockRuntime) {
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
@@ -724,13 +735,14 @@ fn harness_ext(
     cfg.category_mut(CategoryId::Aux)
         .expect("default config has AUX")
         .max_models = 1;
-    Scheduler::start(
+    let handle = Scheduler::start(
         cfg,
         write_modelconf_ext(specs),
         adapters,
-        Arc::new(runtime) as Arc<dyn EngineRuntime>,
+        Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
         witness,
-    )
+    );
+    (handle, runtime)
 }
 
 #[tokio::test]
@@ -855,6 +867,141 @@ async fn settle_refuses_when_observed_card_stays_busy() {
     assert!(
         error.contains("52.0 GiB free after release, 67.0 GiB required incl. 2.0 GiB reserve"),
         "explanatory settle error: {error}"
+    );
+    // R2-19-03: the settle-refusal ROW was pinned only inside a hand-written webui
+    // fixture, which cannot fail. Pin the ledger truth beside the error text: the
+    // refused load terminalizes (fail funnel, no spawn: it ends at `Idle`), carries
+    // the settle outcome verbatim, and keeps `is_fault` - the headline rule the
+    // operator reads. A refactor that terminalizes settle refusals with a different
+    // outcome or drops the fault flag goes red here.
+    assert!(job.terminal, "{job:?}");
+    assert_eq!(
+        job.kind,
+        simplehar_se::scheduler::JobKind::Load,
+        "the refused load stays a load row: {job:?}"
+    );
+    assert_eq!(
+        job.outcome.as_deref(),
+        Some("memory did not settle after release"),
+        "the row names the settle outcome verbatim: {job:?}"
+    );
+    assert_eq!(
+        job.state,
+        simplehar_se::scheduler::SwapState::Idle,
+        "the fail funnel (no spawn) walks Failed -> Reap -> Idle: {job:?}"
+    );
+    assert!(
+        job.is_fault,
+        "a refused load is the headline fault: {job:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_launch_floor_refuses_before_any_release() {
+    // R2-19-01 (the Row-10 guard, RULED 2026-11-01): when NO release the harness may
+    // perform can reach the launch floor, `finish_admit` refuses BEFORE any kill and
+    // the refusal names the guard sentence "No releases allow for the VRAM floor.
+    // Check foreign residents". The guard deliberately PRECEDES the release-first
+    // arm: destroying the resident is an accepted cost only for a deficit a release
+    // could actually fix, never for a floor the card denies. Delete the
+    // `!no_releases_reach` condition at src/scheduler/mod.rs:4002 and this very swap
+    // first KILLS the resident, then dies in the settle window on the same
+    // unreachable floor - a model destroyed on paper, with a `settle timeout` error
+    // instead of the guard: every assertion below goes red. The sibling
+    // `greedy_replacement_clears_floor_after_victim_release` has a REACHABLE floor
+    // (guard false), so no other test drives this guard.
+    // Card 72, reserve 2, tolerance 2 (defaults): holder books 20, the card shows 60
+    // used (40 GiB of it foreign). free at admit = 72 - 2 - 60 + 20 = 30.0 - the
+    // resident's own credit is already inside it, and no cross-category victim
+    // exists - so even releasing everything the harness may release leaves
+    // 65 - 2 > 30.0 + 0.0: the floor is unreachable.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0)]);
+    let (handle, runtime) = harness_ext_rt(
+        &[
+            (
+                "holder",
+                &[
+                    "name: holder",
+                    "engine: mock",
+                    "category: WORK",
+                    "vram_gb: 20",
+                ],
+            ),
+            (
+                "greedy65",
+                &[
+                    "name: greedy65",
+                    "engine: mock",
+                    "category: WORK",
+                    "vram_gb: 55",
+                    "cost: greedy",
+                    "launch_only_with_at_least_vram_free: 65",
+                ],
+            ),
+        ],
+        Arc::new(witness.clone()),
+        2,
+    );
+    let Reply::Loaded(holder) = handle
+        .swap("holder", CategoryId::Work)
+        .await
+        .expect("the resident loads onto the empty card")
+    else {
+        panic!("expected Loaded");
+    };
+    // The card after install: holder's 20 plus 40 GiB of foreign occupancy the
+    // harness may never release.
+    witness.set_used(60.0);
+
+    let error = handle
+        .swap("greedy65", CategoryId::Work)
+        .await
+        .expect_err("no release can reach the floor: the guard must refuse");
+    let message = error.to_string();
+    assert!(
+        message.contains("launch floor not met: at least 65.0 GiB free required, free 30.0 GiB"),
+        "the refusal is the floor refusal with the compared figure: {message}"
+    );
+    assert!(
+        message.contains("No releases allow for the VRAM floor. Check foreign residents"),
+        "the refusal must name the guard, not a bare floor miss: {message}"
+    );
+
+    // The ruling's other half: the refusal landed BEFORE any kill. The resident is
+    // untouched - same slot, same engine still answering, nothing ever queued or
+    // released against it.
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        model_of(&status, CategoryId::Work).as_deref(),
+        Some("holder"),
+        "the resident a release could not save stays installed"
+    );
+    let job = job_row(&status, "greedy65");
+    assert!(job.terminal, "{job:?}");
+    assert_eq!(
+        job.outcome.as_deref(),
+        Some("admission refused"),
+        "refused at the gate, never at settle: {job:?}"
+    );
+    assert_eq!(job.gate_target_gib, Some(65.0), "the floor was the gate");
+    assert!(
+        job.victims_released.is_empty(),
+        "the guard refuses before any release: {:?}",
+        job.victims_released
+    );
+    assert_eq!(
+        runtime.spawn_count(),
+        1,
+        "the refused greedy load never spawned"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "only the resident's engine is live"
+    );
+    assert!(
+        !runtime.is_dead(holder.port).await,
+        "no kill ever reached the resident's engine"
     );
 }
 
