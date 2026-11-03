@@ -414,6 +414,25 @@ recorded here so dated references to ARCHIVED still resolve:
   now carries both keys in every gate run, so the knob set cannot silently drift from
   the engine contract again.
 
+- **Implemented** RULED 2026-11-03 (B1): **Basalt option A approved - direct Python server,
+  harness-rendered profile.** (a) Launch `basalt_python -m serve.server` in `basalt_cwd`
+  directly, NOT the source-tree launcher; the adapter supplies `--engine-bin`, `--alias`,
+  `--gpu 0`, and `--parallel`, and the row forces `--host 127.0.0.1` and the slot `--port`.
+  (b) GO the row-19 render shape: the harness renders the `{"server": ...}` profile (the
+  `alias`, the `.basalt` model path, and `parallel` only) and stages it content-addressed
+  under `.simplehar/basalt-profiles`; the spawn rewrites `--config` to exactly the staged
+  file, so the child can never point at another profile. (c) Cost: declared `vram_gb` with
+  `cost: fixed` is the booking source; NO Fit - the engine reports no projection, the
+  direct child is the Python server, so its `per_process` figure is never "the model" and
+  the grandchild's `total_diff` never books. (d) Kill: harness job-object termination owns
+  the Python server, and Basalt's own kill-on-close engine job is the crash-path orphan
+  guarantee; a card run must prove VRAM release and no orphan. Rejected: variant B
+  (`basalt.exe serve` - launcher layer plus source-tree coupling) and variant C (strata
+  profile reuse - different schema and flag ownership). The single-writer scheduler
+  semantics are unchanged. Implemented in the Basalt adapter; the operator card run
+  remains the final acceptance.
+  | 2026-11-03 | `TASK-BASALT`
+
 - **Accepted** Governance D1-D11 adopted 2026-11-02: durable core tracked, live state local, DESIGN
   historical, decisions moved to `docs/architecture/DECISIONS.md`, maximum two working
   subagents, narrative commits, cardless CI, local gotchas/findings, live-layer backup,

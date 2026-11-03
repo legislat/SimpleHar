@@ -5,6 +5,7 @@
 //! constructible from data alone — no adapter may hide a decision a template could
 //! express. Readiness is typed, never a string heuristic (defect D7/E1 class).
 
+pub(crate) mod basalt;
 pub(crate) mod fit;
 pub mod llama;
 pub mod mock;
@@ -67,8 +68,37 @@ pub enum ReadinessSpec {
         /// Top-level JSON boolean that must not be `false`.
         field: String,
     },
+    /// `GET path` must answer `expect_status` **and** the JSON body at `pointer`
+    /// (a JSON Pointer, e.g. `/data/0/id`) must be exactly the string `expect`.
+    /// Fail-CLOSED, the inverse posture of [`ReadinessSpec::HttpFlag`]: a body
+    /// that is not JSON, a missing pointer, or a non-string value is `NotYet`,
+    /// never Ready — the served id is verified, not trusted (basalt `/v1/models`
+    /// alias check, `TASK-BASALT` stage 1).
+    HttpString {
+        /// Probe path.
+        path: String,
+        /// Required status code.
+        expect_status: u16,
+        /// JSON Pointer whose string value is required.
+        pointer: String,
+        /// The exact string the pointer must hold.
+        expect: String,
+    },
     /// Both specs in order (e.g. `/health` then `/v1/models` for ninfer).
     Then(Box<ReadinessSpec>, Box<ReadinessSpec>),
+}
+
+/// A harness-rendered engine profile, tagged with the engine that rendered it.
+/// The runtime resolves its staging root from the tag — the `custody_data_roots`
+/// first cell of the named row — so one engine's bytes can never stage into
+/// another engine's custody directory (`TASK-BASALT` stage 1 generalized the
+/// strata-only door of ruling 19 into a per-engine one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderedProfile {
+    /// The id of the engine whose adapter rendered these bytes.
+    pub engine: &'static str,
+    /// The rendered bytes; the staged file name binds them by content address.
+    pub text: String,
 }
 
 /// Everything the engine-blind spawn/kill/reap machinery needs (Step 7).
@@ -100,17 +130,18 @@ pub struct LaunchSpec {
     /// `Some` demands argv shape `[..., "bash", <script>, ...]`. `None` for process
     /// engines and for a launch that runs the operator's own script verbatim.
     pub script: Option<String>,
-    /// A strata profile JSON the runtime must stage into the harness's own
+    /// A profile JSON the runtime must stage into the harness's own
     /// profile root and pass via `--config` **instead of** the operator path named
-    /// in argv (strata template mode, operator ruling 2026-11-02 row 19): the
-    /// adapter renders the full profile from validated row-yaml values, so the
-    /// child can only ever read a file the harness wrote — `host`/`port`/`key`
-    /// are absent by construction and the bind/port stay harness-forced argv.
-    /// The runtime stages the bytes content-addressed (atomic write, keep-N
-    /// prune, hash-in-name verified against the bytes) and rewrites the
-    /// `--config` value to the staged absolute path before spawning. `None` for
-    /// every other engine.
-    pub rendered_profile: Option<String>,
+    /// in argv (strata template mode, operator ruling 2026-11-02 row 19; engine-
+    /// tagged for basalt in `TASK-BASALT` stage 1): the adapter renders the full
+    /// profile from validated row-yaml values, so the child can only ever read a
+    /// file the harness wrote — `host`/`port`/`key` are absent by construction and
+    /// the bind/port stay harness-forced argv. The runtime stages the bytes
+    /// content-addressed (atomic write, keep-N prune, hash-in-name verified
+    /// against the bytes) under the root its [`RenderedProfile::engine`] tag names
+    /// and rewrites the `--config` value to the staged absolute path before
+    /// spawning. `None` for every other engine.
+    pub rendered_profile: Option<RenderedProfile>,
     /// The engine id when this launch must be recorded in the harness custody
     /// sidecar (chunk 10 slice 10b): the runtime writes the started child's
     /// pid + start-time token + slot port + instance name (the model, as
@@ -201,9 +232,9 @@ pub trait EngineAdapter: Send + Sync {
 /// `Then` chains probe steps in order: the first non-`Ready` step short-circuits.
 pub async fn http_probe(client: &reqwest::Client, port: u16, readiness: &ReadinessSpec) -> Probe {
     match readiness {
-        ReadinessSpec::Http { .. } | ReadinessSpec::HttpFlag { .. } => {
-            probe_one(client, port, readiness).await
-        }
+        ReadinessSpec::Http { .. }
+        | ReadinessSpec::HttpFlag { .. }
+        | ReadinessSpec::HttpString { .. } => probe_one(client, port, readiness).await,
         ReadinessSpec::Then(first, second) => {
             let first = probe_one(client, port, first).await;
             if first != Probe::Ready {
@@ -214,7 +245,8 @@ pub async fn http_probe(client: &reqwest::Client, port: u16, readiness: &Readine
     }
 }
 
-/// One leaf expectation (`Http` or `HttpFlag`); a nested `Then` is a contract bug.
+/// One leaf expectation (`Http`, `HttpFlag` or `HttpString`); a nested `Then` is
+/// a contract bug.
 async fn probe_one(client: &reqwest::Client, port: u16, spec: &ReadinessSpec) -> Probe {
     let (path, expect) = match spec {
         ReadinessSpec::Http {
@@ -222,6 +254,11 @@ async fn probe_one(client: &reqwest::Client, port: u16, spec: &ReadinessSpec) ->
             expect_status,
         }
         | ReadinessSpec::HttpFlag {
+            path,
+            expect_status,
+            ..
+        }
+        | ReadinessSpec::HttpString {
             path,
             expect_status,
             ..
@@ -247,6 +284,28 @@ async fn probe_one(client: &reqwest::Client, port: u16, spec: &ReadinessSpec) ->
         };
     }
     let ReadinessSpec::HttpFlag { field, .. } = spec else {
+        // The served-id match (basalt): fail-closed — only a string exactly
+        // equal to `expect` at `pointer` is Ready; anything else keeps waiting
+        // inside the deadline (a wrong id is as un-ready as no id).
+        if let ReadinessSpec::HttpString {
+            pointer, expect, ..
+        } = spec
+        {
+            return match response.json::<serde_json::Value>().await {
+                Ok(body) => match body.pointer(pointer) {
+                    Some(serde_json::Value::String(found)) if found == expect => Probe::Ready,
+                    Some(found) => Probe::NotYet {
+                        reason: format!("`{pointer}` is `{found}`, not the expected `{expect}`"),
+                    },
+                    None => Probe::NotYet {
+                        reason: format!("`{pointer}` is absent from the body"),
+                    },
+                },
+                Err(error) => Probe::NotYet {
+                    reason: format!("the body is not JSON yet: {error}"),
+                },
+            };
+        }
         return Probe::Ready;
     };
     // Status matched and a flag is required: honor `field` only when the body is
@@ -408,8 +467,8 @@ pub trait EngineRuntime: Send + Sync {
     }
 }
 
-/// Production boot's adapter map (FINDINGS-10 [3]): llama + strata + ninfer always,
-/// the test-facing `mock` adapter only on the config's explicit
+/// Production boot's adapter map (FINDINGS-10 [3]): llama + strata + basalt +
+/// ninfer always, the test-facing `mock` adapter only on the config's explicit
 /// `allow_mock_engine` grant (its argv is the bare name `mock-engine`, which
 /// `CreateProcessW` resolves through the harness's own directories). A stray
 /// `engine: mock` yaml without the grant therefore meets an adapter-lookup
@@ -443,6 +502,7 @@ pub fn default_adapters(
             config.strata_cwd(),
         )),
     );
+    adapters.insert("basalt".to_string(), Arc::new(basalt::BasaltAdapter));
     adapters.insert(
         "ninfer".to_string(),
         Arc::new(ninfer::NinferAdapter::new(
@@ -558,6 +618,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_string_pointer_match_is_ready() {
+        let port = serve_health(200, r#"{"object":"list","data":[{"id":"alias-x"}]}"#).await;
+        let spec = ReadinessSpec::HttpString {
+            path: "/health".to_string(),
+            expect_status: 200,
+            pointer: "/data/0/id".to_string(),
+            expect: "alias-x".to_string(),
+        };
+        assert_eq!(http_probe(&client(), port, &spec).await, Probe::Ready);
+    }
+
+    #[tokio::test]
+    async fn http_string_mismatch_is_not_ready() {
+        let port = serve_health(200, r#"{"data":[{"id":"other"}]}"#).await;
+        let spec = ReadinessSpec::HttpString {
+            path: "/health".to_string(),
+            expect_status: 200,
+            pointer: "/data/0/id".to_string(),
+            expect: "alias-x".to_string(),
+        };
+        assert!(matches!(
+            http_probe(&client(), port, &spec).await,
+            Probe::NotYet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_string_missing_pointer_is_not_ready() {
+        let port = serve_health(200, r#"{"data":[]}"#).await;
+        let spec = ReadinessSpec::HttpString {
+            path: "/health".to_string(),
+            expect_status: 200,
+            pointer: "/data/0/id".to_string(),
+            expect: "alias-x".to_string(),
+        };
+        assert!(matches!(
+            http_probe(&client(), port, &spec).await,
+            Probe::NotYet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_string_non_string_value_is_not_ready() {
+        let port = serve_health(200, r#"{"data":[{"id":7}]}"#).await;
+        let spec = ReadinessSpec::HttpString {
+            path: "/health".to_string(),
+            expect_status: 200,
+            pointer: "/data/0/id".to_string(),
+            expect: "7".to_string(),
+        };
+        assert!(matches!(
+            http_probe(&client(), port, &spec).await,
+            Probe::NotYet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_string_non_json_body_is_not_ready() {
+        let port = serve_health(200, "not json at all").await;
+        let spec = ReadinessSpec::HttpString {
+            path: "/health".to_string(),
+            expect_status: 200,
+            pointer: "/data/0/id".to_string(),
+            expect: "alias-x".to_string(),
+        };
+        assert!(matches!(
+            http_probe(&client(), port, &spec).await,
+            Probe::NotYet { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_string_wrong_status_is_not_ready() {
+        let port = serve_health(503, r#"{"data":[{"id":"alias-x"}]}"#).await;
+        let spec = ReadinessSpec::HttpString {
+            path: "/health".to_string(),
+            expect_status: 200,
+            pointer: "/data/0/id".to_string(),
+            expect: "alias-x".to_string(),
+        };
+        assert!(matches!(
+            http_probe(&client(), port, &spec).await,
+            Probe::NotYet { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn then_chains_in_order() {
         let port = serve_health(200, r#"{"loaded":false}"#).await;
         let spec = ReadinessSpec::Then(
@@ -645,14 +792,14 @@ mod tests {
         let ids: Vec<String> = default_adapters(&config).into_keys().collect();
         assert_eq!(
             ids,
-            ["llama", "ninfer", "strata"],
+            ["basalt", "llama", "ninfer", "strata"],
             "default boot has no mock"
         );
         config.allow_mock_engine = true;
         let ids: Vec<String> = default_adapters(&config).into_keys().collect();
         assert_eq!(
             ids,
-            ["llama", "mock", "ninfer", "strata"],
+            ["basalt", "llama", "mock", "ninfer", "strata"],
             "the grant adds mock"
         );
     }

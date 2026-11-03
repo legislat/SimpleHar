@@ -47,6 +47,13 @@ pub(crate) const NINFER_KEYS_ROOT: &str = "$HOME/.simplehar/keys";
 /// path from the single source that this cell spells.
 pub(crate) const STRATA_RENDERED_PROFILES_ROOT: &str = ".simplehar/strata-profiles";
 
+/// The Windows directory harness-rendered basalt profiles stage into, as the
+/// tail below the executable's own directory — the same exe-adjacent custody
+/// posture as [`STRATA_RENDERED_PROFILES_ROOT`], one directory per engine so a
+/// basalt launch can never stage into strata's pool or the reverse
+/// (`TASK-BASALT` stage 1; `process::rendered_profiles_dir` resolves it).
+pub(crate) const BASALT_RENDERED_PROFILES_ROOT: &str = ".simplehar/basalt-profiles";
+
 /// The CLOSED allow-list of `extra_args` option words an operator may pass
 /// through to llama-server (FINDINGS2-0910 [1]): the inversion of the old
 /// `HARNESS_OWNED_FLAGS` denial list, which could only ever name ten of the
@@ -256,6 +263,209 @@ pub(crate) fn ninfer_serve_arg_owner(flag: &str) -> Option<&'static str> {
         .map(|(_, owner)| *owner)
 }
 
+/// The basalt `serve.server` flags a yaml may never contribute through
+/// `basalt_engine_args`: the ones the harness writes itself (the bind, the
+/// slot port, the staged profile, the weights, the engine binary, the alias,
+/// the pool size, the interpreter, the key), the load/unload and memory-budget
+/// decisions the scheduler and the witness own, and the request-time/CORS/
+/// logging surface the harness keeps off the launch line. Unlike ninfer, the
+/// match is EXACT on the option name: the upstream parser runs
+/// `allow_abbrev=False`, so a prefix is an unknown option to the server, never
+/// an alias (the abbreviation door is closed only where a parser opens it).
+pub(crate) const BASALT_FORBIDDEN_SERVER_FLAGS: &[&str] = &[
+    "--model",
+    "--engine-bin",
+    "--alias",
+    "--parallel",
+    "--host",
+    "--port",
+    "--config",
+    "--gpu",
+    "--python",
+    "--api-key",
+    "--mock-engine",
+    "--script",
+    "--slot-full-context",
+    "--vision",
+    "--tokenizer",
+    "--open",
+    "--fit-max-tokens",
+    "--grammar",
+    "--no-grammar",
+    "--allowed-host",
+    "--cors-origin",
+    "--debug",
+    "--request-lines",
+    "--lazy",
+    "--idle-unload",
+    "--idle-sleep",
+    "--temperature",
+    "--top-p",
+    "--top-k",
+    "--min-p",
+    "--presence-penalty",
+    "--frequency-penalty",
+    "--repetition-penalty",
+    "--penalty-last-n",
+    "--seed",
+    "--min-free-vram-mib",
+    "--reasoning-budget-tokens",
+    "--thinking-loop-tokens",
+    "--answer-room",
+    "--no-answer-room",
+];
+
+/// Which harness mechanism owns each flag a refused `basalt_engine_args` word
+/// names: the refusal tells the operator where the decision lives, one entry
+/// per [`BASALT_FORBIDDEN_SERVER_FLAGS`] member (the table test fails on drift).
+pub(crate) const BASALT_SERVER_ARG_OWNERS: &[(&str, &str)] = &[
+    ("--model", "`model:` names the weights"),
+    ("--engine-bin", "`basalt_exe:` names the engine binary"),
+    ("--alias", "`serve_model:` owns the served id"),
+    ("--parallel", "`basalt_parallel:` owns the worker pool"),
+    ("--host", "the bind is harness-forced (loopback, \u{a7}5)"),
+    (
+        "--port",
+        "the port is harness-assigned from category config",
+    ),
+    (
+        "--config",
+        "the profile is the harness-rendered file staged under the basalt custody root",
+    ),
+    (
+        "--gpu",
+        "GPU placement is the harness witness's (one GPU, \u{a7}5)",
+    ),
+    ("--python", "`basalt_python:` names the interpreter"),
+    ("--api-key", "request authentication is harness-owned"),
+    (
+        "--mock-engine",
+        "the launched program is the harness's choice",
+    ),
+    ("--script", "the launched program is the harness's choice"),
+    (
+        "--slot-full-context",
+        "the served context is a harness capacity decision",
+    ),
+    ("--vision", "vision files are a harness decision, not argv"),
+    (
+        "--tokenizer",
+        "the tokenizer rides the weights the harness names",
+    ),
+    (
+        "--open",
+        "a serving engine never opens a browser on the operator's machine",
+    ),
+    (
+        "--fit-max-tokens",
+        "the memory budget is the harness witness's (\u{a7}5)",
+    ),
+    (
+        "--grammar",
+        "grammar enforcement is a request-time decision, not launch argv",
+    ),
+    (
+        "--no-grammar",
+        "grammar enforcement is a request-time decision, not launch argv",
+    ),
+    (
+        "--allowed-host",
+        "bind and host-header policy is harness-forced (\u{a7}5)",
+    ),
+    (
+        "--cors-origin",
+        "CORS policy is harness-owned (loopback only)",
+    ),
+    ("--debug", "log discipline is harness-owned"),
+    ("--request-lines", "log discipline is harness-owned"),
+    ("--lazy", "load timing is the harness scheduler's decision"),
+    (
+        "--idle-unload",
+        "unload timing is the harness scheduler's decision",
+    ),
+    (
+        "--idle-sleep",
+        "unload timing is the harness scheduler's decision",
+    ),
+    (
+        "--temperature",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--top-p",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--top-k",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--min-p",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--presence-penalty",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--frequency-penalty",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--repetition-penalty",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--penalty-last-n",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--seed",
+        "sampling defaults are request-time values, not launch argv",
+    ),
+    (
+        "--min-free-vram-mib",
+        "the memory budget is the harness witness's (\u{a7}5)",
+    ),
+    (
+        "--reasoning-budget-tokens",
+        "generation budgets are request-time values, not launch argv",
+    ),
+    (
+        "--thinking-loop-tokens",
+        "generation budgets are request-time values, not launch argv",
+    ),
+    (
+        "--answer-room",
+        "generation budgets are request-time values, not launch argv",
+    ),
+    (
+        "--no-answer-room",
+        "generation budgets are request-time values, not launch argv",
+    ),
+];
+
+/// The denylist match a `basalt_engine_args` option name fails: EXACT equality
+/// with a server-owned flag (the upstream `allow_abbrev=False` parser resolves
+/// no prefixes, so no abbreviation door exists to close). `None` = the name is
+/// not harness-owned.
+#[must_use]
+pub(crate) fn forbidden_basalt_server_flag(name: &str) -> Option<&'static str> {
+    BASALT_FORBIDDEN_SERVER_FLAGS
+        .iter()
+        .copied()
+        .find(|flag| *flag == name)
+}
+
+/// Where the decision behind a refused `basalt_engine_args` flag actually lives.
+#[must_use]
+pub(crate) fn basalt_server_arg_owner(flag: &str) -> Option<&'static str> {
+    BASALT_SERVER_ARG_OWNERS
+        .iter()
+        .find(|(name, _)| *name == flag)
+        .map(|(_, owner)| *owner)
+}
+
 /// The harness mechanism that owns each decision a refused `extra_args` word
 /// moves (slice 10c): the refusal names the yaml key or forced line that owns
 /// it, so the operator edits the live key instead of fighting the closed list.
@@ -395,6 +605,14 @@ const STRATA_KNOBS: &[&str] = &[
     "strata_vision",
     "strata_sampling",
     "strata_uncensored",
+];
+
+const BASALT_KNOBS: &[&str] = &[
+    "basalt_python",
+    "basalt_cwd",
+    "basalt_exe",
+    "basalt_parallel",
+    "basalt_engine_args",
 ];
 
 const NINFER_KNOBS: &[&str] = &[
@@ -730,6 +948,53 @@ static STRATA_ROW: EnginePolicy = EnginePolicy {
     supports_fit: false,
 };
 
+static BASALT_ROW: EnginePolicy = EnginePolicy {
+    id: "basalt",
+    forced_fields: &[
+        ForcedField {
+            flag: "-m",
+            value: ForcedValue::Literal("serve.server"),
+        },
+        ForcedField {
+            flag: "--host",
+            // Same loopback literal the llama and strata rows force: the bind
+            // is harness-forced argv and the rendered profile carries no
+            // `host` key at all (§5, row 19 posture).
+            value: ForcedValue::Literal(LLAMA_ENGINE_HOST),
+        },
+        ForcedField {
+            flag: "--config",
+            value: ForcedValue::OperatorData,
+        },
+        ForcedField {
+            flag: "--port",
+            value: ForcedValue::SlotPort,
+        },
+    ],
+    // Exact-name denylist (the upstream parser resolves no abbreviations);
+    // enforced twice: by the row's `extra_words` contract at scan/validate
+    // time and by the adapter at render (defense in depth).
+    forbidden_words: BASALT_FORBIDDEN_SERVER_FLAGS,
+    allow_words: &[],
+    extra_words: Some(ExtraWordsContract {
+        yaml_key: "basalt_engine_args",
+        check: super::basalt::check_engine_args_value,
+    }),
+    knobs: BASALT_KNOBS,
+    path_markers: &["--config"],
+    custody_exec_roots: &[],
+    // The data cell is load-bearing from the first stage: the engine's profile
+    // is the harness-rendered file under [`BASALT_RENDERED_PROFILES_ROOT`],
+    // and the spawn rewrites `--config` to exactly that path — mirroring the
+    // strata row 19 door, engine-tagged.
+    custody_data_roots: &[BASALT_RENDERED_PROFILES_ROOT],
+    serve_template: None,
+    // No harness-config defaults exist for basalt (the row names every path
+    // explicitly); the config-parity test alarms if that ever changes.
+    config_knobs: &[],
+    supports_fit: false,
+};
+
 static NINFER_ROW: EnginePolicy = EnginePolicy {
     id: crate::ownership::NINFER_ENGINE,
     // Every forced line rides inside the canonical script; the argv only
@@ -750,7 +1015,7 @@ static NINFER_ROW: EnginePolicy = EnginePolicy {
     supports_fit: false,
 };
 
-static POLICIES: &[&EnginePolicy] = &[&MOCK_ROW, &LLAMA_ROW, &STRATA_ROW, &NINFER_ROW];
+static POLICIES: &[&EnginePolicy] = &[&MOCK_ROW, &LLAMA_ROW, &STRATA_ROW, &BASALT_ROW, &NINFER_ROW];
 
 /// Every row of the compiled-in table, in table order. The acceptance and
 /// parity tests iterate it; production code always resolves its own row by id.
@@ -965,7 +1230,14 @@ mod tests {
         out.push('\u{1}');
         out.push_str(spec.script.as_deref().unwrap_or(""));
         out.push('\u{1}');
-        out.push_str(spec.rendered_profile.as_deref().unwrap_or(""));
+        match spec.rendered_profile.as_ref() {
+            None => {}
+            Some(profile) => {
+                out.push_str(profile.engine);
+                out.push(':');
+                out.push_str(&profile.text);
+            }
+        }
         out.push('\u{1}');
         out.push_str(spec.custody.as_deref().unwrap_or(""));
         out
@@ -990,6 +1262,9 @@ mod tests {
             )
             .spec(entry, 18109)
             .expect("strata renders"),
+            "basalt" => crate::engine::basalt::BasaltAdapter
+                .spec(entry, 18109)
+                .expect("basalt renders"),
             "ninfer" => crate::engine::ninfer::NinferAdapter::new("Ubuntu", "ops")
                 .spec(entry, 18109)
                 .expect("ninfer renders"),
@@ -1026,6 +1301,30 @@ mod tests {
                     ],
                 );
                 model.serve_model = Some("strata-policy".to_string());
+                model
+            }
+            "basalt" => {
+                let dir = crate::testutil::temp_dir("policy-basalt");
+                let weights = dir.join("m.basalt");
+                std::fs::write(&weights, b"w").expect("weights fixture");
+                std::fs::write(dir.join("python.exe"), b"p").expect("python fixture");
+                std::fs::write(dir.join("basalt-engine.exe"), b"e").expect("engine fixture");
+                let mut model = entry(
+                    "basalt",
+                    &[
+                        (
+                            "basalt_python",
+                            dir.join("python.exe").to_str().expect("utf-8"),
+                        ),
+                        (
+                            "basalt_exe",
+                            dir.join("basalt-engine.exe").to_str().expect("utf-8"),
+                        ),
+                        ("basalt_cwd", dir.to_str().expect("utf-8")),
+                    ],
+                );
+                model.model_ref = Some(weights.to_str().expect("utf-8").to_string());
+                model.serve_model = Some("basalt-policy".to_string());
                 model
             }
             "ninfer" => entry(
@@ -1125,6 +1424,48 @@ mod tests {
                                 !serve_args_line(&script).contains(word),
                                 "ninfer L3 admitted forbidden `{word}`: {script}"
                             );
+                        }
+                    }
+                    "basalt" => {
+                        // Exact-name denylist: the hostile word rides as
+                        // `word=value`, the same token name the server would
+                        // parse, and the refusal is demanded (the row's
+                        // `extra_words` contract runs at validate and at
+                        // render), so absence-from-L3 is proven by the refusal.
+                        let dir = crate::testutil::temp_dir("policy-basalt-hostile");
+                        std::fs::write(dir.join("python.exe"), b"p").expect("python fixture");
+                        std::fs::write(dir.join("basalt-engine.exe"), b"e")
+                            .expect("engine fixture");
+                        std::fs::write(dir.join("m.basalt"), b"w").expect("weights fixture");
+                        let mut hostile = entry(
+                            "basalt",
+                            &[
+                                (
+                                    "basalt_python",
+                                    dir.join("python.exe").to_str().expect("utf-8"),
+                                ),
+                                (
+                                    "basalt_exe",
+                                    dir.join("basalt-engine.exe").to_str().expect("utf-8"),
+                                ),
+                                ("basalt_cwd", dir.to_str().expect("utf-8")),
+                                ("basalt_engine_args", &format!("{word}=victim")),
+                            ],
+                        );
+                        hostile.model_ref =
+                            Some(dir.join("m.basalt").to_str().expect("utf-8").to_string());
+                        hostile.serve_model = Some("basalt-hostile".to_string());
+                        let spec = crate::engine::basalt::BasaltAdapter.spec(&hostile, 18109);
+                        match spec {
+                            Ok(spec) => assert!(
+                                !spec.argv.iter().any(|t| t.starts_with(word)),
+                                "basalt L3 admitted forbidden `{word}`: {:?}",
+                                spec.argv
+                            ),
+                            Err(error) => assert!(
+                                error.to_string().contains(word),
+                                "basalt refused `{word}` without naming it: {error}"
+                            ),
                         }
                     }
                     other => {
@@ -1386,7 +1727,7 @@ mod tests {
         }
     }
 
-    /// "One mechanism, four instances": the table and the adapter registry
+    /// "One mechanism, five instances": the table and the adapter registry
     /// must know the same engine ids — a new adapter without a row, or a row
     /// without an adapter, is exactly the fork this chunk exists to close.
     #[test]
@@ -1458,14 +1799,15 @@ mod tests {
     }
 
     /// Full `extra_args` enforcement (slice 10c): the scan-facing contract
-    /// exists exactly on the two rows that admit operator words, each on its
-    /// own key — and it refuses the same words the render refuses, so the file
+    /// exists exactly on the rows that admit operator words, each on its own
+    /// key — and it refuses the same words the render refuses, so the file
     /// dies at rescan rather than at spawn.
     #[test]
     fn only_the_word_admitting_rows_carry_an_extra_words_contract() {
         let cases = [
             ("llama", "extra_args", "--api-key sekrit"),
             ("ninfer", "ninfer_serve_args", "--max-context 999"),
+            ("basalt", "basalt_engine_args", "--host=0.0.0.0"),
         ];
         for (id, key, hostile) in cases {
             let row = engine_policy(id).expect("row");
@@ -1504,6 +1846,12 @@ mod tests {
                 "`ninfer_serve_args` flag `{flag}` has no owner sentence"
             );
         }
+        for flag in BASALT_FORBIDDEN_SERVER_FLAGS {
+            assert!(
+                basalt_server_arg_owner(flag).is_some(),
+                "`basalt_engine_args` flag `{flag}` has no owner sentence"
+            );
+        }
         // Abbreviations resolve through the denylist matcher to their full
         // flag (the parser-resolves-prefixes rule), so they inherit the owner.
         let abbreviated = forbidden_serve_flag("--max-cont").expect("--max-cont is --max-context");
@@ -1531,5 +1879,76 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             "the ninfer owner table must carry exactly one entry per forbidden flag"
         );
+        let owners: BTreeSet<&str> = BASALT_SERVER_ARG_OWNERS.iter().map(|(f, _)| *f).collect();
+        assert_eq!(
+            owners,
+            BASALT_FORBIDDEN_SERVER_FLAGS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "the basalt owner table must carry exactly one entry per forbidden flag"
+        );
+    }
+
+    /// R2/BS-03: the deny-list test above iterates the list itself, so deleting
+    /// a member would keep it green. This independent pin names every upstream
+    /// `serve.server` option; removing one from the production list, or letting
+    /// one past the extra-args check, turns this RED.
+    #[test]
+    fn basalt_server_owned_flags_are_pinned_by_name() {
+        for flag in [
+            "--mock-engine",
+            "--model",
+            "--engine-bin",
+            "--alias",
+            "--parallel",
+            "--slot-full-context",
+            "--config",
+            "--vision",
+            "--host",
+            "--script",
+            "--port",
+            "--gpu",
+            "--tokenizer",
+            "--open",
+            "--fit-max-tokens",
+            "--grammar",
+            "--no-grammar",
+            "--temperature",
+            "--top-p",
+            "--top-k",
+            "--min-p",
+            "--presence-penalty",
+            "--frequency-penalty",
+            "--repetition-penalty",
+            "--penalty-last-n",
+            "--seed",
+            "--api-key",
+            "--allowed-host",
+            "--cors-origin",
+            "--debug",
+            "--request-lines",
+            "--lazy",
+            "--idle-unload",
+            "--idle-sleep",
+            "--min-free-vram-mib",
+            "--reasoning-budget-tokens",
+            "--thinking-loop-tokens",
+            "--answer-room",
+            "--no-answer-room",
+        ] {
+            assert!(
+                BASALT_FORBIDDEN_SERVER_FLAGS.contains(&flag),
+                "`{flag}` is a server-owned basalt flag and must stay in the deny-list"
+            );
+            assert!(
+                basalt_server_arg_owner(flag).is_some(),
+                "`{flag}` must keep an owner sentence"
+            );
+            assert!(
+                crate::engine::basalt::check_engine_args_value("basalt", "model", flag).is_err(),
+                "`{flag}` must be refused through `basalt_engine_args`"
+            );
+        }
     }
 }

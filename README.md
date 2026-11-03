@@ -31,17 +31,18 @@ Current release: **v1.1.0**. Windows 10/11, one NVIDIA GPU, single user.
 ## What it is
 
 SimpleHar SE starts, monitors, and stops your engine processes: llama.cpp `llama-server`,
-strata Python servers, and ninfer GPU containers. One scheduler swaps models between four
-category listeners and is the only writer of scheduler state. The harness admits loads on
-the reading the card itself gives (the witness), minus a reserve, refuses to overcommit,
-and names its reasons. No engine starts at boot: an engine starts only when a model loads.
+strata and basalt Python servers, and ninfer GPU containers. One scheduler swaps models
+between four category listeners and is the only writer of scheduler state. The harness
+admits loads on the reading the card itself gives (the witness), minus a reserve, refuses
+to overcommit, and names its reasons. No engine starts at boot: an engine starts only when
+a model loads.
 
 ## Scope and non-goals
 
 - Not a model downloader. You place model files on disk yourself.
 - Not a multi-user server. One user, one machine, one GPU.
 - Windows only (10/11). No Linux or macOS host support.
-- Not an inference engine. It supervises llama.cpp, strata, and ninfer.
+- Not an inference engine. It supervises llama.cpp, strata, basalt, and ninfer.
 
 ## Who this is for
 
@@ -107,7 +108,7 @@ model on the page: the harness starts its engine and the slot turns loaded.
 <summary>Terms</summary>
 
 - **harness**: this application, SimpleHar SE.
-- **engine**: an inference server the harness starts and stops (`llama`, `strata`, `ninfer`).
+- **engine**: an inference server the harness starts and stops (`llama`, `strata`, `basalt`, `ninfer`).
 - **category**: one of the four model groups (WORK, RP, AUX, EMB).
 - **listener**: the public HTTP port that serves one category.
 - **slot**: one model position inside a category.
@@ -124,11 +125,12 @@ model on the page: the harness starts its engine and the slot turns loaded.
 |---|---|---|
 | `llama` (default) | a native `llama-server.exe` process per model, serving a GGUF file | [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server.exe` (default expected at `C:\Inference\llama.cpp\llama-server.exe`, configurable) |
 | `strata` | `python -m serve.server --engine strata` in a Python venv, on a harness-rendered profile | A strata install with its virtualenv (default `C:\Strata\.venv\Scripts\python.exe`, cwd `C:\Strata`). The model row's yaml carries the profile fields, and the harness renders the JSON. |
+| `basalt` | `python -m serve.server` in a Python venv, on a harness-rendered profile | A Basalt install with its venv and engine binary. The model row's yaml names the interpreter, the source root, and the binary, and the harness renders the profile JSON. |
 | `ninfer` | a GPU container inside WSL2. The harness renders and stages the autostart script, starts the container, and reaps it by container name. | A WSL2 distro and Docker, plus the ninfer container image. Set `wsl_distro` / `wsl_user` in the config. |
 
 - Windows 10/11 with an NVIDIA GPU; GPU memory is read through NVML with `nvidia-smi` fallback.
 - WSL2 and Docker only for `ninfer`; the Rust toolchain only for source builds.
-- One GGUF file per `llama` model, or the engine artifact for `strata` and `ninfer`.
+- One GGUF file per `llama` model, or the engine artifact for `strata`, `basalt`, and `ninfer`.
 
 ## Categories and ports
 
@@ -234,8 +236,8 @@ With no token set the harness has **no authentication**. `internal_host: 0.0.0.0
 to LAN) then trusts every machine on the segment to load and unload models and to drive
 the GPUs; it warns loudly at boot, and the default is loopback only. The token guards
 only the harness's own listeners: engine ports have no harness auth, so the harness forces
-llama and strata engines to loopback regardless of `internal_host`, and every ninfer
-launch publishes loopback-only.
+llama, strata, and basalt engines to loopback regardless of `internal_host`, and every
+ninfer launch publishes loopback-only.
 
 ## Docs, help, and license
 

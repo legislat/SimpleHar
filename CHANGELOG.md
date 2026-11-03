@@ -18,6 +18,12 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## Unreleased
 
+### Added
+
+- Basalt engine support: direct Python server launch with a harness-rendered
+  server profile, `/health` loaded and `/v1/models` alias readiness, declared
+  `vram_gb` booking, and job-object release. The operator card run remains.
+
 ### Changed
 
 - Split the scheduler's `ActorState` method clusters into child modules:

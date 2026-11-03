@@ -50,6 +50,7 @@ The harness keeps its state beside the exe:
 | `ModelConf\` | The catalog directory. Default `<exe dir>\ModelConf`. |
 | `logs\` | The harness log and the engine child logs. |
 | `.simplehar\strata-profiles\` | The rendered strata profile JSONs, written at each load. |
+| `.simplehar\basalt-profiles\` | The rendered basalt profile JSONs, written at each load. |
 | `ninfer-claims.json` | The ninfer claim ledger beside the harness exe. |
 | `ninfer-autostart-template.sh` | The readable copy of the ninfer launch template, beside the exe in the release package. |
 | `autostart.vbs` | Present only when you registered autostart, at the path the `Run` key names. |

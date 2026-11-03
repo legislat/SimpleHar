@@ -17,7 +17,7 @@ pointed to, never copied here.
 ## 1. Project orientation
 
 - SimpleHar SE is a Windows tray harness (single Rust crate) that supervises local LLM
-  inference engines (llama, strata, ninfer, mock) on one GPU.
+  inference engines (llama, strata, basalt, ninfer, mock) on one GPU.
 - A swap scheduler is the single writer: it admits and evicts engine jobs against live
   memory, so loads and unloads serialize through one decision point.
 - Admission is the product. It refuses with named blockers and never overcommits; the

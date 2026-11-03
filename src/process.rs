@@ -480,9 +480,11 @@ pub struct ProcessRuntime {
     /// confirmed release, swept at boot — one shared record per process
     /// lifetime, the same single-authority rule as the claim ledger.
     custody: Arc<Mutex<CustodyLedger>>,
-    /// The root harness-rendered strata profiles stage into (ruling 2026-11-02
-    /// row 19): beside the custody sidecar, owned by the harness alone.
-    strata_profiles_root: PathBuf,
+    /// Test seam: per-engine overrides of the rendered-profile staging roots
+    /// (`TASK-BASALT` stage 1 generalized the strata-only root of ruling 19;
+    /// production always resolves the compiled-in row per launch).
+    #[cfg(test)]
+    profiles_root_overrides: BTreeMap<&'static str, PathBuf>,
     client: reqwest::Client,
     logs_dir: PathBuf,
     wsl_distro: String,
@@ -814,22 +816,52 @@ pub(crate) fn sanitize_slug(slug: &str) -> String {
         .collect()
 }
 
-/// The absolute directory harness-rendered strata profiles stage into: the
-/// [`crate::engine::policy::STRATA_RENDERED_PROFILES_ROOT`] tail resolved
-/// under the executable's own directory — beside the strata custody sidecar,
-/// the same exe-adjacent home [`strata_custody_path`] keeps (operator ruling
-/// 2026-11-02 row 19; single source from the compiled-in cell, exactly how
-/// [`staged_scripts_root`] pins the ninfer side).
+/// The staged file name a rendered profile carries: the sanitized model slug
+/// plus the same content address the runtime verifies the bytes against before
+/// it rewrites `--config` (one hash, one naming rule — the ledger, the argv
+/// placeholder and the file on disk name the same bytes). Engine-blind: every
+/// engine that stages a rendered profile names it the same way
+/// ([`crate::engine::strata`] delegates here; [`crate::engine::basalt`] calls
+/// through it), so the prune and the verify can never disagree with the writer.
 #[must_use]
-pub(crate) fn strata_profiles_dir() -> PathBuf {
-    let root = crate::engine::policy::engine_policy("strata")
+pub(crate) fn staged_profile_name(slug: &str, text: &str) -> String {
+    format!(
+        "{}-{:016x}.json",
+        sanitize_slug(slug),
+        script_content_hash(text)
+    )
+}
+
+/// The absolute directory harness-rendered profiles of one engine stage into:
+/// the first `custody_data_roots` cell of that engine's compiled-in row,
+/// resolved under the executable's own directory — the exe-adjacent home
+/// [`strata_custody_path`] keeps (operator ruling 2026-11-02 row 19 for strata;
+/// `TASK-BASALT` stage 1 generalized the door, one root per engine).
+///
+/// # Panics
+///
+/// When the compiled-in table carries no row for `engine`, or the row ships no
+/// data root — an adapter handing the runtime a rendered profile for an engine
+/// with no custody root is a builder bug, not operator input.
+#[must_use]
+pub(crate) fn rendered_profiles_dir(engine: &str) -> PathBuf {
+    let root = crate::engine::policy::engine_policy(engine)
         .and_then(|row| row.custody_data_roots.first())
         .copied()
-        .expect("invariant: the compiled-in strata row ships its rendered-profiles custody root");
+        .unwrap_or_else(|| {
+            panic!("invariant: the compiled-in `{engine}` row ships its rendered-profiles custody root")
+        });
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(root)))
         .unwrap_or_else(|| PathBuf::from(root))
+}
+
+/// The strata spelling of [`rendered_profiles_dir`], kept for the strata call
+/// sites and their pins (byte-identical tail: `.simplehar/strata-profiles`).
+#[must_use]
+pub(crate) fn strata_profiles_dir() -> PathBuf {
+    rendered_profiles_dir("strata")
 }
 
 fn staged_script_path(slug: &str, script: &str) -> String {
@@ -912,8 +944,9 @@ fn rewrite_config_slot(mut argv: Vec<String>, path: &str) -> Option<Vec<String>>
     Some(argv)
 }
 
-/// Stage a harness-rendered strata profile into the exe-adjacent profile root
-/// (operator ruling 2026-11-02 row 19). Three guarantees, one door:
+/// Stage a harness-rendered profile into the exe-adjacent root named by its
+/// engine's row (operator ruling 2026-11-02 row 19, engine-tagged in
+/// `TASK-BASALT` stage 1). Three guarantees, one door:
 ///
 /// * **name binds bytes** — the argv placeholder must equal
 ///   `<slug>-<fnv>.json` recomputed from `text`, so a hand-built spec cannot
@@ -929,17 +962,18 @@ fn rewrite_config_slot(mut argv: Vec<String>, path: &str) -> Option<Vec<String>>
 /// # Returns
 ///
 /// The absolute staged path on success, or the refusal sentence.
-fn stage_strata_profile(
+fn stage_rendered_profile(
+    engine: &str,
     root: &Path,
     slug: &str,
     text: &str,
     placeholder: &str,
 ) -> Result<PathBuf, String> {
-    let expected = crate::engine::strata::staged_profile_name(slug, text);
+    let expected = staged_profile_name(slug, text);
     if placeholder != expected {
         return Err(format!(
-            "the argv names `{placeholder}` but these bytes render `{expected}`: a staged \
-             profile must carry its own content address"
+            "the {engine} argv names `{placeholder}` but these bytes render `{expected}`: a \
+             staged profile must carry its own content address"
         ));
     }
     std::fs::create_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
@@ -1379,7 +1413,8 @@ impl ProcessRuntime {
             // rule (slice 10b): recorded when a custodied launch really
             // started, cleared on confirmed release, swept at boot.
             custody: Arc::new(Mutex::new(CustodyLedger::load(strata_custody_path()))),
-            strata_profiles_root: strata_profiles_dir(),
+            #[cfg(test)]
+            profiles_root_overrides: BTreeMap::new(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
@@ -1431,14 +1466,38 @@ impl ProcessRuntime {
         self
     }
 
-    /// Points this runtime's rendered-profile root at `path`. Test-only, the
-    /// same rule as the ledger seams: pins must neither touch the directory
+    /// Points this runtime's strata rendered-profile root at `path`. Test-only,
+    /// the same rule as the ledger seams: pins must neither touch the directory
     /// beside the test exe nor the harness's release folder.
     #[cfg(test)]
     #[must_use]
     pub fn with_profiles_root(mut self, path: impl Into<PathBuf>) -> Self {
-        self.strata_profiles_root = path.into();
+        self.profiles_root_overrides.insert("strata", path.into());
         self
+    }
+
+    /// Points this runtime's rendered-profile root for `engine` at `path`.
+    /// Test-only, the rule [`Self::with_profiles_root`] states, generalized to
+    /// the per-engine roots of `TASK-BASALT` stage 1.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_rendered_profiles_root(
+        mut self,
+        engine: &'static str,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        self.profiles_root_overrides.insert(engine, path.into());
+        self
+    }
+
+    /// Where rendered profiles of `engine` stage for this runtime: the
+    /// compiled-in row's custody root, or the test seam's override for it.
+    fn profiles_root(&self, engine: &str) -> PathBuf {
+        #[cfg(test)]
+        if let Some(path) = self.profiles_root_overrides.get(engine) {
+            return path.clone();
+        }
+        rendered_profiles_dir(engine)
     }
 
     /// Fails the job-object step after the client started. Test-only; see the
@@ -1726,19 +1785,21 @@ impl EngineRuntime for ProcessRuntime {
                 })
             }
         };
-        // Strata template mode (operator ruling 2026-11-02 row 19): a spec
-        // carrying a rendered profile reads THAT file — the bytes stage into
-        // the harness's own root, the placeholder in the `--config` slot is
-        // rewritten to the staged absolute path, and the name's content address
-        // is verified against the bytes before the child can read them. A
-        // failed staging is a spawn failure, never a fallback.
-        let spec = match spec.rendered_profile.as_deref() {
+        // Rendered-profile mode (operator ruling 2026-11-02 row 19; per-engine
+        // roots in `TASK-BASALT` stage 1): a spec carrying a rendered profile
+        // reads THAT file — the bytes stage into the harness's own root for
+        // the tag's engine, the placeholder in the `--config` slot is rewritten
+        // to the staged absolute path, and the name's content address is
+        // verified against the bytes before the child can read them. A failed
+        // staging is a spawn failure, never a fallback.
+        let spec = match spec.rendered_profile.as_ref() {
             None => spec,
-            Some(text) => {
-                let staged = stage_strata_profile(
-                    &self.strata_profiles_root,
+            Some(profile) => {
+                let staged = stage_rendered_profile(
+                    profile.engine,
+                    &self.profiles_root(profile.engine),
                     &spec.log_name,
-                    text,
+                    &profile.text,
                     spec.argv
                         .iter()
                         .position(|arg| arg == "--config")
@@ -1757,7 +1818,8 @@ impl EngineRuntime for ProcessRuntime {
                     Err(reason) => {
                         return Err(SpawnError::SpawnFailed {
                             reason: format!(
-                                "cannot stage the harness-rendered strata profile: {reason}"
+                                "cannot stage the harness-rendered {} profile: {reason}",
+                                profile.engine
                             ),
                         });
                     }
@@ -2700,8 +2762,9 @@ mod tests {
         let slug = "strata iq3s";
         let stage = |i: u32| -> PathBuf {
             let text = format!("{{\"render\": {i}}}");
-            let placeholder = crate::engine::strata::staged_profile_name(slug, &text);
-            let landed = stage_strata_profile(&root, slug, &text, &placeholder).expect("stages");
+            let placeholder = staged_profile_name(slug, &text);
+            let landed =
+                stage_rendered_profile("strata", &root, slug, &text, &placeholder).expect("stages");
             assert_eq!(
                 std::fs::read_to_string(&landed).expect("reads back"),
                 text,
@@ -2734,17 +2797,19 @@ mod tests {
         assert!(!first.is_file(), "the oldest render is the first to go");
         // A second slug stages beside the first and keeps its own pool.
         let other_text = "{\"other\": true}";
-        let other = stage_strata_profile(
+        let other = stage_rendered_profile(
+            "strata",
             &root,
             "other",
             other_text,
-            &crate::engine::strata::staged_profile_name("other", other_text),
+            &staged_profile_name("other", other_text),
         )
         .expect("stages");
         assert!(other.is_file(), "one slug's prune never touches another's");
         // The name binds its bytes: a hand-built spec cannot stage one
         // profile under another model's name.
-        let wrong = stage_strata_profile(
+        let wrong = stage_rendered_profile(
+            "strata",
             &root,
             slug,
             "{\"n\": 1}",
@@ -2783,7 +2848,7 @@ mod tests {
         let profiles = dir.join("profiles");
         let text = "{\"model_name\": \"probe\"}".to_string();
         let slug = "strata iq3s";
-        let placeholder = crate::engine::strata::staged_profile_name(slug, &text);
+        let placeholder = staged_profile_name(slug, &text);
         let runtime = ProcessRuntime::new().with_profiles_root(&profiles);
         let spec = LaunchSpec {
             argv: vec![
@@ -2808,7 +2873,10 @@ mod tests {
             },
             container: None,
             script: None,
-            rendered_profile: Some(text.clone()),
+            rendered_profile: Some(crate::engine::RenderedProfile {
+                engine: "strata",
+                text: text.clone(),
+            }),
             custody: None,
         };
         let tk = SpawnTicket {
@@ -2839,6 +2907,272 @@ mod tests {
             staged.display()
         );
         assert_eq!(std::fs::read_to_string(&staged).expect("reads back"), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `TASK-BASALT` stage 1: the staging roots are per-engine — the strata
+    /// door of ruling 19 keeps its byte-identical tail, basalt stages beside
+    /// it, and the two pools can never prune each other's files.
+    #[test]
+    fn rendered_profile_roots_are_per_engine_and_distinct() {
+        let strata = rendered_profiles_dir("strata");
+        assert_eq!(
+            strata_profiles_dir(),
+            strata,
+            "the strata spelling is unchanged"
+        );
+        let basalt = rendered_profiles_dir("basalt");
+        assert!(strata.ends_with(".simplehar/strata-profiles"), "{strata:?}");
+        assert!(basalt.ends_with(".simplehar/basalt-profiles"), "{basalt:?}");
+        assert_ne!(strata, basalt);
+    }
+
+    /// Minimal `serve.server` stand-in: the exact `python -m serve.server`
+    /// shape the adapter launches. Reports `/health` `loaded: false` for its
+    /// first two requests (the readiness must wait), serves the alias on
+    /// `/v1/models`, and records its received argv for the spawn-path pin.
+    const FAKE_BASALT_SERVER: &str = r#"import http.server
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+
+
+def opt(name, default=None):
+    if name in args:
+        return args[args.index(name) + 1]
+    for word in args:
+        if word.startswith(name + "="):
+            return word.split("=", 1)[1]
+    return default
+
+
+port = int(opt("--port"))
+alias = opt("--alias", "anon")
+with open(os.path.join(os.getcwd(), "argv.json"), "w", encoding="utf-8") as fh:
+    json.dump(args, fh)
+
+state = {"health": 0}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *rest):
+        pass
+
+    def do_GET(self):
+        if self.path == "/health":
+            state["health"] += 1
+            self._send(200, {"status": "ok", "loaded": state["health"] > 2})
+        elif self.path == "/v1/models":
+            self._send(200, {"object": "list", "data": [{"id": alias, "object": "model"}]})
+        else:
+            self._send(404, {"error": "no such path"})
+
+    def _send(self, code, body):
+        raw = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"#;
+
+    /// The first real `python`/`py` on PATH, as an absolute path (the row
+    /// validation demands one), or `None` — the pin then skips itself: it is
+    /// a launch-path pin, not a language claim.
+    fn find_python() -> Option<PathBuf> {
+        for program in ["python.exe", "py.exe"] {
+            let located = std::process::Command::new("where.exe")
+                .arg(program)
+                .output()
+                .ok()?;
+            if !located.status.success() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&located.stdout);
+            let path = text
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(PathBuf::from)?;
+            if !path.is_absolute() || !path.is_file() {
+                continue;
+            }
+            let ok = std::process::Command::new(&path)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if ok {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// The stage-1 end-to-end pin, cardless: a real `python -m serve.server`
+    /// child (a stand-in module, no engine, no model, loopback only), spawned
+    /// through `ProcessRuntime` from a `BasaltAdapter` spec. Pins the whole
+    /// chain the scheduler will ride: exact argv with the `--config` slot
+    /// rewritten to the staged bytes under the BASALT root, `loaded: false`
+    /// held at `NotYet` then released, the served id verified and discovered,
+    /// and a clean kill with proven release.
+    #[tokio::test]
+    async fn a_fake_python_basalt_launch_serves_the_verified_id_end_to_end() {
+        let Some(python) = find_python() else {
+            eprintln!("skip: no python on PATH to run the serve.server stand-in");
+            return;
+        };
+        let dir = crate::testutil::temp_dir("basalt-py");
+        let serve = dir.join("serve");
+        std::fs::create_dir_all(&serve).expect("serve pkg");
+        std::fs::write(serve.join("__init__.py"), b"").expect("pkg init");
+        std::fs::write(serve.join("server.py"), FAKE_BASALT_SERVER).expect("server");
+        let weights = dir.join("m.basalt");
+        std::fs::write(&weights, b"not a real artifact").expect("weights");
+        let engine_bin = dir.join("basalt-engine.exe");
+        std::fs::write(&engine_bin, b"never executed by the stand-in").expect("engine");
+        let profiles = dir.join("basalt-profiles");
+        let raw = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let model = crate::model::ModelEntry {
+            name: "basalt-fake".to_string(),
+            engine: "basalt".to_string(),
+            category: crate::config::CategoryId::Work,
+            vram_gb: Some(10.0),
+            gguf_size_gb: None,
+            cost: crate::model::CostClass::Fixed,
+            launch_floor_gb: None,
+            load_timeout_s: None,
+            measured_gb: None,
+            measured_min_gb: None,
+            measured_offload: None,
+            measured_attribution: None,
+            measured_profile: None,
+            fit_gb: None,
+            model_ref: Some(weights.to_string_lossy().into_owned()),
+            serve_model: Some("fake-alias".to_string()),
+            file: None,
+            raw: raw(&[
+                ("basalt_python", python.to_str().expect("utf-8")),
+                ("basalt_exe", engine_bin.to_str().expect("utf-8")),
+                ("basalt_cwd", dir.to_str().expect("utf-8")),
+            ]),
+        };
+        // Ephemeral loopback port: bind, read, release (the SE test rule: no
+        // protected port, no fixed bind).
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+            listener.local_addr().expect("addr").port()
+        };
+        let spec =
+            crate::engine::EngineAdapter::spec(&crate::engine::basalt::BasaltAdapter, &model, port)
+                .expect("fixture spec");
+        let profile = spec.rendered_profile.clone().expect("rendered");
+        assert_eq!(profile.engine, "basalt");
+        let runtime = ProcessRuntime::new().with_rendered_profiles_root("basalt", &profiles);
+        let tk = SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 0,
+            port,
+        };
+        let spawned = runtime
+            .spawn(&spec, tk.clone())
+            .await
+            .expect("the stand-in starts");
+        assert_eq!(spawned.port, port);
+        let staged = profiles.join(staged_profile_name("basalt-fake", &profile.text));
+        assert!(
+            staged.is_file(),
+            "the render staged under the BASALT root: {profiles:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&staged).expect("reads back"),
+            profile.text
+        );
+        // The child received the staged path, not the placeholder.
+        let argv_path = dir.join("argv.json");
+        let mut argv: Option<Vec<String>> = None;
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(&argv_path) {
+                argv = Some(serde_json::from_str(&text).expect("child argv json"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let child_argv = argv.expect("the child recorded its argv");
+        let config_at = child_argv
+            .iter()
+            .position(|arg| arg == "--config")
+            .expect("--config");
+        assert_eq!(
+            child_argv[config_at + 1],
+            staged.to_string_lossy(),
+            "the --config slot carries the staged absolute path"
+        );
+        assert_eq!(
+            child_argv
+                .get(
+                    child_argv
+                        .iter()
+                        .position(|arg| arg == "--port")
+                        .expect("--port")
+                        + 1
+                )
+                .expect("port value"),
+            &port.to_string()
+        );
+        // Readiness: the stand-in answers `loaded: false` until its third
+        // `/health`, so the chain must first wait, then verify the id.
+        let mut saw_not_yet = false;
+        let mut ready = false;
+        for _ in 0..100 {
+            match runtime.probe(port, &spec.readiness).await {
+                Probe::Ready => {
+                    ready = true;
+                    break;
+                }
+                Probe::NotYet { .. } => {
+                    saw_not_yet = true;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Probe::Failed { reason } => panic!("terminal probe failure: {reason}"),
+            }
+        }
+        assert!(ready, "the chain reached Ready inside the window");
+        assert!(
+            saw_not_yet,
+            "`loaded: false` must have held the chain at NotYet"
+        );
+        assert_eq!(
+            runtime.discover_model_id(port).await.as_deref(),
+            Some("fake-alias"),
+            "the discovered id is the alias the row served"
+        );
+        runtime.kill(&tk).await.expect("kill our child");
+        let mut released = false;
+        for _ in 0..100 {
+            if runtime
+                .release_confirmed(&tk)
+                .await
+                .expect("release evidence is checkable")
+            {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(released, "death of the child is provable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

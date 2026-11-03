@@ -34,7 +34,7 @@
 //! at spec, so a value that references a path the disk lacks is refused before
 //! the child starts, never launched on.
 
-use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
+use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec, RenderedProfile};
 use crate::model::ModelEntry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -720,14 +720,11 @@ pub(crate) fn render_profile(model: &ModelEntry, cwd: &Path) -> Result<String, E
 
 /// The staged file name a rendered profile carries: the sanitized model slug
 /// plus the same content address the runtime verifies the bytes against before
-/// it rewrites `--config` (one hash, one naming rule — the ledger, the argv
-/// placeholder and the file on disk name the same bytes).
+/// it rewrites `--config`. The naming rule is engine-blind and lives with the
+/// staging door it must agree with — [`crate::process::staged_profile_name`]
+/// is the single home; this is the strata-side spelling the strata pins use.
 pub(crate) fn staged_profile_name(slug: &str, text: &str) -> String {
-    format!(
-        "{}-{:016x}.json",
-        crate::process::sanitize_slug(slug),
-        crate::process::script_content_hash(text)
-    )
+    crate::process::staged_profile_name(slug, text)
 }
 
 /// Strata adapter: argv from data, `/health` 200 **and** `loaded != false`.
@@ -902,7 +899,10 @@ impl EngineAdapter for StrataAdapter {
             ),
             container: None,
             script: None,
-            rendered_profile: Some(profile_text),
+            rendered_profile: Some(RenderedProfile {
+                engine: "strata",
+                text: profile_text,
+            }),
             // The strata router outlives nothing but its own job object unless the
             // harness records it: every strata launch rides the custody sidecar
             // (chunk 10 slice 10b) so a crashed run's orphan is provably ours to
@@ -1074,7 +1074,7 @@ mod tests {
                 &format!("--pack, --native, {}", path_text(&weights)),
             )],
         );
-        let text = spec.rendered_profile.expect("template render");
+        let text = spec.rendered_profile.expect("template render").text;
         let name = spec
             .argv
             .iter()
@@ -1163,7 +1163,7 @@ mod tests {
                 ),
             ],
         );
-        let text = spec.rendered_profile.expect("template render");
+        let text = spec.rendered_profile.expect("template render").text;
         let profile: serde_json::Value = serde_json::from_str(&text).expect("rendered JSON");
         assert_eq!(profile["lib_dirs"][0], path_text(&pack));
         assert_eq!(profile["env"]["STRATA_KVA"], "0");

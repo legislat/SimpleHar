@@ -32,8 +32,8 @@ edit never leaves a half-written model file in use.
 | Key | Notes |
 |---|---|
 | `name` | Optional. The file stem is the model identity. A `name` that mismatches the stem is refused: rename the file or drop the key. |
-| `model` | GGUF path (or the engine's model URI). **Required for llama**. |
-| `engine` | `llama` (default), `strata`, or `ninfer`. |
+| `model` | GGUF path (or the engine's model URI). **Required for llama**. A basalt row requires an absolute `.basalt` pack path. |
+| `engine` | `llama` (default), `strata`, `basalt`, or `ninfer`. |
 | `category` | `WORK`/`RP`/`AUX`/`EMB`. |
 | `vram_gb` | Declared admission cost in GiB. `fixed` falls back to `file size x 1.15 + 2`. `exact` refuses without it. |
 | `cost` | `fixed` (default): the declared size binds admission. `greedy`: the model offloads to RAM/SSD; the size never refuses, but a launch floor is mandatory. `exact`: an engine-computed number, required and binding. |
@@ -43,7 +43,7 @@ edit never leaves a half-written model file in use.
 | `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served: `measured_gb` is the high end and `measured_gb_min` the low end. The harness writes them back after a load. When `vram_gb` is absent, admission books `measured_gb`. The `measured_attribution` stamp decides whose number it is, and only these attributions book: `engine_report` (the container's own startup reservation) and `per_process` (the witness attributed the bytes to this engine's process). A `total_diff` figure (a free-memory delta) displays but never books. An **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure, whatever the provenance, because it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes. The identity is the profile name, plus the resolved `kv` for an override line. An edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, because the reservation follows the KV pool. The write-back also records `measured_offload`, the `cpu_offload` state the pair was taken under; a later flip voids the pair. |
 | `is_embedding_model` | A truthy value forces category `EMB`. It conflicts with another explicit category. |
 | `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. |
-| `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. |
+| `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. For the basalt 482B class, `load_timeout: 1200` is the recommended starting point. |
 | `strata_exe` | **Required for strata** (template mode): the absolute path of the engine binary that the harness-rendered profile names. Its presence selects template mode. `serve_model` is also required, and it becomes the profile's served model name. |
 | `strata_tokenizer` | **Required for strata**: the absolute tokenizer path that the rendered profile names. |
 | `strata_python` | Interpreter. It must be an existing `.exe` **file**; it is the program the harness launches (default `C:\Strata\.venv\Scripts\python.exe`). |
@@ -57,6 +57,11 @@ edit never leaves a half-written model file in use.
 | `strata_sampling` | Whitespace-separated `key=value` sampling defaults (number or bool) rendered as the profile's `sampling` dict. |
 | `strata_uncensored` | Strict `true`/`false` rendered as the profile's `uncensored` switch. An explicit `false` is written intent and is different from absence. |
 | `strata_config` | **Superseded** (operator ruling 2026-11-02, row 19). A row that still declares it is refused at scan, with the migration sentence: run `simplehar-se import strata <profile.json> --apply <row.yaml>` to merge the emitted knobs and delete the `strata_config` line, or print and paste manually. A row that carries both `strata_exe` and `strata_config` meets the mutual-exclusion refusal; delete the `strata_config` line. |
+| `basalt_python` | **Required for basalt**: the interpreter `.exe`. It must be an absolute path to an existing file, and it is the program the harness launches. |
+| `basalt_cwd` | **Required for basalt**: the Basalt source-root directory. It must be an absolute path to an existing directory. The `-m serve.server` module resolves from this working directory. |
+| `basalt_exe` | **Required for basalt**: the engine binary. It must be an absolute path to an existing file, and the harness passes it as `--engine-bin`. |
+| `basalt_parallel` | Optional worker-pool size passed as `--parallel`: a whole number `1..=8`, default `1`. It changes the KV footprint, so the row's declared cost must match it. |
+| `basalt_engine_args` | Comma-separated engine flags appended to the launch line; each entry is exactly one word. Long options only (`--flag` or `--flag=value`). The harness refuses a server-owned flag by exact name and says which mechanism owns that decision. |
 | `extra_args` | **Closed allow-list, not a denial list.** The harness splits the value on whitespace and appends a word to the argv only when it is a reviewed option: `--embedding`, `--embeddings`, `--pooling <mode>`, `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`, `--warmup`, `--no-warmup`. The value words a reviewed option consumes are appended too. A value may not be option-shaped, so it cannot smuggle another flag. **Anything else is refused with the launch**, and the message names the word. The model, host, port, gpu-layers, jinja, api-key, lora, and rpc options and every other option are not on the list, so their absence refuses them and there is nothing to dodge. The harness appends its forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` after these args, and they win. |
 | `ninfer_image` | **Required for ninfer**: selects **template mode, the only mode**. The harness renders the canonical autostart script from your yaml, stages it into the distro, verifies it by distro-side checksum, and launches exactly **that** script. Its required companions are `ninfer_model_name` (the directory that holds the artifact), `ninfer_artifact` (the file inside it), and `ninfer_model_roots` (comma-separated absolute WSL directories, searched in order). Each must be a plain word, and the harness refuses a bad value and names the key. `ninfer_internal_port` (the port the container binds inside its own namespace) is optional and defaults to the SE internal number **8808**. That is the harness's 87xx family plus 100: clear of the manual 80xx world, the 87xx listeners, and the 181xx engine plan. It may not name a `protected_ports`, public-listener, or harness engine port. The manual/harness separation covers container-internal numbers too, so the harness refuses a row that borrows one at load, and the rescan names it. |
 | `ninfer_serve_cmd` | The server command inside the container (default `ninfer-serve`). |
@@ -75,6 +80,10 @@ every load the harness writes the full profile JSON into
 `.simplehar\strata-profiles` beside the exe (content-addressed
 `<model>-<hash>.json`, atomic write, keep-N prune) and launches only its own
 staged copy. See "Strata engines" below.
+
+The harness renders basalt rows the same way. At every load it writes its
+`{"server": ...}` profile into `.simplehar\basalt-profiles` beside the exe
+and launches only its own staged copy. See "Basalt engines" below.
 
 The harness keeps unknown keys for reference and reports them as
 `unknown_key` warnings. The model still loads. `host` and `port` keys belong
@@ -129,6 +138,69 @@ the merge actually changed, not the emitted field count. Without `--apply`,
 the command only prints; it never touches the row or the profile file. `C:\Strata` stays the
 manual-launch home that the harness never reads on the serve path. The
 import CLI is the one sanctioned reader.
+
+### Basalt engines
+
+Basalt models (`engine: basalt`) run the Basalt Python server directly. The
+harness launches `python -m serve.server` in `basalt_cwd`. It never uses the
+source-tree launcher. The row names the three executed paths: the
+interpreter (`basalt_python`), the source root (`basalt_cwd`), and the
+engine binary (`basalt_exe`). `serve_model` is the served alias: it is
+passed as `--alias` and verified at readiness.
+
+The harness renders the profile itself. The JSON carries one `server`
+object with three figures only: the `alias`, the absolute `.basalt` model
+path, and `parallel`. The render is staged under `.simplehar\basalt-profiles`
+beside the exe (content-addressed `<model>-<hash>.json`, atomic write,
+keep-N prune). The spawn rewrites `--config` to exactly that file, so the
+child can never point at another profile. The profile carries no `host`,
+`port`, `api-key`, `gpu`, or `engine-bin`: those decisions ride the forced
+argv (`--host 127.0.0.1`, the harness-assigned `--port`, the staged
+`--config`), and the adapter supplies `--engine-bin`, `--alias`, `--gpu 0`,
+and `--parallel`. `basalt_engine_args` entries append after them, and the
+server validates each word against the engine binary before load.
+
+Readiness needs `/health` 200 with the JSON `loaded` flag not being `false`,
+because Basalt answers HTTP while weights stream. Then `/v1/models` must
+report the `serve_model` alias. For the 482B class, `load_timeout: 1200` is
+the recommended starting point for the load floor. A basalt engine starts
+only when you load it; booting the harness starts nothing.
+
+Cost is the declared `vram_gb` with `cost: fixed`. Both are required: the
+engine reports no projection, so there is no Fit, and a `.basalt` pack's
+bytes never feed the GGUF size estimate. The direct child is the Python
+server, so the witness attributes bytes to that child; the engine grandchild
+appears only as a display-only `total_diff` delta, and that figure never
+books. Set `launch_only_with_at_least_vram_free` to the declared cost:
+Basalt needs the card, and a loaded stranger must refuse before spawn.
+
+Kill: the harness job object terminates the Python server. Basalt's server
+puts the engine child in its own kill-on-close job, so a Python death also
+terminates the engine and the crash path cannot orphan it. A card run must
+prove VRAM release and no orphan.
+
+Example row (placeholders, not machine facts):
+
+```yaml
+model: <models-dir>\basalt\model-482b.basalt
+engine: basalt
+serve_model: basalt-482b
+category: WORK
+vram_gb: 40
+cost: fixed
+launch_only_with_at_least_vram_free: 40
+load_timeout: 1200
+basalt_python: <basalt-dir>\.venv\Scripts\python.exe
+basalt_cwd: <basalt-dir>
+basalt_exe: <basalt-dir>\bin\basalt.exe
+basalt_parallel: 1
+basalt_engine_args: --vram-reserve-mib, 700
+```
+
+The `vram_gb` figure and its floor here are illustrative only. Basalt fills
+the card's free VRAM up to its reserve policy, so the row must declare the
+ceiling you intend. Measure your current card and one witnessed serve, then
+write the number; do not copy a figure from a note.
 
 ### Ninfer engines
 

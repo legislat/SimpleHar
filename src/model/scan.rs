@@ -56,9 +56,9 @@ pub enum ScanKind {
     /// Warn-only, exactly the retired `host:`/`port:` policy-hint posture: the
     /// entry still publishes. The mechanism is the knob table (slice 10c
     /// generalization of the 2026-10-28 `cpu_offload` ruling): every
-    /// engine-scoped key — `cpu_offload` and its llama siblings, the strata
-    /// and ninfer key families — is scoped the same data-driven way, so a new
-    /// row knob needs no new scan code.
+    /// engine-scoped key — `cpu_offload` and its llama siblings, the strata,
+    /// basalt and ninfer key families — is scoped the same data-driven way, so
+    /// a new row knob needs no new scan code.
     InertKey,
     /// A yaml file the scan refuses to publish (Fork C doctrine): it carried at
     /// least one problem line — then the `reason` names every offending line — or it
@@ -114,8 +114,8 @@ impl Catalog {
 }
 
 /// The canonical set of yaml keys the harness reads anywhere: scan identity, the
-/// typed entry, the llama flag table and its extra reads, the strata and ninfer
-/// adapters, and the measured triple. This const is THE source of truth for the
+/// typed entry, the llama flag table and its extra reads, the strata, basalt and
+/// ninfer adapters, and the measured triple. This const is THE source of truth for the
 /// unknown-key report: a key outside it is published with a warn-only
 /// [`ScanKind::UnknownKey`] (entry stays loadable — README: "preserved for
 /// reference"). The `consumed_keys_cover_every_key_the_code_reads` test fails when
@@ -166,6 +166,11 @@ const CONSUMED_KEYS: &[&str] = &[
     "strata_vision",
     "strata_sampling",
     "strata_uncensored",
+    "basalt_python",
+    "basalt_cwd",
+    "basalt_exe",
+    "basalt_parallel",
+    "basalt_engine_args",
     "ninfer_autostart",
     "ninfer_container",
     "ninfer_profile",
@@ -747,7 +752,13 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                         continue;
                     }
                 }
-                entry.gguf_size_gb = stat.map(|meta| meta.len() as f64 / (1024.0_f64).powi(3));
+                // A basalt `.basalt` pack is not a GGUF: its bytes must never
+                // feed the size×1.15+2 estimate. The booking source of a basalt
+                // row is the declared `vram_gb` with `cost: fixed` (TASK-BASALT
+                // design), so a pack stat stays display-blind here.
+                if entry.engine != "basalt" {
+                    entry.gguf_size_gb = stat.map(|meta| meta.len() as f64 / (1024.0_f64).powi(3));
+                }
                 // A strata row is either template mode — the row yaml owns the
                 // profile's fields and the harness renders the JSON, so the
                 // scan renders the same bytes and refuses a referenced path
@@ -831,6 +842,45 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                                 continue;
                             }
                         }
+                    }
+                }
+                // A basalt row passes through the adapter's single door
+                // (`basalt::validate_row`, stage 1), so the scan refuses at
+                // rescan exactly what the adapter would refuse at spec time —
+                // a doomed launch can never evict a resident first. The honest
+                // mapping: an absent or blank required key (`model`,
+                // `serve_model`, `basalt_python`, `basalt_cwd`, `basalt_exe`,
+                // `vram_gb`) names its field as a typed reject; a `.basalt`
+                // weights file the disk lacks travels the same
+                // `ModelPathMissing` door as llama's `model:`; a server-owned
+                // word in `basalt_engine_args` meets the policy surface — the
+                // row's `extra_words` contract already refuses it in
+                // `from_flat`, and this leg keeps the direct door consistent
+                // (slice 10c voice). The `vram_gb`/`cost` booking requirements
+                // are `validate_row`'s, mapped through unchanged.
+                if entry.engine == "basalt" {
+                    if let Err(problem) = crate::engine::basalt::validate_row(&entry) {
+                        let kind = match &problem {
+                            crate::engine::basalt::BasaltRowError::MissingPath { .. } => {
+                                ScanKind::ModelPathMissing
+                            }
+                            crate::engine::basalt::BasaltRowError::Bad { key, .. } => {
+                                if key == "basalt_engine_args" {
+                                    ScanKind::PolicyRefused
+                                } else {
+                                    ScanKind::Other
+                                }
+                            }
+                            crate::engine::basalt::BasaltRowError::Missing { .. } => {
+                                ScanKind::Other
+                            }
+                        };
+                        catalog.errors.push(ScanError {
+                            kind,
+                            file: file_name.clone(),
+                            reason: problem.into_engine_error().to_string(),
+                        });
+                        continue;
                     }
                 }
                 // Unknown keys are reported, never fatal (README doctrine), but
@@ -2656,6 +2706,212 @@ mod tests {
         assert_eq!(catalog.models[0].name, "clean");
     }
 
+    /// The disk shape a valid basalt row validates against (the same shape
+    /// `basalt::validate_row` walks in its own module): an absolute `.basalt`
+    /// pack with bytes, an interpreter, an engine binary; the cwd is `dir`
+    /// itself. Returns the pack path.
+    fn basalt_pack(dir: &Path) -> std::path::PathBuf {
+        let weights = dir.join("m.basalt");
+        std::fs::write(&weights, b"basalt-pack-bytes").expect("write pack");
+        std::fs::write(dir.join("python.exe"), b"p").expect("write interpreter");
+        std::fs::write(dir.join("basalt-engine.exe"), b"e").expect("write engine");
+        weights
+    }
+
+    /// One basalt row document in the valid five-knob shape, every path under
+    /// `dir`. An override `Some(value)` replaces (or adds) the line; `None`
+    /// drops it — the shape `validate_row` answers with the missing-key door.
+    fn basalt_yaml(dir: &Path, weights: &Path, overrides: &[(&str, Option<&str>)]) -> String {
+        let mut lines: Vec<(&str, String)> = vec![
+            ("engine", "basalt".to_string()),
+            ("model", weights.to_string_lossy().into_owned()),
+            ("serve_model", "basalt-served".to_string()),
+            ("vram_gb", "42".to_string()),
+            ("cost", "fixed".to_string()),
+            (
+                "basalt_python",
+                dir.join("python.exe").to_string_lossy().into_owned(),
+            ),
+            ("basalt_cwd", dir.to_string_lossy().into_owned()),
+            (
+                "basalt_exe",
+                dir.join("basalt-engine.exe").to_string_lossy().into_owned(),
+            ),
+        ];
+        for (key, value) in overrides {
+            if let Some(line) = lines.iter_mut().find(|(k, _)| *k == *key) {
+                if let Some(value) = value {
+                    line.1 = value.to_string();
+                } else {
+                    line.0 = "";
+                }
+            } else if let Some(value) = value {
+                lines.push((key, value.to_string()));
+            }
+        }
+        lines
+            .iter()
+            .filter(|(k, _)| !k.is_empty())
+            .map(|(k, v)| format!("{k}: {v}\n"))
+            .collect()
+    }
+
+    /// A basalt row that lacks a key the launch requires is refused at rescan
+    /// — before any load could evict a resident for the doomed spawn — and the
+    /// report names the field. An absent key and a present-but-blank one are
+    /// the same door (the adapter's `validate_row` is the single source of the
+    /// required set, so the scan names whatever that door names). Falsifier:
+    /// no basalt branch in the scan publishes the row and the report is empty.
+    #[test]
+    fn a_basalt_row_missing_a_required_key_is_refused_naming_the_key() {
+        let dir = crate::testutil::temp_dir("scan-basalt-missing-key");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let weights = basalt_pack(&dir);
+        for (key, value) in [
+            ("model", None),
+            ("serve_model", None),
+            ("basalt_python", None),
+            ("basalt_cwd", None),
+            ("basalt_exe", None),
+            ("vram_gb", None),
+            // The blank leg: a present value that carries nothing is as
+            // unservable as the absent one.
+            ("serve_model", Some("")),
+        ] {
+            std::fs::write(
+                dir.join("row.yaml"),
+                basalt_yaml(&dir, &weights, &[(key, value)]),
+            )
+            .expect("write row");
+            let catalog = scan_dir(&dir);
+            assert!(
+                catalog.models.is_empty(),
+                "`{key}` missing/blank must refuse the row: {:?}",
+                catalog.errors
+            );
+            let error = catalog
+                .errors
+                .iter()
+                .find(|e| e.file.contains("row.yaml"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{key}` missing/blank must be reported: {:?}",
+                        catalog.errors
+                    )
+                });
+            assert_eq!(error.kind, ScanKind::Other, "{error:?}");
+            assert!(
+                error.reason.contains(key),
+                "must name `{key}`: {}",
+                error.reason
+            );
+        }
+    }
+
+    /// The `.basalt` pack is the weights file the launch spawns against: a
+    /// missing one is the same `ModelPathMissing` door as llama's `model:`
+    /// (FINDINGS-13 [2] class — refuse before admission can evict a victim for
+    /// the doomed spawn), not a generic typed reject. Falsifier: mapping every
+    /// `BasaltRowError::Bad` to `Other` reports the right file under the wrong
+    /// kind.
+    #[test]
+    fn a_basalt_row_naming_a_missing_pack_is_model_path_missing() {
+        let dir = crate::testutil::temp_dir("scan-basalt-missing-pack");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        basalt_pack(&dir);
+        std::fs::write(
+            dir.join("row.yaml"),
+            basalt_yaml(&dir, &dir.join("ghost.basalt"), &[]),
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(
+            catalog.models.is_empty(),
+            "a pack that is not on disk must not publish: {:?}",
+            catalog.errors
+        );
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::ModelPathMissing)
+            .expect("the missing pack travels the llama `model:` door");
+        assert!(error.file.contains("row.yaml"), "{error:?}");
+        assert!(error.reason.contains("ghost.basalt"), "{}", error.reason);
+    }
+
+    /// A server-owned flag smuggled through `basalt_engine_args` meets the
+    /// policy surface (`PolicyRefused`), naming the flag and its owner, exactly
+    /// like the `extra_args`/`ninfer_serve_args` family (slice 10c). The row's
+    /// `extra_words` contract in `from_flat` is the first door; the scan's
+    /// direct `validate_row` leg keeps the mapping consistent.
+    #[test]
+    fn a_basalt_row_with_a_server_owned_engine_arg_is_policy_refused() {
+        let dir = crate::testutil::temp_dir("scan-basalt-hostile-arg");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let weights = basalt_pack(&dir);
+        std::fs::write(
+            dir.join("row.yaml"),
+            basalt_yaml(
+                &dir,
+                &weights,
+                &[("basalt_engine_args", Some("--host=0.0.0.0"))],
+            ),
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(
+            catalog.models.is_empty(),
+            "a harness-owned flag must refuse the row: {:?}",
+            catalog.errors
+        );
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::PolicyRefused)
+            .expect("the hostile word is the policy surface, never a typed reject");
+        assert!(error.file.contains("row.yaml"), "{error:?}");
+        assert!(
+            error.reason.contains("`--host`") && error.reason.contains("harness-owned"),
+            "the refusal names the flag and its owner: {}",
+            error.reason
+        );
+    }
+
+    /// The happy path pinned whole: a valid basalt row publishes with its five
+    /// knobs live on their own row — zero reports, neither `UnknownKey` (the
+    /// knobs are consumed) nor `InertKey` (the basalt row reads them) — and the
+    /// `.basalt` pack's bytes never book into `gguf_size_gb` (the booking
+    /// source is the declared `vram_gb` with `cost: fixed`). Falsifier: without
+    /// the scan-branch and consumed-key work the knobs warn and the pack size
+    /// books.
+    #[test]
+    fn a_valid_basalt_row_publishes_with_its_five_knobs_live() {
+        let dir = crate::testutil::temp_dir("scan-basalt-valid");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let weights = basalt_pack(&dir);
+        let yaml = basalt_yaml(
+            &dir,
+            &weights,
+            &[
+                ("basalt_parallel", Some("2")),
+                ("basalt_engine_args", Some("--temp=0.7")),
+            ],
+        );
+        std::fs::write(dir.join("row.yaml"), yaml).expect("write");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        assert!(
+            catalog.errors.is_empty(),
+            "a knob on its own row stays silent: {:?}",
+            catalog.errors
+        );
+        assert_eq!(catalog.models[0].engine, "basalt");
+        assert!(
+            catalog.models[0].gguf_size_gb.is_none(),
+            "a .basalt pack size never feeds the GGUF estimate"
+        );
+    }
+
     #[test]
     fn a_one_edit_typo_gets_a_unique_suggestion() {
         assert_eq!(did_you_mean("contex"), " (did you mean 'context'?)");
@@ -2725,6 +2981,11 @@ mod tests {
              strata_vision: exe=C:/Strata/vision.exe mmproj=D:/m/mmproj.gguf model=D:/m/m.gguf\n\
              strata_sampling: temperature=1.0 top_p=0.95 top_k=20\n\
              strata_uncensored: false\n\
+             basalt_python: C:/Basalt/.venv/Scripts/python.exe\n\
+             basalt_cwd: C:/Basalt\n\
+             basalt_exe: C:/Basalt/bin/basalt.exe\n\
+             basalt_parallel: 1\n\
+             basalt_engine_args: --temp=0.7\n\
              ninfer_autostart: /opt/a.sh\n\
              ninfer_container: golden-box\n\
              ninfer_profile: b\n\
@@ -2874,6 +3135,11 @@ mod tests {
             "strata_vision",
             "strata_sampling",
             "strata_uncensored",
+            "basalt_python",
+            "basalt_cwd",
+            "basalt_exe",
+            "basalt_parallel",
+            "basalt_engine_args",
             "ninfer_autostart",
             "ninfer_container",
             "ninfer_profile",

@@ -21,7 +21,8 @@ model, and API reference tables live in `docs/reference/`.
 
 - SimpleHar SE is a Windows tray harness: one Rust crate
   (`simplehar-se`, `Cargo.toml`), one process, one NVIDIA GPU, several local
-  LLM inference engines (`llama`, `strata`, `ninfer`, plus a test-only `mock`).
+  LLM inference engines (`llama`, `strata`, `basalt`, `ninfer`, plus a
+  test-only `mock`).
 - It owns engine processes as its children, swaps models between four
   category listeners through one single-writer scheduler, and admits loads
   against the card's live reading. It refuses with named blockers rather than
@@ -33,8 +34,9 @@ model, and API reference tables live in `docs/reference/`.
   `nvml-wrapper` (GPU witness), `tray-icon` plus the `windows` crate (tray,
   Job Objects, single-instance mutex), `tracing` (logging), `serde`
   (config and API), `base64` (ninfer script staging).
-- Engine software itself (llama.cpp, strata, the ninfer container) is
-  external. The harness launches and supervises it; it does not contain it.
+- Engine software itself (llama.cpp, strata, basalt, the ninfer container)
+  is external. The harness launches and supervises it; it does not contain
+  it.
 
 ## 2. Process and actor model
 
@@ -58,6 +60,9 @@ One harness process, one tokio runtime, plus OS-level children:
   harness death kills the tree (the crash-proof orphan guarantee). Ninfer is
   the documented carve-out: the child is a short-lived `wsl.exe` client; the
   container is reaped by name with `docker rm -f` and reconciled pre-spawn.
+  Basalt's direct child is the Python server and rides the same job object;
+  Basalt puts the engine child in its own kill-on-close job, so the crash
+  path cannot orphan the engine.
 - Tray - `src/tray.rs`. The tray is a view: it renders the scheduler snapshot
   and the listener registry and sends the same commands the HTTP handlers
   send. No tray-only state.
@@ -128,7 +133,7 @@ One harness process, one tokio runtime, plus OS-level children:
   builds the map. `LaunchSpec` must be constructible from data alone.
 - Policy table (`src/engine/policy.rs`, `EnginePolicy::all`): the compiled-in
   single-source table behind L1/L2/L3 - one row per engine, `forced_fields`,
-  forbidden words, and word contracts. One mechanism, four instances.
+  forbidden words, and word contracts. One mechanism, five instances.
 - `llama` (`src/engine/llama.rs`): native `llama-server.exe` per GGUF. The
   flag map is data, parity-tested against the operator's start script. The
   harness forces `--host 127.0.0.1` (`LLAMA_ENGINE_HOST`) and the assigned
@@ -146,6 +151,19 @@ One harness process, one tokio runtime, plus OS-level children:
   (`superseded_sentence`) naming `simplehar-se import strata <profile.json>`.
   Readiness needs `/health` 200 and the JSON `loaded` flag (strata answers
   200 while weights stream).
+- `basalt` (`src/engine/basalt.rs`): native Windows engine with a Python
+  OpenAI-compatible server. The harness launches `python -m serve.server`
+  directly in `basalt_cwd` (not the source-tree launcher), forces
+  `--host 127.0.0.1` and the assigned `--port`, and supplies `--engine-bin`,
+  `--alias`, `--gpu 0`, and `--parallel`. It renders the `{"server": ...}`
+  profile at every load under `.simplehar\basalt-profiles`
+  (`process::rendered_profiles_dir`, content-addressed, atomic, keep-N
+  prune) and rewrites `--config` to exactly that staged file. Readiness
+  needs `/health` 200 with the JSON `loaded` flag not `false`, then
+  `/v1/models` must report the `serve_model` alias. Cost is the declared
+  `vram_gb` with `cost: fixed`; no Fit, because the engine reports no
+  projection. Kill is the job object; the engine child rides Basalt's own
+  kill-on-close job.
 - `ninfer` (`src/engine/ninfer.rs`): GPU container inside WSL2. Template
   mode is the current and only mode: the row declares `ninfer_image`, and
   the harness renders the canonical autostart script
@@ -165,7 +183,10 @@ One harness process, one tokio runtime, plus OS-level children:
   tests build their own adapter maps.
 - Custody: `src/custody.rs` (`CustodyLedger`) records what the harness
   launched for custodied engines (strata) and reconciles by pid identity at
-  boot; engine-side custody is untrusted.
+  boot; engine-side custody is untrusted. Basalt rides the job object and
+  its own engine job instead of a sidecar entry; the witness sees the Python
+  child rather than the engine grandchild, so the grandchild reads only as
+  a display-only `total_diff`.
 
 ## 6. Configuration layers L1/L2/L3
 
@@ -236,7 +257,7 @@ One harness process, one tokio runtime, plus OS-level children:
 | `src/scheduler/` | single-writer actor and job state machine (`mod.rs`, `vocab.rs`, method-cluster child modules) |
 | `src/budget.rs` | admission arithmetic, `AdmissionError`, witnesses' types |
 | `src/witness.rs` | NVML witness with `nvidia-smi` fallback, TTL caches |
-| `src/engine/` | adapters (`llama.rs`, `strata.rs`, `ninfer.rs`, `mock.rs`), `EnginePolicy` table (`policy.rs`), Fit probe (`fit.rs`) |
+| `src/engine/` | adapters (`llama.rs`, `strata.rs`, `basalt.rs`, `ninfer.rs`, `mock.rs`), `EnginePolicy` table (`policy.rs`), Fit probe (`fit.rs`) |
 | `src/process.rs` | Job-Object supervision, script staging, single-instance guard, log files |
 | `src/ownership.rs` | `SpawnTicket` provenance, `ContainerClaims` ledger, boot-reap rule |
 | `src/custody.rs` | harness-side custody sidecar for strata launches |
@@ -263,7 +284,8 @@ One harness process, one tokio runtime, plus OS-level children:
 5. `Spawn`: the adapter builds the L3 `LaunchSpec`; the runtime launches it
    under its Job Object with scrubbed environment and log capture.
 6. `Ready`: typed readiness probes (`Probe`) poll the engine - `/health`,
-   `/v1/models`, and engine-specific flags such as strata's `loaded`.
+   `/v1/models`, and engine-specific flags such as the `loaded` figure that
+   strata and basalt answer while weights stream.
 7. `Install -> Serving`: the occupant enters the slot table, measured
    footprints fold back toward the model row, SSE pushes the new state, and
    proxy traffic streams through to the engine.
