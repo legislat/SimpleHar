@@ -514,8 +514,15 @@ pub fn set_flags_on_file(
 /// `.yaml.bak` incident copy first (FINDINGS-13 [5] Fork B), the error naming
 /// both files truthfully — and only claiming a location its own read-back
 /// confirmed (FINDINGS-BATCH-2026-10-28 [1]/[3]). Called with [`write_gate`]
-/// already held.
-fn commit_verified(path: &Path, original: &str, updated: &str) -> Result<(), WritebackError> {
+/// already held. `pub(crate)` so the import merge (ruling 2026-11-03,
+/// `simplehar-se import strata --apply`) publishes through this same temp +
+/// rename + revalidate machine instead of duplicating it — it validates its own
+/// merged text but owns no second write path.
+pub(crate) fn commit_verified(
+    path: &Path,
+    original: &str,
+    updated: &str,
+) -> Result<(), WritebackError> {
     // Validate before touching the file: the result must still parse, and an edit
     // of an "identity" key must leave a parseable, non-empty map.
     let (map, problems) = parse_flat_yaml(updated);

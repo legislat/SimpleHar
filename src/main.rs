@@ -149,7 +149,9 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
 /// The command-line verbs the binary answers instead of booting. Today one:
 /// `import strata <profile.json>` (ruling 2026-11-02 row 19c) — the yaml lands
 /// on stdout (pipeable bytes, no log decoration), refusals on the tracing
-/// stream. `None` means "not a command line, boot the harness".
+/// stream. `--apply <row.yaml>` (ruling 2026-11-03) merges the block into the
+/// live row instead of printing it; the merge refuses loudly and writes
+/// nothing. `None` means "not a command line, boot the harness".
 fn run_cli(mut words: impl Iterator<Item = String>) -> Option<ExitCode> {
     let first = words.next()?;
     if first != "import" {
@@ -157,18 +159,44 @@ fn run_cli(mut words: impl Iterator<Item = String>) -> Option<ExitCode> {
     }
     let verb = words.next().unwrap_or_default();
     let path = words.next().unwrap_or_default();
-    if verb != "strata" || path.trim().is_empty() || words.next().is_some() {
+    let usage = || {
         tracing::error!(
-            "usage: simplehar-se import strata <profile.json> \
-             (prints the row yaml, deletes nothing)"
+            "usage: simplehar-se import strata <profile.json> [--apply <row.yaml>] \
+             (prints the row yaml and writes nothing, or merges the block into the row)"
         );
+    };
+    if verb != "strata" || path.trim().is_empty() {
+        usage();
         return Some(ExitCode::FAILURE);
     }
-    match simplehar_se::import::strata_yaml(std::path::Path::new(path.trim())) {
-        Ok(yaml) => {
-            print!("{yaml}");
-            Some(ExitCode::SUCCESS)
+    let row = match words.next() {
+        None => None,
+        Some(flag) if flag == "--apply" => {
+            let row = words.next().unwrap_or_default();
+            if row.trim().is_empty() || words.next().is_some() {
+                usage();
+                return Some(ExitCode::FAILURE);
+            }
+            Some(row)
         }
+        Some(_) => {
+            usage();
+            return Some(ExitCode::FAILURE);
+        }
+    };
+    let outcome = match row {
+        None => simplehar_se::import::strata_yaml(std::path::Path::new(path.trim()))
+            .map(|yaml| print!("{yaml}")),
+        Some(row) => {
+            let outcome = simplehar_se::import::apply_strata_row(
+                std::path::Path::new(path.trim()),
+                std::path::Path::new(row.trim()),
+            );
+            outcome.map(|report| println!("{report}"))
+        }
+    };
+    match outcome {
+        Ok(()) => Some(ExitCode::SUCCESS),
         Err(reason) => {
             tracing::error!(reason = %reason, "import refused");
             Some(ExitCode::FAILURE)
@@ -1056,7 +1084,7 @@ mod tests {
 
     use super::{
         boot_config, boot_order, decode_console_output, first_run_target, gate_verdict,
-        log_boot_banner, parse_excluded_ranges, probe_outcome, run, supervise_listener,
+        log_boot_banner, parse_excluded_ranges, probe_outcome, run, run_cli, supervise_listener,
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1074,6 +1102,143 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The CLI door of TASK-IMPORT-APPLY: only `import` is answered (anything
+    /// else boots the harness), `--apply` takes exactly one row path, and every
+    /// malformed shape is refused with a usage error instead of a boot.
+    #[test]
+    fn run_cli_answers_only_import_and_refuses_malformed_shapes() {
+        // Not our verb: the harness boots, the CLI answers nothing.
+        for words in [
+            vec![],
+            vec!["serve".to_string()],
+            vec!["status".to_string()],
+        ] {
+            assert_eq!(
+                run_cli(words.clone().into_iter()),
+                None,
+                "not an import line must boot the harness: {words:?}"
+            );
+        }
+        let dir = simplehar_se::testutil::temp_dir("cli-import");
+        let profile = dir.join("profile.json");
+        std::fs::write(
+            &profile,
+            r#"{"exe": "C:\\Strata\\strata.exe", "model_name": "m"}"#,
+        )
+        .expect("profile");
+        let profile = profile.display().to_string();
+        for words in [
+            vec!["import".to_string()],
+            vec!["import".to_string(), "strata".to_string()],
+            vec!["import".to_string(), "ninfer".to_string(), profile.clone()],
+            vec![
+                "import".to_string(),
+                "strata".to_string(),
+                profile.clone(),
+                "tail".to_string(),
+            ],
+            vec![
+                "import".to_string(),
+                "strata".to_string(),
+                profile.clone(),
+                "--apply".to_string(),
+            ],
+            vec![
+                "import".to_string(),
+                "strata".to_string(),
+                profile.clone(),
+                "--apply".to_string(),
+                "row.yaml".to_string(),
+                "extra".to_string(),
+            ],
+            vec![
+                "import".to_string(),
+                "strata".to_string(),
+                profile.clone(),
+                "--merge".to_string(),
+                "row.yaml".to_string(),
+            ],
+        ] {
+            assert_eq!(
+                run_cli(words.clone().into_iter()),
+                Some(std::process::ExitCode::FAILURE),
+                "a malformed import line must refuse, never boot: {words:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The end-to-end CLI path (cardless): `--apply` merges the block into the
+    /// row on disk and answers success; emit-only prints and creates nothing.
+    #[test]
+    fn run_cli_apply_merges_the_row_and_emit_only_touches_nothing() {
+        let dir = simplehar_se::testutil::temp_dir("cli-import-apply");
+        let profile = dir.join("profile.json");
+        std::fs::write(
+            &profile,
+            r#"{"exe": "C:\\Strata\\strata.exe", "model_name": "m", "gpu": 0}"#,
+        )
+        .expect("profile");
+        let row = dir.join("row.yaml");
+        std::fs::write(
+            &row,
+            "# keep me\nname: m\nengine: strata\nvram_gb: 24.0\nstrata_config: C:/old.json\n",
+        )
+        .expect("row");
+        // Emit-only: success, and the directory grows nothing.
+        assert_eq!(
+            run_cli(
+                ["import", "strata", &profile.display().to_string()]
+                    .into_iter()
+                    .map(String::from)
+            ),
+            Some(std::process::ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&row).expect("row unchanged"),
+            "# keep me\nname: m\nengine: strata\nvram_gb: 24.0\nstrata_config: C:/old.json\n"
+        );
+        // --apply: the block lands, the scheduling bytes survive, the legacy
+        // pointer line is deleted.
+        assert_eq!(
+            run_cli(
+                [
+                    "import",
+                    "strata",
+                    &profile.display().to_string(),
+                    "--apply",
+                    &row.display().to_string()
+                ]
+                .into_iter()
+                .map(String::from)
+            ),
+            Some(std::process::ExitCode::SUCCESS)
+        );
+        let text = std::fs::read_to_string(&row).expect("read back");
+        assert!(text.starts_with("# keep me\n"), "header lost: {text}");
+        assert!(
+            text.contains("vram_gb: 24.0"),
+            "scheduling key lost: {text}"
+        );
+        assert!(
+            text.contains("serve_model: m") && text.contains("strata_exe: C:\\Strata\\strata.exe"),
+            "the block did not merge: {text}"
+        );
+        assert!(text.contains("strata_gpu: 0"), "emitted key lost: {text}");
+        assert!(
+            !text.contains("strata_config"),
+            "the pointer line survived: {text}"
+        );
+        assert!(
+            !std::fs::read_dir(&dir)
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().ends_with(".sh.tmp")),
+            "the CLI write leaves no temp"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

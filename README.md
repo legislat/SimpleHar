@@ -220,7 +220,7 @@ edit never leaves a half-written model file in use.
 | `strata_vision` | Whitespace-separated `k=v` vision block over the closed key set `exe`, `mmproj`, `model`, `gpu`, `max_tokens`, `min_tokens`, `threads`. `exe`, `mmproj`, and `model` are absolute paths and are required together. `gpu` defaults on. Rendering the block also appends the `--vision` switch to `args`. |
 | `strata_sampling` | Whitespace-separated `key=value` sampling defaults (number or bool) rendered as the profile's `sampling` dict. |
 | `strata_uncensored` | Strict `true`/`false` rendered as the profile's `uncensored` switch. An explicit `false` is written intent and is different from absence. |
-| `strata_config` | **Superseded** (operator ruling 2026-11-02, row 19). A row that still declares it is refused at scan, with the migration sentence: run `simplehar-se import strata <profile.json>`, merge its emitted knob block into the row, and delete the `strata_config` line. A row that carries both `strata_exe` and `strata_config` meets the mutual-exclusion refusal; delete the `strata_config` line. |
+| `strata_config` | **Superseded** (operator ruling 2026-11-02, row 19). A row that still declares it is refused at scan, with the migration sentence: run `simplehar-se import strata <profile.json> --apply <row.yaml>` to merge the emitted knobs and delete the `strata_config` line, or print and paste manually. A row that carries both `strata_exe` and `strata_config` meets the mutual-exclusion refusal; delete the `strata_config` line. |
 | `extra_args` | **Closed allow-list, not a denial list.** The harness splits the value on whitespace and appends a word to the argv only when it is a reviewed option: `--embedding`, `--embeddings`, `--pooling <mode>`, `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`, `--warmup`, `--no-warmup`. The value words a reviewed option consumes are appended too. A value may not be option-shaped, so it cannot smuggle another flag. **Anything else is refused with the launch**, and the message names the word. The model, host, port, gpu-layers, jinja, api-key, lora, and rpc options and every other option are not on the list, so their absence refuses them and there is nothing to dodge. The harness appends its forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` after these args, and they win. |
 | `ninfer_image` | **Required for ninfer**: selects **template mode, the only mode**. The harness renders the canonical autostart script from your yaml, stages it into the distro, verifies it by distro-side checksum, and launches exactly **that** script. Its required companions are `ninfer_model_name` (the directory that holds the artifact), `ninfer_artifact` (the file inside it), and `ninfer_model_roots` (comma-separated absolute WSL directories, searched in order). Each must be a plain word, and the harness refuses a bad value and names the key. `ninfer_internal_port` (the port the container binds inside its own namespace) is optional and defaults to the SE internal number **8808**. That is the harness's 87xx family plus 100: clear of the manual 80xx world, the 87xx listeners, and the 181xx engine plan. It may not name a `protected_ports`, public-listener, or harness engine port. The manual/harness separation covers container-internal numbers too, so the harness refuses a row that borrows one at load, and the rescan names it. |
 | `ninfer_serve_cmd` | The server command inside the container (default `ninfer-serve`). |
@@ -279,8 +279,16 @@ or when a client request names it. Booting the harness starts nothing.
 The external-profile mode is superseded (operator ruling 2026-11-02, row
 19): a row that declares `strata_config` is refused at scan. The command
 `simplehar-se import strata <profile.json>` reads a manual profile and
-**emits** the yaml knob block. It never touches the row or the profile file,
-so adoption is your own paste of the emitted block. `C:\Strata` stays the
+**emits** the yaml knob block. Add `--apply <row.yaml>` (operator ruling
+2026-11-03) to merge the block into the live row in one atomic write:
+strata-owned keys and `serve_model` are replaced; `strata_config` and stale
+`strata_*` keys are deleted; `category`, `vram_gb`, `cost`, `load_timeout`,
+`launch_only_with_at_least_vram_free`, `context`, `name`, `model`,
+`strata_python`, comments, and key order are preserved. A missing,
+unreadable, duplicate-key, empty, or non-strata target is refused with a
+named reason, and nothing is written. The apply summary counts the row lines
+the merge actually changed, not the emitted field count. Without `--apply`,
+the command only prints; it never touches the row or the profile file. `C:\Strata` stays the
 manual-launch home that the harness never reads on the serve path. The
 import CLI is the one sanctioned reader.
 
