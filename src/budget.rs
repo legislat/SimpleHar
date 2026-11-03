@@ -466,6 +466,13 @@ pub fn parse_smi_sample(gpu_csv: &str, apps_csv: &str) -> Result<MemorySample, S
             .trim()
             .parse()
             .map_err(|_| format!("not a number in --query-gpu line: {line:?}"))?;
+        // R2-01-03: `parse::<f64>` accepts "NaN"/"inf"/"-inf"; a half-wedged
+        // nvidia-smi printing garbage must not hand it through as a figure.
+        // Rejecting here fails the whole sample, which the gate treats as a
+        // refusal (F-3/F-7) instead of resting on the downstream guards.
+        if !mib.is_finite() {
+            return Err(format!("not a finite number in --query-gpu line: {line:?}"));
+        }
         Ok(mib / 1024.0)
     };
     let first = gpu_csv.lines().next().ok_or("empty --query-gpu output")?;
@@ -481,8 +488,11 @@ pub fn parse_smi_sample(gpu_csv: &str, apps_csv: &str) -> Result<MemorySample, S
             Err(_) => continue,
         };
         let used: f64 = match used.trim().trim_end_matches(" MiB").parse::<f64>() {
-            Ok(mib) => mib / 1024.0,
-            Err(_) => continue,
+            // R2-01-03: a garbage (`NaN`/`inf`) process figure is dropped like
+            // any other unreadable entry — the totals still gate, the entry is
+            // never booked.
+            Ok(mib) if mib.is_finite() => mib / 1024.0,
+            _ => continue,
         };
         processes.push((pid, used));
     }
@@ -745,5 +755,47 @@ mod tests {
             CardOccupancy::ForeignDominated,
             "movement with nothing of its own to blame it on is foreign"
         );
+    }
+
+    /// R2-01-03: Rust's `parse::<f64>` succeeds on "NaN"/"inf"/"-inf"/"infinity"
+    /// (documented behaviour), so a half-wedged `nvidia-smi` printing garbage in
+    /// a memory column used to produce a "valid" `MemorySample` whose honesty
+    /// rested entirely on the downstream guards. The gpu columns now reject it at
+    /// the source — the sample fails, so the gate refuses (fail-closed) rather
+    /// than comparing garbage. The guards stay as defence-in-depth.
+    #[test]
+    fn smi_parser_rejects_non_finite_gpu_figures() {
+        for garbage in ["NaN", "inf", "-inf", "infinity"] {
+            assert!(
+                parse_smi_sample(&format!("{garbage}, 4096"), "").is_err(),
+                "total {garbage:?} is driver garbage, not a figure"
+            );
+            assert!(
+                parse_smi_sample(&format!("73728, {garbage}"), "").is_err(),
+                "used {garbage:?} is driver garbage, not a figure"
+            );
+        }
+        // The finite pair still parses (rejection is the garbage, not the rule).
+        let s = parse_smi_sample("73728, 30720", "").expect("finite pair parses");
+        assert!(close(s.total_gib, 72.0) && close(s.used_gib, 30.0));
+    }
+
+    /// Same rejection for the `--query-compute-apps` column: a garbage process
+    /// figure is dropped like any other unreadable entry (the totals still gate),
+    /// and all-garbage attribution reports absence, never a fake entry.
+    #[test]
+    fn smi_parser_drops_non_finite_process_figures() {
+        for garbage in ["NaN", "inf", "-inf"] {
+            let s = parse_smi_sample("73728, 30720", &format!("42, {garbage}\n7, 1024"))
+                .expect("the totals are finite");
+            assert_eq!(
+                s.processes,
+                vec![(7, 1.0)],
+                "the {garbage:?} entry must be dropped, not booked"
+            );
+        }
+        let s = parse_smi_sample("73728, 30720", "42, NaN").expect("the totals are finite");
+        assert!(s.processes.is_empty(), "no readable entry survives");
+        assert_eq!(s.attribution, AttributionQuality::Unavailable);
     }
 }

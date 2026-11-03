@@ -413,3 +413,13 @@ Unresolved questions live ONLY in `DECISIONS-PENDING.md`. This file only ever *g
   unobserved capture. Cost: one metadata call per parked load; no engine, no volume.
   Reopen only if a profile shows the park path as a hot spot.
   | 2026-11-03 | `TASK-DEBT-LEFTOVERS`
+
+- FIXED 2026-11-03 (R2 chunk 01/03): the post-release settle gate is reserve-aware.
+  `freed_for(gate_target + vram_reserve_gb, witness_tolerance_gb)` matches the
+  direct-admit guard band; the 2026-10-26 one-sided tolerance is unchanged. This is
+  intentionally stricter: a swap must reach `gate + reserve`, so the settle-timeout
+  surface grows on a card that runs near the reserve. The same-slot holder credit is
+  counted once: the ledger term is `free_at_admit + (released_cost -
+  holder_released_cost)`, while the observed term keeps the full release cost. The
+  shipped test that pinned the inflated skip is renamed and re-pinned at 55 < 56.
+  | 2026-11-03 | `TASK-DEBT-LEFTOVERS`

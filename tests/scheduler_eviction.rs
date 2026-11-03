@@ -559,8 +559,8 @@ async fn aux_load_cannot_evict_anything_cross_category() {
     let message = error.to_string();
     assert!(message.contains("settle timeout"), "was: {message}");
     assert!(
-        message.contains("22.0 GiB free after release, 55.0 GiB required"),
-        "the re-gate must name the physical truth: {message}"
+        message.contains("22.0 GiB free after release, 57.0 GiB required incl. 2.0 GiB reserve"),
+        "the re-gate must name the physical truth and its guard band: {message}"
     );
     let status = handle.status().await.expect("actor alive");
     let aux = aux_models(&status);
@@ -853,7 +853,7 @@ async fn settle_refuses_when_observed_card_stays_busy() {
         .expect("job recorded");
     let error = job.error.clone().expect("failed job carries the reason");
     assert!(
-        error.contains("52.0 GiB free after release, 65.0 GiB required"),
+        error.contains("52.0 GiB free after release, 67.0 GiB required incl. 2.0 GiB reserve"),
         "explanatory settle error: {error}"
     );
 }
@@ -908,8 +908,9 @@ async fn fresh_load_refused_on_physically_full_card() {
 #[tokio::test]
 async fn a_load_two_victims_short_releases_both_least_disposable_first() {
     // FINDINGS-20 [3]: every planned-victim assertion in the repo was a single element,
-    // so the one-at-a-time release loop, its ordering comparator (least-disposable
-    // first) and `released_cost` across releases ran entirely untested. Neither victim
+    // so the one-at-a-time release loop, its ordering comparator (most-disposable
+    // first = most categories may evict it) and `released_cost` across releases ran
+    // entirely untested. Neither victim
     // here covers the deficit alone (12 + 20 against a 24 GiB short), so the load can
     // only be admitted on the SUM of both credits; the card is scripted to stay busy
     // with the unreleased victim's bytes until that victim's own release is proven, so
@@ -995,8 +996,9 @@ async fn a_load_two_victims_short_releases_both_least_disposable_first() {
     assert_eq!(
         job.victims_released,
         vec!["aux12".to_string(), "rp20".to_string()],
-        "the release ORDER is least-disposable first: AUX (WORK and RP may evict it) \
-         before RP (WORK only)"
+        "the release ORDER is most-disposable first (most categories may evict it), the \
+         planner's `least-protected first`: AUX (WORK and RP may evict it) before RP \
+         (WORK only)"
     );
     assert_eq!(job.gate_target_gib, Some(62.0));
     assert_eq!(
@@ -1018,14 +1020,17 @@ async fn a_load_two_victims_short_releases_both_least_disposable_first() {
 }
 
 #[tokio::test]
-async fn the_release_loop_stops_as_soon_as_the_credits_already_cover_the_gate() {
-    // FINDINGS-20 [3], the early-stop branch (`release sufficient; skipping remaining
-    // victims`, src/scheduler/mod.rs): this load queues three release targets — the
-    // same-slot holder and BOTH AUX victims (15 + 15 against a 16 GiB deficit, so the
-    // planner cannot settle for one) — and the first two credits are what carry the
-    // gate from 40 to 57 GiB against a 56 GiB need. Drop any part of the accumulation
-    // and the third victim is killed as well, which is exactly the harm the branch
-    // exists to prevent (an operator's model dies for nothing).
+async fn the_release_loop_stops_only_when_the_single_counted_credit_covers_the_gate() {
+    // FINDINGS-20 [3] (the early-stop branch, `release sufficient; skipping remaining
+    // victims`, src/scheduler/mod.rs) read together with R2-03-01: this load queues
+    // three release targets — the same-slot holder and BOTH AUX victims (15 + 15
+    // against a 16 GiB deficit, so the planner cannot settle for one). The holder's
+    // 2.0 GiB is already inside `free_at_admit` (40.0 = 72 - 2 reserve - 32 used + 2
+    // holder credit), so after holder + aux_a the honest ledger reads 40.0 + 15.0 =
+    // 55.0 against the 56.0 gate — 1.0 GiB short, so aux_b must die. The double
+    // count R2-03-01 filed read 40.0 + 2.0 + 15.0 = 57.0, already over the gate, and
+    // the loop stopped with an operator model still loaded; this test pins the honest
+    // single count, so it is red on the double count and green on the fix.
     let witness = FakeWitness::with(vec![sample(72.0, 32.0)]);
     let (handle, runtime) = harness_rt(
         2,
@@ -1068,13 +1073,13 @@ async fn the_release_loop_stops_as_soon_as_the_credits_already_cover_the_gate() 
     })
     .await;
     // Admit already happened (it precedes `Dispose`), so this only moves the card for
-    // the settle gate: the holder's 2 GiB and the first victim's 15 have come back, and
-    // the untouched second victim still holds its 15.
-    witness.set_used(15.0);
+    // the settle gate: every byte the loop has released is back, and the window has
+    // nothing left to wait for once the last release is proven.
+    witness.set_used(0.0);
     let Reply::Loaded(receipt) = loading
         .await
         .expect("task alive")
-        .expect("work56 admits on the first victim's credit alone")
+        .expect("work56 admits only on BOTH victims' credits")
     else {
         panic!("expected Loaded");
     };
@@ -1084,15 +1089,29 @@ async fn the_release_loop_stops_as_soon_as_the_credits_already_cover_the_gate() 
     let job = job_row(&status, "work56");
     assert_eq!(
         job.victims_released,
-        vec!["aux_a".to_string()],
-        "the loop must stop before the third target: the victim nobody needed stays loaded"
+        vec!["aux_a".to_string(), "aux_b".to_string()],
+        "the honest credit is 1.0 GiB short after the first victim, so the loop may \
+         not stop before the second: {:?}",
+        job.victims_released
     );
+    let free_at_admit = job
+        .free_at_admit_gib
+        .expect("the admit figure is recorded for post-checks");
     assert_eq!(
-        job.free_at_admit_gib,
-        Some(40.0),
-        "the figure the accumulated credits were compared against"
+        free_at_admit, 40.0,
+        "72 - 2 reserve - 32 used + the holder's 2.0 credit"
     );
     assert_eq!(job.gate_target_gib, Some(56.0));
+    // Falsifier leg (R2-03-01): the fixture must straddle the gate between the two
+    // accounting forms — after aux_a the double-counted ledger term (40.0 + 2.0 +
+    // 15.0 = 57.0) clears the 56.0 gate, the single-counted one (40.0 + 15.0 = 55.0)
+    // does not. Should the holder's credit ever be counted twice again, this leg goes
+    // red before anyone can re-pin the release list to the inflated figure.
+    assert!(
+        free_at_admit + 2.0 + 15.0 > 56.0 && free_at_admit + 15.0 < 56.0,
+        "double-counted 57.0 clears the 56.0 gate while the honest 55.0 does not: \
+         free_at_admit {free_at_admit}"
+    );
     assert_eq!(
         model_of(&status, CategoryId::Work).as_deref(),
         Some("work56"),
@@ -1101,24 +1120,24 @@ async fn the_release_loop_stops_as_soon_as_the_credits_already_cover_the_gate() 
     let aux = aux_models(&status);
     assert!(
         !aux.contains(&Some("aux_a".to_string())),
-        "the planned victim was released: {aux:?}"
+        "the first victim was released: {aux:?}"
     );
     assert!(
-        aux.contains(&Some("aux_b".to_string())),
-        "the skipped victim survived: {aux:?}"
+        !aux.contains(&Some("aux_b".to_string())),
+        "the second victim was required by the honest credit too: {aux:?}"
     );
     assert_eq!(
         runtime.server_count(),
-        2,
-        "the kill count is the proof: work56 plus the spared aux_b"
+        1,
+        "the kill count is the proof: only the admitted load is live"
     );
     assert!(
         runtime.is_dead(aux_a.port).await,
-        "the released victim's port refuses"
+        "the first victim's port refuses"
     );
     assert!(
-        !runtime.is_dead(aux_b.port).await,
-        "the skipped victim still answers"
+        runtime.is_dead(aux_b.port).await,
+        "the second victim's port refuses"
     );
     assert_eq!(runtime.spawn_count(), 4, "holder, aux_a, aux_b, work56");
 }

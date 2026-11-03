@@ -109,7 +109,7 @@ pub enum SchedulerError {
     #[error("settle timeout: {reason}")]
     SettleTimeout {
         /// What the settle gate saw, e.g. `12.4 GiB free after release, 34.0 GiB
-        /// required (used 58.2 of 72.0)`.
+        /// required incl. 2.0 GiB reserve (used 58.2 of 72.0)`.
         reason: String,
     },
     /// The actor task is gone (shutting down).
@@ -1205,11 +1205,14 @@ struct Job {
     launch_floor: Option<f64>,
     /// Model's per-load readiness deadline (`load_timeout:`); `None` = config default.
     load_timeout_s: Option<u64>,
-    /// The `available` value (free_at_admit + released) the release-minimality
-    /// re-check must reach before spawning: `max(need, floor)` at plan time
-    /// (floor alone for greedy). Without it, a greedy job whose booked need was
-    /// clamped small would skip floor victims after the first release (review
-    /// CRITICAL, 2026-10-26).
+    /// The `available` value (free_at_admit + released, each credit counted once) the
+    /// release-minimality re-check must reach before spawning: `max(need, floor)` at
+    /// plan time (floor alone for greedy). Without it, a greedy job whose booked need
+    /// was clamped small would skip floor victims after the first release (review
+    /// CRITICAL, 2026-10-26). The physical settle gate in
+    /// [`ActorState::spawn_settle_task`] compares this same figure plus
+    /// `vram_reserve_gb` against the card, so both halves apply one guard band
+    /// (R2-01-01).
     gate_target: Option<f64>,
     free_at_admit: Option<Gibibytes>,
     /// Observed physical free (total - used) at admit; `None` when the witness
@@ -1246,6 +1249,11 @@ struct Job {
     victims_released: Vec<String>,
     /// Ledger cost freed by confirmed releases so far (Step 6 minimality check).
     released_cost: f64,
+    /// The part of [`Self::released_cost`] that came from the non-evicted same-slot
+    /// holder. Its booked need is already inside `free_at_admit`, so the ledger leg of
+    /// the release re-check subtracts it and counts it once (R2-03-01). The observed
+    /// leg keeps the full figure: a physical reading never held the paper credit.
+    holder_released_cost: f64,
     /// Ledger need booked for *other* occupants when this engine was admitted. The
     /// measured diff subtracts only what appeared after this point, so a tenant that
     /// was already resident is not double-counted (review, 2026-10-27).
@@ -2442,6 +2450,7 @@ impl ActorState {
             victims: Vec::new(),
             victims_released: Vec::new(),
             released_cost: 0.0,
+            holder_released_cost: 0.0,
             other_need_at_admit: 0.0,
             note: Some(note.to_string()),
             warnings: Vec::new(),
@@ -3596,6 +3605,7 @@ impl ActorState {
             victims: Vec::new(),
             victims_released: Vec::new(),
             released_cost: 0.0,
+            holder_released_cost: 0.0,
             other_need_at_admit: 0.0,
             note: None,
             warnings: Vec::new(),
@@ -3839,10 +3849,13 @@ impl ActorState {
         };
         let floor_deficit = floor.map(|f| (f - free.0).max(0.0)).unwrap_or(0.0);
         let deficit = need_deficit.max(floor_deficit);
-        // What `available` (free_at_admit + released) must reach before spawn.
-        // Comparing only `need` re-admits the bug this review caught: greedy
-        // books a clamped-small need, so the re-check would skip the very floor
-        // victims the planner queued.
+        // What `available` (free_at_admit + released, each credit counted once) must
+        // reach before spawn. Comparing only `need` re-admits the bug this review
+        // caught: greedy books a clamped-small need, so the re-check would skip the
+        // very floor victims the planner queued. The stored figure is the planned
+        // target alone: `free_at_admit` already carries the reserve band, and
+        // [`ActorState::spawn_settle_task`] adds it to the physical re-gate, so both
+        // halves of this decision judge the same guard band (DOCTRINE item 4).
         let gate_target = if greedy {
             floor.unwrap_or(0.0)
         } else {
@@ -4177,11 +4190,16 @@ impl ActorState {
     }
 
     /// §0.3 memory evidence: after a confirmed release, wait until the card has
-    /// *physically* freed the gate target (`max(need, launch floor)`, within the
-    /// witness tolerance) before the spawn fires. This is where a replacement load
-    /// proves the card truly emptied (operator 2026-10-26: the stopper is observed
-    /// VRAM, judged after release). No ledger baseline is consulted — an
-    /// unattributable desktop floor is not a leak.
+    /// *physically* freed the gate target **plus the reserve guard band** — the same
+    /// `vram_reserve_gb` the direct-admit gate subtracts (DOCTRINE item 4: the gate is
+    /// `total - reserve - observed_used + credits`, and this window is the physical
+    /// half of that same decision) — within the witness tolerance before the spawn
+    /// fires. This is where a replacement load proves the card truly emptied (operator
+    /// 2026-10-26: the stopper is observed VRAM, judged after release). The compare
+    /// stays physical free against `max(need, launch floor) + vram_reserve_gb` with the
+    /// ruled 2026-10-26 one-sided tolerance: no ledger baseline is consulted — an
+    /// unattributable desktop floor is not a leak — but the config guard band is, so a
+    /// swap cannot reach the card state the no-release path refuses (R2-01-01).
     ///
     /// A witness that dies mid-window fails **closed**, exactly as at admission: a
     /// confirmed release proves the port closed, never that the VRAM came back, and
@@ -4190,7 +4208,12 @@ impl ActorState {
     /// through (review, 2026-10-26).
     fn spawn_settle_task(&mut self, job_id: JobId) {
         let tolerance = self.cfg.witness_tolerance_gb;
+        let reserve = self.cfg.vram_reserve_gb;
         let gate = self.jobs[&job_id].gate_target.unwrap_or(0.0);
+        // The figure the window actually compares: the planned gate plus the reserve
+        // band the admit-time gate subtracted, so the swap path keeps the same guard
+        // band as the no-release path.
+        let required = gate + reserve;
         let model = self.jobs[&job_id].model.clone();
         let deadline = Duration::from_secs(self.cfg.settle_timeout_s);
         let ledger_only = self.witness.ledger_only();
@@ -4202,13 +4225,15 @@ impl ActorState {
                 match witness.sample().await {
                     Ok(sample) => {
                         let observed_free = sample.free_gib();
-                        if sample.freed_for(gate, tolerance) {
+                        if sample.freed_for(required, tolerance) {
                             if crate::observability::extended_logging() {
                                 tracing::info!(
                                     used_gib = sample.used_gib,
                                     total_gib = sample.total_gib,
                                     free_gib = observed_free,
                                     gate_gib = gate,
+                                    reserve_gib = reserve,
+                                    required_gib = required,
                                     "settle evidence (extended)"
                                 );
                             }
@@ -4237,9 +4262,11 @@ impl ActorState {
                     let numbers = match witness.sample().await {
                         Ok(sample) => {
                             let observed_free = sample.free_gib();
+                            // G13: the figures the window actually compared, reserve
+                            // band named inside the required figure.
                             let msg = format!(
-                                "{:.1} GiB free after release, {:.1} GiB required (used {:.1} of {:.1})",
-                                observed_free, gate, sample.used_gib, sample.total_gib
+                                "{:.1} GiB free after release, {:.1} GiB required incl. {:.1} GiB reserve (used {:.1} of {:.1})",
+                                observed_free, required, reserve, sample.used_gib, sample.total_gib
                             );
                             // The load that never spawned must still be readable
                             // in the ring (§0.3 evidence, operator 2026-10-26).
@@ -4250,12 +4277,15 @@ impl ActorState {
                                 total_gib = sample.total_gib,
                                 free_gib = observed_free,
                                 gate_gib = gate,
+                                reserve_gib = reserve,
+                                required_gib = required,
                                 "settle timeout: the card never freed the required space"
                             );
                             msg
                         }
                         Err(reason) => {
                             tracing::warn!(%job_id, %model, reason = %reason, gate_gib = gate,
+                                reserve_gib = reserve, required_gib = required,
                                 "settle timeout: the witness never answered again");
                             format!("witness lost during settle: {reason}")
                         }
@@ -4600,6 +4630,15 @@ impl ActorState {
                         job.released_cost += victim.cost;
                         if victim.evicted {
                             job.victims_released.push(victim.model.clone());
+                        } else {
+                            // The same-slot holder's booked need is already inside
+                            // `free_at_admit` (Step 4 credits the bytes this job is
+                            // about to reclaim). Crediting the same release there
+                            // again is the double count R2-03-01 filed, so it rides a
+                            // separate accumulator the ledger leg subtracts. The
+                            // observed leg keeps the full figure: the physical reading
+                            // at admit never held this credit.
+                            job.holder_released_cost += victim.cost;
                         }
                     }
                 }
@@ -4616,16 +4655,18 @@ impl ActorState {
                             .gate_target
                             .unwrap_or_else(|| self.jobs[&job_id].need.map_or(0.0, |n| n.0));
                         // free_at_admit was computed with everything still in the
-                        // ledger; every confirmed release has since freed its cost.
-                        // The observed figure is the same arithmetic against the
-                        // card as physically sampled at admit (never ledger-only).
-                        let available = self.jobs[&job_id].free_at_admit.map_or(0.0, |f| f.0)
-                            + self.jobs[&job_id].released_cost;
-                        let available = self.jobs[&job_id]
-                            .observed_at_admit
-                            .map_or(available, |obs| {
-                                available.min(obs + self.jobs[&job_id].released_cost)
-                            });
+                        // ledger and already carries the same-slot holder's credit, so
+                        // the ledger term adds only the cross-category releases
+                        // (R2-03-01: counting the holder twice let the early stop fire
+                        // on a figure the reserve-aware ledger never reached). The
+                        // observed figure is the card as physically sampled at admit —
+                        // never credited — plus every confirmed release.
+                        let job = &self.jobs[&job_id];
+                        let ledger_available = job.free_at_admit.map_or(0.0, |f| f.0)
+                            + (job.released_cost - job.holder_released_cost);
+                        let available = job.observed_at_admit.map_or(ledger_available, |obs| {
+                            ledger_available.min(obs + job.released_cost)
+                        });
                         if target <= available {
                             if let Some(job) = self.jobs.get_mut(&job_id) {
                                 job.victims.clear();
@@ -6118,6 +6159,7 @@ mod tests {
                 victims: Vec::new(),
                 victims_released: Vec::new(),
                 released_cost: 0.0,
+                holder_released_cost: 0.0,
                 other_need_at_admit: 0.0,
                 note: Some("loaded".to_string()),
                 warnings: Vec::new(),

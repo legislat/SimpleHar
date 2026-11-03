@@ -3,12 +3,15 @@
 //! NVML in-process is the primary source (no process spawn per sample, per-process
 //! attribution where the driver offers it). When the NVML library or a sample fails,
 //! the witness falls back to spawning `nvidia-smi` — logged once, and labelled as a
-//! fallback by `source()` (F-7). When neither answers, `sample()` errors and the
+//! fallback by `source()` (F-7): the label follows the leg that served the **current**
+//! figure, so a later NVML sample clears the fallback attribution again (R2-01-02).
+//! When neither answers, `sample()` errors and the
 //! caller **refuses** rather than deciding on a stale guess or a bookkeeping fallback
 //! (F-3/F-7 lesson); only `LedgerOnlyWitness` budgets from the ledger instead.
 
 use crate::budget::{attribution_from_processes, parse_smi_sample, MemorySample, VramWitness};
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -45,7 +48,14 @@ pub struct NvmlWitness {
     /// Held across a refill: the TTL check and the store straddle an `await`, so
     /// without this N concurrent misses each spawned their own `nvidia-smi` pair.
     refill: tokio::sync::Mutex<()>,
+    /// Attribution of the figure currently served: true iff `nvidia-smi` produced
+    /// it. Set by an smi sample and **cleared** by an NVML sample (R2-01-02), so
+    /// the label tracks the producing leg instead of latching on a first failure.
     fell_back: Mutex<bool>,
+    /// Whether the fallback warning was already logged (the module doc's "logged
+    /// once"). Kept apart from `fell_back` so clearing the attribution does not
+    /// re-arm the warning.
+    fallback_warned: AtomicBool,
 }
 
 impl NvmlWitness {
@@ -59,6 +69,7 @@ impl NvmlWitness {
             failure: Mutex::new(None),
             refill: tokio::sync::Mutex::new(()),
             fell_back: Mutex::new(false),
+            fallback_warned: AtomicBool::new(false),
         }
     }
 
@@ -153,10 +164,8 @@ impl NvmlWitness {
         ])
         .await
         .unwrap_or_default();
-        let first_fallback = !*self.fell_back.lock().expect("witness lock");
-        if first_fallback {
+        if !self.fallback_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!("witness serving from nvidia-smi fallback (NVML absent)");
-            *self.fell_back.lock().expect("witness lock") = true;
         }
         parse_smi_sample(&gpu, &apps)
     }
@@ -199,14 +208,14 @@ impl Default for NvmlWitness {
 impl VramWitness for NvmlWitness {
     fn source(&self) -> String {
         // Naming the source is the point: a fallback reading must never be
-        // displayed as an in-process NVML one (F-7).
-        if self.nvml.get().is_none_or(Option::is_none)
-            || *self.fell_back.lock().expect("witness lock")
-        {
-            "nvidia-smi (fallback)".to_string()
-        } else {
-            "NVML".to_string()
-        }
+        // displayed as an in-process NVML one (F-7). R2-01-02: the label follows
+        // the leg that served the current figure — `sample()` re-derives the
+        // latch on every successful sample.
+        source_label(
+            self.nvml.get().is_none_or(Option::is_none),
+            *self.fell_back.lock().expect("witness lock"),
+        )
+        .to_string()
     }
 
     async fn sample(&self) -> Result<MemorySample, String> {
@@ -225,11 +234,11 @@ impl VramWitness for NvmlWitness {
         if let Some(reason) = self.fresh_failure() {
             return Err(reason);
         }
-        let result = match self.sample_nvml() {
-            Ok(sample) => Ok(sample),
+        let (result, served_by) = match self.sample_nvml() {
+            Ok(sample) => (Ok(sample), ServingSource::Nvml),
             Err(reason) => {
                 tracing::debug!(reason = %reason, "nvml sample failed; trying nvidia-smi");
-                self.sample_smi().await
+                (self.sample_smi().await, ServingSource::Smi)
             }
         };
         match result {
@@ -237,6 +246,12 @@ impl VramWitness for NvmlWitness {
                 *self.cache.lock().expect("witness cache lock") =
                     Some((Instant::now(), sample.clone()));
                 *self.failure.lock().expect("witness failure lock") = None;
+                // R2-01-02: attribute the figure now served to its producing leg.
+                // An NVML success clears a stale fallback latch, so the label
+                // never claims "nvidia-smi (fallback)" for an NVML figure. The
+                // fail-closed error arm below is untouched: no figure, no label.
+                let mut latch = self.fell_back.lock().expect("witness lock");
+                *latch = next_fell_back(*latch, served_by);
                 Ok(sample)
             }
             Err(reason) => {
@@ -245,6 +260,35 @@ impl VramWitness for NvmlWitness {
                 Err(reason)
             }
         }
+    }
+}
+
+/// Which leg produced a served figure (R2-01-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServingSource {
+    Nvml,
+    Smi,
+}
+
+/// Fallback-label state machine for one served figure, pure (R2-01-02): the
+/// latch reflects the leg that produced the **current** figure, not the worst
+/// leg ever seen. The old code OR'd into the latch and never cleared it
+/// (`fell_back || smi`), so one transient per-call NVML failure mislabelled
+/// every later NVML figure as a fallback for the life of the process.
+/// `fell_back` is the previous state — deliberately unused: an NVML sample
+/// clears whatever the latch held.
+fn next_fell_back(fell_back: bool, served_by: ServingSource) -> bool {
+    let _ = fell_back;
+    matches!(served_by, ServingSource::Smi)
+}
+
+/// The `source()` label for the figure currently served (F-7): a fallback
+/// whenever NVML never answered or the last figure came from `nvidia-smi`.
+fn source_label(nvml_unavailable: bool, fell_back: bool) -> &'static str {
+    if nvml_unavailable || fell_back {
+        "nvidia-smi (fallback)"
+    } else {
+        "NVML"
     }
 }
 
@@ -387,5 +431,40 @@ mod tests {
         assert_eq!(witness.source(), expected);
         *witness.fell_back.lock().expect("witness lock") = true;
         assert_eq!(witness.source(), "nvidia-smi (fallback)");
+    }
+
+    /// R2-01-02 regression: the old latch was sticky (`fell_back || smi`, never
+    /// cleared), so after one transient per-call NVML failure — init stays `Some`,
+    /// only `device_count`/`memory_info` hiccup — every later figure actually
+    /// served from NVML was labelled "nvidia-smi (fallback)" for the life of the
+    /// process. The update is the producing leg alone: the sticky form returns
+    /// `true` on the second leg, the fix returns `false`. The NVML call itself is
+    /// not injectable, so the state machine is pinned as the pure helper
+    /// [`next_fell_back`]; [`VramWitness::sample`] routes the real path through it.
+    #[test]
+    fn fallback_latch_follows_the_producing_leg() {
+        assert!(
+            next_fell_back(false, ServingSource::Smi),
+            "a fallback sample is labelled a fallback"
+        );
+        assert!(
+            !next_fell_back(true, ServingSource::Nvml),
+            "an NVML sample must clear the fallback attribution (sticky latch kept claiming fallback)"
+        );
+        assert!(
+            next_fell_back(false, ServingSource::Smi),
+            "a later fallback labels as a fallback again"
+        );
+    }
+
+    /// The label decision for the figure currently served: NVML only while the
+    /// driver answered AND the last figure came from it; fail-closed labelling
+    /// keeps everything a fallback while NVML never answered, latch or not.
+    #[test]
+    fn source_label_names_the_current_figure_s_producer() {
+        assert_eq!(source_label(false, false), "NVML");
+        assert_eq!(source_label(false, true), "nvidia-smi (fallback)");
+        assert_eq!(source_label(true, false), "nvidia-smi (fallback)");
+        assert_eq!(source_label(true, true), "nvidia-smi (fallback)");
     }
 }

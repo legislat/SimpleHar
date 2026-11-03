@@ -162,10 +162,11 @@ async fn admission_refuses_when_the_card_has_no_room() {
 async fn settle_blocks_spawn_while_the_card_has_not_freed() {
     // Load model A, then swap to B while the card still reports the released
     // engine's bytes: the settle gate refuses with the numbers and never spawns B
-    // (G12: no double-spawn). The gate is physical free vs the gate target — a
-    // leftover that still leaves room is no reason to refuse (operator 2026-10-26:
-    // the ledger-baseline form timed out every swap against a ~3 GiB desktop floor
-    // that had nothing to do with the release).
+    // (G12: no double-spawn). The gate is physical free vs the gate target **plus the
+    // reserve band** — a leftover that still leaves room is no reason to refuse
+    // (operator 2026-10-26: the ledger-baseline form timed out every swap against a
+    // ~3 GiB desktop floor that had nothing to do with the release), but the reserve
+    // the no-release path keeps unreachable is part of the compared figure (R2-01-01).
     let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
     let cfg = AppConfig {
         settle_timeout_s: 1,
@@ -181,8 +182,8 @@ async fn settle_blocks_spawn_while_the_card_has_not_freed() {
         panic!("expected Loaded");
     };
     // A's memory never comes back: 68 of 72 used leaves 4.0 GiB free — under the
-    // 8.0 GiB gate even with the witness tolerance — while B's own admit fits,
-    // because the victim's 8 GiB are credited to it.
+    // 8.0 GiB gate plus the 2.0 GiB reserve even with the 2.0 GiB witness tolerance
+    // — while B's own admit fits, because the victim's 8 GiB are credited to it.
     witness.set(sample(72.0, 68.0, vec![]));
     let error = handle
         .swap("b", CategoryId::Work)
@@ -191,8 +192,8 @@ async fn settle_blocks_spawn_while_the_card_has_not_freed() {
     let message = error.to_string();
     assert!(message.contains("settle timeout"), "was: {message}");
     assert!(
-        message.contains("4.0 GiB free after release, 8.0 GiB required"),
-        "was: {message}"
+        message.contains("4.0 GiB free after release, 10.0 GiB required"),
+        "the compared figure carries the reserve band: {message}"
     );
 
     let status = handle.status().await.expect("actor alive");
@@ -241,6 +242,84 @@ async fn settle_passes_once_the_card_frees() {
         .await
         .expect("task alive")
         .expect("b loads after settle");
+    assert!(matches!(reply, Reply::Loaded(_)), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn settle_holds_the_reserve_band_the_no_release_path_keeps_unreachable() {
+    // R2-01-01: the settle window is the physical half of the same admission decision,
+    // so it compares `max(need, launch floor) + vram_reserve_gb`, never raw free
+    // against the bare gate. `reserve 4.0 / tolerance 1.0` keeps the guard band
+    // distinct from the tolerance: an 8.0 GiB gate requires 12.0 GiB free. A card at
+    // 9.0 GiB free sits inside the band — the no-release admission path refuses that
+    // state outright, and the swap path must refuse it too. Falsifier: the pre-fix
+    // raw-free compare (`free + tolerance >= gate`) settles here and spawns B onto a
+    // card the direct gate would never admit onto.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
+    let cfg = AppConfig {
+        settle_timeout_s: 1,
+        vram_reserve_gb: 4.0,
+        witness_tolerance_gb: 1.0,
+        ..AppConfig::default()
+    };
+    let (handle, _dir) = harness_models(
+        cfg,
+        &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 8.0)],
+        Arc::new(witness.clone()),
+    );
+
+    let Reply::Loaded(_) = handle.swap("a", CategoryId::Work).await.expect("a loads") else {
+        panic!("expected Loaded");
+    };
+    // Admit still fits (72 - 4 reserve - 63 used + the holder's 8 credit = 13 >= 8),
+    // so the victim dies and the settle window is what judges: raw free 9.0 is above
+    // the 8.0 gate and inside the 12.0 reserve-aware target.
+    witness.set(sample(72.0, 63.0, vec![]));
+    let error = handle
+        .swap("b", CategoryId::Work)
+        .await
+        .expect_err("a card inside the reserve band must not settle");
+    let message = error.to_string();
+    assert!(message.contains("settle timeout"), "was: {message}");
+    assert!(
+        message.contains("9.0 GiB free after release, 12.0 GiB required incl. 4.0 GiB reserve"),
+        "the refusal names the reserve-aware figure it compared: {message}"
+    );
+
+    let status = handle.status().await.expect("actor alive");
+    assert!(
+        status.slots.iter().all(|slot| slot.model.is_none()),
+        "the card inside the guard band never spawned B"
+    );
+}
+
+#[tokio::test]
+async fn settle_passes_once_the_card_frees_to_the_reserve_aware_target() {
+    // The pass leg beside the refusal pin above: the card gives back the whole band,
+    // 12.0 GiB free against the 8.0 GiB gate plus the 4.0 GiB reserve, and B loads.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0, vec![])]);
+    let cfg = AppConfig {
+        settle_timeout_s: 5,
+        vram_reserve_gb: 4.0,
+        witness_tolerance_gb: 1.0,
+        ..AppConfig::default()
+    };
+    let (handle, _dir) = harness_models(
+        cfg,
+        &[("a", CategoryId::Work, 8.0), ("b", CategoryId::Work, 8.0)],
+        Arc::new(witness.clone()),
+    );
+
+    let Reply::Loaded(_) = handle.swap("a", CategoryId::Work).await.expect("a loads") else {
+        panic!("expected Loaded");
+    };
+    // 60 of 72 used leaves 12.0 free: the admit fits (72 - 4 - 60 + 8 = 16 >= 8) and
+    // the settle window clears `8.0 + 4.0` exactly, with no tolerance spent.
+    witness.set(sample(72.0, 60.0, vec![]));
+    let reply = handle
+        .swap("b", CategoryId::Work)
+        .await
+        .expect("b loads at the reserve-aware target");
     assert!(matches!(reply, Reply::Loaded(_)), "got {reply:?}");
 }
 
