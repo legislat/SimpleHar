@@ -16,6 +16,14 @@ a Changelog. Versions follow Semantic Versioning.
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
+## Unreleased
+
+### Fixed
+
+- The Basalt child receives `USERPROFILE` and `HOME` so its Python server can
+  resolve `Path.home()` for the model cache. The v1.1.1 release harness failed
+  Basalt loads without them.
+
 ## v1.1.1 - 2026-11-03
 
 Commit: `405505e` (release prep). Artifact: `simplehar-se.exe`, SHA256
