@@ -196,7 +196,7 @@ impl ActorState {
     /// Re-baselines the spawn-side capture after a **harness-owned** write to a
     /// resident's own yaml (Axis-2 interlock 5: the measured fold and the API's flag
     /// edit must never amber their own model). The legitimate mutators are a CLOSED
-    /// set — the measured persist (`mod.rs`'s fold success path) and
+    /// set — the measured persist (`measured.rs`'s fold success path) and
     /// `har_config_model`'s rewrite (api, note sent before its reload) — and the
     /// closure is pinned by `the_writeback_mutator_set_stays_closed_to_the_rebaseline_table`
     /// (FINDINGS-BATCH-2026-10-28P [P-4]): a new writer must register here with its
