@@ -1722,6 +1722,74 @@ async fn a_wrong_typed_cpu_is_refused_rather_than_silently_dropped() {
 }
 
 #[tokio::test]
+async fn a_wrong_typed_category_is_refused_rather_than_silently_dropped() {
+    // R2-07-04: the exact parity sibling of the `cpu` leg above (FINDINGS2-0507 [5]).
+    // `body.get("category").and_then(Value::as_str)` read `5`, `true` and `null` as
+    // "absent", so `{"model":x,"category":5,"cpu":true}` applied only the cpu edit
+    // and answered `{"status":"edited"}` — one of the two requested changes,
+    // reported as success. `/har/config/default` already refuses the same shape;
+    // one field's parity bug may not stay on its sibling.
+    let (control, _, _, _, _, modelconf) = build_app(
+        AppConfig::default(),
+        &[("gguf3", "llama", CategoryId::Work, Some(4.0))],
+        &[("llama", Arc::new(MockAdapter))],
+    );
+    let file = modelconf.join("gguf3.yaml");
+    let before = std::fs::read_to_string(&file).expect("model file");
+
+    for presented in ["5", "true", "null", r#"["AUX"]"#, r#"{"c":"AUX"}"#] {
+        let (status, body) = post_json(
+            &control,
+            "/har/config/model",
+            &format!(r#"{{"model":"gguf3","category":{presented}}}"#),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`category:{presented}` is a caller mistake, not an absent field: {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("category") && message.contains("string"),
+            "the refusal must name the key and what it wanted: {message}"
+        );
+    }
+
+    // The leg with teeth: the type error precedes the rewrite, so the sibling `cpu`
+    // edit riding the same body is refused with it — no half-applied write behind
+    // a 400. Pre-fix this leg answered 200 `"edited"` with only the cpu key landed.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"gguf3","category":5,"cpu":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    let untouched = std::fs::read_to_string(&file).expect("read back");
+    assert_eq!(
+        untouched, before,
+        "a refused request may not edit the file at all"
+    );
+    assert!(!untouched.contains("cpu_offload"), "was: {untouched}");
+
+    // And a real string is still accepted, exactly as before.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"gguf3","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        std::fs::read_to_string(&file)
+            .expect("read")
+            .contains("category: AUX"),
+        "a valid category edit must still land"
+    );
+}
+
+#[tokio::test]
 async fn the_webui_fixture_is_a_document_the_endpoint_can_actually_emit() {
     // FINDINGS2-0507 [8]: the DOM suite drives the page from a hand-maintained
     // `tests/webui/fixtures/status.json`, and nothing compared that file with what
@@ -3711,6 +3779,140 @@ async fn retagging_an_unloaded_aux_model_leaves_the_loaded_aux_occupant_alive() 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "aux1 is still answering: {body}");
+}
+
+/// The boot config with `WORK`'s default pointed at `model`, the shape the retag
+/// dangling-default clear acts on (operator finding #1, 2026-10-26).
+fn config_defaulting_work(model: &str) -> AppConfig {
+    let mut config = AppConfig::default();
+    config
+        .categories
+        .iter_mut()
+        .find(|c| c.id == CategoryId::Work)
+        .expect("WORK category")
+        .default_model = Some(model.to_string());
+    config
+}
+
+#[tokio::test]
+async fn the_retag_reply_surfaces_the_slot_and_default_follow_ups() {
+    // R2-07-05: the retag branch swallowed the slot-free (`let _ =`) and the
+    // dangling-default clear (the dropped `(effective, persisted)` tuple), so a
+    // default-clear whose write failed still answered a bare `"status":"edited"`
+    // with no field, log contrast, or warning for either failure. The 200 stays an
+    // acceptance of the yaml edit; the reply now names each follow-up's outcome,
+    // with `null` marking one that was not attempted.
+    let specs = [("qwen3", "mock", CategoryId::Work, Some(4.0))];
+
+    // Leg 1 — both follow-ups land: the clear reaches the file (build_app stamps
+    // source_path inside the test's own modelconf dir, FINDINGS-18 [2]).
+    let (control, _, _, _, _, modelconf) = build_app(config_defaulting_work("qwen3"), &specs, &[]);
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a retag never 500s: {body}");
+    assert_eq!(body["status"], "edited", "acceptance contract kept: {body}");
+    assert_eq!(
+        body["slot_freed"],
+        serde_json::json!(true),
+        "the own-slot free ran (idempotent Done for a never-loaded model): {body}"
+    );
+    assert_eq!(
+        body["default_cleared"],
+        serde_json::json!(true),
+        "the dangling WORK default was cleared and persisted: {body}"
+    );
+    assert!(
+        body["warnings"].as_array().is_some_and(Vec::is_empty),
+        "a clean retag carries no warnings: {body}"
+    );
+    let written: Value = serde_json::from_str(
+        &std::fs::read_to_string(modelconf.join(TEST_CONFIG_NAME))
+            .expect("the default-clear wrote the config file"),
+    )
+    .expect("the written config file is JSON");
+    let work = written["categories"]
+        .as_array()
+        .expect("categories array")
+        .iter()
+        .find(|c| c["id"] == "WORK")
+        .expect("WORK entry");
+    assert_eq!(
+        work["default_model"],
+        Value::Null,
+        "the file no longer points WORK at the moved model: {written}"
+    );
+
+    // A non-retag edit attempts neither follow-up: both fields stay null.
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "same-category edit: {body}");
+    assert_eq!(body["slot_freed"], Value::Null, "not attempted: {body}");
+    assert_eq!(
+        body["default_cleared"],
+        Value::Null,
+        "not attempted: {body}"
+    );
+
+    // Leg 2 — the clear cannot persist: a hand-stamped source_path in a missing
+    // directory makes the gated write fail (disk-full/locked-file stand-in). The
+    // 200 and `"edited"` stay — the yaml edit is honestly done — but the reply says
+    // the file still names the moved model, and `/har/status` shows the memory
+    // value that did move.
+    let mut broken = config_defaulting_work("qwen3");
+    let unwriteable = simplehar_se::testutil::temp_dir("api-retag-nopersist")
+        .join("gone")
+        .join(TEST_CONFIG_NAME);
+    broken.source_path = Some(unwriteable.clone());
+    let (control, _, _, _, _, _) = build_app(broken, &specs, &[]);
+    let (status, body) = post_json(
+        &control,
+        "/har/config/model",
+        r#"{"model":"qwen3","category":"AUX"}"#,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "acceptance is unchanged by a failed follow-up: {body}"
+    );
+    assert_eq!(body["status"], "edited", "acceptance contract kept: {body}");
+    assert_eq!(
+        body["default_cleared"],
+        serde_json::json!(false),
+        "the swallowed failure is now an answered false: {body}"
+    );
+    assert!(
+        body["warnings"]
+            .as_array()
+            .expect("warnings stays an array")
+            .iter()
+            .any(|w| w.as_str().is_some_and(|w| w.contains("default"))),
+        "the swallowed failure must surface as a warning naming the default: {body}"
+    );
+    assert!(
+        !unwriteable.exists(),
+        "a failed persist may not leave a file behind"
+    );
+    let (_, doc) = get_json(&control, "/har/status").await;
+    let work = doc["categories"]
+        .as_array()
+        .expect("categories array")
+        .iter()
+        .find(|c| c["id"] == "WORK")
+        .expect("WORK entry");
+    assert_eq!(
+        work["default_model"],
+        Value::Null,
+        "memory still took the clear even though the file did not: {doc}"
+    );
 }
 
 #[tokio::test]

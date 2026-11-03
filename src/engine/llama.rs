@@ -35,7 +35,7 @@
 use super::{EngineAdapter, EngineError, LaunchSpec, ReadinessSpec};
 use crate::model::ModelEntry;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// IPv4 loopback address the harness forces as the engine bind address (`--host`).
 ///
@@ -176,9 +176,11 @@ pub(crate) fn check_extra_words_value(
 }
 
 /// yaml key -> llama-server flag, in `start.ps1` order. Empty values are skipped,
-/// exactly like the script's `if ($v)`. `pub(crate)` so the scan's consumed-keys
-/// const test can assert every table key is a consumed key (FINDINGS-13 [8]): a
-/// flag added here without joining `scan::CONSUMED_KEYS` fails that test.
+/// exactly like the script's `if ($v)`; a non-empty value faces the shared shape
+/// floor [`table_value_problem`] before it can reach the argv. `pub(crate)` so the
+/// scan's consumed-keys const test can assert every table key is a consumed key
+/// (FINDINGS-13 [8]): a flag added here without joining `scan::CONSUMED_KEYS`
+/// fails that test.
 pub(crate) const FLAG_TABLE: &[(&str, &str)] = &[
     ("mmproj", "--mmproj"),
     ("context", "-c"),
@@ -193,6 +195,86 @@ pub(crate) const FLAG_TABLE: &[(&str, &str)] = &[
     ("fit_target", "--fit-target"),
     ("fit_ctx", "--fit-ctx"),
 ];
+
+/// `FLAG_TABLE` keys whose engine flag documents a legitimate negative value
+/// form. Empty by review: every table flag takes a non-negative number or a
+/// word, so a leading `-` on a table value is always the option-shaped
+/// smuggling shape [`table_value_problem`] refuses. A leading `-` stays legal
+/// only on the `extra_args` door, where the flag itself passed review and a
+/// finite negative (the engine's own `--seed -1`) is a value, not an option
+/// ([`valid_extra_value`]); a table key joins this list only by that same
+/// review decision.
+const NEGATIVE_FORM_KEYS: &[&str] = &[];
+
+/// The shared value-shape floor for every [`FLAG_TABLE`] value (R2-09-01,
+/// FINDINGS-09 [1]). The closed `extra_args` allow-list is only closed while
+/// the value slot of a harness-owned flag cannot carry an option word: a
+/// parser that will not bind `--api-key` to the preceding `-c` re-reads it as
+/// its own option — the door [`valid_extra_value`] slams on the operator's
+/// door while `context: --api-key` walked through this one. The floor: a
+/// present flag takes a real value (a whitespace-only one is not), a value is
+/// not option-shaped unless its flag documents a negative form, and a value
+/// is one clean token with no control characters. The refusal is raised in
+/// [`build_args`], which `preflight_spec` runs before `Quiesce`/`Dispose` —
+/// a row typo costs the operator an `AdmitFail`, never the resident model.
+/// `None` admits the value; `Some(detail)` names what is wrong, for
+/// [`rejected_table_value`].
+fn table_value_problem(key: &str, flag: &str, value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        return Some(format!(
+            "is blank: a present `{flag}` requires a value (a truly empty key is skipped by \
+             design, whitespace is not a value)"
+        ));
+    }
+    if value.starts_with('-') && !NEGATIVE_FORM_KEYS.contains(&key) {
+        return Some(format!(
+            "is option-shaped: the engine re-reads a leading `-` as its own option, which is \
+             how the closed allow-list is walked around (FINDINGS2-0910 [1]), and `{flag}` \
+             documents no negative value form"
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Some(format!(
+            "carries control characters: `{flag}` takes one clean token"
+        ));
+    }
+    None
+}
+
+/// Echoes a refused value without obeying it: control characters come back
+/// escaped, so a hostile row cannot forge extra lines into the refusal text
+/// (G6 says name the problem, not launder the payload).
+fn safe_display(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The refusal voice for a failed value-shape floor: the typed
+/// [`EngineError::Rejected`] naming the yaml key, the flag it feeds, and the
+/// value that failed (escaped), so the operator deletes exactly one line (G6).
+fn rejected_table_value(
+    model_name: &str,
+    key: &str,
+    flag: &str,
+    value: &str,
+    detail: &str,
+) -> EngineError {
+    EngineError::Rejected {
+        engine: "llama".to_string(),
+        model: model_name.to_string(),
+        reason: format!(
+            "`{key}` value `{}` for `{flag}` {detail}",
+            safe_display(value)
+        ),
+    }
+}
 
 /// Engine ids for which `cpu_offload` is a live concept. Since slice 10c the
 /// single source is the rows' `knobs` cell; this record stays only as the
@@ -237,6 +319,36 @@ pub fn jinja_on(value: &str) -> bool {
     matches!(value, "true" | "1" | "on")
 }
 
+/// Resolves a `model:` value to the one path the scan, the booking, and the
+/// launch all read (R2-09-02, FINDINGS-09 [2]). The scan stats a relative
+/// value as `ModelConf_dir/<value>` and books `gguf_size_gb` from that stat,
+/// while the engine — spawned with `cwd = exe.parent()` — resolved the raw
+/// string against the binary's directory: one key, two places. Joining the
+/// same directory here makes the launched file the booked file. Scheme
+/// sentinels (`hf://…`) name no local file and launch verbatim, the same
+/// exemption the scan's existence trace gives them. With no catalog file to
+/// anchor on (a synthetic entry), the value launches as before — only rows
+/// that went through the scan's stat get the guarantee.
+fn resolve_model_path(raw: &str, dir: Option<&Path>) -> String {
+    if raw.contains("://") || Path::new(raw).is_absolute() {
+        return raw.to_string();
+    }
+    dir.map_or_else(
+        || raw.to_string(),
+        |dir| {
+            let joined = dir.join(raw);
+            // Absolutize against the harness CWD — lexically, exactly how the OS
+            // resolved the same `dir.join(path)` when the scan stat'd it — so a
+            // relative `ModelConf` path in config can never split stat target
+            // from open target when the child resolves `-m` from its own CWD.
+            std::path::absolute(&joined)
+                .unwrap_or(joined)
+                .to_string_lossy()
+                .into_owned()
+        },
+    )
+}
+
 /// Builds the llama-server argv from the raw yaml map, mirroring `start.ps1:45-63`
 /// (the deliberate deviation: the forced flags move to the tail): `-m` first
 /// (required), `--mmproj`, the remaining mapped flags with non-empty
@@ -259,10 +371,18 @@ pub fn jinja_on(value: &str) -> bool {
 ///   refuses to launch without it too.
 /// - [`EngineError::Rejected`] when an `extra_args` word is not on the allow-list,
 ///   naming the offending token.
+/// - [`EngineError::Rejected`] when a `FLAG_TABLE` value fails the shared shape
+///   floor [`table_value_problem`], naming the key, the flag and the value.
+///
+/// `model_dir` is the catalog directory that anchors a relative `model:` (the
+/// parent of the entry's yaml — the same directory the scan stat'd for the
+/// existence trace and the size booking, [`resolve_model_path`]); `None`
+/// launches the value verbatim, the pre-R2-09-02 behavior.
 pub(crate) fn build_args(
     raw: &BTreeMap<String, String>,
     port: u16,
     model_name: &str,
+    model_dir: Option<&Path>,
 ) -> Result<Vec<String>, EngineError> {
     let Some(model) = raw
         .get("model")
@@ -283,7 +403,8 @@ pub(crate) fn build_args(
         .unwrap_or_default();
     check_extra_args(&extra, model_name)?;
     let cpu_offload = raw.get("cpu_offload").is_some_and(|v| jinja_on(v));
-    let mut args = vec!["-m".to_string(), model.to_string()];
+    let model = resolve_model_path(model, model_dir);
+    let mut args = vec!["-m".to_string(), model];
     // Script order (start.ps1:45-63): mmproj leads the table, then the rest of the
     // table, then --jinja, then extra_args; the forced flags come last of all.
     for (key, flag) in FLAG_TABLE {
@@ -291,6 +412,9 @@ pub(crate) fn build_args(
             continue; // A.7: cpu_offload forces -ngl 0 and suppresses the yaml ngl.
         }
         if let Some(v) = value(key) {
+            if let Some(detail) = table_value_problem(key, flag, v) {
+                return Err(rejected_table_value(model_name, key, flag, v, &detail));
+            }
             args.extend([flag.to_string(), v.to_string()]);
         }
     }
@@ -333,17 +457,26 @@ impl EngineAdapter for LlamaAdapter {
     }
 
     fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
-        let argv = build_args(&model.raw, port, &model.name)?;
+        // The catalog dir that anchors a relative `model:` is the parent of
+        // the entry's yaml — the dir the scan stat'd for the existence trace
+        // and the size booking (R2-09-02); a synthetic entry has none.
+        let model_dir = model.file.as_deref().and_then(Path::parent);
+        let argv = build_args(&model.raw, port, &model.name, model_dir)?;
         Ok(LaunchSpec {
             argv: [self.exe.to_string_lossy().into_owned()]
                 .into_iter()
                 .chain(argv)
                 .collect(),
+            // R2-09-03: `Path::new("llama-server.exe").parent()` is `Some("")`
+            // — std strips the last component of a bare file name to the empty
+            // path — so the fallback must also fire on the empty parent, or a
+            // bare `llama_server_exe` hands `""` (not NULL) to the spawn's
+            // working directory instead of the documented current dir.
             cwd: self
                 .exe
                 .parent()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".")),
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("."), PathBuf::from),
             env: BTreeMap::new(),
             log_name: model.name.clone(),
             readiness: ReadinessSpec::Http {
@@ -382,6 +515,7 @@ mod tests {
             ]),
             18109,
             "test",
+            None,
         )
         .expect("valid");
         assert_eq!(
@@ -433,6 +567,7 @@ mod tests {
             ]),
             18109,
             "test",
+            None,
         )
         .expect("valid");
         assert_eq!(
@@ -474,7 +609,7 @@ mod tests {
 
     #[test]
     fn missing_model_refuses_to_launch() {
-        let error = build_args(&raw(&[]), 18109, "ghost").expect_err("must refuse");
+        let error = build_args(&raw(&[]), 18109, "ghost", None).expect_err("must refuse");
         assert!(matches!(error, EngineError::MissingField { .. }));
     }
 
@@ -543,8 +678,13 @@ mod tests {
     /// The reason text of the `Rejected` one `extra_args` value earns, or a panic
     /// naming the value that was wrongly admitted.
     fn refused_reason(extra: &str) -> String {
-        let error = build_args(&raw(&[("model", "m"), ("extra_args", extra)]), 18109, "t")
-            .expect_err("a word outside the allow-list must be refused");
+        let error = build_args(
+            &raw(&[("model", "m"), ("extra_args", extra)]),
+            18109,
+            "t",
+            None,
+        )
+        .expect_err("a word outside the allow-list must be refused");
         let text = error.to_string();
         match error {
             EngineError::Rejected {
@@ -731,8 +871,13 @@ mod tests {
             ("--temp -0.5", "-0.5"),
             ("--pooling=last", "--pooling=last"),
         ] {
-            let args = build_args(&raw(&[("model", "m"), ("extra_args", extra)]), 18109, "t")
-                .unwrap_or_else(|error| panic!("`{extra}` must be admitted: {error}"));
+            let args = build_args(
+                &raw(&[("model", "m"), ("extra_args", extra)]),
+                18109,
+                "t",
+                None,
+            )
+            .unwrap_or_else(|error| panic!("`{extra}` must be admitted: {error}"));
             assert!(
                 args.iter().any(|word| word == value),
                 "`{extra}` lost `{value}`: {args:?}"
@@ -759,6 +904,7 @@ mod tests {
             &raw(&[("model", "m"), ("extra_args", "--embedding --pooling last")]),
             18109,
             "t",
+            None,
         )
         .expect("benign extra_args must be accepted");
         let window = args
@@ -778,6 +924,7 @@ mod tests {
             ]),
             18109,
             "t",
+            None,
         )
         .expect("valid");
         let last_ngl = args
@@ -802,6 +949,7 @@ mod tests {
             &raw(&[("model", "m"), ("ngl", "99"), ("cpu_offload", "true")]),
             18109,
             "t",
+            None,
         )
         .expect("valid");
         let joined = args.join(" ");
@@ -812,8 +960,8 @@ mod tests {
     #[test]
     fn jinja_follows_the_scripts_truth_set_not_generic_truthy() {
         for on in ["true", "1", "on"] {
-            let args =
-                build_args(&raw(&[("model", "m"), ("jinja", on)]), 18109, "t").expect("valid");
+            let args = build_args(&raw(&[("model", "m"), ("jinja", on)]), 18109, "t", None)
+                .expect("valid");
             assert!(
                 args.contains(&"--jinja".to_string()),
                 "{on} must enable jinja"
@@ -821,7 +969,7 @@ mod tests {
         }
         // start.ps1: 'yes' is NOT in the truth set.
         let args =
-            build_args(&raw(&[("model", "m"), ("jinja", "yes")]), 18109, "t").expect("valid");
+            build_args(&raw(&[("model", "m"), ("jinja", "yes")]), 18109, "t", None).expect("valid");
         assert!(!args.contains(&"--jinja".to_string()));
     }
 
@@ -831,12 +979,176 @@ mod tests {
             &raw(&[("model", "m"), ("context", ""), ("ngl", "0")]),
             18109,
             "t",
+            None,
         )
         .expect("valid");
         assert!(!args.contains(&"-c".to_string()));
         assert!(
             args.windows(2).any(|w| w == ["-ngl", "0"]),
             "ngl 0 must survive"
+        );
+    }
+
+    /// R2-09-01 falsifier (FINDINGS-09 [1]): a `FLAG_TABLE` value is data,
+    /// never a second door into the engine parser. The review's probe `context:
+    /// --api-key` used to render `Ok` and placed the forbidden word in L3, and
+    /// any garbage value cleared `preflight_spec` so a row typo evicted the
+    /// resident before the engine's own parser died. Every value here must
+    /// refuse at render (the path `preflight_spec` runs, before
+    /// `Quiesce`/`Dispose`), naming the key, the flag, and the value — as one
+    /// clean line, so the refusal cannot be forged into extra lines.
+    #[test]
+    fn a_flag_table_value_of_the_wrong_shape_refuses_at_render() {
+        for (key, flag, value) in [
+            ("context", "-c", "--api-key"),
+            ("ngl", "-ngl", "--gpu-layers"),
+            ("batch", "-b", "-m"),
+            ("parallel", "--parallel", "-1"),
+            ("fit", "--fit", "on\n--embedding"),
+            ("cache_type_k", "--cache-type-k", "f16\u{1b}[0m"),
+            ("ubatch", "--ubatch-size", " "),
+        ] {
+            let mut map = raw(&[("model", "m")]);
+            map.insert(key.to_string(), value.to_string());
+            let error = build_args(&map, 18109, "t", None)
+                .expect_err(&format!("`{key}: {value:?}` must refuse"));
+            let EngineError::Rejected {
+                engine,
+                model,
+                reason,
+            } = &error
+            else {
+                panic!("expected Rejected for `{key}: {value:?}`, got {error:?}");
+            };
+            assert_eq!(engine, "llama");
+            assert_eq!(model, "t");
+            assert!(reason.contains(&format!("`{key}`")), "{reason}");
+            assert!(reason.contains(&format!("`{flag}`")), "{reason}");
+            assert!(
+                !reason.chars().any(char::is_control),
+                "the reason escapes the value, never replays it: {reason:?}"
+            );
+        }
+    }
+
+    /// The floor must cost the legitimate catalog nothing: word values and
+    /// paths (spaces included) survive, and a negative value joins the argv
+    /// exactly when its key is on the reviewed `NEGATIVE_FORM_KEYS` set —
+    /// which today is empty, so the pin here is that the set drives the gate
+    /// rather than the shape alone.
+    #[test]
+    fn a_clean_flag_table_value_still_passes_the_floor() {
+        let args = build_args(
+            &raw(&[
+                ("model", "F:/My Models/m.gguf"),
+                ("mmproj", "F:/My Models/mmproj.gguf"),
+                ("flash_attn", "on"),
+                ("cache_type_k", "q8_0"),
+                ("fit_target", "0.9"),
+            ]),
+            18109,
+            "t",
+            None,
+        )
+        .expect("clean values must be admitted");
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--mmproj", "F:/My Models/mmproj.gguf"]));
+        assert!(args.windows(2).any(|w| w == ["--flash-attn", "on"]));
+        assert!(NEGATIVE_FORM_KEYS.is_empty());
+    }
+
+    /// R2-09-02 (FINDINGS-09 [2]): one `model:` key, one location. The scan
+    /// existence-traced and size-booked a relative value against the yaml's
+    /// own dir, while `-m` carried the raw string and the engine opened it
+    /// relative to its spawn `cwd` — the exe's parent — so the same key
+    /// resolved in two places and the usual outcome was engine-dies-after-
+    /// eviction. The spec now launches the absolute yaml-dir join: the engine
+    /// cwd (deliberately a different directory here — the old resolution base)
+    /// can no longer reach the weights. Mutating the process cwd is off
+    /// limits in a parallel test binary; an absolute `-m` is cwd-proof by
+    /// construction, and the exe-dir join is the falsifier that must NOT
+    /// appear.
+    #[test]
+    fn a_relative_model_launches_at_the_yaml_dir_not_the_engine_cwd() {
+        let yaml_home = crate::testutil::temp_dir("llama-rel-model");
+        let exe_home = crate::testutil::temp_dir("llama-rel-exe");
+        let gguf = yaml_home.join("weights.gguf");
+        std::fs::write(&gguf, b"0123456789").expect("seed gguf");
+        let mut model = entry(&[("model", "weights.gguf")]);
+        model.file = Some(yaml_home.join("row.yaml"));
+        let spec = LlamaAdapter::new(exe_home.join("llama-server.exe"))
+            .spec(&model, 18109)
+            .expect("valid");
+        assert_eq!(spec.argv[1], "-m");
+        let launched = Path::new(&spec.argv[2]);
+        assert!(
+            launched.is_absolute(),
+            "`-m` must be absolute: {launched:?}"
+        );
+        assert_eq!(
+            launched,
+            std::path::absolute(&gguf)
+                .expect("fixture path absolutizes")
+                .as_path(),
+            "the launched path is the yaml-dir join the scan stats and books"
+        );
+        assert_ne!(
+            launched,
+            exe_home.join("weights.gguf").as_path(),
+            "the old resolution against the engine cwd must not reappear"
+        );
+        assert_eq!(
+            model.raw.get("model").map(String::as_str),
+            Some("weights.gguf"),
+            "resolution is for the launch only: the row's raw map (the write-back target) stays verbatim"
+        );
+    }
+
+    /// `scheme://` sentinels name no local file (the scan's existence trace
+    /// exempts them for the same reason): `-m` carries them verbatim, never
+    /// joined onto the yaml dir.
+    #[test]
+    fn a_scheme_sentinel_model_launches_verbatim() {
+        let yaml_home = crate::testutil::temp_dir("llama-sentinel");
+        let mut model = entry(&[("model", "hf://org/repo/x.gguf")]);
+        model.file = Some(yaml_home.join("row.yaml"));
+        let spec = LlamaAdapter::new(PathBuf::from("llama-server.exe"))
+            .spec(&model, 18109)
+            .expect("valid");
+        assert_eq!(spec.argv[1], "-m");
+        assert_eq!(spec.argv[2], "hf://org/repo/x.gguf");
+    }
+
+    /// R2-09-03 (FINDINGS-09 [3]): `Path::new("llama-server.exe").parent()` is
+    /// `Some("")`, so the old fallback fired only for the blank config (known
+    /// row R2-11-06) and a bare `llama_server_exe` handed an empty working
+    /// directory to the spawn instead of the documented current dir.
+    #[test]
+    fn a_bare_or_blank_exe_name_falls_back_to_the_documented_dot_cwd() {
+        let bare = LlamaAdapter::new(PathBuf::from("llama-server.exe"))
+            .spec(&entry(&[("model", "F:/m.gguf")]), 18109)
+            .expect("a bare name still renders");
+        assert_eq!(
+            bare.cwd,
+            PathBuf::from("."),
+            "a bare exe name falls back to the current dir"
+        );
+        let blank = LlamaAdapter::new(PathBuf::new())
+            .spec(&entry(&[("model", "F:/m.gguf")]), 18109)
+            .expect("a blank name still renders");
+        assert_eq!(
+            blank.cwd,
+            PathBuf::from("."),
+            "blank config keeps its fallback"
+        );
+        let nested = LlamaAdapter::new(PathBuf::from("bin").join("llama-server.exe"))
+            .spec(&entry(&[("model", "F:/m.gguf")]), 18109)
+            .expect("a nested name renders");
+        assert_eq!(
+            nested.cwd,
+            PathBuf::from("bin"),
+            "a real parent directory stays exactly as configured"
         );
     }
 
