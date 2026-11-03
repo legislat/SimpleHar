@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use super::{JobId, JobStatus};
+use super::{jobs::JobStatus, JobId};
 
 /// Immutable status snapshot (Step 2: reads never probe and never mutate).
 #[derive(Debug, Clone, Serialize)]
