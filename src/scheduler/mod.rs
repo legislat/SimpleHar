@@ -1034,17 +1034,6 @@ struct Occupant {
     /// unreadable at install: no capture, and the verdict never accuses on absence
     /// of evidence (same posture as the queued row's KEEP legs).
     spawn_config: Option<(PathBuf, crate::model::FileFingerprint)>,
-    /// The strata profile JSON this launch read at install, paired with its
-    /// install-time stat — the profile-layer variant of the `stale_config`
-    /// verdict (reload-drift Axis 2, slice 10c): a profile edited under a
-    /// claimed path has NOT reached the running engine (it read its bytes at
-    /// spawn), so the same amber names the gesture that applies it. Ninfer
-    /// needs no capture: its profile layer is the harness-rendered script the
-    /// runtime stages, replaces atomically, and cksum-verifies on every
-    /// launch — drift-proof by construction (the Axis-2 note "custody shrinks
-    /// it"). `None` = no claimed profile file, or the stat was unreadable at
-    /// install: the verdict never accuses on absence of evidence.
-    spawn_profile: Option<(PathBuf, crate::model::FileFingerprint)>,
     /// The cached verdict the snapshot reads (zero fs on the status path,
     /// FINDINGS2-04 [2]): refreshed at install, on the reload turn
     /// ([`ActorState::refresh_stale_markers`]) and on the harness's own
@@ -1272,12 +1261,6 @@ struct Job {
     /// `None` = a synthetic entry, or the stat was unreadable at registration:
     /// nothing to compare, nothing to retire on.
     queue_fingerprint: Option<crate::model::FileFingerprint>,
-    /// The strata profile path this launch's entry claims (`strata_config`),
-    /// captured at registration so `install` can fingerprint the bytes the
-    /// child actually obeyed (slice 10c profile-layer drift). Only strata
-    /// claims an operator-side profile file; ninfer's profile layer is the
-    /// harness-rendered script re-staged and verified at every launch.
-    profile: Option<PathBuf>,
 }
 
 struct ActorState {
@@ -1833,38 +1816,29 @@ impl ActorState {
     ///   gesture that matters is unload + reload, and a respawned engine re-captures
     ///   cleanly.
     ///
-    /// Profile layer (slice 10c): the verdict is the OR of the yaml capture and
-    /// the strata profile capture — a profile edited under a claimed path has
-    /// not reached the running engine either, and the same amber names the same
-    /// gesture. Only the yaml re-baselines on a harness write-back (the harness
-    /// never writes a profile); a resident with neither capture is never accused.
+    /// The yaml capture is the whole verdict: no engine ships a harness-tracked
+    /// profile file any more (ruling 2026-11-02 row 19 made strata's profile
+    /// harness-rendered L3 bytes, and ninfer's is the cksum-verified staged
+    /// script — both drift-proof by construction), so `queue_fingerprint` →
+    /// `spawn_config` is the entire `stale_config` story (FINDINGS-25). Only the
+    /// yaml re-baselines on a harness write-back; a resident with no capture is
+    /// never accused.
     fn refresh_stale_markers(&mut self, drift: &DriftStats) {
         for slot in &mut self.slots {
             let Some(occupant) = slot.occupant.as_mut() else {
                 continue;
             };
-            let (yaml, profile) = (
-                occupant.spawn_config.as_ref(),
-                occupant.spawn_profile.as_ref(),
-            );
-            if yaml.is_none() && profile.is_none() {
+            let Some((file, then)) = occupant.spawn_config.as_ref() else {
                 continue;
-            }
-            // `Some(drifted)` = this leg was judged from gathered evidence;
-            // `None` = no capture on this leg, or the path was never observed
-            // for this round (state moved after dispatch) — never an accusation.
-            let verdict = |capture: Option<&(PathBuf, crate::model::FileFingerprint)>| {
-                let (file, then) = capture?;
-                drift
-                    .stats
-                    .get(file.as_path())
-                    .map(|now| *now != Some(*then))
             };
-            let (yaml_v, profile_v) = (verdict(yaml), verdict(profile));
-            if yaml_v.is_none() && profile_v.is_none() {
+            // The resident was judged only from gathered evidence; a path absent
+            // from the map was never observed for this round (state moved after
+            // dispatch) — an unobserved verdict is kept, never computed from a
+            // missing stat.
+            let Some(now) = drift.stats.get(file.as_path()) else {
                 continue;
-            }
-            occupant.stale_config = yaml_v.unwrap_or(false) || profile_v.unwrap_or(false);
+            };
+            occupant.stale_config = *now != Some(*then);
         }
     }
 
@@ -1937,15 +1911,7 @@ impl ActorState {
         self.slots
             .iter()
             .filter_map(|slot| slot.occupant.as_ref())
-            .flat_map(|occupant| {
-                [
-                    occupant.spawn_config.as_ref(),
-                    occupant.spawn_profile.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                .map(|(file, _)| file.clone())
-            })
+            .filter_map(|occupant| occupant.spawn_config.as_ref().map(|(file, _)| file.clone()))
             .collect()
     }
 
@@ -2482,7 +2448,6 @@ impl ActorState {
             slot: Some(slot),
             // Unload rows queue against an occupant, not a file: nothing to compare.
             queue_fingerprint: None,
-            profile: None,
         };
         self.jobs.insert(job_id, job);
         self.slots[slot].job = Some(job_id);
@@ -3642,15 +3607,11 @@ impl ActorState {
             // The yaml as the catalog saw it, statted inline once per
             // registration on the park path: `apply_catalog` itself is now
             // zero-fs (FINDINGS-07 [8]), so this is the reload flow's one
-            // surviving inline stat — it rides a file the just-applied scan
-            // already read, and is a future-offload candidate.
+            // surviving inline stat. Accepted as-is (FINDINGS-12-P): it rides
+            // a file the just-applied scan already read, moves no engine and
+            // no volume, and an offload would add a second read or couple
+            // queue registration to scan internals for one `metadata` call.
             queue_fingerprint: entry.file.as_deref().and_then(crate::model::fingerprint),
-            profile: crate::engine::policy::engine_policy(&entry.engine)
-                .and_then(|row| row.profile_field)
-                .and_then(|key| entry.raw.get(key))
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
         };
         self.jobs.insert(job_id, job);
         self.set_timing(job_id, |t| &mut t.queue_ms);
@@ -4856,7 +4817,9 @@ impl ActorState {
             // resident. The path is the fold anchor's own file (the identity the
             // measured persist writes), so the marker and the fold never drift onto
             // different files; an unreadable stat (or a synthetic row) yields no
-            // capture, and the verdict then never accuses.
+            // capture, and the verdict then never accuses. This yaml capture is the
+            // whole `stale_config` story: no engine ships a harness-tracked profile
+            // file any more (FINDINGS-25 retired the dormant profile layer).
             let spawn_config = self
                 .jobs
                 .get(&job_id)
@@ -4866,15 +4829,6 @@ impl ActorState {
                         crate::model::fingerprint(file).map(|fp| (file.clone(), fp))
                     })
                 });
-            // Profile layer (slice 10c): the same one-stat install-time
-            // capture for the strata profile this launch claimed — the bytes
-            // the child read on the way up, so a later profile edit ambers
-            // `stale_config` instead of looking applied.
-            let spawn_profile = self
-                .jobs
-                .get(&job_id)
-                .and_then(|job| job.profile.as_ref())
-                .and_then(|path| crate::model::fingerprint(path).map(|fp| (path.clone(), fp)));
             self.slots[slot].occupant = Some(Occupant {
                 model: job_model,
                 need: job_need,
@@ -4883,7 +4837,6 @@ impl ActorState {
                 loaded_at: Instant::now(),
                 launched_at_wall: std::time::SystemTime::now(),
                 spawn_config,
-                spawn_profile,
                 stale_config: false,
                 serve_id: serve_id.clone(),
                 measure: None,
@@ -6170,7 +6123,6 @@ mod tests {
                 warnings: Vec::new(),
                 slot: Some(0),
                 queue_fingerprint: None,
-                profile: None,
             },
         );
         state.slots = vec![Slot {
@@ -6185,7 +6137,6 @@ mod tests {
                 loaded_at: Instant::now(),
                 launched_at_wall: std::time::SystemTime::now(),
                 spawn_config: None,
-                spawn_profile: None,
                 stale_config: false,
                 serve_id: None,
                 measure: None,
@@ -7654,7 +7605,6 @@ mod tests {
                 loaded_at: Instant::now(),
                 launched_at_wall: std::time::SystemTime::now(),
                 spawn_config: None,
-                spawn_profile: None,
                 stale_config: false,
                 serve_id: None,
                 measure: None,
@@ -7901,7 +7851,6 @@ mod tests {
                 loaded_at: Instant::now(),
                 launched_at_wall: std::time::SystemTime::now(),
                 spawn_config: Some((yaml.clone(), capture)),
-                spawn_profile: None,
                 stale_config: false,
                 serve_id: None,
                 measure: None,
@@ -7952,59 +7901,28 @@ mod tests {
         state.apply_catalog(catalog, None, &drift);
     }
 
-    /// The profile-layer variant of Axis 2 (slice 10c): a strata profile edited
-    /// under the claimed path ambers the same `stale_config` verdict even
-    /// though the yaml stands untouched — the running engine read its profile
-    /// bytes at spawn, so the gesture that applies the edit is still unload +
-    /// reload, and the page must stop calling the config current. Falsifier:
-    /// dropping the profile leg from `refresh_stale_markers` (amber never
-    /// fires), or letting it fire without a capture (accuses on absence).
+    /// The yaml fingerprint alone carries the `stale_config` verdict since
+    /// FINDINGS-25 retired the dormant profile leg: an unchanged row never
+    /// accuses, and an edit to the resident's own row ambers on the refresh
+    /// turn with no other capture anywhere — the same amber, the same
+    /// unload + reload gesture. Falsifier: dropping the yaml leg from
+    /// `refresh_stale_markers` (amber never fires). The no-capture posture is
+    /// pinned separately by the L3 leg, which has no capture at all.
     #[test]
-    fn a_profile_edit_under_a_claimed_path_ambers_the_resident() {
-        let dir = crate::testutil::temp_dir("stale-profile");
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let profile = dir.join("p.json");
-        std::fs::write(&profile, "v1\n").expect("seed profile");
-        let capture = crate::model::fingerprint(&profile).expect("seed stat");
-        let (mut state, yaml, _then) = resident_on_a_file();
-        if let Some(occupant) = state.slots[0].occupant.as_mut() {
-            occupant.spawn_profile = Some((profile.clone(), capture));
-        }
-        let both = || vec![profile.clone(), yaml.clone()];
-        state.refresh_stale_markers(&gather_drift_stats(&both()));
-        assert_eq!(
-            state.snapshot().slots[0].stale_config,
-            Some(false),
-            "an unchanged profile must not accuse"
-        );
-        std::fs::write(&profile, "v2\n").expect("edit profile");
-        state.refresh_stale_markers(&gather_drift_stats(&both()));
-        assert_eq!(
-            state.snapshot().slots[0].stale_config,
-            Some(true),
-            "a changed profile ambers even with the yaml untouched"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A resident with no profile capture (every non-strata launch) is judged
-    /// by the yaml leg alone — the profile layer changes nothing for it, and
-    /// the capture's absence never accuses.
-    #[test]
-    fn a_missing_profile_capture_never_accuses() {
+    fn the_yaml_fingerprint_alone_ambers_the_resident_on_a_changed_row() {
         let (mut state, yaml, _capture) = resident_on_a_file();
         state.refresh_stale_markers(&gather_drift_stats(std::slice::from_ref(&yaml)));
         assert_eq!(
             state.snapshot().slots[0].stale_config,
             Some(false),
-            "no capture of either kind, no accusation"
+            "an unchanged fingerprint must not accuse"
         );
-        std::fs::write(&yaml, "engine: mock\n").expect("edit yaml");
+        std::fs::write(&yaml, "engine: mock\n").expect("edit row");
         state.refresh_stale_markers(&gather_drift_stats(std::slice::from_ref(&yaml)));
         assert_eq!(
             state.snapshot().slots[0].stale_config,
             Some(true),
-            "the yaml leg still judges on its own"
+            "a changed yaml fingerprint ambers on its own"
         );
     }
 
@@ -9398,7 +9316,6 @@ mod tests {
                 loaded_at: Instant::now(),
                 launched_at_wall: std::time::SystemTime::now(),
                 spawn_config: None,
-                spawn_profile: None,
                 stale_config: false,
                 serve_id: serve_id.map(str::to_string),
                 measure: None,

@@ -18,9 +18,12 @@
 //!   bodies are `400`.
 //!
 //! Verdict vocabulary (per case, from the plan §17): PASS / FAIL / FINDING /
-//! BLOCKED / SKIP. A failing assertion fails the test = FAIL; `BLOCKED` and
-//! `SKIP` print and return early. Flake policy: re-run once, then classify
-//! FLAKY n/3 by worst observed.
+//! BLOCKED / SKIP. A failing assertion fails the test = FAIL; a `BLOCKED`
+//! declaration prints and PANICS - the older "print and return early" was the
+//! vacuous PASS chunk 21 exists to catch (libtest hides a passing test's stdout
+//! and exits 0). Only `SKIP` (t11 - adoption scrapped, it loads nothing) still
+//! prints and returns. Flake policy: re-run once, then classify FLAKY n/3 by
+//! worst observed.
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -87,6 +90,101 @@ fn use_mid_t08() -> bool {
     std::env::var("SE_T_MIDS").map_or(true, |value| value != "0") && mid_gguf().exists()
 }
 
+// The T-suite card gate, mirrored inside the test binary (FINDINGS-21 [3]).
+// `tier.ps1` prices the same tiers and `run-group.ps1` enforces them per test;
+// that gate stays the PRIMARY one - under the driver this check only re-confirms
+// the tier it just enforced. Its reason to exist is the bare
+// `cargo test --test t_switching -- --ignored` that bypasses the scripts: the
+// runbook forbids it in prose and, before this, nothing in code prevented it.
+// Only the `#[ignore]`d card tests in this file reach these helpers - without
+// `--ignored` no test here runs at all - so cardless tests are never affected.
+//
+// The mirror is deliberate duplication (REV4-07), not a shared source of truth:
+// the two files share no mechanism, but `Test-TierParity` in `run-group.ps1`
+// refuses every group while a constant here and its `tier.ps1` twin disagree.
+// Change a tier -> change both files in one edit, and keep each const on ONE
+// line: the tripwire matches that shape.
+const TIER_NOLOAD_MIB: u64 = 1024; // t01, t13: no engine ever loads
+const TIER_LIGHT_MIB: u64 = 10240; // up to three ~1 GiB llama engines
+const TIER_MID_MIB: u64 = 16384; // t08 default: the mid model
+const TIER_SINGLE31_MIB: u64 = 36864; // t08 variant: one 31B
+const TIER_DOUBLE31_MIB: u64 = 66560; // t06, t07: two 31B resident
+
+/// The tier for one spawn tag, in free MiB. The t08 leg prices with the same
+/// `use_mid_t08()` the test itself branches on, so the guard always refuses for
+/// what the test is actually about to put on the card. Lockstep with
+/// `Get-RequiredMiB` in `tier.ps1`: `Test-TierParity` in `run-group.ps1` refuses
+/// every group while the two copies disagree.
+fn required_free_mib(tag: &str) -> u64 {
+    if tag.starts_with("t06") || tag.starts_with("t07") {
+        TIER_DOUBLE31_MIB
+    } else if tag.starts_with("t08") {
+        if use_mid_t08() {
+            TIER_MID_MIB
+        } else {
+            TIER_SINGLE31_MIB
+        }
+    } else if tag.starts_with("t01") || tag.starts_with("t13") {
+        TIER_NOLOAD_MIB
+    } else {
+        TIER_LIGHT_MIB
+    }
+}
+
+/// Free VRAM exactly as `nvidia-smi` reports it: the same query, first row
+/// (GPU0) and digit scrape as `tier.ps1`'s `Get-Nvidia`, so gate and guard
+/// price the card identically. An unreadable card is an `Err` - fail-closed,
+/// like every `Get-FreeMiB` call site in the scripts.
+fn free_vram_mib() -> Result<u64, String> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .map_err(|error| format!("nvidia-smi could not run: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "nvidia-smi exited with {} ({})",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let first = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let digits: String = first.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse::<u64>()
+        .map_err(|_| format!("nvidia-smi --query-gpu=memory.free returned '{first}'"))
+}
+
+/// The in-test fallback gate: refuses before anything loads when the card
+/// cannot hold this test's tier. Panics, never `return;` - a quiet early
+/// return is exactly the vacuous PASS this suite just learned to distrust
+/// (chunk 21). The anchored `T<n> BLOCKED` line keeps the outcome classifiable
+/// as BLOCKED under `run-group.ps1`; the panic message is the stop sign for a
+/// bare `cargo test`.
+fn require_free_vram(tag: &str) {
+    let need = required_free_mib(tag);
+    let number: String = tag
+        .chars()
+        .skip(1)
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let label = format!("T{}", number.trim_start_matches('0'));
+    match free_vram_mib() {
+        Ok(free) if free >= need => {}
+        Ok(free) => {
+            println!("{label} BLOCKED: free={free}MiB need={need}MiB (in-test VRAM guard)");
+            panic!("T-suite refuses: need {need} MiB, free {free} MiB");
+        }
+        Err(reason) => {
+            println!("{label} BLOCKED: free VRAM unreadable ({reason})");
+            panic!("T-suite refuses: free VRAM unreadable ({reason})");
+        }
+    }
+}
+
 /// The `vram_gb` to declare for `path`: the product's own estimate for an undeclared
 /// model, so the ledger the admission gate reasons about here is the one it would
 /// compute in production (`need_gb`, src/budget.rs:193) rather than a hand-written guess.
@@ -113,6 +211,9 @@ impl Harness {
     /// Async because the readiness probe must share the test's tokio runtime: a
     /// nested blocking runtime dropped from this context aborts the test (Run 2).
     async fn spawn(tag: &str) -> Harness {
+        // The card is priced before the temp catalog is even written
+        // (FINDINGS-21 [3]): this runs before anything here can load a model.
+        require_free_vram(tag);
         let work_dir = simplehar_se::testutil::temp_dir(&format!("t14-{tag}"));
         let modelconf = work_dir.join("ModelConf");
         std::fs::create_dir_all(&modelconf).expect("temp ModelConf");
@@ -949,7 +1050,11 @@ async fn t06_eviction_matrix() {
     let harness = Harness::spawn("t06").await;
     if !harness.baseline_check(&[&big_work_gguf(), &big_rp_gguf(), &big_aux_gguf()]) {
         println!("T6 BLOCKED: 31B model files missing (SE_T_* overrides)");
-        return;
+        panic!(
+            "T-suite refuses: the three 31B model files are missing \
+             (SE_T_WORK31 / SE_T_RP31 / SE_T_AUX31); loading zero models must FAIL, \
+             never report a vacuous PASS"
+        );
     }
 
     // SE ledger: rp31 (29) + aux31 (29) = 58 ledger, free 10; work31 needs 29
@@ -1009,7 +1114,11 @@ async fn t07_admission_failure() {
     let harness = Harness::spawn("t07").await;
     if !harness.baseline_check(&[&big_work_gguf(), &big_rp_gguf(), &big_aux_gguf()]) {
         println!("T7 BLOCKED: 31B model files missing (SE_T_* overrides)");
-        return;
+        panic!(
+            "T-suite refuses: the three 31B model files are missing \
+             (SE_T_WORK31 / SE_T_RP31 / SE_T_AUX31); loading zero models must FAIL, \
+             never report a vacuous PASS"
+        );
     }
 
     // Fill WORK + RP (58 of 68 budgeted GiB); an AUX load cannot evict WORK/RP
@@ -1059,7 +1168,11 @@ async fn t08_cancel_during_load() {
     };
     if !harness.baseline_check(&[&file]) {
         println!("T8 BLOCKED: {model} model file missing (SE_T_MID / SE_T_RP31)");
-        return;
+        panic!(
+            "T-suite refuses: the {model} model file is missing \
+             (SE_T_MID / SE_T_RP31); loading zero models must FAIL, \
+             never report a vacuous PASS"
+        );
     }
 
     // 8.1: load it and cancel WHILE IT IS STILL LOADING. The POST is on its own task

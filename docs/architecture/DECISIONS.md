@@ -405,3 +405,11 @@ Unresolved questions live ONLY in `DECISIONS-PENDING.md`. This file only ever *g
   the scheduler tolerance test. Deferred: the `engines.llama.fit_validate_slack_gib`
   knob, which owes the llama policy row's `config_knobs` claim and the parity literal.
   | 2026-11-02 | `TASK-R11-FIT`
+
+- ACCEPTED 2026-11-03 (12-P): the park-path queue fingerprint stays one
+  `fs::metadata` on the yaml file the just-applied scan read. The scan is zero-fs by
+  design; offloading the stat costs a second read or couples queue registration to scan
+  internals, and a deferred stat races the KEEP-on-absence rule that must excuse an
+  unobserved capture. Cost: one metadata call per parked load; no engine, no volume.
+  Reopen only if a profile shows the park path as a hot spot.
+  | 2026-11-03 | `TASK-DEBT-LEFTOVERS`

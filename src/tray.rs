@@ -82,7 +82,8 @@ pub enum TrayState {
     Yellow,
     /// Nothing loaded, and every category has a verdict.
     Gray,
-    /// An error needs the operator's attention.
+    /// A listener is down; the reason rides in the tooltip. Per-job errors are
+    /// not red (operator decision 2026-10-25).
     Red,
     /// No verdict: a category is still `Pending` after [`BOOT_GRACE`], or this tick's
     /// status fetch returned nothing. The same word for both, per the 2026-10-28
@@ -162,10 +163,10 @@ fn command_for(id: &str) -> Option<Command> {
 
 /// Spawns the tray thread. Returns nothing; the tray dies with the process.
 ///
-/// # Panics
-///
-/// Panics on the tray thread (and so fails loudly) only if the icon cannot be built —
-/// a broken tray must be visible, not silent.
+/// A tray that cannot be built — menu, icon, or window — logs one error line and
+/// the harness continues headless (FINDINGS-15 [6]): the icon is a view, and
+/// losing it never takes the serving process with it. The only panic is the
+/// thread-spawn invariant below.
 pub fn spawn(
     scheduler: SchedulerHandle,
     listeners: crate::listeners::ListenerRegistry,
@@ -495,8 +496,9 @@ fn tick(
     }
 }
 
-/// The tray state for one snapshot; precedence red > amber > yellow > green > gray
-/// (Step 15; operator ruling "A + amber" 2026-10-28).
+/// The tray colour for one tick, decided from the listener signal first and the
+/// snapshot second; precedence red > amber > yellow > green > gray (Step 15;
+/// operator ruling "A + amber" 2026-10-28; no-freeze rule FINDINGS-15 [1]).
 ///
 /// # Arguments
 ///
