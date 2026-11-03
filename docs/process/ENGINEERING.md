@@ -218,7 +218,5 @@ this crate (`Cargo.toml`); otherwise skip it. Nothing here is a reason to introd
   warranted.
 - `secrecy`: dropped as a named-crate mandate; its intent folded into the Security section
   as an env/`.env` rule.
-- The "$100 fine for not fully optimized" line: dropped; replaced by the measurable
-  complexity, allocation, and benchmark criteria above.
 - "Unit tests for all new functions": rescoped to behavior and risk to match the
   integration-heavy style, keeping the falsifier and no-disabled-tests rules.
