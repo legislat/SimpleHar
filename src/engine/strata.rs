@@ -619,10 +619,16 @@ pub(crate) fn render_profile(model: &ModelEntry, cwd: &Path) -> Result<String, E
         })?,
         None => Vec::new(),
     };
-    if let Some(banned) = args
-        .iter()
-        .find(|token| *token == "--host" || *token == "--port")
-    {
+    if let Some(banned) = args.iter().find(|token| {
+        // The ban reads the option token's *name*, not the whole token: the eq
+        // form is spawn truth too (server.py splits `--flag=value`, ruling 10[1]),
+        // so `--host=0.0.0.0` must not smuggle past a whole-token comparison
+        // (R2-10-02, the ninfer serve-args denylist is the in-repo precedent).
+        let name = token
+            .split_once('=')
+            .map_or(token.as_str(), |(name, _)| name);
+        name == "--host" || name == "--port"
+    }) {
         return Err(rejected(format!(
             "`{banned}` in `strata_args` is harness-forced argv and must not be spelled by the row"
         )));
@@ -1259,6 +1265,9 @@ mod tests {
             ("strata_env", "LD_PRELOAD=x", "STRATA_"),
             ("strata_args", "--pack,,--native", "non-empty"),
             ("strata_args", "--host, 0.0.0.0", "harness-forced argv"),
+            ("strata_args", "--port, 8004", "harness-forced argv"),
+            ("strata_args", "--host=0.0.0.0", "harness-forced argv"),
+            ("strata_args", "--port=8004", "harness-forced argv"),
             ("strata_vision", "exe=nowhere", "absolute path"),
             ("strata_sampling", "temperature=hot", "number or bool"),
             ("strata_uncensored", "maybe", "`true` or `false`"),

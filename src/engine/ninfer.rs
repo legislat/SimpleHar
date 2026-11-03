@@ -1623,27 +1623,50 @@ mod tests {
 
     #[test]
     fn a_template_launch_names_the_key_file_it_will_read_and_never_the_secret() {
-        let mut pairs = template_pairs();
-        pairs.push(("ninfer_key", "true"));
-        let spec = NinferAdapter::new("Ubuntu", "ops")
-            .spec(&entry(&pairs), 18109)
-            .expect("key mode renders");
-        let script = spec.script.expect("rendered");
-        assert!(
-            script.contains("API_KEY_FILE=\"$HOME/.simplehar/keys/ninfer-x.key\""),
-            "{script}"
-        );
-        assert!(script.contains("missing or empty"), "{script}");
-        // The rendered bytes are about to be staged and logged: a key value must
-        // never be inside them — every `--api-key` occurrence is the command
-        // substitution text, so the secret is read by the container at launch and
-        // the staged file can sit in a world-readable directory unashamed.
-        for (index, _) in script.match_indices("--api-key") {
-            let tail = &script[index..];
+        // R2-10-01: the serve line must expand the key array itself, in the
+        // `set -u` safe form — the expansion rides the run line whether or not
+        // the row declared a key, and expands to nothing for an empty array.
+        const KEY_EXPANSION: &str = r#"${API_KEY_ARGS[@]+"${API_KEY_ARGS[@]}"}"#;
+        for with_key in [true, false] {
+            let mut pairs = template_pairs();
+            if with_key {
+                pairs.push(("ninfer_key", "true"));
+            }
+            let spec = NinferAdapter::new("Ubuntu", "ops")
+                .spec(&entry(&pairs), 18109)
+                .expect("key mode renders");
+            let script = spec.script.expect("rendered");
             assert!(
-                tail.starts_with("--api-key \"$(cat \"$API_KEY_FILE\")\""),
-                "the render embedded a literal key: {tail}"
+                script.contains("API_KEY_FILE=\"$HOME/.simplehar/keys/ninfer-x.key\""),
+                "{script}"
             );
+            assert!(script.contains("missing or empty"), "{script}");
+            let run = &script[script.find("docker run").expect("the docker run line")
+                ..script
+                    .rfind("echo \"autostart:")
+                    .expect("the final launch stamp echo")];
+            let expanded = run.find(KEY_EXPANSION).unwrap_or_else(|| {
+                panic!("ninfer_key={with_key}: the run line lost the key expansion: {run}")
+            });
+            assert!(
+                run[expanded..].contains(r#"${SERVE_ARGS[@]+"${SERVE_ARGS[@]}"}"#),
+                "the key expansion must ride the serve line before the serve-args tail: {run}"
+            );
+            assert!(
+                !run.contains("--api-key"),
+                "ninfer_key={with_key}: the run line carries the key only through the array expansion, never a literal --api-key: {run}"
+            );
+            // The rendered bytes are about to be staged and logged: a key value must
+            // never be inside them — every `--api-key` occurrence is the command
+            // substitution text, so the secret is read by the container at launch and
+            // the staged file can sit in a world-readable directory unashamed.
+            for (index, _) in script.match_indices("--api-key") {
+                let tail = &script[index..];
+                assert!(
+                    tail.starts_with("--api-key \"$(cat \"$API_KEY_FILE\")\""),
+                    "the render embedded a literal key: {tail}"
+                );
+            }
         }
     }
 }
@@ -1851,6 +1874,9 @@ fn lookup_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
     if let Some(n) = node.as_u64() {
         return Some(n);
     }
+    if let Some(s) = node.as_str() {
+        return s.parse::<u64>().ok();
+    }
     node.as_f64()
         .filter(|f| *f >= 0.0 && *f == f.trunc())
         .map(|f| f as u64)
@@ -1890,6 +1916,29 @@ mod startup_tests {
             "was {}",
             report.required_to_free_gb
         );
+    }
+
+    /// R2-10-03: the doc promises "a float or a numeric string", so a build
+    /// that quotes the byte counts must still book — and a string that is not
+    /// a non-negative integer must stay absent, never a silent zero.
+    #[test]
+    fn quoted_numeric_strings_parse_like_unquoted_numbers() {
+        let quoted = "{\"environment\":{\"total_device_memory_bytes\":\"77309411328\"},\
+            \"memory\":{\"available_after_startup_bytes\":\"47244640256\"}}";
+        let report = parse_startup_memory(quoted).expect("a quoted record parses");
+        // Same 72 - 44 = 28 GiB as the unquoted fixture.
+        assert!(
+            (report.required_to_free_gb - 28.0).abs() < 1e-6,
+            "was {}",
+            report.required_to_free_gb
+        );
+        assert_eq!(report.total_device_memory_bytes, 72 * GIB_B);
+        assert_eq!(report.available_after_startup_bytes, 44 * GIB_B);
+        // Non-numeric strings are no record: the caller falls back to the
+        // labelled total_diff, never to a booked zero.
+        let junk = "{\"environment\":{\"total_device_memory_bytes\":\"72 GiB\"},\
+            \"memory\":{\"available_after_startup_bytes\":\"44 GiB\"}}";
+        assert_eq!(parse_startup_memory(junk), None);
     }
 
     #[test]

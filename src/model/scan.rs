@@ -9,7 +9,8 @@
 //! Catalog-trust rules (FINDINGS-13 [2]/[3]/[7]/[8]): identity is the yaml FILE
 //! STEM — a `name:` key is legacy-optional and only legal when it equals the stem,
 //! because that value is the one component of a yaml that reaches a filesystem path
-//! (the engine log name); a llama entry whose local `model:` file is gone, and a
+//! (the engine log name); a llama entry whose local `model:` or declared `mmproj:`
+//! file is gone, and a
 //! strata entry whose profile JSON is unreadable or references a missing absolute
 //! path, are refused here with the file named, before admission can evict a resident
 //! engine for a doomed spawn; and a key outside [`CONSUMED_KEYS`] is reported
@@ -31,8 +32,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanKind {
-    /// The model's backing file — or a path its strata profile references — is not
-    /// on disk; the entry was dropped.
+    /// The model's backing file — or a declared `mmproj:`, or a path its strata
+    /// profile references — is not a regular file on disk; the entry was dropped.
     ModelPathMissing,
     /// A `name:` key contradicts the file stem, or the stem is empty; dropped.
     InvalidName,
@@ -501,6 +502,30 @@ fn is_accepted_config(file_type: &std::fs::FileType, path: &Path) -> bool {
             .is_some_and(|e| e.eq_ignore_ascii_case("yaml"))
 }
 
+/// The existence-trace file-type predicate (R2-13-01): the traces accept
+/// **regular files** only. `fs::metadata` succeeds
+/// for a directory, so without this filter an operator typo
+/// (`model: F:/models/Qwen-GGUF` — the folder, filename forgotten) publishes,
+/// admission evicts victims, and the engine dies at Spawn on the directory path
+/// — the exact doomed-spawn swap the trace exists to refuse — and the same stat
+/// books the directory's byte size (often 0 on NTFS) into `gguf_size_gb`.
+fn regular_file_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    std::fs::metadata(path).ok().filter(|meta| meta.is_file())
+}
+
+/// The one base an existence trace joins a relative yaml value onto: the yaml's
+/// own directory — the same base `model:` uses (launch resolves `model:`
+/// against the same dir; the engine worker owns relative resolution on the
+/// launch side, the scan only refuses).
+fn trace_under_yaml_dir(dir: &Path, raw: &str) -> std::path::PathBuf {
+    let path = Path::new(raw);
+    if path.is_relative() {
+        dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Scans a ModelConf directory: every regular (non-symlink) `*.yaml` file becomes
 /// an entry or an error; `.yml` and every other name is **silently inert** (the
 /// 13[5] Fork B acceptance gate, [`is_accepted_config`]); a missing directory is
@@ -681,25 +706,43 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 // refuse a llama entry launched against nothing, before admission
                 // can evict a resident for the doomed spawn. `scheme://` sentinels
                 // and every other engine are exempt (their checks live elsewhere).
+                // A trace passes only on a regular file (R2-13-01): a directory
+                // neither passes the trace nor books its byte size as the model's.
                 let local = entry
                     .model_ref
                     .as_deref()
                     .filter(|r| !r.contains("://"))
-                    .map(|raw| {
-                        let path = Path::new(raw);
-                        if path.is_relative() {
-                            dir.join(path)
-                        } else {
-                            path.to_path_buf()
-                        }
-                    });
-                let stat = local.as_ref().and_then(|p| std::fs::metadata(p).ok());
+                    .map(|raw| trace_under_yaml_dir(dir, raw));
+                let stat = local.as_ref().and_then(|p| regular_file_metadata(p));
                 if entry.engine == "llama" && stat.is_none() {
                     if let Some(missing) = &local {
                         catalog.errors.push(ScanError {
                             kind: ScanKind::ModelPathMissing,
                             file: file_name.clone(),
                             reason: format!("model file not found: {}", missing.display()),
+                        });
+                        continue;
+                    }
+                }
+                // R2-13-02 (scan half): a declared `mmproj:` is the second
+                // weights file (policy.rs names it so) — llama-server dies
+                // without it, after victims are gone. Existence-trace it like
+                // `model:`: same yaml-dir join, same regular-file predicate,
+                // same `ModelPathMissing`. The raw map is not resolved or
+                // rewritten — relative values resolve at launch in the engine
+                // worker (chunk 9); the scan only refuses here.
+                if entry.engine == "llama" {
+                    let mmproj_missing = map
+                        .get("mmproj")
+                        .map(|v| v.trim())
+                        .filter(|v| !v.is_empty() && !v.contains("://"))
+                        .map(|raw| trace_under_yaml_dir(dir, raw))
+                        .filter(|path| regular_file_metadata(path).is_none());
+                    if let Some(missing) = mmproj_missing {
+                        catalog.errors.push(ScanError {
+                            kind: ScanKind::ModelPathMissing,
+                            file: file_name.clone(),
+                            reason: format!("mmproj file not found: {}", missing.display()),
                         });
                         continue;
                     }
@@ -1903,6 +1946,131 @@ mod tests {
             error.reason
         );
         assert!(error.file.contains("gone.yaml"));
+    }
+
+    /// R2-13-01: the existence trace accepts regular files only — a
+    /// directory-valued `model:` is `ModelPathMissing` before admission (the
+    /// operator typo class: folder named, file forgotten), and the directory's
+    /// byte size is never booked as `gguf_size_gb` for any engine (the same
+    /// stat feeds the size for every engine, so the filter must hold there
+    /// too — the surviving mock row proves the booking half).
+    #[test]
+    fn a_directory_valued_model_path_is_dropped_and_never_books_its_size() {
+        let dir = crate::testutil::temp_dir("scan-llama-dir-model");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::create_dir_all(dir.join("Qwen-GGUF")).expect("model folder");
+        let folder = dir.join("Qwen-GGUF").display().to_string();
+        std::fs::write(
+            dir.join("folder.yaml"),
+            format!("engine: llama\nmodel: {folder}\nvram_gb: 8\n"),
+        )
+        .expect("write llama row");
+        std::fs::write(
+            dir.join("mockfolder.yaml"),
+            format!("engine: mock\nmodel: {folder}\nvram_gb: 2\n"),
+        )
+        .expect("write mock row");
+        let catalog = scan_dir(&dir);
+        assert_eq!(
+            catalog.models.len(),
+            1,
+            "only the mock row survives the trace: {:?}",
+            catalog.errors
+        );
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::ModelPathMissing)
+            .expect("a directory is not a model file");
+        assert!(
+            error.reason.starts_with("model file not found: ")
+                && error.reason.contains("Qwen-GGUF"),
+            "{}",
+            error.reason
+        );
+        assert!(error.file.contains("folder.yaml"));
+        assert!(
+            catalog.models.iter().all(|m| m.gguf_size_gb.is_none()),
+            "a directory's byte size is never booked, for any engine: {:?}",
+            catalog
+                .models
+                .iter()
+                .map(|m| &m.gguf_size_gb)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// R2-13-02 (scan half): a declared `mmproj:` is existence-traced like
+    /// `model:` — a llama row whose vision file is gone must not publish and
+    /// evict for the same doomed spawn; same kind, the refusal names the file.
+    #[test]
+    fn a_llama_entry_with_a_missing_mmproj_is_dropped_and_named() {
+        let dir = crate::testutil::temp_dir("scan-llama-missing-mmproj");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("weights.gguf"), b"0123456789").expect("write gguf");
+        std::fs::write(
+            dir.join("vision.yaml"),
+            format!(
+                "engine: llama\nmodel: {}\nmmproj: Z:/definitely-not-here/mmproj.gguf\n",
+                dir.join("weights.gguf").display()
+            ),
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(catalog.models.is_empty(), "a doomed spawn must not publish");
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::ModelPathMissing)
+            .expect("the missing mmproj must be a ModelPathMissing report");
+        assert!(
+            error.reason.starts_with("mmproj file not found: ")
+                && error.reason.contains("mmproj.gguf"),
+            "{}",
+            error.reason
+        );
+        assert!(error.file.contains("vision.yaml"));
+    }
+
+    /// R2-13-02: the join base for a relative `mmproj:` is the yaml dir (the
+    /// `model:` base), and the trace never resolves or rewrites the raw map —
+    /// the published value stays the operator's word; resolution is launch-side.
+    #[test]
+    fn a_relative_mmproj_is_traced_against_the_yaml_dir() {
+        let dir = crate::testutil::temp_dir("scan-llama-mmproj-join");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("weights.gguf"), b"0123456789").expect("write gguf");
+        std::fs::write(
+            dir.join("vision.yaml"),
+            format!(
+                "engine: llama\nmodel: {}\nmmproj: vision-proj.gguf\n",
+                dir.join("weights.gguf").display()
+            ),
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(catalog.models.is_empty(), "a relative miss must refuse");
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::ModelPathMissing)
+            .expect("the missing relative mmproj must be a ModelPathMissing report");
+        assert!(
+            error.reason.starts_with("mmproj file not found: ")
+                && error.reason.contains("vision-proj.gguf")
+                && error.reason.contains(&dir.display().to_string()),
+            "the refusal names the yaml-dir-joined path: {}",
+            error.reason
+        );
+        std::fs::write(dir.join("vision-proj.gguf"), b"0123456789").expect("write mmproj");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
+        assert_eq!(
+            catalog.models[0].raw.get("mmproj").map(String::as_str),
+            Some("vision-proj.gguf"),
+            "the trace refuses but never resolves or rewrites the raw value"
+        );
     }
 
     #[test]

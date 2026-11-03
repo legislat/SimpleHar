@@ -320,7 +320,9 @@ pub fn jinja_on(value: &str) -> bool {
 }
 
 /// Resolves a `model:` value to the one path the scan, the booking, and the
-/// launch all read (R2-09-02, FINDINGS-09 [2]). The scan stats a relative
+/// launch all read (R2-09-02, FINDINGS-09 [2]). The same resolver anchors a
+/// relative `mmproj:` (R2-13-02): the vision projector is a second weights
+/// file and must open at the same base as the GGUF. The scan stats a relative
 /// value as `ModelConf_dir/<value>` and books `gguf_size_gb` from that stat,
 /// while the engine — spawned with `cwd = exe.parent()` — resolved the raw
 /// string against the binary's directory: one key, two places. Joining the
@@ -376,8 +378,9 @@ fn resolve_model_path(raw: &str, dir: Option<&Path>) -> String {
 ///
 /// `model_dir` is the catalog directory that anchors a relative `model:` (the
 /// parent of the entry's yaml — the same directory the scan stat'd for the
-/// existence trace and the size booking, [`resolve_model_path`]); `None`
-/// launches the value verbatim, the pre-R2-09-02 behavior.
+/// existence trace and the size booking, [`resolve_model_path`]) and, by the
+/// same base, a relative `mmproj:` (R2-13-02); `None` launches the value
+/// verbatim, the pre-R2-09-02 behavior.
 pub(crate) fn build_args(
     raw: &BTreeMap<String, String>,
     port: u16,
@@ -415,7 +418,15 @@ pub(crate) fn build_args(
             if let Some(detail) = table_value_problem(key, flag, v) {
                 return Err(rejected_table_value(model_name, key, flag, v, &detail));
             }
-            args.extend([flag.to_string(), v.to_string()]);
+            // R2-13-02 (engine half): a relative `mmproj:` is a second weights
+            // file — it joins the yaml dir exactly like `model:` (R2-09-02),
+            // never the engine's exe-dir cwd. The row's raw map stays verbatim.
+            let token = if *key == "mmproj" {
+                resolve_model_path(v, model_dir)
+            } else {
+                v.to_string()
+            };
+            args.extend([flag.to_string(), token]);
         }
     }
     if raw.get("jinja").is_some_and(|v| jinja_on(v)) {
@@ -1101,6 +1112,54 @@ mod tests {
         assert_eq!(
             model.raw.get("model").map(String::as_str),
             Some("weights.gguf"),
+            "resolution is for the launch only: the row's raw map (the write-back target) stays verbatim"
+        );
+    }
+
+    /// R2-13-02 (engine half): a relative `mmproj:` is a second weights file,
+    /// so `--mmproj` joins the yaml dir exactly like `-m` (R2-09-02) — never
+    /// the engine's exe-dir cwd — and the row's raw map stays verbatim. The
+    /// exe lives in a different directory here: the old exe-dir resolution is
+    /// the falsifier that must NOT appear.
+    #[test]
+    fn a_relative_mmproj_launches_at_the_yaml_dir_not_the_engine_cwd() {
+        let yaml_home = crate::testutil::temp_dir("llama-rel-mmproj");
+        let exe_home = crate::testutil::temp_dir("llama-rel-mmproj-exe");
+        let gguf = yaml_home.join("weights.gguf");
+        let mmproj = yaml_home.join("vision").join("mmproj.gguf");
+        std::fs::create_dir_all(mmproj.parent().expect("vision dir")).expect("seed vision dir");
+        std::fs::write(&gguf, b"0123456789").expect("seed gguf");
+        std::fs::write(&mmproj, b"0123456789").expect("seed mmproj");
+        let mut model = entry(&[("model", "weights.gguf"), ("mmproj", "vision/mmproj.gguf")]);
+        model.file = Some(yaml_home.join("row.yaml"));
+        let spec = LlamaAdapter::new(exe_home.join("llama-server.exe"))
+            .spec(&model, 18109)
+            .expect("valid");
+        let at = spec
+            .argv
+            .iter()
+            .position(|a| a == "--mmproj")
+            .expect("--mmproj rides the argv");
+        let launched = Path::new(&spec.argv[at + 1]);
+        assert!(
+            launched.is_absolute(),
+            "`--mmproj` must be absolute: {launched:?}"
+        );
+        assert_eq!(
+            launched,
+            std::path::absolute(&mmproj)
+                .expect("fixture path absolutizes")
+                .as_path(),
+            "the launched projector is the yaml-dir join, the same base as `-m`"
+        );
+        assert_ne!(
+            launched,
+            exe_home.join("vision/mmproj.gguf").as_path(),
+            "the old resolution against the engine cwd must not reappear"
+        );
+        assert_eq!(
+            model.raw.get("mmproj").map(String::as_str),
+            Some("vision/mmproj.gguf"),
             "resolution is for the launch only: the row's raw map (the write-back target) stays verbatim"
         );
     }

@@ -542,10 +542,20 @@ pub(crate) fn commit_verified(
         return Ok(());
     }
     let tmp = temp_beside(path);
-    write_synced(&tmp, updated.as_bytes()).map_err(|e| WritebackError::WriteFailed {
-        file: tmp.clone(),
-        io: e.to_string(),
-    })?;
+    let written = write_synced(&tmp, updated.as_bytes());
+    #[cfg(test)]
+    let written = fail_temp_write_if_armed(path, written);
+    if let Err(error) = written {
+        // R2-13-04: a refused write lands exactly after `create` succeeded, so
+        // the half-written temp is this arm's litter to remove — the
+        // RenameFailed arm below has always done the same; neither path may
+        // leave a `.sh.tmp` beside the target forever.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(WritebackError::WriteFailed {
+            file: tmp,
+            io: error.to_string(),
+        });
+    }
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(WritebackError::RenameFailed {
@@ -554,18 +564,29 @@ pub(crate) fn commit_verified(
         });
     }
     // Post-write revalidation: if the renamed file does not parse (fs hiccup),
-    // restore the original bytes and fail loudly (D4's silent-200 fix).
+    // or reads back as the zero-key shape this very function refuses to
+    // pre-write (R2-13-03), restore the original bytes and fail loudly (D4's
+    // silent-200 fix).
     let read_back = std::fs::read_to_string(path);
     #[cfg(test)]
     let read_back = corrupt_if_armed(path, read_back);
+    #[cfg(test)]
+    let read_back = empty_read_back_if_armed(path, read_back);
     if read_back
         .map_err(|e| format!("post-write read failed: {e}"))
         .and_then(|text| {
-            let (_, problems) = parse_flat_yaml(&text);
-            if problems.is_empty() {
-                Ok(())
-            } else {
+            let (map, problems) = parse_flat_yaml(&text);
+            if !problems.is_empty() {
                 Err(problems.join("; "))
+            } else if map.is_empty() {
+                // A clean but zero-key read-back is exactly the shape the
+                // pre-write gate above refuses as `EmptyFile` and the scan
+                // refuses as `InvalidYaml`; passing it would answer Ok over an
+                // unpublishable file, keep a catalog row whose file the next
+                // scan drops, and skip the restore/forensic path entirely.
+                Err("the file read back clean but holds no `key: value` lines".to_string())
+            } else {
+                Ok(())
             }
         })
         .is_err()
@@ -1022,6 +1043,67 @@ fn corrupt_target_if_armed(
         }
     }
     read_back
+}
+
+/// One-shot clean-empty read-back arms (R2-13-03), keyed by the target path:
+/// the next post-write re-read of **that** file is replaced in memory with a
+/// zero-key document that parses without a single problem line — the shape the
+/// corrupt seam (junk lines) cannot drive. The on-disk bytes stay honest, the
+/// restore branch must run for real, and the arm disarms itself on fire.
+#[cfg(test)]
+fn post_write_empties() -> &'static Mutex<Vec<PathBuf>> {
+    static ARMS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    ARMS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Arms the R2-13-03 seam: the next post-write validation of exactly `path`
+/// reads back clean but empty.
+#[cfg(test)]
+pub(crate) fn arm_post_write_clean_empty_readback(path: &Path) {
+    post_write_empties()
+        .lock()
+        .expect("empty read-back seam lock")
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn empty_read_back_if_armed(
+    path: &Path,
+    read_back: Result<String, std::io::Error>,
+) -> Result<String, std::io::Error> {
+    if take_mismatch(post_write_empties(), path) && read_back.is_ok() {
+        return Ok(String::new());
+    }
+    read_back
+}
+
+/// One-shot temp-write-failure arms (R2-13-04), keyed by the target path: the
+/// next `commit_verified` of **that** file has its temp write refused after
+/// the temp is on disk (a simulated full volume — `write_synced` itself is
+/// untouched), so the `WriteFailed` arm's own temp cleanup is falsifiable in
+/// the suite: deleting it turns `assert_no_temp_leftovers` red. The arm
+/// disarms itself on fire.
+#[cfg(test)]
+fn temp_write_failures() -> &'static Mutex<Vec<PathBuf>> {
+    static ARMS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    ARMS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Arms the R2-13-04 seam: the next temp write of exactly `path` fails.
+#[cfg(test)]
+pub(crate) fn arm_temp_write_failure(path: &Path) {
+    temp_write_failures()
+        .lock()
+        .expect("temp write seam lock")
+        .push(path.to_path_buf());
+}
+
+#[cfg(test)]
+fn fail_temp_write_if_armed(path: &Path, written: std::io::Result<()>) -> std::io::Result<()> {
+    if take_mismatch(temp_write_failures(), path) && written.is_ok() {
+        return Err(std::io::Error::other("simulated refused temp write (seam)"));
+    }
+    written
 }
 
 /// Order probe for the restore (FINDINGS-BATCH-2026-10-28 [1]): `restore_original_bytes`
@@ -2025,10 +2107,13 @@ mod tests {
     /// must SUCCEED, leave the bytes and the directory alone (no temp, no `.bak`),
     /// while a real edit on that very same locked target must still be refused in
     /// the rename. Removing the short-circuit turns the first assert red. The
-    /// refused rename doubles as FINDINGS-13 [11]'s residue case: it is the only
-    /// path where a temp can survive a write, so the directory is checked for
-    /// `*.sh.tmp` afterwards — deleting `commit_verified`'s cleanup line turns
-    /// exactly that assert red and nothing else.
+    /// refused rename doubles as FINDINGS-13 [11]'s residue case: since
+    /// R2-13-04 both refused arms (temp write and rename) remove their temp,
+    /// so no write path leaves a `*.sh.tmp` behind and only a killed process
+    /// can; the directory is checked for `*.sh.tmp` afterwards — deleting the
+    /// rename's cleanup line turns exactly that assert red, and deleting the
+    /// temp write's cleanup line turns red
+    /// `a_refused_temp_write_removes_its_temp_and_keeps_the_target`.
     #[cfg(windows)]
     #[test]
     fn a_true_no_op_edit_never_reaches_the_disk() {
@@ -2084,10 +2169,12 @@ mod tests {
             .contains("cpu_offload"));
 
         // FINDINGS-13 [11]: a completed write never leaves its temp behind. This is
-        // the success-path half; the refused-rename half (the only path on which a
-        // temp can actually survive) is pinned in
-        // `a_true_no_op_edit_never_reaches_the_disk`, which is also what already
-        // caught a direct `fs::write(path)` before this assert existed.
+        // the success-path half; the refused-rename half is pinned in
+        // `a_true_no_op_edit_never_reaches_the_disk` and the refused-temp-write
+        // half (R2-13-04 closed the gap: no refused arm leaves a temp now) in
+        // `a_refused_temp_write_removes_its_temp_and_keeps_the_target`, which
+        // together with this assert also caught a direct `fs::write(path)`
+        // before it existed.
         // Temp-name uniqueness is operator-ruled vacuous (ledger 13[11], single dir + gate).
         assert_no_temp_leftovers(&dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2460,6 +2547,65 @@ mod tests {
             "the incident copy is inert by the acceptance gate: {:?}",
             catalog.errors
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-13-03: a read-back that parses clean but holds zero keys is not a
+    /// publishable file — it is the exact shape `commit_verified` refuses to
+    /// write (`EmptyFile`) and the scan refuses (`InvalidYaml`) — so the
+    /// post-write gate must reject it and run the same restore/forensic path,
+    /// never answer Ok over a file the next scan would drop. The corrupt seam
+    /// (junk lines) cannot drive this arm: its `!problems.is_empty()` fails
+    /// the same way under the old and the new predicate.
+    #[test]
+    fn a_clean_empty_read_back_fails_validation_and_restores() {
+        let dir = crate::testutil::temp_dir("writeback-clean-empty-readback");
+        let path = seed(&dir, CLEAN);
+        arm_post_write_clean_empty_readback(&path);
+        let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
+            .expect_err("a clean but zero-key read-back must fail post-write validation");
+        assert!(
+            matches!(&error, WritebackError::PostWriteValidation { .. }),
+            "the clean-empty read-back is a post-write validation failure, got {error:?}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.starts_with("post-write validation failed; original restored (backup: "),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("target"),
+            CLEAN,
+            "the original came back, the empty read-back did not stay"
+        );
+        let bak_text = std::fs::read_to_string(dir.join("qwen3.yaml.bak")).expect("incident copy");
+        assert_eq!(bak_text, CLEAN, "the copy is the verbatim original");
+        assert_no_temp_leftovers(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-13-04: a refused temp write (disk full / write refused right after
+    /// `create` succeeded) must not leave its `.sh.tmp` beside the target —
+    /// the arm the RenameFailed cleanup has always mirrored. The seam leaves
+    /// the temp on disk and refuses the write; removing the arm's
+    /// `remove_file` turns `assert_no_temp_leftovers` red.
+    #[test]
+    fn a_refused_temp_write_removes_its_temp_and_keeps_the_target() {
+        let dir = crate::testutil::temp_dir("writeback-temp-write-fail");
+        let path = seed(&dir, CLEAN);
+        arm_temp_write_failure(&path);
+        let error = set_flag_on_file(&path, "cpu_offload", Some("true"))
+            .expect_err("the seam must refuse the temp write");
+        assert!(
+            matches!(&error, WritebackError::WriteFailed { .. }),
+            "the seam drives the WriteFailed arm, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("target"),
+            CLEAN,
+            "the target never saw the refused write"
+        );
+        assert_no_temp_leftovers(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

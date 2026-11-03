@@ -516,6 +516,7 @@ docker run -d --name "$NAME" \
   --kv-capacity "{{KV_CAP}}" \
   --max-concurrency "{{CONC}}" \
   --kv-dtype "{{KV_DTYPE}}" \
+  ${API_KEY_ARGS[@]+"${API_KEY_ARGS[@]}"} \
   {{MODEL_ID_ARG}}${SERVE_ARGS[@]+"${SERVE_ARGS[@]}"}
 
 echo "autostart: '$NAME' profile '{{PROFILE}}' (ctx={{MAX_CTX}} kv={{KV_CAP}} conc={{CONC}} kvdtype={{KV_DTYPE}} key=$([[ "$WITH_KEY" == key ]] && echo on || echo off)) on port $PUBLISH->$PORT"

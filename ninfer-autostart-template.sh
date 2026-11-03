@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # REFERENCE ONLY — not on the launch path. The authoritative template is
-# CANONICAL_NINFER_SCRIPT in src/engine/ninfer.rs, which the harness renders from
+# CANONICAL_NINFER_SCRIPT in src/engine/policy.rs, which the harness renders from
 # the model yaml, stages into the distro, and launches. Keep the two in sync.
 # autostart.sh — start one NInfer service with a VRAM profile: a|b|c|d|e (default b)
 set -euo pipefail
@@ -59,7 +59,7 @@ docker run -d --name "$NAME" \
   --host 0.0.0.0 \
   --port "$INTERNAL_PORT" \
   --model-id "$MODEL_ID" \
-  "${API_KEY_ARGS[@]}" \
+  ${API_KEY_ARGS[@]+"${API_KEY_ARGS[@]}"} \
   --max-context "$MAX_CTX" \
   --kv-capacity "$KV_CAP" \
   --max-concurrency "$CONC"
