@@ -709,8 +709,10 @@ async fn probe_names_the_missing_model_file_when_a_child_exits_early() {
     // than only the exit status. Pre-fix this fails: the reason is the bare
     // `engine process exited early (...)`.
     let runtime = ProcessRuntime::new();
-    // +5: the next free offset below the protected 18203/18204 window.
-    let port = TEST_PORT + 5;
+    // +9: the next free offset below the protected 18203/18204 window; +5 stays
+    // free because 18_195 is reserved for the lib binary's engine-child test
+    // (header contract, R2-20-04).
+    let port = TEST_PORT + 9;
     let missing = "Z:\\definitely-not-here\\doomed.gguf";
     let spec = LaunchSpec {
         argv: vec![

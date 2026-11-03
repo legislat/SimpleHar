@@ -381,7 +381,12 @@ async fn load_flow_populates_jobs_and_status() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["slots"][0]["model"], "qwen3");
 
-    let job_id = body["jobs"][0]["id"].as_u64().unwrap_or_default();
+    // R2-18-01: `unwrap_or_default()` read a renamed or dropped `id` as 0, and 0 is
+    // exactly the id of the one job this test mints — the detail leg could never
+    // fail. Demand the key: a ledger row that stops carrying its id goes red here.
+    let job_id = body["jobs"][0]["id"]
+        .as_u64()
+        .expect("the /har/status ledger row carries its id for /har/jobs/{id}");
     let (status, _) = get_json(&control, &format!("/har/jobs/{job_id}")).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = get_json(&control, "/har/jobs/999").await;
@@ -1049,26 +1054,71 @@ async fn no_model_fallback_serves_the_loaded_occupant() {
 
 #[tokio::test]
 async fn no_model_fallback_loads_the_category_default() {
+    // R2-18-05: with one RP entry the old fixture could not tell "loads the
+    // configured default_model" from "loads the only entry of the category". The
+    // decoy carries a distinct name AND a distinct engine-reported id, so a
+    // fallback that ignored the default's value (while keeping the
+    // default-existence gate) serves `engine-decoy` and goes red below.
     let mut config = AppConfig::default();
     config
         .category_mut(CategoryId::Rp)
         .expect("default config has RP")
         .default_model = Some("default-model".to_string());
-    let (control, _, rp, _, runtime, _modelconf) = app(
+    let adapters: Vec<(&str, Arc<dyn EngineAdapter>)> = vec![
+        (
+            "mock-id-default",
+            Arc::new(mock_runtime::MockIdAdapter {
+                engine: "mock-id-default",
+                serve_id: "engine-default",
+            }),
+        ),
+        (
+            "mock-id-decoy",
+            Arc::new(mock_runtime::MockIdAdapter {
+                engine: "mock-id-decoy",
+                serve_id: "engine-decoy",
+            }),
+        ),
+    ];
+    let (control, _, rp, _, runtime, _modelconf) = build_app(
         config,
-        &[("default-model", "mock", CategoryId::Rp, Some(4.0))],
+        &[
+            (
+                "default-model",
+                "mock-id-default",
+                CategoryId::Rp,
+                Some(4.0),
+            ),
+            ("decoy-rp", "mock-id-decoy", CategoryId::Rp, Some(4.0)),
+        ],
+        &adapters,
     );
-    let _ = control;
 
     let (status, body) = post_json(&rp, "/v1/chat/completions", r#"{"messages":[]}"#).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["body"]["model"], "mock-model");
+    assert_eq!(
+        body["body"]["model"].as_str(),
+        Some("engine-default"),
+        "the no-model request must reach the CONFIGURED default's engine, never \
+         the decoy's: {body}"
+    );
     assert_eq!(
         runtime.server_count(),
         1,
         "the default model was loaded on demand"
     );
-    let _ = control;
+
+    let (_, status) = get_json(&control, "/har/status").await;
+    let rp_slot = status["slots"]
+        .as_array()
+        .expect("slots array")
+        .iter()
+        .find(|slot| slot["category"] == "RP")
+        .expect("RP slot present");
+    assert_eq!(
+        rp_slot["model"], "default-model",
+        "the loaded row is the configured default, not the decoy: {status}"
+    );
 }
 
 #[tokio::test]
@@ -2532,9 +2582,14 @@ async fn load_of_an_ambiguous_gguf_alias_is_409_naming_both_yamls() {
     assert_eq!(body["code"], "conflict", "flat code: {body}");
     assert_eq!(body["error"]["code"], "conflict", "envelope code: {body}");
     let message = body["message"].as_str().unwrap_or_default();
+    // R2-18-02: a bare `contains('2')` was satisfiable by a digit in the fixture
+    // temp path the same message embeds, so a count-free regression still passed.
+    // Pin the operator-visible phrase the wire actually renders.
     assert!(
-        message.contains("ambiguous") && message.contains("`twin`") && message.contains('2'),
-        "names the query and the count: {message}"
+        message.contains("ambiguous")
+            && message.contains("`twin`")
+            && message.contains("2 catalog entries"),
+        "names the query and the entry count: {message}"
     );
     assert!(
         message.contains("twin-work.yaml") && message.contains("twin-aux.yaml"),

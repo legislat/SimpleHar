@@ -80,7 +80,10 @@ async fn health_and_status_answer_on_default_config() {
 }
 
 #[tokio::test]
-async fn unknown_route_is_typed_not_found() {
+async fn unknown_route_answers_not_found() {
+    // Status only, by design: the unknown-route 404 body is still the open
+    // R2-05-03 product gap (axum `text/plain`, not the typed envelope), so the
+    // name must not claim a typed answer the assertion does not check.
     let response = app()
         .oneshot(
             Request::get("/har/nope")

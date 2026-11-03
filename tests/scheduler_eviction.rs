@@ -482,31 +482,131 @@ async fn equal_cost_victims_evict_the_less_protected_category() {
 }
 
 #[tokio::test]
+async fn equal_total_victims_evict_the_fewer_victims() {
+    // R2-20-02: the planner's documented `fewer victims` tie-break (the
+    // `count < best_count` arm of `plan_victims`, src/scheduler/admission.rs) was
+    // pinned by no fixture — every candidate multiset here had either one covering
+    // mask or different totals (R2-20 [2] read them all). AUX 12 + 8 and one AUX
+    // 20 against a 20 GiB deficit tie at total 20: the count arm must release the
+    // single 20, never the pair. Delete that clause and the planner may kill two
+    // operator models where one would do, chosen by disposability alone, with
+    // every current pin still green.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0)]);
+    let handle = harness(
+        3,
+        &[
+            ("aux12", "mock", CategoryId::Aux, 12.0),
+            ("aux8", "mock", CategoryId::Aux, 8.0),
+            ("aux20", "mock", CategoryId::Aux, 20.0),
+            ("work50", "mock", CategoryId::Work, 50.0),
+        ],
+        Arc::new(witness.clone()),
+    );
+    // The card tracks the ledger load by load, so WORK's admit-time reading is
+    // the honest 40 when the 20 GiB deficit (free 30, need 50) is computed.
+    handle
+        .swap("aux12", CategoryId::Aux)
+        .await
+        .expect("aux12 loads");
+    witness.set_used(12.0);
+    handle
+        .swap("aux8", CategoryId::Aux)
+        .await
+        .expect("aux8 loads");
+    witness.set_used(20.0);
+    handle
+        .swap("aux20", CategoryId::Aux)
+        .await
+        .expect("aux20 loads");
+    witness.set_used(40.0);
+
+    let loading = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work50", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work50" && job.state == simplehar_se::scheduler::SwapState::Dispose
+        })
+    })
+    .await;
+    // The card gives back the single victim's bytes; the 12 and the 8 stay resident.
+    witness.set_used(20.0);
+    let Reply::Loaded(_) = loading
+        .await
+        .expect("task alive")
+        .expect("work50 loads after the single victim is released")
+    else {
+        panic!("expected Loaded");
+    };
+
+    let status = handle.status().await.expect("actor alive");
+    let job = job_row(&status, "work50");
+    assert_eq!(
+        job.victims_released,
+        vec!["aux20".to_string()],
+        "the equal-total tie must fall to the FEWER victims, never the 12 + 8 pair: {:?}",
+        job.victims_released
+    );
+    let aux = aux_models(&status);
+    assert!(
+        aux.contains(&Some("aux12".to_string())),
+        "the surviving half of the pair: {aux:?}"
+    );
+    assert!(
+        aux.contains(&Some("aux8".to_string())),
+        "the surviving half of the pair: {aux:?}"
+    );
+    assert!(
+        !aux.contains(&Some("aux20".to_string())),
+        "the single victim was the release: {aux:?}"
+    );
+}
+
+#[tokio::test]
 async fn rp_load_cannot_evict_work_and_refuses_with_blockers() {
-    // WORK holds 50; RP wants 50: free 20, deficit 30, and the only candidate
-    // (WORK) is not evictable by RP -> refusal naming the blocker and the rule.
-    // Script tracks the ledger: the card is empty until work50 lands (the
-    // observed gate refuses loads onto a card the witness sees as busy).
-    let witness = FakeWitness::with(vec![sample(72.0, 0.0), sample(72.0, 50.0)]);
+    // WORK holds 50 and a small AUX 8 sits beside it; RP wants 50: free 12,
+    // deficit 38. WORK is no candidate (RP cannot evict it) — the blocker — and
+    // AUX 8 is a candidate too small to cover. The refusal must carry BOTH arms
+    // of the G6 tail (R2-20-03): `considered evicting:` naming the candidate with
+    // its GiB figure, and `blocked by:` naming the rule. No executed test ever
+    // had a non-empty candidate list before, so the whole `considered evicting`
+    // arm in src/budget.rs could be deleted without turning anything red.
+    // Release-first is same-slot only: a paper refusal may not kill the candidate.
+    let witness = FakeWitness::with(vec![sample(72.0, 0.0)]);
     let handle = harness(
         1,
         &[
             ("work50", "mock", CategoryId::Work, 50.0),
             ("rp50", "mock", CategoryId::Rp, 50.0),
+            ("aux8", "mock", CategoryId::Aux, 8.0),
         ],
-        Arc::new(witness),
+        Arc::new(witness.clone()),
     );
 
     handle
         .swap("work50", CategoryId::Work)
         .await
         .expect("work loads");
+    // The card tracks the ledger by `used` override, not a queue step: unrelated
+    // readings must not shift which phase a sample belongs to (FakeWitness note).
+    witness.set_used(50.0);
+    handle
+        .swap("aux8", CategoryId::Aux)
+        .await
+        .expect("the small AUX candidate loads");
+    witness.set_used(58.0);
     let error = handle
         .swap("rp50", CategoryId::Rp)
         .await
         .expect_err("RP cannot evict WORK");
     let message = error.to_string();
     assert!(message.contains("insufficient VRAM"), "was: {message}");
+    assert!(
+        message.contains("considered evicting: aux8 (AUX), 8.0 GiB"),
+        "the refusal must name the candidate it could not use, with its GiB \
+         figure, before the blocker half: {message}"
+    );
     assert!(message.contains("blocked by: work50"), "was: {message}");
     // WORK.evictable_by is empty: nothing may evict it.
     assert!(message.contains("nothing may evict WORK"), "was: {message}");
@@ -520,6 +620,11 @@ async fn rp_load_cannot_evict_work_and_refuses_with_blockers() {
     assert_eq!(
         model_of(&status, CategoryId::Work).as_deref(),
         Some("work50")
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Aux).as_deref(),
+        Some("aux8"),
+        "the insufficient candidate survived the refusal"
     );
 }
 
