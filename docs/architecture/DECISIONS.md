@@ -435,3 +435,12 @@ Unresolved questions live ONLY in `DECISIONS-PENDING.md`. This file only ever *g
   `api::tests::config_write_path_follows_boot_and_never_the_legacy_file_on_fallback`
   (fallback never legacy; stamped explicit selection wins).
   | 2026-11-03 | `TASK-DEBT-LEFTOVERS`
+
+- RULED 2026-11-03 (R2-02-02, option B): a job that terminalizes with an unconfirmed
+  release and a spawned ticket gets one bounded late-release watcher. The watcher is
+  ticket- and generation-scoped, observes only, runs for one additional
+  `release_timeout_s`, warns once, and never re-kills. `Ok(true)` clears the same
+  generation; `StaleTicket` means a successor exists and the watch stops without
+  touching it. Next load or boot reclaim remains the recovery. This makes the residue
+  visible without adding live kill authority.
+  | 2026-11-03 | `TASK-DEBT-LEFTOVERS`

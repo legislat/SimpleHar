@@ -319,14 +319,19 @@ async fn killing_a_port_we_do_not_own_is_a_noop() {
         Probe::Ready,
         "the harness's own child must be serving before anyone tests a kill"
     );
-    let foreign = bind_foreign_listener(59_999).await;
+    let foreign = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind a foreign listener on an ephemeral port");
+    let foreign_port = foreign
+        .local_addr()
+        .expect("the foreign listener has a local address")
+        .port();
 
     runtime
-        .kill(&ticket(59_999))
+        .kill(&ticket(foreign_port))
         .await
         .expect("unknown ticket is a no-op kill");
     assert!(runtime
-        .release_confirmed(&ticket(59_999))
+        .release_confirmed(&ticket(foreign_port))
         .await
         .expect("evidence runs"));
 
@@ -334,7 +339,7 @@ async fn killing_a_port_we_do_not_own_is_a_noop() {
     // would have taken it down), and so does the runtime's OWN child — an unscoped
     // kill path does not get to touch a process it did not start, ticket or not.
     assert!(
-        tokio::net::TcpStream::connect(("127.0.0.1", 59_999))
+        tokio::net::TcpStream::connect(("127.0.0.1", foreign_port))
             .await
             .is_ok(),
         "the foreign listener survived a kill of its port — the harness killed something"
