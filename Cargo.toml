@@ -1,6 +1,6 @@
 [package]
 name = "simplehar-se"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 description = "One app managing local inference engines with a simple, reliable, adjustable model swap"
 license = "Apache-2.0"

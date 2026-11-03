@@ -19,7 +19,7 @@ harness admits loads on the reading the card itself gives (the witness), minus
 a reserve, with in-flight bookings counted. The harness refuses to
 overcommit, and it names its reasons.
 
-Latest release: **v1.0.1** (`v1.0.1` tag). Repository HEAD may be ahead of
+Latest release: **v1.1.0** (`v1.1.0` tag). Repository HEAD may be ahead of
 the tag; HEAD is not itself a release. `cargo build --release` produces
 `target\release\simplehar-se.exe`, or use the shipped exe directly.
 

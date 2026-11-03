@@ -16,10 +16,46 @@ a Changelog. Versions follow Semantic Versioning.
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
-## Unreleased
+## v1.1.0 - 2026-11-03
 
-Repository governance work: durable documentation, process documents, and
-automation. This work changes no product behavior yet.
+Commit: the release commit; tag `v1.1.0`.
+
+### Added
+
+- `simplehar-se import strata <profile.json> --apply <row.yaml>` merges the
+  emitted knob block into a live row in one atomic write. It preserves the
+  scheduling keys and `strata_python`, deletes `strata_config`, and refuses
+  conflicts without a partial write.
+
+### Security
+
+- The canonical ninfer launch now passes `--api-key` when `ninfer_key: true`.
+  Before this fix the engine ran unauthenticated while the stamp said `key=on`.
+
+### Fixed
+
+- Strata rejects `--host=` and `--port=` as well as the space forms.
+- Admission settles against `gate + reserve`, and a same-slot holder is
+  credited once.
+- A late unconfirmed release gets one bounded, observe-only watcher.
+- The boot config is flushed before rename; a landed-but-unverified write
+  records the real verdict.
+- Model files must be regular files; `mmproj` is traced and resolved.
+- Log rotation prunes the generation budget; a contended sink cannot wedge
+  emitters.
+- The control page is self-contained and a refused logging flip unflips.
+- The Windows test gate uses an ephemeral foreign port.
+
+### Changed
+
+- Dependencies: the unused `reqwest` blocking feature is removed and `tokio`
+  uses the explicit feature set.
+- README documents the current logs, tray, model keys, and import contract.
+
+### Removed
+
+- The legacy `ninfer_autostart` launch path. A row that declares it is refused
+  with a migration message; template mode is the only ninfer path.
 
 ## v1.0.1 - 2026-11-02
 
