@@ -18,7 +18,10 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## v1.1.0 - 2026-11-03
 
-Commit: the release commit; tag `v1.1.0`.
+Commit: `f6c6381` (release prep). Artifact: `simplehar-se.exe`, SHA256
+`031D94D827E407AB5A3B1B5E75B651E3FF108BE804B7C869A665EDD76D45A376`, built
+2026-11-03 and staged at `C:\Inference\SimpleHar-SE_release_v1.1.0`. The live
+harness remains on v1.0.1 until the operator switches it.
 
 ### Added
 
