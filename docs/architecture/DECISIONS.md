@@ -444,3 +444,30 @@ Unresolved questions live ONLY in `DECISIONS-PENDING.md`. This file only ever *g
   touching it. Next load or boot reclaim remains the recovery. This makes the residue
   visible without adding live kill authority.
   | 2026-11-03 | `TASK-DEBT-LEFTOVERS`
+
+- RULED 2026-11-03 (N3): approve the scheduler cohesion split in principle. Phase 1
+  (free-cluster relocation) runs after the chunked R2 review and after release 1.1.0,
+  in a dedicated no-scheduler-edits window. Phase 2 (split `impl ActorState`) runs only
+  after a green wave-verify. Phase 3 (API split) is deferred. Single-writer semantics
+  stay LOCKED; pure moves only; cardless gate after each module.
+  | 2026-11-03 | `TASK-N3-SPLIT`
+
+- RULED 2026-11-03 (N7): approve dependency hygiene. Remove the unused `reqwest`
+  blocking feature, narrow `tokio` features to what the crate uses, and dedupe
+  `base64`/`syn` where a compatible upgrade exists. No new dependency; report any
+  duplicate that cannot be removed without an upgrade.
+  | 2026-11-03 | `TASK-N7-DEPS`
+
+- RULED 2026-11-03 (release): release **1.1.0** after the chunked R2 review is
+  complete. Version, changelog, README release claim, tag, deploy, and artifact hash
+  move together.
+  | 2026-11-03 | `TASK-RELEASE-NEXT`
+
+- RULED 2026-11-03 (import): GO for `simplehar-se import strata --apply <row.yaml>`.
+  Merge the emitted block into the live row, keep scheduling keys and `strata_python`,
+  refuse on conflict instead of guessing, and delete `strata_config`.
+  | 2026-11-03 | `TASK-IMPORT-APPLY`
+
+- RULED 2026-11-03 (priority): after release 1.1.0, Basalt is priority 1 and Berth
+  borrows are priority 2. Neither starts before the release.
+  | 2026-11-03 | `TASK-BASALT`, `TASK-BERTH-BORROWS`
