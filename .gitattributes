@@ -1,0 +1,5 @@
+# Source-scan and include_str! pins read exact bytes and expect LF.
+# Windows checkouts (core.autocrlf=true, the GitHub runner default) produced
+# CRLF and broke every column-0 and line-based pin. Force LF on checkout for
+# all text; `text=auto` leaves any future binary untouched.
+* text=auto eol=lf
