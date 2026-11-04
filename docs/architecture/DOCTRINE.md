@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: agent
 source_of_truth_for: [binding product invariants]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-04
 review_trigger: new-decision, release
 ---
 
@@ -78,10 +78,12 @@ non-ASCII punctuation in quotes is replaced with ASCII equivalents only.
     figure carries a provenance and books only if trusted"; a `total_diff`
     figure "never books"; "provenance is never upgraded post-hoc"; a
     `cpu_offload` flip or a `ninfer_profile`/`--kv-capacity` change voids the
-    figure. Amended ruling: "Cost = max booking cost" - a guarded
-    `engine_report` figure above the declared value books instead of it.
-    Consequence: admission books only trusted attributions, and the physical
-    gate stopper stays the observed `used_gib`.
+    figure. Amended ruling: "Cost = max booking cost" - a guarded engine-reported
+    figure above the declared value books instead of it (`engine_report` from a
+    container, `engine_status` from a process engine's own status/metrics; valid
+    without a profile stamp, the profile identity stays ninfer-only, and an
+    `engine:` flip voids it). Consequence: admission books only trusted
+    attributions, and the physical gate stopper stays the observed `used_gib`.
 13. **Container-internal ports are a third namespace (R10).** The container
     inside is a third namespace; `ninfer_internal_port` defaults to the SE
     number 8808; "a row naming a `protected_ports`, public-listener or
