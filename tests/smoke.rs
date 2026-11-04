@@ -81,9 +81,8 @@ async fn health_and_status_answer_on_default_config() {
 
 #[tokio::test]
 async fn unknown_route_answers_not_found() {
-    // Status only, by design: the unknown-route 404 body is still the open
-    // R2-05-03 product gap (axum `text/plain`, not the typed envelope), so the
-    // name must not claim a typed answer the assertion does not check.
+    // R2-05-03: the unknown-route 404 answers the typed envelope, so the name
+    // claims exactly what the legs check — status, JSON body, and both codes.
     let response = app()
         .oneshot(
             Request::get("/har/nope")
@@ -94,4 +93,16 @@ async fn unknown_route_answers_not_found() {
         .await
         .expect("in-process request");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .starts_with("application/json"));
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope JSON");
+    assert_eq!(body["code"], "not_found", "body: {body}");
+    assert_eq!(body["error"]["code"], "not_found", "body: {body}");
 }

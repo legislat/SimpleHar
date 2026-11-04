@@ -398,7 +398,9 @@ pub const ENCODED_BODY: &[u8] = b"\x1f\x8b\x08\x00opaque-not-really-gzip\x00\xff
 /// `"mock_hop_by_hop": true` is answered with one of every hop-by-hop response
 /// header (plus a `connection` value naming one more) beside an ordinary marker
 /// header, so the proxy's engine→client strip list has a real emitter to pin
-/// against (R2-06-02).
+/// against (R2-06-02). A body carrying `"mock_plain_404": true` is answered with
+/// a `404` under `content-type: text/plain`, the silent engine refusing on the
+/// wire (R2-05-03 pass-through integrity).
 async fn echo(
     State(state): State<MockState>,
     uri: axum::http::Uri,
@@ -465,6 +467,22 @@ async fn echo(
                 ("x-hop-named", "must-not-reach-the-client"),
             ],
             r#"{"hop_by_hop":true}"#,
+        )
+            .into_response();
+    }
+    // R2-05-03 test support: an engine answering a plain-text `404`. On a proxy
+    // path this is the engine's own refusal, and the harness envelope must not
+    // replace it (pass-through integrity).
+    if body.as_ref().is_some_and(|Json(value)| {
+        value
+            .get("mock_plain_404")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }) {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            "engine says no such route",
         )
             .into_response();
     }

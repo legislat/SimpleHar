@@ -106,6 +106,11 @@ pub enum ApiError {
     /// Real command, later milestone — `501`.
     #[error("not implemented: {reason}")]
     NotImplemented { reason: String },
+    /// The path exists but the HTTP method does not — `405`. The router raises
+    /// this class for every wrong-method request; the envelope middleware carries
+    /// it in the same JSON shape as every other class (R2-05-03).
+    #[error("method not allowed: {reason}")]
+    MethodNotAllowed { reason: String },
     /// Harness-side failure — `500`.
     #[error("internal error: {reason}")]
     Internal { reason: String },
@@ -126,6 +131,7 @@ impl ApiError {
             ApiError::Forbidden { .. } => "forbidden",
             ApiError::UnsupportedMedia { .. } => "unsupported_media_type",
             ApiError::NotImplemented { .. } => "not_implemented",
+            ApiError::MethodNotAllowed { .. } => "method_not_allowed",
             ApiError::Internal { .. } => "internal",
         }
     }
@@ -144,6 +150,7 @@ impl ApiError {
             ApiError::Forbidden { .. } => StatusCode::FORBIDDEN,
             ApiError::UnsupportedMedia { .. } => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ApiError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
+            ApiError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             ApiError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -198,6 +205,17 @@ impl ApiError {
     }
 }
 
+/// The dual envelope every JSON error body uses (A2), built from a decided
+/// `code` and `message`. `error_body` and the router refusals share it, so one
+/// shape lives in exactly one place.
+fn router_error_body(code: &'static str, message: String) -> Value {
+    json!({
+        "code": code,
+        "message": message,
+        "error": { "message": message, "type": "simplehar_error", "code": code },
+    })
+}
+
 /// The single JSON error body (A2): SE-native flat `code`/`message` plus the
 /// OpenAI-compatible `error` envelope with the same values.
 ///
@@ -224,11 +242,7 @@ fn error_body(error: &ApiError) -> Value {
         other => other.to_string(),
     };
     let code = error.code();
-    json!({
-        "code": code,
-        "message": message,
-        "error": { "message": message, "type": "simplehar_error", "code": code },
-    })
+    router_error_body(code, message)
 }
 
 impl IntoResponse for ApiError {
@@ -2181,11 +2195,88 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
     response
 }
 
+/// The routes whose bodies come from the engine, not from the harness. A `404`
+/// here is the engine's own answer. The client must receive it byte-for-byte
+/// (proxy pass-through, FINDINGS-06 [9]), so the envelope rewrite below never
+/// touches these three paths.
+const PROXY_PASSTHROUGH_PATHS: [&str; 3] =
+    ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"];
+
+/// Rewrites the router's own refusals to the typed JSON envelope (R2-05-03).
+///
+/// An unknown route answers `404` from the router fallback, and a wrong method
+/// answers `405` from the method router. Both are plain-text answers, and a
+/// client could not branch on a missing `code` — the same contract FINDINGS-05
+/// [3] fixed for body rejections. Only those two statuses are rewritten, and
+/// only while the body is still axum's (no content type, or `text/plain`). A
+/// `404` on a proxy pass-through path is the engine's answer, not the harness's,
+/// so it is never touched. Every other status, and every response that is
+/// already JSON, passes through unchanged.
+async fn envelope_router_errors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    let status = response.status();
+    let harness_refusal = status == StatusCode::METHOD_NOT_ALLOWED
+        || (status == StatusCode::NOT_FOUND && !PROXY_PASSTHROUGH_PATHS.contains(&path.as_str()));
+    if !harness_refusal {
+        return response;
+    }
+    let plain_text = match response.headers().get(axum::http::header::CONTENT_TYPE) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .is_ok_and(|value| value.starts_with("text/plain")),
+    };
+    if !plain_text {
+        return response;
+    }
+    let (code, message) = if status == StatusCode::METHOD_NOT_ALLOWED {
+        (
+            "method_not_allowed",
+            format!("method_not_allowed: {method} {path} is not accepted"),
+        )
+    } else {
+        (
+            "not_found",
+            format!("not_found: no route for {method} {path}"),
+        )
+    };
+    // The body swap takes its framing headers with it: the old bytes may carry
+    // an inner layer's gzip, and `content-length` would then lie about the new
+    // JSON. Every other header survives — `x-request-id` from the guard, the
+    // `Allow` list of a `405`, and anything a later layer adds.
+    let headers = response.headers_mut();
+    headers.remove(axum::http::header::CONTENT_TYPE);
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    headers.remove(axum::http::header::CONTENT_ENCODING);
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    *response.body_mut() = Body::from(router_error_body(code, message).to_string());
+    response
+}
+
 /// `GET /har/log?limit=N` — the last N harness log events from the in-memory
 /// ring (Step 16): why did the last load fail, without opening files.
+///
+/// A query the extractor rejects answers `400 bad_request` in the project
+/// envelope, never axum's plain-text rejection (R2-05-03). The branch is
+/// defensive: the 0.8 form decoder is lossy and the map type accepts every
+/// pair, so a query rarely rejects on this surface today.
 async fn har_log(
-    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    query: Result<
+        axum::extract::Query<std::collections::HashMap<String, String>>,
+        axum::extract::rejection::QueryRejection,
+    >,
 ) -> Result<Json<Value>, ApiError> {
+    let axum::extract::Query(query) = query.map_err(|rejection| ApiError::BadRequest {
+        reason: rejection.to_string(),
+    })?;
     let limit = query
         .get("limit")
         .and_then(|limit| limit.parse::<usize>().ok())
@@ -3057,6 +3148,9 @@ pub fn category_router(api: Arc<ApiState>, category: CategoryId) -> Router {
             DefaultBodyLimit::max(PROXY_BODY_LIMIT),
         ))
         .layer(axum::middleware::from_fn_with_state(guard_state, guard))
+        // Outermost: the router's own 404/405 refusals carry the project
+        // envelope, the guard's request id included (R2-05-03).
+        .layer(axum::middleware::from_fn(envelope_router_errors))
 }
 
 /// Builds the control listener: its own category's surface plus `/har/*`.
@@ -3103,6 +3197,12 @@ pub fn control_router(api: Arc<ApiState>) -> Router {
             // narrows it to CONTROL_BODY_LIMIT above.
             DefaultBodyLimit::max(PROXY_BODY_LIMIT),
         ))
+        // Outermost, over the merged surface: the merged fallback and every
+        // sub-router's own 404/405 answer the project envelope here, request id
+        // and `Allow` headers included (R2-05-03). The category surface already
+        // normalizes inside `category_router`; this is what catches the `/har/*`
+        // method refusals and the page fallback.
+        .layer(axum::middleware::from_fn(envelope_router_errors))
 }
 
 #[cfg(test)]

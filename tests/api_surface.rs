@@ -1659,6 +1659,18 @@ async fn control_bodies_are_capped_below_the_proxy_ceiling() {
         text.contains("length limit exceeded"),
         "the refusal must name the limit, not a parse error: {text}"
     );
+    // Operator ruling 2026-11-04: an over-limit body stays `400 bad_request`;
+    // `413` is not used — request-shape refusals stay one class.
+    let body: Value = serde_json::from_slice(&bytes).expect("the refusal is the JSON envelope");
+    assert_eq!(body["code"], "bad_request", "flat envelope: {body}");
+    assert_eq!(body["error"]["code"], "bad_request", "envelope: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("length limit exceeded"),
+        "the envelope message still names the limit: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1692,6 +1704,18 @@ async fn proxy_bodies_are_capped_at_64_mib() {
     assert!(
         text.contains("length limit exceeded"),
         "the refusal must name the limit, not a JSON parse error: {text}"
+    );
+    // Operator ruling 2026-11-04: an over-limit body stays `400 bad_request`;
+    // `413` is not used — request-shape refusals stay one class.
+    let body: Value = serde_json::from_slice(&bytes).expect("the refusal is the JSON envelope");
+    assert_eq!(body["code"], "bad_request", "flat envelope: {body}");
+    assert_eq!(body["error"]["code"], "bad_request", "envelope: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("length limit exceeded"),
+        "the envelope message still names the limit: {body}"
     );
 }
 
@@ -4281,5 +4305,199 @@ async fn a_missing_gguf_is_dropped_by_the_scan_and_named_on_the_page() {
         status,
         StatusCode::NOT_FOUND,
         "a dropped entry is unknown: {body}"
+    );
+}
+
+/// Sends one GET with the loopback `Host` and hands back the whole response, so
+/// a leg can read headers the `get_json` helper drops.
+async fn get_full(app: &Router, path: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::get(path)
+                .header("host", "127.0.0.1:8708")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request")
+}
+
+/// Checks one refusal leg: status, JSON content type, the guard's request id,
+/// and the dual envelope with `want_code` in both shapes. Returns the body.
+async fn refusal_envelope(
+    response: axum::response::Response,
+    want_status: StatusCode,
+    want_code: &str,
+) -> Value {
+    assert_eq!(response.status(), want_status);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("application/json"),
+        "the refusal must answer the JSON envelope, not {content_type:?}"
+    );
+    assert!(
+        response.headers().contains_key("x-request-id"),
+        "the envelope rewrite must keep the guard's request id: {:?}",
+        response.headers()
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    let body: Value = serde_json::from_slice(&bytes).expect("envelope JSON");
+    assert_eq!(body["code"], want_code, "flat envelope: {body}");
+    assert_eq!(body["error"]["code"], want_code, "OpenAI envelope: {body}");
+    assert_eq!(body["error"]["type"], "simplehar_error", "{body}");
+    assert_eq!(body["error"]["message"], body["message"], "{body}");
+    body
+}
+
+/// R2-05-03: a route the harness does not know answers the typed envelope on
+/// every listener. Pre-fix the control listener answered the webui fallback's
+/// empty body and a category listener answered axum's `text/plain` 404 —
+/// nothing could branch on a missing `code`. Falsifier: drop the
+/// `envelope_router_errors` layer and every leg dies in `refusal_envelope`.
+#[tokio::test]
+async fn unknown_routes_answer_the_envelope_on_every_listener() {
+    let (control, work, _, _, _, _) = app(AppConfig::default(), &[]);
+    let body = refusal_envelope(
+        get_full(&control, "/har/definitely-not-a-route").await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    assert_eq!(
+        body["message"], "not_found: no route for GET /har/definitely-not-a-route",
+        "{body}"
+    );
+    let body = refusal_envelope(
+        get_full(&work, "/nope").await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    assert_eq!(
+        body["message"], "not_found: no route for GET /nope",
+        "{body}"
+    );
+}
+
+/// R2-05-03/04: a known route with the wrong method answers `405
+/// method_not_allowed` in the same envelope, and the router's `Allow` header
+/// survives the rewrite. The guard's POST content-type gate runs before
+/// routing, so the `POST /health` leg declares JSON exactly as the page would.
+#[tokio::test]
+async fn wrong_methods_answer_the_envelope_and_keep_the_allow_header() {
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
+    let body = refusal_envelope(
+        get_full(&control, "/har/load").await,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+    )
+    .await;
+    assert_eq!(
+        body["message"], "method_not_allowed: GET /har/load is not accepted",
+        "{body}"
+    );
+    let response = control
+        .oneshot(
+            Request::post("/health")
+                .header("host", "127.0.0.1:8708")
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    let allow = response
+        .headers()
+        .get("allow")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = refusal_envelope(
+        response,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+    )
+    .await;
+    assert_eq!(
+        body["message"], "method_not_allowed: POST /health is not accepted",
+        "{body}"
+    );
+    assert_eq!(
+        allow, "GET,HEAD",
+        "the router's Allow list survives: {body}"
+    );
+}
+
+/// R2-05-03: `har_log` extracts `Result<Query, QueryRejection>` and answers a
+/// rejection with the typed `400 bad_request` envelope, never axum's plain-text
+/// one. Honest scope: on axum 0.8.9 that branch is defensive. The form decoder
+/// passes a bad escape through and replaces invalid UTF-8 (`decode_utf8_lossy`),
+/// and a `HashMap<String, String>` map accepts every pair, so no wire input
+/// makes the extractor reject — `%zz` stays a key and `%ff` becomes one
+/// replacement character. These legs pin that such inputs keep answering the
+/// ring document with the `limit` fallback. A decoder that rejects in the
+/// future must answer the envelope (the `Result` arm); the legs then move to
+/// the `400` shape, they must not silently return to `text/plain`.
+#[tokio::test]
+async fn a_bad_query_on_har_log_stays_inside_the_typed_surface() {
+    let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
+    for query in ["%zz", "%ff", "limit=abc"] {
+        let (status, body) = get_json(&control, &format!("/har/log?{query}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "`{query}` decodes leniently: {body}"
+        );
+        assert!(body["events"].is_array(), "ring document answers: {body}");
+        assert!(body["capacity"].is_u64(), "{body}");
+    }
+}
+
+/// R2-05-03 must not eat the proxy contract: an engine that answers a plain-text
+/// `404` keeps its content type and its bytes on the wire — the rewrite never
+/// touches a proxy path. Closest existing pass-through pins:
+/// `proxy_passes_the_engines_content_encoding_through_verbatim` and
+/// `proxy_forwards_with_model_rewrite_and_streams_the_response`, which stay
+/// green for the same reason.
+#[tokio::test]
+async fn an_upstream_plain_404_on_a_proxy_path_is_never_rewritten() {
+    let (control, work, _, _, _, _) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    let response = work
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header("host", "127.0.0.1:8708")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"qwen3","mock_plain_404":true}"#))
+                .expect("static request"),
+        )
+        .await
+        .expect("in-process request");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain"),
+        "the engine's content type survives the pass-through"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("bounded body");
+    assert_eq!(
+        bytes.as_ref(),
+        b"engine says no such route",
+        "the engine's body must arrive byte-for-byte, not as a harness envelope"
     );
 }

@@ -73,9 +73,15 @@ Every error carries both a flat `{code, message}` and the OpenAI-style
 `code` is one of: `not_found` (404), `bad_request` (400), `unauthorized`
 (401, control token), `forbidden` (403, cross-site `Origin` on a POST),
 `conflict` (409, cancelled / superseded / port still held / an edit the
-scanner would refuse to publish), `unsupported_media_type` (415),
+scanner would refuse to publish), `method_not_allowed` (405),
+`unsupported_media_type` (415),
 `unavailable` (503, admission refused with the numbers and blockers),
 `below_launch_floor` (503, refused before spawn), `witness_unavailable`
 (503, card unreadable), `upstream` (502), `not_implemented` (501),
 `internal` (500). A refusal that carries numbers puts them in `message` and
 in the job ledger, never in a bare status.
+
+An unknown route and a wrong method answer this same envelope on every
+listener. A body over the limit answers `400 bad_request`, not `413`
+(64 KiB on the `/har/*` control routes, 64 MiB on the proxy routes). The
+operator ruled on 2026-11-04 that a request-shape refusal stays one class.

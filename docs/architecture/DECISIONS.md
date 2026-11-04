@@ -566,3 +566,14 @@ recorded here so dated references to ARCHIVED still resolve:
   exceed the 72 GiB card under RAM offload. `cost: exact` still refuses with a message
   naming the two bookable classes.
   | 2026-11-04 | `1fc2681`
+
+- **Ruled** R2-05-04 by operator ruling 2026-11-04: an over-limit body keeps the
+  `400 bad_request` class, not `413`; request-shape refusals stay one class, the
+  same spirit as the recorded R2-04-03 taxonomy. `docs/reference/API.md` states it and
+  the two limit pins name the ruling. R2-05-03 closed beside it: unknown routes (`404
+  not_found`) and wrong methods (`405 method_not_allowed`) answer the project envelope
+  on every listener; a proxy pass-through path keeps the engine's own body byte-for-byte.
+  The recorded `har_log` query-rejection leg of R2-05-03 is unreachable on axum 0.8
+  (the form decoder is lossy and the map type accepts every pair); the handler keeps
+  the typed-400 arm defensively and the test pins the honest lenient-decode behavior.
+  | 2026-11-04 | `ad19144..`
