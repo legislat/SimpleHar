@@ -507,12 +507,15 @@ pub trait EngineRuntime: Send + Sync {
         None
     }
 
-    /// The engine's own status snapshot as JSON
+    /// The engine's own snapshot as JSON
     /// (`GET http://127.0.0.1:{port}{path}`): a generic loopback read with the
     /// runtime's short timeout and no engine knowledge — the per-engine parse
-    /// lives in the adapter ([`basalt::measurement_from_status`],
-    /// [`strata::measurement_from_status`], same split as the
+    /// lives in the adapter ([`basalt::measurement_from_metrics`],
+    /// [`strata::measurement_from_metrics`], same split as the
     /// [`Self::container_report`] / `ninfer::parse_startup_memory` pair).
+    /// The sampler reads each process engine's real surface (`/metrics` —
+    /// the 2026-11-04 capture proved `/status` is liveness only and
+    /// `/v1/status` reports no footprint).
     /// `None` for any failure (no answer, body that is not JSON): the sampler
     /// then falls back to the witness-based process-tree sum rather than
     /// guessing (`TASK-ENGINE-MEASUREMENT` ORCHESTRATION §1). Default `None`:
@@ -521,9 +524,13 @@ pub trait EngineRuntime: Send + Sync {
         None
     }
 
-    /// The DIRECT children of `pid` — one Toolhelp32 generation is enough
-    /// (strata.exe spawns strata-vision; the fallback sum must never reach
-    /// past the engine's own family, and never enumerates grandchildren).
+    /// ALL descendants of `pid`, at every depth — one bounded recursive
+    /// Toolhelp32 walk over a single snapshot. The 2026-11-04 capture proves
+    /// the depth the fallback must reach: both engines sit two levels below
+    /// the harness child (python launcher -> python server -> engine, plus
+    /// the engine's own vision child), so direct children alone miss the
+    /// process holding the card. The root itself is never listed, the walk
+    /// touches no process, and a hard pid cap bounds a pathological tree.
     /// Empty on any snapshot failure and for a pid already gone: absence is
     /// reported, never a guess (`TASK-ENGINE-MEASUREMENT` ORCHESTRATION §1).
     /// Default empty: only the process runtime answers.

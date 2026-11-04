@@ -150,9 +150,11 @@ impl ActorState {
 
     /// The process-engine measurement landing (`TASK-ENGINE-MEASUREMENT`,
     /// ORCHESTRATION §3) for the non-container engines `basalt`/`strata`,
-    /// mirroring [`Self::report_container`]: fetch the engine's own status
-    /// snapshot once at readiness (basalt `/v1/status`, strata `/status`) and
-    /// hand the parsed figure to the actor. `Some(figure)` means the
+    /// mirroring [`Self::report_container`]: fetch the engine's own metrics
+    /// snapshot once at readiness (both engines read their real surface,
+    /// `GET /metrics` — the capture 2026-11-04 proved `/status` is liveness
+    /// only and `/v1/status` reports no footprint) and hand the parsed
+    /// figure to the actor. `Some(figure)` means the
     /// measurement landed; for the elastic `basalt`/`strata` rows the caller
     /// then hands the sampler to [`Self::elastic_refresh`] instead of ending
     /// it (phase 4: an elastic cache keeps moving after the first fold), while
@@ -160,17 +162,19 @@ impl ActorState {
     /// refusal returns `None` so the witness loop stands in rather than
     /// losing the measurement outright (review 2026-10-31 M1). The
     /// fall-through order is exact: the
-    /// process-tree fallback is attempted ONLY when the status path yielded no
-    /// measurement — a body the engine's own parse will not take (phases 2
-    /// and 3 parse their status snapshots now and answer `None` for every
-    /// other shape) or an engine that never answers. A
+    /// process-tree fallback is attempted ONLY when the metrics path yielded
+    /// no measurement — a body the engine's own parse will not take (phases
+    /// 2-5 parse the `/metrics` engine blocks now and answer `None` for
+    /// every other shape) or an engine that never answers. A
     /// PARSED figure that [`ActorState::measurable_figure`] would refuse is not
     /// retried through the fallback: the one-shot returns `None` here and the
     /// witness loop takes over, standing in with its own fresh readings. The
     /// fallback sums the witness's per-process bytes over the engine's own pid
-    /// plus its direct children ([`EngineRuntime::descendant_pids`] — the
-    /// strata.exe -> strata-vision family) and carries `ProcessTreeNvml`
-    /// provenance; the engine's own status answer carries `EngineStatus`. The
+    /// plus ALL its descendants ([`EngineRuntime::descendant_pids`] — on the
+    /// captured serves the engine hangs two levels below the harness child:
+    /// python launcher -> python server -> engine, plus the engine's vision
+    /// child) and carries `ProcessTreeNvml`
+    /// provenance; the engine's own metrics answer carries `EngineStatus`. The
     /// witness is sampled on both paths because its live reading is the bound
     /// the figure gate and the actor's fold both measure against (doctrine 4);
     /// a witness that never answers is silence here too, and the sampler's own
@@ -182,8 +186,8 @@ impl ActorState {
         witness: &Arc<dyn crate::budget::VramWitness>,
     ) -> Option<f64> {
         let status_path = match ctx.engine.as_str() {
-            "basalt" => "/v1/status",
-            "strata" => "/status",
+            "basalt" => "/metrics",
+            "strata" => "/metrics",
             _ => return None,
         };
         let sample = witness.sample().await.ok()?;
@@ -192,16 +196,18 @@ impl ActorState {
             .await;
         let parsed = status.as_ref().and_then(|body| {
             if ctx.engine == "basalt" {
-                crate::engine::basalt::measurement_from_status(body)
+                crate::engine::basalt::measurement_from_metrics(body)
             } else {
-                crate::engine::strata::measurement_from_status(body)
+                crate::engine::strata::measurement_from_metrics(body)
             }
         });
         let measurement = match parsed {
             Some(measurement) => measurement,
             None => {
-                // The witness-based process-tree sum: the engine's own pid plus
-                // its direct children (one generation — never grandchildren).
+                // The witness-based process-tree sum: the engine's own pid
+                // plus every descendant at every depth — the captured
+                // engines hang two levels below the harness child, so a
+                // one-generation sum misses the process holding the card.
                 let mut pids = vec![ctx.ticket.pid];
                 pids.extend(runtime.descendant_pids(ctx.ticket.pid).await);
                 let own = sample.own_gib(&pids)?;
@@ -241,13 +247,13 @@ impl ActorState {
     }
 
     /// The elastic refresh loop (`TASK-ENGINE-MEASUREMENT` phase 4): a
-    /// `basalt`/`strata` row whose status figure landed keeps its sampler
+    /// `basalt`/`strata` row whose metrics figure landed keeps its sampler
     /// alive instead of ending it, because an elastic engine's footprint
     /// MOVES after load — the Strata expert cache (`--vram-elastic`) and the
     /// Basalt expert cache grow and shrink against the card while serving —
     /// and a booking frozen at the readiness reading re-creates the
     /// 2026-11-04 readmission incident with fresh numbers. Every `every`-spaced
-    /// tick re-reads the engine's own status endpoint and re-folds only when
+    /// tick re-reads the engine's own metrics endpoint and re-folds only when
     /// the move crosses the hysteresis band:
     ///
     /// * **Up moves freely.** Any rise above the last booked figure re-folds
@@ -261,7 +267,7 @@ impl ActorState {
     ///   hysteresis delays release credit, it never denies it.
     ///
     /// Silence on any leg — the witness not answering (the same hard stop the
-    /// witness loop takes: absence is never a guess, §0.3), a status body the
+    /// witness loop takes: absence is never a guess, §0.3), a metrics body the
     /// parse refuses, or a figure the actor would drop — is absence: that
     /// tick is skipped and the poll continues, because the last honest figure
     /// stays booked and an engine mid-cache-rebuild answers again next tick.
@@ -277,8 +283,8 @@ impl ActorState {
         every: std::time::Duration,
     ) {
         let status_path = match ctx.engine.as_str() {
-            "basalt" => "/v1/status",
-            "strata" => "/status",
+            "basalt" => "/metrics",
+            "strata" => "/metrics",
             _ => return,
         };
         let mut tick = tokio::time::interval(every);
@@ -304,9 +310,9 @@ impl ActorState {
                 .await;
             let parsed = status.as_ref().and_then(|body| {
                 if ctx.engine == "basalt" {
-                    crate::engine::basalt::measurement_from_status(body)
+                    crate::engine::basalt::measurement_from_metrics(body)
                 } else {
-                    crate::engine::strata::measurement_from_status(body)
+                    crate::engine::strata::measurement_from_metrics(body)
                 }
             });
             let Some(measurement) = parsed else {

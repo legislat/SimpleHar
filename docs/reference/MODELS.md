@@ -127,20 +127,28 @@ therefore carries no `host`, `port`, or key at all. Readiness needs `/health`
 200 while weights stream in. A strata engine starts only when you load it,
 or when a client request names it. Booting the harness starts nothing.
 
-Measurement: after readiness the harness reads `info.vram` from the engine's
-own `GET /status` snapshot. It books `expert_cache_mib + reserve_mib` as the
-footprint: the bytes the engine took, plus the headroom its fill policy
-keeps. The figure carries the `engine_status` stamp. Above the declared
-`vram_gb` it books instead of it; the declared value stays the floor. The
-harness keeps polling that status while the engine serves, and it re-books
-the resident when an expert-cache move crosses the hysteresis band. With no
-status answer, the witness sums the bytes of the `strata.exe` engine plus
-its direct `strata-vision` child and books the `per_process` tree sum. A
-free-memory `total_diff` reading displays and never books. The repo holds no
-captured strata status body: the field names are recorded only for the
-sibling engine's status snapshot. The card run must capture the real body,
-and a differing field set is fixed from that capture, never from a widened
-guess.
+Measurement: after readiness the harness reads the `engine` block of the
+engine's own `GET /metrics` snapshot. The card capture of 2026-11-04 proved
+the routes the earlier phases assumed do not carry a footprint: `/status`
+is liveness only and `/v1/status` reports no engine VRAM field. The parse
+sums `expert_cache_mib + conversation_cache_mib + arena_mib`. These are
+COMPONENTS, not a footprint, and the capture states the comparison: the
+components total 59.9 GiB against a 69.75 GiB measured hold and the
+declared 67.8 row - the engine does not itemize weights or KV, so the
+figure is a **lower bound**. The figure carries the `engine_status` stamp.
+Above the declared `vram_gb` it books instead of it; the declared floor
+remains the booking today and the parse only ever books growth above it.
+The harness keeps polling `/metrics` while the engine serves, and it
+re-books the resident when a cache move crosses the hysteresis band. With
+no answer, the witness sums the bytes over the engine's FULL process tree -
+the python launcher, its python server child, the `strata.exe` engine, and
+its `strata-vision` child, two levels below the harness child on the
+captured serve - and books the `per_process` tree sum. Per-process NVML
+answers `[N/A]` on the captured driver, so that fallback cannot book on
+that machine; it stays the only full-footprint route where the driver does
+report per-process bytes. A free-memory `total_diff` reading displays and
+never books. The captured bodies are pinned as test fixtures, so a field-set
+drift fails the pin instead of widening a guess.
 
 The external-profile mode is superseded (operator ruling 2026-11-02, row
 19): a row that declares `strata_config` is refused at scan. The command
@@ -189,21 +197,27 @@ only when you load it; booting the harness starts nothing.
 
 Cost starts as the declared `vram_gb` with `cost: fixed`. Both are required:
 a `.basalt` pack's bytes never feed the GGUF size estimate, and the engine
-offers no Fit projection. After readiness the harness reads
-`engine.info.vram` from the engine's own `GET /v1/status` snapshot. It books
-`expert_cache_mib + reserve_mib` as the footprint: the bytes the engine took,
-plus the slab its reserve policy keeps. The figure carries the
-`engine_status` stamp. Above the declared `vram_gb` it books instead of it;
-the declared value stays the floor. The harness keeps polling that status
-while the engine serves, and it re-books the resident when an expert-cache
-move crosses the hysteresis band. With no status answer, the witness sums
-the bytes of the engine's own process tree - the Python server plus its
-direct children - and books the `per_process` tree sum. The Python parent's
-per-process figure alone never books. A free-memory `total_diff` reading
-displays and never books. The evidence holds no raw status body; the card
-run must capture the real one, and a differing field set is fixed from that
-capture. Set `launch_only_with_at_least_vram_free` to the declared cost:
-Basalt needs the card, and a loaded stranger must refuse before spawn.
+offers no Fit projection. After readiness the harness reads the `engine`
+block of the engine's own `GET /metrics` snapshot and books
+`expert_cache_mib` alone - 59.9 GiB in the 2026-11-04 capture. The earlier
+status routes carry no footprint: `/status` is liveness only and
+`/v1/status` reports no engine VRAM field. The other components are
+excluded on purpose: expert 59.9 + `arena_mib` 19.8 +
+`conversation_cache_mib` 4.0 sum to 83.7 GiB, over the 72 GiB card,
+because this serve offloads to RAM (`--ple-io ram`; 72.4 of 95.1 GiB RAM
+used) - for a spilling engine a component sum is not a VRAM footprint. The
+figure carries the `engine_status` stamp. The measured row (67.4) stays the
+booking floor; the parse only ever books growth above it. The harness keeps
+polling `/metrics` while the engine serves, and it re-books the resident
+when the cache moves across the hysteresis band. With no answer, the
+witness sums the bytes of the engine's full process tree - the Python
+launcher, its serve child, the `basalt.exe` engine two levels down - and
+books the `per_process` tree sum. The Python parent's per-process figure
+alone never books. A free-memory `total_diff` reading displays and never
+books. The captured bodies are pinned as test fixtures, so a field-set drift
+fails the pin instead of widening a guess. Set
+`launch_only_with_at_least_vram_free` to the declared cost: Basalt needs
+the card, and a loaded stranger must refuse before spawn.
 
 Kill: the harness job object terminates the Python server. Basalt's server
 puts the engine child in its own kill-on-close job, so a Python death also

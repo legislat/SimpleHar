@@ -624,25 +624,36 @@ fn published_elsewhere_evidence(container: &str, offered: u16, text: &str) -> Op
     ))
 }
 
-/// The DIRECT children of `pid` from one Toolhelp32 process snapshot
-/// (`TASK-ENGINE-MEASUREMENT` ORCHESTRATION §1): the witness fallback sums the
-/// engine and the children it spawned itself (strata.exe -> strata-vision)
-/// and must never reach past that first generation. Every failure path —
-/// snapshot refused, walk broken at any point — answers an empty Vec:
-/// absence is reported, never a guess (doctrine 4).
+/// The hard bound on [`descendant_pids_of`]'s answer: a healthy engine
+/// family is a handful of pids, so any reachable tree this large is a
+/// pathological one and the walk stops rather than spin.
+const DESCENDANT_CAP: usize = 4_096;
+
+/// ALL descendants of `root`, at every depth, from ONE Toolhelp32 process
+/// snapshot (`TASK-ENGINE-MEASUREMENT` phase 5, card capture 2026-11-04):
+/// both engines sit TWO levels below the harness child — python launcher ->
+/// python server -> engine, plus the engine's own vision child — so a
+/// one-generation sum misses the very process that holds the card. The
+/// snapshot becomes a parent->children table and a breadth-first walk leaves
+/// from the root with a visited set, so a parent cycle in the table cannot
+/// spin the walk and the root itself never enters the answer. The walk reads
+/// the snapshot only and touches no process. Every failure path — snapshot
+/// refused, walk broken at any point — answers an empty Vec: absence is
+/// reported, never a guess (doctrine 4).
 #[must_use]
-fn direct_child_pids(pid: u32) -> Vec<u32> {
+fn descendant_pids_of(root: u32) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet, VecDeque};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
-    let mut children = Vec::new();
     // Safety: a fresh process-list snapshot; `CreateToolhelp32Snapshot`
     // answers Err for the invalid handle, and every entry buffer passed to
     // the walk is owned here, zeroed, and carries its exact size in `dwSize`.
     let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return children;
+        return Vec::new();
     };
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
@@ -652,9 +663,10 @@ fn direct_child_pids(pid: u32) -> Vec<u32> {
     // snapshot — the walk simply stops.
     let mut walking = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
     while walking {
-        if entry.th32ParentProcessID == pid {
-            children.push(entry.th32ProcessID);
-        }
+        children_of
+            .entry(entry.th32ParentProcessID)
+            .or_default()
+            .push(entry.th32ProcessID);
         // Safety: the same live handle and entry as the `First` call;
         // `Next` reports the end of the list (and any error) as a failed walk.
         walking = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
@@ -662,7 +674,26 @@ fn direct_child_pids(pid: u32) -> Vec<u32> {
     // Safety: sole owner of the snapshot handle from above; this single close
     // is the release on every path, mirroring the [`JobHandle`] discipline.
     let _ = unsafe { windows::Win32::Foundation::CloseHandle(snapshot) };
-    children
+    let mut seen: HashSet<u32> = HashSet::new();
+    seen.insert(root); // the root is asked-about, never an answer of its own
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    queue.push_back(root);
+    let mut descendants: Vec<u32> = Vec::new();
+    while let Some(parent) = queue.pop_front() {
+        let Some(children) = children_of.get(&parent) else {
+            continue;
+        };
+        for &child in children {
+            if descendants.len() >= DESCENDANT_CAP {
+                return descendants; // pathological tree: bounded, never unbounded work
+            }
+            if seen.insert(child) {
+                descendants.push(child);
+                queue.push_back(child);
+            }
+        }
+    }
+    descendants
 }
 
 /// Whether this kill must reap a container. A CONFIRMED reap retires the duty
@@ -2313,7 +2344,7 @@ impl EngineRuntime for ProcessRuntime {
     }
 
     async fn descendant_pids(&self, pid: u32) -> Vec<u32> {
-        direct_child_pids(pid)
+        descendant_pids_of(pid)
     }
 
     async fn container_report(&self, container: &str) -> Option<String> {
@@ -5067,14 +5098,15 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         );
     }
 
-    /// `descendant_pids` enumerates DIRECT children of the asked pid only
-    /// (ORCHESTRATION §1: one generation is enough for strata.exe ->
-    /// strata-vision). The pin spawns one plain hidden `cmd.exe` child — no
-    /// engine execs here, the same stand-in class as the control-command pin —
-    /// and asks the live table where it hangs; an absent pid answers empty,
+    /// `descendant_pids` lists every descendant of the asked pid at every
+    /// depth — a direct child is in the set (capture 2026-11-04: both
+    /// engines hang two levels below the harness child, so the full tree is
+    /// the contract). The pin spawns one plain hidden `cmd.exe` child — no
+    /// engine execs here, the same stand-in class as the control-command pin
+    /// — and asks the live table where it hangs; an absent pid answers empty,
     /// never a guess.
     #[tokio::test]
-    async fn descendant_pids_lists_the_direct_children_of_the_asked_pid() {
+    async fn descendant_pids_includes_the_direct_children_of_the_asked_pid() {
         use std::os::windows::process::CommandExt;
         let mut child = std::process::Command::new("cmd.exe")
             .args(["/c", "ping -n 30 127.0.0.1 >nul"])
@@ -5084,7 +5116,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             .stderr(Stdio::null())
             .spawn()
             .expect("cmd.exe stands in for a child engine");
-        let children = direct_child_pids(std::process::id());
+        let children = descendant_pids_of(std::process::id());
         let found = children.contains(&child.id());
         // The child is ours (spawned above), so reaping it is ours to do.
         let _ = child.kill();
@@ -5094,8 +5126,65 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             "the spawned child must appear under its own parent: {children:?}"
         );
         assert!(
-            direct_child_pids(u32::MAX).is_empty(),
-            "a pid with no children has none, never a guess"
+            descendant_pids_of(u32::MAX).is_empty(),
+            "a pid with no descendants has none, never a guess"
+        );
+    }
+
+    /// Phase-5 pin: the walk reaches the GRANDCHILD level. An outer
+    /// `cmd.exe` synchronously runs an inner `cmd.exe`, which itself spawns
+    /// `ping.exe` — the same python -> python -> engine depth as the
+    /// captured Strata and Basalt serves — and every stand-in stays alive
+    /// while the walk runs. The pin proves depth, not just membership: some
+    /// listed pid is itself a parent of another listed pid, which the
+    /// one-generation contract could never show. All stand-ins are spawned
+    /// by this test, so the whole chain is its own to reap: `taskkill` over
+    /// the tree it created, then the handle it owns. Falsifier: restore the
+    /// direct-children-only walk and the nested inclusion fails (the set is
+    /// just the inner cmd.exe, whose own child is missing from it).
+    #[tokio::test]
+    async fn descendant_pids_reaches_the_grandchildren_of_the_asked_pid() {
+        use std::os::windows::process::CommandExt;
+        let mut outer = std::process::Command::new("cmd.exe")
+            .args(["/c", "cmd /c ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("outer cmd.exe stands in for the harness child");
+        // The inner cmd.exe and its ping take a moment to exist: poll the
+        // bounded walk until the second generation shows up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let descendants = loop {
+            let found = descendant_pids_of(outer.id());
+            if found.len() >= 2 || std::time::Instant::now() >= deadline {
+                break found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let nested = descendants.iter().any(|&pid| {
+            let children = descendant_pids_of(pid);
+            !children.is_empty() && children.iter().all(|child| descendants.contains(child))
+        });
+        // Reap the whole stand-in tree this test spawned, then its handle.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &outer.id().to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = outer.kill();
+        let _ = outer.wait();
+        assert!(
+            descendants.len() >= 2,
+            "the inner cmd.exe AND its ping must both hang under the outer: {descendants:?}"
+        );
+        assert!(
+            nested,
+            "a listed pid must itself parent another listed pid — depth two reached: \
+             {descendants:?}"
         );
     }
 }

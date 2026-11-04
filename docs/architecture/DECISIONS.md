@@ -541,3 +541,14 @@ recorded here so dated references to ARCHIVED still resolve:
   the floor-clamped booking stands; F-EM-404 - a mid-swap rescan re-book is conservative and the
   plan-time ledger terms of the in-flight swap stay frozen.
   | 2026-11-04 | `11f76f4`
+
+- **Recorded** 2026-11-04 (freed card window, TASK-ENGINE-MEASUREMENT): the real engine surfaces are
+  `/metrics` `engine` blocks; `/status` is liveness only and `/v1/status` carries no `info.vram`, so
+  the shipped status parses were corrected to the captured shapes. The booked figure is a LOWER BOUND
+  (Strata components 59.9 GiB vs a 69.75 GiB hold vs the declared 67.8; Basalt components 83.7 GiB
+  exceed the 72 GiB card because of RAM offload, so only `expert_cache_mib` books), and the declared
+  floor remains the booking. The process-tree NVML fallback is unavailable on this driver
+  (`attributed_gb: null`). Basalt is greedy with dynamic offload by operator ruling - the adapter
+  still refuses the class: `TASK-BASALT-GREEDY`. Evidence:
+  `handoff/evidence/2026-11-04-engine-measurement/CARD-CAPTURE.md`.
+  | 2026-11-04 | `bbbf74e`

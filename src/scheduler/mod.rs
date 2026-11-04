@@ -3413,17 +3413,17 @@ mod tests {
         }
     }
 
-    /// Fake Basalt-shaped status JSON on an ephemeral port (the SE fake-server
-    /// rule, same posture as `serve_health` in `engine/mod.rs`).
+    /// Fake engine metrics JSON on an ephemeral port, served at the path the
+    /// sampler's path map reads (`/metrics`; the 2026-11-04 capture proved
+    /// the status routes carry no footprint). The SE fake-server rule, same
+    /// posture as `serve_health` in `engine/mod.rs`.
     async fn serve_status_json(body: &'static str) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral");
         let port = listener.local_addr().expect("addr").port();
-        let app = axum::Router::new().route(
-            "/v1/status",
-            axum::routing::get(move || async move { body }),
-        );
+        let app =
+            axum::Router::new().route("/metrics", axum::routing::get(move || async move { body }));
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -3452,11 +3452,11 @@ mod tests {
         })
     }
 
-    /// Phase-1 pin, kept honest by phase 2 (`TASK-ENGINE-MEASUREMENT`,
-    /// ORCHESTRATION §3): the fake status server answers with a body the
-    /// Basalt parse MUST refuse — `vram` is a scalar, not the snapshot
-    /// object with the three figures (the phase-1 stub answered `None` for
-    /// every body; the phase-2 parse refuses this one by shape, pinned in
+    /// Phase-1 pin, kept honest by the metric parse (`TASK-ENGINE-MEASUREMENT`,
+    /// ORCHESTRATION §3): the fake metrics server answers with a body the
+    /// Basalt parse MUST refuse — `vram` is a scalar riding a foreign
+    /// wrapper, and the parse requires `engine.expert_cache_mib` from the
+    /// captured `/metrics` engine block (pinned in
     /// `engine::basalt::tests::the_scalar_vram_body_stays_refused`) — so the
     /// one-shot must NOT consume the sampler: the process-tree fallback has
     /// no per-process bytes to sum here either, `report_measurement` returns
@@ -4814,17 +4814,17 @@ mod tests {
         }
     }
 
-    /// A Strata-shaped vram snapshot booking `expert_cache_mib + reserve_mib`
-    /// (`measurement_from_status`, the triple the 2026-11-04 evidence line
-    /// records for the sibling engine).
+    /// A Strata-shaped `/metrics` engine block booking the component sum
+    /// `expert_cache_mib + conversation_cache_mib + arena_mib`
+    /// (`measurement_from_metrics`; the conversation and arena components
+    /// are zeroed so the fixture figure follows the expert cache alone
+    /// (the captured body's own `arena_mib` is zero too).
     fn strata_vram_status(expert_cache_mib: u64) -> serde_json::Value {
         serde_json::json!({
-            "info": {
-                "vram": {
-                    "expert_cache_mib": expert_cache_mib,
-                    "vram_free_mib": 2048,
-                    "reserve_mib": 0,
-                }
+            "engine": {
+                "expert_cache_mib": expert_cache_mib,
+                "conversation_cache_mib": 0,
+                "arena_mib": 0,
             }
         })
     }
@@ -4930,8 +4930,8 @@ mod tests {
         assert_eq!(
             ActorState::report_measurement(&runtime, &tx, &ctx, &witness).await,
             Some(30.0),
-            "the status endpoint is silent at readiness: the engine plus its \
-             direct children land the booking, and the sampler is not consumed"
+            "the status endpoint is silent at readiness: the engine plus all its \
+             descendants land the booking, and the sampler is not consumed"
         );
         let sampler = tokio::spawn(async move {
             ActorState::elastic_refresh(

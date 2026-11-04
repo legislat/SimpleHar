@@ -122,14 +122,22 @@ One harness process, one tokio runtime, plus OS-level children:
   asks the engine's own `llama-fit-params` before spawn; a Fit figure is never
   persisted and is recomputed per proven change; the scheduler owns the cache.
 - Process-engine measurement (`basalt`, `strata`; `TASK-ENGINE-MEASUREMENT`):
-  at readiness the sampler reads the engine's own status snapshot and books
-  that footprint as `engine_status`, the process-engine analog of
-  `engine_report`. With no status answer, the witness sums the bytes of the
-  engine's pid plus its direct children and books the `per_process` tree sum.
-  An elastic resident keeps polling its status and re-books under the
-  down-band hysteresis (`occupant.rs`). A fold or a cost-only rescan re-books
-  the slot occupant without a reload; an amber or greedy-launched resident is
-  never re-booked.
+  at readiness the sampler reads the `engine` block of the engine's own
+  `GET /metrics` snapshot and books its figure as `engine_status`, the
+  process-engine analog of `engine_report`. The captured bodies make the
+  semantics explicit: the components are a lower bound (weights and KV are
+  not itemized) and a RAM-spilling engine's component sum exceeds the card,
+  so the declared row stays the booking floor and the measured figure only
+  ever books growth above it. With no answer, the witness sums the bytes of
+  the engine's pid and ALL its descendants (both engines hang two levels
+  below the harness child: python launcher -> python server -> engine, plus
+  the engine's vision child) and books the `per_process` tree sum;
+  per-process NVML is unavailable on the captured driver, so that fallback
+  cannot book there, and it stays the only full-footprint route on a driver
+  that reports per-process bytes. An elastic resident keeps polling
+  `/metrics` and re-books under the down-band hysteresis (`occupant.rs`). A
+  fold or a cost-only rescan re-books the slot occupant without a reload; an
+  amber or greedy-launched resident is never re-booked.
 - Fold gate: `budget::grade_card_occupancy` grades the movement of
   unaccounted memory across a serve; a `ForeignDominated` window mints no
   `total_diff` pair.
