@@ -73,6 +73,10 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
   model name sanitized like the staged profiles. A model with a space in its
   name no longer keeps two half-pools, and one model's keep-N prune can no
   longer delete a differently named model's files.
+- A spawned engine cannot escape its kill-on-close job: the child starts
+  suspended, is assigned to the job, and only then resumes, so no engine
+  descendant can be born outside the reaped tree. A seal that fails kills the
+  still-frozen child and leaves no ownership evidence behind.
 
 ## v1.1.2 - 2026-11-03
 

@@ -8,7 +8,9 @@
 //! cooperatively (`docker rm -f` in `kill`) and reconciled pre-spawn by removing
 //! any stale container of the same name — a harness crash can orphan one until the
 //! model loads again.
-//! Spawns are hidden (`CREATE_NO_WINDOW`) with stdout/stderr captured to
+//! Spawns are hidden (`CREATE_NO_WINDOW`); engine children additionally start
+//! suspended and run only after the kill job has claimed them (R2-08-04), so no
+//! engine descendant can be born outside the job. stdout/stderr are captured to
 //! `logs/<slug>-<epoch>.log`, the stem sanitized by `sanitize_slug` — the one
 //! forensic pool key shared with the container snapshots (R2-08-03). Engine
 //! children receive exactly an OS baseline plus
@@ -494,8 +496,10 @@ pub struct ProcessRuntime {
     wsl_distro: String,
     wsl_user: String,
     /// Test seam: fails the job-object step *after* `command.spawn()` succeeded, so
-    /// the post-spawn failure path — the one that must retract a claim this call
-    /// minted (FINDINGS2-0910 [3]) — is reachable without a wedged Win32 API.
+    /// the post-spawn failure path — the one that must leave no ownership evidence
+    /// behind (FINDINGS2-0910 [3]; since R2-08-04 it never has any, because the
+    /// claim and custody writes happen only after the job seal succeeds) — is
+    /// reachable without a wedged Win32 API.
     #[cfg(test)]
     fail_job_after_spawn: bool,
     /// Test seam: parks this runtime's `release_confirmed` pollers in the gap
@@ -1627,9 +1631,10 @@ impl ProcessRuntime {
         (self, seam)
     }
 
-    /// Creates the kill-on-close job for a freshly spawned child. The `#[cfg(test)]`
-    /// seam exists so the post-spawn failure path (which must retract a claim) can be
-    /// reached without a wedged Win32 API.
+    /// Creates the kill-on-close job for the freshly spawned, still-suspended
+    /// child. The `#[cfg(test)]` seam exists so the post-spawn failure path
+    /// (which must leave no ownership evidence behind) can be reached without a
+    /// wedged Win32 API.
     ///
     /// # Errors
     ///
@@ -1644,25 +1649,10 @@ impl ProcessRuntime {
         unsafe { create_kill_on_close_job() }
     }
 
-    /// Retracts the claim this spawn minted, when the spawn is nevertheless reported
-    /// as failed after the client started but before it was ever recorded (a job-object
-    /// failure): no later `kill`/`release_confirmed` can reach this resource, so the
-    /// claim would be permanent evidence for something the harness has disowned
-    /// (FINDINGS2-0910 [3]'s belt, on top of minting the claim only after a real
-    /// spawn).
-    fn retract_claim(&self, name: Option<&str>) {
-        if let Some(name) = name {
-            self.claims
-                .lock()
-                .expect("container claim ledger lock")
-                .unclaim(name);
-        }
-    }
-
     /// Clears this launch's custody sidecar entry, token-guarded: `None` (the
     /// launch was never recorded) forgets nothing, and a foreign token can
     /// never erase a later launch's record (slice 10b, engine `drop_record`
-    /// rule). Used by the spawn-failure retract and the confirmed release.
+    /// rule). Used by the confirmed release.
     fn forget_custody(&self, pid: u32, token: Option<u64>) {
         if let Some(token) = token {
             self.custody
@@ -1969,7 +1959,13 @@ impl EngineRuntime for ProcessRuntime {
                 reason: format!("cannot duplicate log handle: {e}"),
             })?)
             .stderr(log_file)
-            .creation_flags(CREATE_NO_WINDOW)
+            // R2-08-04: hidden AND suspended. The primary thread runs no
+            // instruction until the seal below has put this child in its kill
+            // job and resumed it, so no engine thread can ever run — and no
+            // grandchild ever be born — outside the job.
+            .creation_flags(
+                CREATE_NO_WINDOW | windows::Win32::System::Threading::CREATE_SUSPENDED.0,
+            )
             // §5 (E3): the child sees exactly the OS baseline plus `spec.env`,
             // never the harness environment. The control commands in this module
             // get the same baseline with no spec entries ([`control_child_env`]).
@@ -1980,8 +1976,45 @@ impl EngineRuntime for ProcessRuntime {
         let mut child = command.spawn().map_err(|e| SpawnError::SpawnFailed {
             reason: format!("cannot spawn {program}: {e}"),
         })?;
+        // R2-08-04 (the escape window, doctrine: no engine descendant may ever
+        // escape the job): a grandchild created between `CreateProcess` and
+        // `AssignProcessToJobObject` escapes `KILL_ON_JOB_CLOSE` forever, and the
+        // claim/custody writes used to sit inside that window and widen it. The
+        // child therefore starts SUSPENDED and the order here is fixed: create
+        // the kill job, assign the frozen child, resume its primary thread. The
+        // first engine instruction runs only after the assignment, so every
+        // descendant is born inside the job; a failed seal kills the still
+        // frozen child, which never runs and never had a thread to fork.
+        let pid = child.id().unwrap_or(0);
+        // Safety: the job handle is created and assigned here, on this task,
+        // while the child is still suspended and before it is stored;
+        // `raw_handle` is valid while the child is alive, and the job is closed
+        // exactly once, by `JobHandle::drop`.
+        let job = match self.create_kill_job().map(JobHandle) {
+            Ok(job) => job,
+            Err(reason) => {
+                let _ = child.kill().await;
+                return Err(SpawnError::SpawnFailed { reason });
+            }
+        };
+        let sealed = match (child.raw_handle(), pid) {
+            (Some(handle), pid) if pid != 0 => {
+                unsafe { assign_to_job(job.0, handle) }.and_then(|()| resume_primary_thread(pid))
+            }
+            _ => Err("the spawned client reported no usable handle or pid".to_string()),
+        };
+        if let Err(reason) = sealed {
+            // Nothing is written as ownership evidence before the seal, so a
+            // failed seal retracts nothing: the frozen child dies here with no
+            // claim, no custody record, and no instruction executed (the
+            // success-path-only rule of FINDINGS2-0910 [3], now enforced by
+            // ordering alone).
+            let _ = child.kill().await;
+            return Err(SpawnError::SpawnFailed { reason });
+        }
         // The claim is the positive ownership evidence the boot reclaim demands, so it
-        // is minted HERE — only once a client really started (FINDINGS2-0910 [3]).
+        // is minted HERE — only once a client really started and stands sealed in its
+        // kill job (FINDINGS2-0910 [3]).
         // Minting it before the spawn let a load that failed at `create_dir_all`,
         // the log file or the spawn itself leave `ninfer-claims.json` holding a name
         // this harness never started, which then passed all three boot gates and
@@ -1994,10 +2027,6 @@ impl EngineRuntime for ProcessRuntime {
                 .expect("container claim ledger lock")
                 .claim(name);
         }
-        // From here the client exists but is not yet recorded: these two paths report
-        // a failed spawn, so anything this call wrote as ownership evidence has to go
-        // back with the report.
-        let pid = child.id().unwrap_or(0);
         // Custody (slice 10b): a custodied launch's identity enters the sidecar
         // only on the success path — after every spawn-failure return — so a
         // load the harness reports as failed never leaves evidence for the
@@ -2032,26 +2061,6 @@ impl EngineRuntime for ProcessRuntime {
             }
             (None, _) => None,
         };
-        // Safety: the job handle is created and assigned here, on this task, before
-        // the child is stored; `raw_handle` is valid while the child is alive, and the
-        // job is closed exactly once, by `JobHandle::drop`.
-        let job = match self.create_kill_job() {
-            Ok(handle) => JobHandle(handle),
-            Err(reason) => {
-                self.retract_claim(container.as_deref());
-                self.forget_custody(pid, custody_token);
-                return Err(SpawnError::SpawnFailed { reason });
-            }
-        };
-        if let Some(handle) = child.raw_handle() {
-            let assigned = unsafe { assign_to_job(job.0, handle) };
-            if let Err(reason) = assigned {
-                let _ = child.kill().await;
-                self.retract_claim(container.as_deref());
-                self.forget_custody(pid, custody_token);
-                return Err(SpawnError::SpawnFailed { reason });
-            }
-        }
         tracing::info!(port = ticket.port, pid, log = %log_path.display(),
             "engine spawned under a kill-on-close job object");
         {
@@ -2676,6 +2685,67 @@ unsafe fn assign_to_job(
 
     AssignProcessToJobObject(job, HANDLE(child as _))
         .map_err(|e| format!("AssignProcessToJobObject: {e}"))
+}
+
+/// Resumes the primary thread of a process created with `CREATE_SUSPENDED`
+/// (R2-08-04): the engine spawn seals the child into its kill job while no
+/// instruction has run, then resumes it exactly once. A suspended process has
+/// precisely one thread — its primary — so the Toolhelp entry whose owner pid
+/// matches is that thread, and it cannot exit while suspended. This helper
+/// needs the id because `std`'s `Command` closes the `CreateProcessW` primary
+/// thread handle it is given and does not expose it.
+///
+/// # Errors
+///
+/// The Win32 reason the primary thread could not be found, opened, or resumed.
+fn resume_primary_thread(pid: u32) -> Result<(), String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    // Safety: a fresh thread-list snapshot; `CreateToolhelp32Snapshot` answers
+    // Err for the invalid handle, and every entry buffer passed to the walk is
+    // owned here, zeroed, and carries its exact size in `dwSize`. The thread
+    // handle is opened by that snapshot's own id and closed on every path
+    // below; resuming the one suspended thread of a child this harness just
+    // created suspended affects nothing else.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+            .map_err(|e| format!("CreateToolhelp32Snapshot: {e}"))?;
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut primary: Option<u32> = None;
+        let mut walking = Thread32First(snapshot, &mut entry).is_ok();
+        while walking {
+            if entry.th32OwnerProcessID == pid {
+                primary = Some(entry.th32ThreadID);
+                break;
+            }
+            walking = Thread32Next(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+        let tid = primary.ok_or_else(|| format!("pid {pid} has no thread to resume"))?;
+        let thread = OpenThread(THREAD_SUSPEND_RESUME, false, tid)
+            .map_err(|e| format!("OpenThread({tid}): {e}"))?;
+        let previous = ResumeThread(thread);
+        let _ = CloseHandle(thread);
+        if previous == u32::MAX {
+            return Err(format!("ResumeThread({tid}) failed"));
+        }
+        if previous > 1 {
+            // `CREATE_SUSPENDED` guarantees one suspend; more would mean the
+            // child is still frozen after this resume. Fail closed: the seal
+            // failure arm kills the child and mints no ownership evidence.
+            return Err(format!(
+                "ResumeThread({tid}) left the primary thread suspended (count {previous})"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Terminates every process in the job.
@@ -4084,20 +4154,32 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The belt on that suspenders: the client started, so the claim was minted —
-    /// then the spawn is nevertheless reported failed (here: the job object could not
-    /// be created). Nothing can ever `release_confirmed` a resource that was never
-    /// recorded, so the claim has to leave with the failure report.
+    /// The belt on that suspenders, in its R2-08-04 shape: the client started
+    /// (suspended) — then the spawn is nevertheless reported failed (here: the job
+    /// object could not be created) before the seal, so the child never ran and
+    /// never reached the claim mint. A failed post-spawn report now leaves no
+    /// claim at all — nothing minted then retracted, nothing written — because the
+    /// ownership evidence moves only on the sealed success path.
+    ///
+    /// Falsifier (pre-fix shape): the child was created RUNNING, so its first act
+    /// — the redirect file — appeared even though the spawn was reported failed.
+    /// The absence poll below goes red on that code; here it proves the seal
+    /// froze the child before any first act and the kill reaped it frozen.
     #[tokio::test]
-    async fn a_post_spawn_failure_retracts_the_claim_it_minted() {
+    async fn a_post_spawn_failure_leaves_no_claim() {
         let dir = crate::testutil::temp_dir("claims-retract");
         let ledger = dir.join("ninfer-claims.json");
+        let first_act = dir.join("first-act.txt");
         let runtime = ProcessRuntime::new()
             .with_claims_ledger(&ledger)
             .with_injected_job_failure();
         let error = runtime
             .spawn(
-                &client_spec("cmd.exe", &["/c", "exit 0"], "se-probe-2"),
+                &client_spec(
+                    "cmd.exe",
+                    &["/c", &format!("echo done > {}", first_act.display())],
+                    "se-probe-2",
+                ),
                 container_ticket(18_282, "se-probe-2"),
             )
             .await
@@ -4107,9 +4189,17 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
                 if reason.contains("injected job-object failure")),
             "{error}"
         );
+        // A frozen child never acts: half a second is ample for a resumed
+        // `cmd.exe` to run its redirect, and the killed-suspended child can
+        // never produce the file at all.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !first_act.exists(),
+            "the reported-failed child must never have run its first act"
+        );
         assert!(
             !runtime.claimed("se-probe-2"),
-            "the claim this call minted must go back with the failure report"
+            "the mint happens only after the seal, so the ledger never saw the name"
         );
         assert!(
             !ContainerClaims::load(&ledger).contains("se-probe-2"),
@@ -4141,6 +4231,66 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         assert!(
             ContainerClaims::load(&ledger).contains("se-probe-3"),
             "and persists for the next boot to read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-08-04, the seal pinned through the production `spawn`: the client
+    /// starts suspended (so no first act can precede the job assignment), the
+    /// seal assigns it to the kill job and resumes it — and the resume really
+    /// happens: the first-act file appears, and the tracked stand-in exits and
+    /// releases inside the kill/poll budget. `cmd.exe` stands in for the
+    /// engine; its environment is the OS baseline, and the redirect target is
+    /// absolute, so no other variable is needed. Falsifier: keep the
+    /// `CREATE_SUSPENDED` flag and drop the resume arm of the seal, and the
+    /// child is frozen forever — the first-act poll times out red.
+    #[tokio::test]
+    async fn a_spawned_engine_resumes_and_runs() {
+        let dir = crate::testutil::temp_dir("spawn-resume");
+        let first_act = dir.join("first-act.txt");
+        let runtime = ProcessRuntime::new();
+        let ticket = child_ticket(18_301);
+        let spawned = runtime
+            .spawn(
+                &client_spec(
+                    "cmd.exe",
+                    &["/c", &format!("echo done > {}", first_act.display())],
+                    "se-resume",
+                ),
+                ticket.clone(),
+            )
+            .await
+            .expect("cmd.exe starts as a suspended-then-resumed engine child");
+        assert_ne!(spawned.pid, 0, "a sealed child reports its pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if first_act.exists() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the spawned child never ran its first act: the resume leg is dead"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        runtime
+            .kill(&ticket)
+            .await
+            .expect("kill of the tracked stand-in");
+        let mut released = false;
+        for _ in 0..50 {
+            if runtime
+                .release_confirmed(&ticket)
+                .await
+                .expect("release evidence check")
+            {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "the resumed child exits and its release reads back as evidence"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4221,7 +4371,8 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
     /// started a client records no custody evidence (the entry is written
     /// only after every spawn-failure return), and a client that started but
     /// whose spawn is nevertheless reported failed (injected job failure)
-    /// retracts what it wrote — a launch the harness calls failed never
+    /// never reaches the write at all — since R2-08-04 the job seal precedes
+    /// every custody write — so a launch the harness calls failed never
     /// leaves a record the boot sweep could act on.
     #[tokio::test]
     async fn a_failed_custodied_spawn_leaves_no_sidecar_entry() {
@@ -4260,7 +4411,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         );
         assert!(
             runtime.custody_entries().is_empty(),
-            "the custody entry this call recorded must go back with the failure report"
+            "the seal failure precedes every custody write: nothing was recorded"
         );
         assert!(
             crate::custody::CustodyLedger::load(&sidecar).is_empty(),
