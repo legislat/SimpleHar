@@ -158,6 +158,66 @@ fn free_vram_mib() -> Result<u64, String> {
         .map_err(|_| format!("nvidia-smi --query-gpu=memory.free returned '{first}'"))
 }
 
+/// The `T<n>` verdict label for a spawn tag (`t06` -> `T6`, `t10b` -> `T10`).
+/// Shared by the two gates below, so every BLOCKED line names its test with the
+/// label the driver parses.
+fn t_label(tag: &str) -> String {
+    let number: String = tag
+        .chars()
+        .skip(1)
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    format!("T{}", number.trim_start_matches('0'))
+}
+
+/// The one stdout line the driver can see for a missing-file refusal.
+/// `Get-TestVerdict` in `handoff/t-suite/tier.ps1` classifies BLOCKED from the
+/// line-anchored, case-sensitive regex `(?m)^T\d+ BLOCKED` — Run 6 learned that
+/// an unanchored match collides with `blocked by:` inside an admission refusal.
+/// Pure, so `missing_files_earn_an_anchored_blocked_line` can pin the shape
+/// without printing (stdout is not capturable from inside the crate).
+#[must_use]
+fn blocked_line(label: &str, files: &[PathBuf]) -> String {
+    let names: Vec<String> = files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    format!(
+        "{label} BLOCKED: model files missing ({})",
+        names.join(", ")
+    )
+}
+
+/// The model-file fallback gate: refuses before anything boots when a gguf this
+/// test needs is not on disk. Panics, never `return;` — a quiet early return is
+/// exactly the vacuous PASS chunk 21 exists to catch. The anchored
+/// [`blocked_line`] output keeps the outcome classifiable as BLOCKED under
+/// `run-group.ps1` (R2-17-01: an assert-only panic for a missing `SE_T_EMB` /
+/// `SE_T_SMALL` file reached the driver as a FAIL and earned a flake re-run);
+/// the panic message is the stop sign for a bare `cargo test` and names the env
+/// overrides the operator must set.
+fn require_files(tag_label: &str, files: &[PathBuf]) {
+    let missing: Vec<PathBuf> = files
+        .iter()
+        .filter(|path| !path.exists())
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    println!("{}", blocked_line(tag_label, &missing));
+    let names: Vec<String> = missing
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    panic!(
+        "T-suite refuses: {tag_label} model files missing ({}); set the matching \
+         SE_T_SMALL / SE_T_EMB / SE_T_WORK31 / SE_T_RP31 / SE_T_AUX31 / SE_T_MID \
+         override to an existing file",
+        names.join(", ")
+    );
+}
+
 /// The in-test fallback gate: refuses before anything loads when the card
 /// cannot hold this test's tier. Panics, never `return;` - a quiet early
 /// return is exactly the vacuous PASS this suite just learned to distrust
@@ -166,12 +226,7 @@ fn free_vram_mib() -> Result<u64, String> {
 /// bare `cargo test`.
 fn require_free_vram(tag: &str) {
     let need = required_free_mib(tag);
-    let number: String = tag
-        .chars()
-        .skip(1)
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    let label = format!("T{}", number.trim_start_matches('0'));
+    let label = t_label(tag);
     match free_vram_mib() {
         Ok(free) if free >= need => {}
         Ok(free) => {
@@ -214,6 +269,12 @@ impl Harness {
         // The card is priced before the temp catalog is even written
         // (FINDINGS-21 [3]): this runs before anything here can load a model.
         require_free_vram(tag);
+        // R2-17-01: the identity sentinel registered below is an EMB model, so
+        // EVERY test here needs the EMB gguf on disk before the harness boots.
+        // Without it the scan drops the sentinel and the identity probe fails 50 s
+        // later with a FAIL the driver re-runs as a flake; the anchored BLOCKED
+        // line must be printed here, where the driver can still see it.
+        require_files(&t_label(tag), &[emb_gguf()]);
         let work_dir = simplehar_se::testutil::temp_dir(&format!("t14-{tag}"));
         let modelconf = work_dir.join("ModelConf");
         std::fs::create_dir_all(&modelconf).expect("temp ModelConf");
@@ -690,13 +751,14 @@ fn harness_exe() -> PathBuf {
 #[ignore = "operator-gated: real exe + real model files (SE_T_*)"]
 async fn t01_listener_routing_guards() {
     serial_lock();
+    // R2-17-01: the precondition prints the anchored `T1 BLOCKED` line before it
+    // panics, and it runs BEFORE the harness boots, so a missing `SE_T_SMALL` /
+    // `SE_T_EMB` file classifies as BLOCKED instead of a FAIL that earns a flake
+    // re-run.
+    require_files("T1", &[small_gguf(), emb_gguf()]);
     let harness = Harness::spawn("t01").await;
     let work = harness_exe();
     assert!(work.exists(), "build the exe first (cargo build)");
-    assert!(
-        harness.baseline_check(&[&small_gguf(), &emb_gguf()]),
-        "T1 BLOCKED: smoke model files missing"
-    );
 
     // 1.1/1.5 (adapted): a WORK model on the RP/AUX/EMB listeners -> 404 BEFORE
     // any load (no job created), wrong-category with the listener hint.
@@ -1641,4 +1703,55 @@ async fn t14_soak() {
         "this run's engine logs bounded: {log_files} files"
     );
     println!("T14 PASS ({iterations} iterations; full plan: set SE_SOAK_ITERATIONS=20)");
+}
+
+// ------------------------------------------------- classifier pin (cardless)
+
+/// R2-17-01: a missing model file must reach the driver as BLOCKED, never as a
+/// FAIL that earns a flake re-run. The driver sees only the run's stdout:
+/// `Get-TestVerdict` in `handoff/t-suite/tier.ps1` classifies BLOCKED from the
+/// line-anchored, case-sensitive regex `(?m)^T\d+ BLOCKED`. This pin is cardless:
+/// it boots no harness and loads nothing. It checks
+/// both halves of the fix: the pure formatter carries the classifier shape, and
+/// `require_files` panics with the missing files named in its stop sign. Printing
+/// to stdout is not capturable in-crate, so the println site and this test share
+/// the one pure formatter `blocked_line`. `T9` is used as the label here on
+/// purpose: no `t09` run ever prints through this formatter, so pinning the shape
+/// cannot forge a real test's marker line.
+#[test]
+fn missing_files_earn_an_anchored_blocked_line() {
+    let missing = std::env::temp_dir().join(format!(
+        "simplehar-se-r2-17-01-missing-{}.gguf",
+        std::process::id()
+    ));
+    assert!(!missing.exists(), "the fixture path must not exist");
+
+    let line = blocked_line("T9", std::slice::from_ref(&missing));
+    // Mirror of the tier.ps1 regex, asserted by hand: `T`, one or more ASCII
+    // digits, a space, then `BLOCKED` in this exact case, all at a line start.
+    let head = line.strip_prefix('T').expect("the label starts with T");
+    let digits: String = head.chars().take_while(|c| c.is_ascii_digit()).collect();
+    assert!(!digits.is_empty(), "the classifier needs digits: {line}");
+    assert!(
+        head[digits.len()..].starts_with(" BLOCKED: "),
+        "the classifier matches `^T\\d+ BLOCKED` at a line start: {line}"
+    );
+    assert!(
+        line.contains(&missing.display().to_string()),
+        "the line names the missing file: {line}"
+    );
+
+    let missing_in_panic = missing.clone();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(move || require_files("T9", &[missing_in_panic]));
+    std::panic::set_hook(hook);
+    let payload = outcome.expect_err("a missing file must panic, not return");
+    let message = payload
+        .downcast_ref::<String>()
+        .expect("the stop sign is a formatted String");
+    assert!(
+        message.contains(&missing.display().to_string()),
+        "the panic message names the missing file: {message}"
+    );
 }

@@ -724,8 +724,13 @@ mod tests {
 
     /// Redaction stays upstream's job (`config`'s `REDACTED(present)` marker, the
     /// 15[9] posture); this pin's teeth are **parity** — the file must add no surface
-    /// the ring does not already have. Falsifier: give the file its own field
-    /// formatting or a private redaction list and the two shapes diverge here.
+    /// the ring does not already have. R2-15-03: the pin now emits real `tracing`
+    /// events through one local subscriber that carries BOTH sink layers, so every
+    /// event runs each layer's real `on_event` — the old shape hand-fed `ring_push`
+    /// and `write_entry`, so a redaction added inside one sink's `on_event` stayed
+    /// green here. Falsifier: redact a field in `FileLayer::on_event` (or give the
+    /// file its own field formatting) and the `api_key`/`min_free` compares below go
+    /// red on the file side while the ring stays plain.
     #[test]
     fn the_file_carries_exactly_what_the_ring_carries() {
         let sink = SinkGuard::attach("logpar");
@@ -735,24 +740,35 @@ mod tests {
             ring.entries.clear();
             ring.dropped = 0;
         }
-        let entries: Vec<LogEntry> = (0..3)
-            .map(|index| {
-                let mut entry = LogEntry::now(
-                    "WARN",
-                    "simplehar_se::scheduler",
-                    format!("launch floor not met {index}"),
-                );
-                entry
-                    .fields
-                    .insert("min_free".to_string(), format!("{index}.0 GiB"));
-                entry
-            })
-            .collect();
-        for entry in &entries {
-            ring_push(entry.clone());
-            write_entry(entry);
-        }
-        let (tail, _) = ring_tail(entries.len());
+        // The same layer pair `init` composes at boot: the ring keeps the boot
+        // filter, the file keeps its own INFO floor. A **local** subscriber, never
+        // `init()` — one process may register a default subscriber once and no lib
+        // test may touch it.
+        let base = log_filter(DEFAULT_LOG_LEVEL).0;
+        let subscriber = tracing_subscriber::registry()
+            .with(RingLayer.with_filter(base.clone()))
+            .with(FileLayer.with_filter(file_filter(&base)));
+        tracing::subscriber::with_default(subscriber, || {
+            for index in 0..3 {
+                if index == 1 {
+                    // One event carries a token-shaped field. No downstream sink
+                    // may redact it: redaction is upstream's job (15[9]).
+                    tracing::warn!(
+                        target: "simplehar_se::scheduler",
+                        min_free = %format!("{index}.0 GiB"),
+                        api_key = %"sk-test-not-a-real-secret",
+                        "launch floor not met {index}"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "simplehar_se::scheduler",
+                        min_free = %format!("{index}.0 GiB"),
+                        "launch floor not met {index}"
+                    );
+                }
+            }
+        });
+        let (tail, _) = ring_tail(3);
         let lines = std::fs::read_to_string(&sink.path).expect("file");
         let file_lines: Vec<&str> = lines.lines().collect();
         assert_eq!(
@@ -766,7 +782,33 @@ mod tests {
             assert_eq!(parsed["level"], entry.level);
             assert_eq!(parsed["target"], entry.target);
             assert_eq!(parsed["fields"]["min_free"], entry.fields["min_free"]);
+            let file_key = parsed["fields"]["api_key"].as_str();
+            let ring_key = entry.fields.get("api_key").map(String::as_str);
+            assert_eq!(
+                file_key, ring_key,
+                "a field one sink redacts (or drops) breaks parity: \
+                 file={file_key:?} ring={ring_key:?}"
+            );
         }
+        // Name the token once, so the loop cannot pass by BOTH sinks dropping it:
+        // the value must arrive in both, whole, with no downstream REDACTED applied.
+        let file_key = serde_json::from_str::<serde_json::Value>(file_lines[1])
+            .expect("JSONL line")["fields"]["api_key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let ring_key = tail[1].fields.get("api_key").cloned().unwrap_or_default();
+        assert!(
+            file_key.contains("sk-test-not-a-real-secret")
+                && ring_key.contains("sk-test-not-a-real-secret"),
+            "both sinks must carry the field as the event said it: \
+             file={file_key:?} ring={ring_key:?}"
+        );
+        assert!(
+            !file_key.contains("REDACTED") && !ring_key.contains("REDACTED"),
+            "redaction stays upstream's job: no sink may apply it downstream: \
+             file={file_key:?} ring={ring_key:?}"
+        );
     }
 
     /// Rolling forward, never renaming an open handle (no `FILE_SHARE_DELETE` on
