@@ -11,6 +11,8 @@
 #   6. No known stale phrase appears in current durable docs or source
 #      (archive paths excluded).
 #   7. `cargo doc --no-deps` is warning-free (skip with -SkipDoc).
+#   8. The webui status fixture quotes the same version as Cargo.toml (a bump
+#      that forgets the fixture pin ships a red test; v1.1.3 proved the gap).
 #
 # Exit 0 only when every check passes.
 
@@ -128,6 +130,25 @@ if (-not $SkipDoc) {
       Write-Output ("cargo doc warning count: " + $warningCount)
     }
   }
+}
+
+# 8. The webui fixture quotes the crate version. The parity test
+#    `the_webui_fixture_is_a_document_the_endpoint_can_actually_emit` pins
+#    `fixture.version == CARGO_PKG_VERSION`; the release-check never runs
+#    tests, so the bump commit itself needs this mechanical guard.
+$fixturePath = 'tests/webui/fixtures/status.json'
+$fixtureOk = $false
+if (Test-Path -LiteralPath $fixturePath) {
+  $fixtureVersion = $null
+  $fm = Select-String -LiteralPath $fixturePath -Pattern '"version"\s*:\s*"([^"]+)"' |
+    Select-Object -First 1
+  if ($fm) { $fixtureVersion = $fm.Matches[0].Groups[1].Value }
+  $fixtureOk = ($fixtureVersion -eq $version)
+  Report $fixtureOk ("webui fixture quotes version " +
+    $(if ($fixtureVersion) { $fixtureVersion } else { "(none)" }) +
+    " matching Cargo.toml " + $version)
+} else {
+  Report $false "webui fixture missing: $fixturePath"
 }
 
 if ($script:allPass) {

@@ -97,12 +97,15 @@ A release is a task with acceptance criteria. Run the steps in this order:
 1. The gate passes on the release commit (`docs/process/VERIFICATION.md`). Run
    `scripts/check-onboarding.ps1` and require PASS; it is the release-scheduled onboarding
    check that `docs/process/VERIFICATION.md` names.
-2. Bump the `Cargo.toml` version. The version must match the tag.
+2. Bump the `Cargo.toml` version. The version must match the tag. The same commit
+   updates the webui fixture pin: `tests/webui/fixtures/status.json` quotes the same
+   version (the parity test compares them; `release-check.ps1` check 8 enforces it).
 3. Write the dated `CHANGELOG.md` entry. Use the Keep a Changelog structure and record
    user-visible changes only.
 4. Update the README release claim. It names the tag, never HEAD.
 5. Run `scripts/release-check.ps1 -Prepare` and require PASS. It checks the version, tag,
-   changelog, README claim, known stale phrases, and `cargo doc` warnings. In `-Prepare`
+   changelog, README claim, known stale phrases, `cargo doc` warnings, and the webui
+   fixture pin. In `-Prepare`
    mode the README claim must name the version being prepared.
 6. Create the annotated tag.
 7. Run `scripts/release-check.ps1` without `-Prepare` and require PASS. It confirms the
