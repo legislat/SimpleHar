@@ -10,15 +10,17 @@ review_trigger: behavior-change, release
 
 # SimpleHarn
 
-[![CI](https://img.shields.io/github/actions/workflow/status/legislat/SimpleHar/ci.yml?branch=main)](https://github.com/legislat/SimpleHar/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/legislat/SimpleHarn/ci.yml?branch=main)](https://github.com/legislat/SimpleHarn/actions/workflows/ci.yml)
 
 SimpleHarn is a Windows tray harness for local LLM inference. It runs several inference
 engines on one GPU behind one OpenAI-compatible API. One swap scheduler is the only writer
 of scheduler state. It admits every model load against the memory the card itself reports,
-and it refuses to overcommit. The product name is SimpleHarn; the repository keeps its
-current name until the repository rename lands as a separate step.
+and it refuses to overcommit. The product name is SimpleHarn, and the repository is
+`legislat/SimpleHarn`. The binary is `simpleharn.exe`, the config file is `simpleharn.json`,
+and the environment names use the `SIMPLEHARN_` prefix. An existing `simplehar-se.json` or
+`simplehar.json` config and the deprecated `SIMPLEHAR_*` environment names keep working.
 
-Current release: **v1.1.3**. Windows 10/11, one NVIDIA GPU, single user.
+Current release: **v1.2.0**. Windows 10/11, one NVIDIA GPU, single user.
 Prebuilt binaries: see the GitHub Releases page of this repository.
 
 > This is a personal harness, built for my own machine and my own setup. Feel free to try
@@ -189,7 +191,7 @@ refusal (unload something; the harness never over-admits). The full list, with t
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) |
 | License | [LICENSE](LICENSE) (Apache-2.0) |
-| Issues | [legislat/SimpleHar/issues](https://github.com/legislat/SimpleHar/issues) |
+| Issues | [legislat/SimpleHarn/issues](https://github.com/legislat/SimpleHarn/issues) |
 
 Found a problem or have an idea? Open an issue. Contributions are welcome; start with
 [CONTRIBUTING.md](CONTRIBUTING.md).

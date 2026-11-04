@@ -19,6 +19,8 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## Unreleased
 
+## v1.2.0 - 2026-11-04
+
 - Renamed the project and binary to SimpleHarn; the config file is now
   simpleharn.json; the SIMPLEHAR_TOKEN/SIMPLEHAR_CONFIG names still work with a
   deprecation warning. No behavior change.
