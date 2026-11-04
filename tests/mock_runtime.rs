@@ -403,6 +403,30 @@ impl MockRuntime {
         self.servers.lock().expect("mock runtime lock").len()
     }
 
+    /// Chaos seam (TASK-BERTH-B7): kill `port` OUT OF BAND — the same teardown the
+    /// harness's own `kill` performs (abort the `axum::serve` future, await its drop,
+    /// clear the table entry) but issued by the test, not through `kill`/the gate.
+    /// This is the fake's stand-in for `contrib/chaos` killing a component at the seam:
+    /// it dies while the harness's own terminate is still parked, so the release
+    /// evidence the harness later reads comes from the gone table entry, not from a
+    /// side effect of its own `kill`. The mock owns no OS process, so this exercises
+    /// only the release-evidence path; a real job-object child kill stays card-only.
+    #[allow(dead_code)]
+    pub async fn external_kill(&self, port: u16) {
+        let handle = {
+            let mut table = self.servers.lock().expect("mock runtime lock");
+            table.get_mut(&port).and_then(|server| server.handle.take())
+        };
+        if let Some(handle) = handle {
+            handle.abort();
+            let _gone = handle.await;
+        }
+        self.servers
+            .lock()
+            .expect("mock runtime lock")
+            .remove(&port);
+    }
+
     /// Number of engines this runtime has ever started, including ones that died.
     /// Crash-retry evidence: a real retry restarts, so the count grows while
     /// `server_count` stays at the live set.
