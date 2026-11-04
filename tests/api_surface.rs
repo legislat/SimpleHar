@@ -5,7 +5,7 @@
 mod mock_runtime;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use axum::Router;
 use mock_runtime::MockRuntime;
 use serde_json::Value;
@@ -722,6 +722,105 @@ async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
         mock_runtime::SSE_BODY.as_bytes(),
         "the streamed body must arrive byte-for-byte, not re-serialised"
     );
+}
+
+#[tokio::test]
+async fn polling_an_empty_slot_never_loads_a_model() {
+    // "Reads never wake" on the REAL router (operator ruling 2026-11-04,
+    // Variant A pins the status quo): `GET /v1/models` and `GET /health` answer
+    // from the catalog and static state and never admit, so the scheduler stays
+    // untouched and the empty slot stays empty. Falsifiers: (1) wire any read
+    // route to `proxy` and the polling legs below go red — a ledger row appears
+    // and an engine boots while nothing was asked to load; (2) stop the
+    // inference door from waking and the positive-control leg below goes red;
+    // (3) a fourth waking path added to `wakes_slot` without the route table
+    // fails the src-side pin `the_wake_set_is_exactly_the_proxy_routes`.
+    let (control, work, _, _, runtime, _modelconf) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+
+    // Baseline before the first polling round (B4R-02): the ledger must start
+    // empty, so a boot-time mint fails here with its own honest message
+    // instead of being misattributed to the polling legs below.
+    let (status, baseline) = get_json(&control, "/har/jobs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        baseline["jobs"].as_array().map(Vec::len),
+        Some(0),
+        "pre-poll baseline: before the first polling round the ledger must already be empty: {baseline}"
+    );
+
+    // Poll like a status page does — catalog, health, and the method variants a
+    // curious client can aim at the inference paths. None of them may admit.
+    for round in 0..3 {
+        let (status, body) = get_json(&work, "/v1/models").await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+        assert_eq!(body["data"].as_array().map(Vec::len), Some(1));
+
+        let (status, _) = get_json(&work, "/health").await;
+        assert_eq!(status, StatusCode::OK, "round {round} health");
+
+        for method in [Method::HEAD, Method::OPTIONS] {
+            for path in ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"] {
+                let response = work
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method.clone())
+                            .uri(path)
+                            .header("host", "127.0.0.1:8708")
+                            .body(Body::empty())
+                            .expect("static request"),
+                    )
+                    .await
+                    .expect("in-process request");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "round {round}: {method} {path} must be refused by routing, before any ensure"
+                );
+                let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("bounded body");
+            }
+        }
+
+        let (status, body) = get_json(&control, "/har/jobs").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["jobs"].as_array().map(Vec::len),
+            Some(0),
+            "round {round}: polling must not mint a job: {body}"
+        );
+        let (_, doc) = get_json(&control, "/har/status").await;
+        let work_slot = doc["slots"]
+            .as_array()
+            .expect("slots array")
+            .iter()
+            .find(|slot| slot["category"] == "WORK")
+            .expect("WORK slot present");
+        assert_eq!(work_slot["state"], "empty", "round {round}: {doc}");
+        assert!(
+            work_slot["model"].is_null(),
+            "round {round}: the empty slot must stay empty: {doc}"
+        );
+    }
+    assert_eq!(runtime.server_count(), 0, "no poll may boot an engine");
+
+    // Positive control: the inference door DOES wake — the same empty slot
+    // takes a load the moment a real inference POST arrives.
+    let (status, body) = post_json(&work, "/v1/chat/completions", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let (status, body) = get_json(&control, "/har/jobs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["jobs"].as_array().map(Vec::len),
+        Some(1),
+        "the inference POST must mint exactly one ledger row: {body}"
+    );
+    assert_eq!(body["jobs"][0]["state"], "Serving", "body: {body}");
+    assert_eq!(runtime.server_count(), 1, "the wake loaded the model");
 }
 
 #[tokio::test]

@@ -22,7 +22,7 @@ use crate::scheduler::{JobId, Reply, SchedulerError, SchedulerHandle, SchedulerS
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -3035,13 +3035,52 @@ async fn swap_for_port(
     Ok((port, serve_id))
 }
 
+/// Does this request wake its slot — that is, may it trigger admission and load a
+/// model?
+///
+/// The deny-by-default, single source of truth for "reads never wake" (operator
+/// ruling 2026-11-04): only the three inference POST paths wake. Everything else
+/// — `GET /v1/models`, `/health`, every `/har/*` route, and any non-POST variant
+/// — answers `false` and can never load a model. [`category_router`] wires
+/// exactly these paths to [`proxy`], and the unit pin
+/// `the_wake_set_is_exactly_the_proxy_routes` fails the moment the predicate and
+/// the route table diverge, in either direction.
+fn wakes_slot(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && matches!(
+            path,
+            "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings"
+        )
+}
+
 /// Proxy pass-through: POST /v1/chat/completions | /v1/completions | /v1/embeddings.
 /// The response body streams through byte-for-byte (SSE included).
 async fn proxy(
     State(listener): State<Arc<ListenerState>>,
+    method: Method,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    // The proxy door is the one place that admits (via `ensure_target` below), so
+    // the request reaching it must satisfy `wakes_slot`. A violation is not a
+    // client error — method routing runs before handlers, so a route arriving here
+    // against the predicate is a router wiring bug, never a request a client sent.
+    // It is reported as such and never as a new user-visible refusal: the release
+    // build logs a structured warning and serves the request exactly as before (no
+    // behavior change, Variant A), and the debug build panics, so the falsifier
+    // suite catches any future mis-wire at its source.
+    if !wakes_slot(&method, uri.path()) {
+        tracing::warn!(
+            method = %method,
+            path = %uri.path(),
+            "wiring bug: a route that must never wake reached the proxy door"
+        );
+        debug_assert!(
+            false,
+            "wiring bug: {method} {} reached the proxy door but must never wake a slot",
+            uri.path()
+        );
+    }
     let Json(mut body) = body.map_err(|rejection| ApiError::BadRequest {
         reason: format!("body must be JSON: {rejection}"),
     })?;
@@ -5915,6 +5954,143 @@ mod tests {
         assert!(
             body.contains("Reply::Done") && body.contains("ApiError::Internal"),
             "the no-port reply must still be refused as an invariant violation: {body}"
+        );
+    }
+
+    /// "Reads never wake" as a table (operator ruling 2026-11-04, Variant A):
+    /// `wakes_slot` answers `true` for exactly the three inference POSTs and
+    /// `false` for every other method/path pair the listeners and a curious
+    /// client can produce — reads, admin routes, and non-POST variants of the
+    /// inference paths. Falsifier: widen `wakes_slot` to wake on a GET or on a
+    /// fourth path and the matching row fails.
+    #[test]
+    fn only_the_three_inference_posts_wake_the_slot() {
+        let table: Vec<(&str, &str, bool)> = vec![
+            ("POST", "/v1/chat/completions", true),
+            ("POST", "/v1/completions", true),
+            ("POST", "/v1/embeddings", true),
+            ("GET", "/v1/chat/completions", false),
+            ("GET", "/v1/completions", false),
+            ("GET", "/v1/embeddings", false),
+            ("HEAD", "/v1/chat/completions", false),
+            ("HEAD", "/v1/completions", false),
+            ("HEAD", "/v1/embeddings", false),
+            ("OPTIONS", "/v1/chat/completions", false),
+            ("OPTIONS", "/v1/completions", false),
+            ("OPTIONS", "/v1/embeddings", false),
+            ("PUT", "/v1/embeddings", false),
+            ("DELETE", "/v1/completions", false),
+            ("GET", "/v1/models", false),
+            ("POST", "/v1/models", false),
+            ("GET", "/health", false),
+            ("POST", "/health", false),
+            ("GET", "/har/status", false),
+            ("GET", "/har/jobs", false),
+            ("POST", "/har/load", false),
+            ("POST", "/har/unload", false),
+            ("POST", "/har/rescan", false),
+            ("POST", "/har/config/model", false),
+            // A fourth inference-style path that is not wired must never wake.
+            ("POST", "/v1/rerank", false),
+            // A trailing slash is a different path; the router 404s it, the
+            // predicate must not wake on it either.
+            ("POST", "/v1/chat/completions/", false),
+            ("POST", "", false),
+            ("GET", "", false),
+        ];
+        for (method, path, wakes) in table {
+            let method = Method::from_bytes(method.as_bytes()).expect("valid method literal");
+            assert_eq!(wakes_slot(&method, path), wakes, "{method} {path}");
+        }
+    }
+
+    /// Route-table falsifier: the predicate's literal list and the category
+    /// listener route table must agree on the exact wake set, in both
+    /// directions — wiring any other route to `proxy` fails the per-route leg,
+    /// and adding any other waking path to `wakes_slot` fails the literal-list
+    /// and proxy-wiring legs. Falsifier: add a fourth path to `wakes_slot`
+    /// without touching the route table and the literal-list leg fails; re-wire
+    /// `/v1/models` to `proxy` and the per-route leg fails.
+    #[test]
+    fn the_wake_set_is_exactly_the_proxy_routes() {
+        fn quoted_literals(text: &str) -> Vec<&str> {
+            let mut out = Vec::new();
+            let mut rest = text;
+            while let Some(open) = rest.find('"') {
+                rest = &rest[open + 1..];
+                let Some(close) = rest.find('"') else { break };
+                out.push(&rest[..close]);
+                rest = &rest[close + 1..];
+            }
+            out
+        }
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn wakes_slot(")
+            .expect("wakes_slot is still in this file");
+        let predicate =
+            &source[start..start + source[start..].find("\n}\n").expect("wakes_slot closes")];
+        let mut woken = quoted_literals(predicate);
+        woken.sort_unstable();
+        assert_eq!(
+            woken,
+            vec!["/v1/chat/completions", "/v1/completions", "/v1/embeddings"],
+            "`wakes_slot` must list exactly the three inference paths and nothing else"
+        );
+
+        let router_at = source
+            .find("pub fn category_router(")
+            .expect("category_router is still in this file");
+        let rest = &source[router_at..];
+        let table = &rest[..rest
+            .find(".layer((")
+            .expect("the route entries end at the first layer")];
+        // Absence leg (B4R-01): the enumeration below counts only `.route(`
+        // entries, so a structural combinator inside the scanned region would
+        // wake a slot without ever reaching the per-route checks or `total`.
+        // A future `.nest(`/`.merge(`/`.fallback(`/`.route_method(` wire-up
+        // must fail here, not escape the pin.
+        assert!(
+            !table.contains(".nest(")
+                && !table.contains(".merge(")
+                && !table.contains(".fallback(")
+                && !table.contains(".route_method("),
+            "route shape must stay enumerable by `.route(`"
+        );
+        let mut proxied: Vec<&str> = Vec::new();
+        let mut total = 0;
+        for entry in table.split(".route(").skip(1) {
+            total += 1;
+            let open = entry.find('"').expect("route path is quoted") + 1;
+            let path = &entry[open..open + entry[open..].find('"').expect("path quote closes")];
+            let (method, method_token) = match (entry.find("get("), entry.find("post(")) {
+                (Some(g), Some(p)) if p < g => (Method::POST, "post("),
+                (Some(_), Some(_)) => (Method::GET, "get("),
+                (Some(_), None) => (Method::GET, "get("),
+                (None, Some(_)) => (Method::POST, "post("),
+                (None, None) => panic!("route {path} wires no known method combinator"),
+            };
+            let handler_at = entry.find(method_token).expect("method token") + method_token.len();
+            let handler = &entry
+                [handler_at..handler_at + entry[handler_at..].find(')').expect("handler closes")];
+            assert_eq!(
+                wakes_slot(&method, path),
+                handler == "proxy",
+                "route {method} {path} ({handler}) must agree with `wakes_slot`"
+            );
+            if handler == "proxy" {
+                proxied.push(path);
+            }
+        }
+        assert_eq!(
+            total, 5,
+            "the category-listener route table changed shape; re-read the wake pin: {table}"
+        );
+        proxied.sort_unstable();
+        assert_eq!(
+            proxied,
+            vec!["/v1/chat/completions", "/v1/completions", "/v1/embeddings"],
+            "`proxy` must be wired to exactly the three waking routes"
         );
     }
 

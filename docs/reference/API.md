@@ -22,6 +22,15 @@ to the loaded model of that category. At AUX this is the most recently used
 model. When nothing is loaded, the harness loads that category's
 `default_model` instead of returning an error.
 
+Polling never loads a model. Only the three inference routes start a load:
+`/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings`. `GET
+/v1/models` and `GET /health` answer from the catalog and static state. They
+never admit. When a slot is not loaded, an inference request loads the model
+first. Admission may refuse that load. The harness then answers `503` and
+names the state or the blockers in `message`. The `wakes_slot` predicate and
+its route-table falsifier pin this contract. A future route that would wake a
+slot on a read fails the pin.
+
 ## Control listener endpoints (8708)
 
 | Endpoint | Body / meaning |
@@ -102,8 +111,9 @@ An admission refusal that answers `unavailable` or `below_launch_floor` also
 carries two wait fields at the flat envelope top level:
 
 - `queue_position`: an integer, or an explicit `null`. It is the one-based
-  place behind the loads that are already ahead in the refused category.
-  A `null` means the refusal got no queue place and no load is ahead.
+  place behind the loads that are already ahead in the refused category. A
+  `null` means no other load is ahead in that category. The harness runs no
+  queue and grants no queue place to any refusal.
 - `expected_release_s`: a number of seconds, to one decimal. It is a rolling
   median of the harness's own measured releases. It is an estimate, never a
   promise. The harness omits the field when it has no measured release to
