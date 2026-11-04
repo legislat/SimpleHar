@@ -20,6 +20,10 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## v1.1.3 - 2026-11-04
 
+Commit: `ba7d3aa` (release prep). Artifact: `simplehar-se.exe`, SHA256
+`125603C84D1522C84B20430EE2ECA426D73DDE4246C186DDD5DF683A136FE7F3`, built
+2026-11-04 and staged at `C:\Inference\SimpleHar-SE_release_v1.1.3`.
+
 ### Added
 
 - Strata and Basalt book a measured memory footprint. After readiness the
