@@ -21,6 +21,10 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## v1.2.0 - 2026-11-04
 
+Tag: `v1.2.0`. Commit: `8fcaa82` (release prep). Artifact: `simpleharn.exe`,
+built 2026-11-04, SHA256
+`CE2CCF1E5721C6006FDB8F8B891ABED1CEC9A532D15DFCC21CEF937F6E4AE1FA`.
+
 - Renamed the project and binary to SimpleHarn; the config file is now
   simpleharn.json; the SIMPLEHAR_TOKEN/SIMPLEHAR_CONFIG names still work with a
   deprecation warning. No behavior change.
