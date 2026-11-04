@@ -63,6 +63,15 @@ pub struct SlotStatus {
     pub serve_id: Option<String>,
     /// Job currently running for this slot, if any.
     pub loading_job: Option<JobId>,
+    /// The slot lifecycle the server derives: `empty`, `loading`, `serving`,
+    /// or `releasing` (operator ruling 2026-11-04). `releasing` names a
+    /// committed release: the occupant is the target of a live unload or
+    /// eviction and stays installed until the driver confirms the release, so
+    /// the label covers the whole window from accept to confirmation. A
+    /// release that timed out is terminal: the occupant stays on purpose and
+    /// the slot reads `serving`, never a stuck `releasing`. The page renders
+    /// this value instead of re-deriving the dot.
+    pub state: String,
     /// Wall-clock launch of the occupant, server-formatted ISO-8601 UTC
     /// (Axis-2 ruling 2026-10-29: the operator sees when the model launched; the
     /// page prints this string verbatim — no date math in the browser). Empty slot:

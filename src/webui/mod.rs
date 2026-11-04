@@ -253,4 +253,47 @@ mod tests {
             "green must be the accent and yellow the warn token, each with its own rule"
         );
     }
+
+    /// The `releasing` slot state (operator ruling 2026-11-04): both the tab
+    /// pill and the model row read the server's `slots[].state` string
+    /// directly — the page never re-derives the release (same rule as the
+    /// stale amber and the fault dot) — and `releasing` gets its own
+    /// stylesheet treatment, distinct from `loading`'s amber. CSS application
+    /// is untestable in the DOM stub (GOTCHAS [ui][test]), so the rule's
+    /// existence is pinned at the byte level, like the amber before it; the
+    /// render legs live in `tests/webui/webui_dom_test.mjs`.
+    ///
+    /// Nature, declared: a source-content assertion over the exact
+    /// `include_str!` bytes `/app.js` and `/style.css` answer.
+    ///
+    /// # Falsifier
+    ///
+    /// Replace a server read with a page-side derivation (`loading_job` or
+    /// `model` alone) and one of the two reads disappears: the count assert
+    /// fails. Delete the `releasing` rule from the stylesheet and its assert
+    /// fails while the cost asserts stay green.
+    #[test]
+    fn served_assets_render_the_server_releasing_state() {
+        const READ: &str = "slot.state === \"releasing\"";
+        assert_eq!(
+            APP_JS.matches(READ).count(),
+            2,
+            "the tab pill AND the model row must read the server's `state` string, \
+             never re-derive it"
+        );
+        assert!(
+            APP_JS.contains("text(\"releasing\u{2026}\")"),
+            "the pill must say releasing, not restate the occupant"
+        );
+        assert!(
+            APP_JS.contains("text(\"Releasing\u{2026}\")"),
+            "the releasing row parks on an honest disabled button"
+        );
+        assert!(
+            STYLE_CSS.contains(".sh-dot[data-state=\"releasing\"]")
+                && STYLE_CSS.contains("--sh-releasing"),
+            "the releasing dot needs its own rule and token or it renders as \
+             another state's colour"
+        );
+    }
 }

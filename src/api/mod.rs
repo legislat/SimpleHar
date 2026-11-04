@@ -3792,6 +3792,7 @@ mod tests {
             idle_s: Some(0),
             serve_id: None,
             loading_job: None,
+            state: "serving".to_string(),
             launched_at: Some(launched.to_string()),
             stale_config: Some(stale),
             container_reported_gb: None,
@@ -5827,6 +5828,7 @@ mod tests {
             idle_s: Some(0),
             serve_id: Some("mock-model".to_string()),
             loading_job: None,
+            state: "serving".to_string(),
             launched_at: None,
             stale_config: None,
             container_reported_gb: None,
@@ -5850,6 +5852,7 @@ mod tests {
         };
         let empty = SlotStatus {
             model: None,
+            state: "empty".to_string(),
             ..occupied_slot("empty", 9_101, now)
         };
         let document = |slots: Vec<SlotStatus>| {
@@ -5968,6 +5971,7 @@ mod tests {
             idle_s: None,
             serve_id: None,
             loading_job: None,
+            state: "empty".to_string(),
             launched_at: None,
             stale_config: None,
             container_reported_gb: None,

@@ -193,7 +193,18 @@ function renderTabItem(status, category) {
   const loading = slotJobsFor(status, category).length > 0;
   // Local name kept clear of the module-level UI `state` object (shadowing here
   // would send the onclick handler reading a string).
-  const dotState = occupants.length > 0 ? "serving" : loading ? "loading" : "idle";
+  // The server owns `slots[].state` (ruling 2026-11-04): a committed release
+  // shows `releasing` while the occupant is still installed. No `releasing`
+  // slot (and no `state` field on an old payload) leaves today's derivation
+  // untouched.
+  const releasing = slots.some((slot) => slot.state === "releasing");
+  const dotState = releasing
+    ? "releasing"
+    : occupants.length > 0
+      ? "serving"
+      : loading
+        ? "loading"
+        : "idle";
   const button = el(
     "button",
     {
@@ -211,7 +222,9 @@ function renderTabItem(status, category) {
     text(category),
   );
   if (entry) button.append(el("span", { class: "sh-tab-port" }, text(`:${entry.public_port}`)));
-  if (loading && occupants.length === 0) {
+  if (dotState === "releasing") {
+    button.append(el("span", { class: "sh-tab-model sh-empty" }, text("releasing…")));
+  } else if (loading && occupants.length === 0) {
     button.append(el("span", { class: "sh-tab-model sh-empty" }, text("loading…")));
   } else if (occupants.length > 0) {
     button.append(el("span", { class: "sh-tab-model" }, text(occupants[0])));
@@ -469,11 +482,25 @@ function modelRow(status, model, category) {
   // The server owns the fault rule (`fault_of`: failed LOAD, cancels excluded) so the
   // row dot and the headline can never disagree (review, 2026-10-26).
   const failed = !!last && last.is_fault === true;
-  const dotState = serving ? "serving" : loading ? "loading" : failed ? "failed" : "idle";
+  // The server owns `slots[].state` (ruling 2026-11-04): the dot follows a
+  // committed release named on this model's slot. A payload without `state`
+  // (an older harness) keeps today's derivation.
+  const releasing = status.slots.some(
+    (slot) => slot.category === category && slot.model === model.id && slot.state === "releasing",
+  );
+  const dotState = releasing
+    ? "releasing"
+    : serving
+      ? "serving"
+      : loading
+        ? "loading"
+        : failed
+          ? "failed"
+          : "idle";
   // Axis 2 (operator ruling 2026-10-29): the amber is the server's own boolean read
   // directly — the page never compares file times or dates (the K-round
   // page-must-not-derive rule). It rides an attribute, not `dotState`, so the
-  // Unload/Load button logic stays exactly the serving-row logic.
+  // Unload/Load/Releasing buttons stay the plain serving-row logic.
   const stale = serving && model.stale_config === true;
   const row = el("tr", {});
   // Operator layout (2026-10-26): actions first, then the name, then the rest —
@@ -492,6 +519,10 @@ function modelRow(status, model, category) {
         text("Unload"),
       ),
     );
+  } else if (dotState === "releasing") {
+    // The release is already committed: a second gesture would only race it,
+    // so the row parks on its honest word until the driver confirms.
+    actions.append(el("button", { class: "sh-mini", disabled: "" }, text("Releasing…")));
   } else if (dotState === "loading") {
     actions.append(el("button", { class: "sh-mini", disabled: "" }, text("Loading…")));
   } else {

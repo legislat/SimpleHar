@@ -364,7 +364,7 @@ const driver = `
       category: "WORK", index: 0, model: "bookedone", port: 18109, pid: 1,
       need_gib: 44, idle_s: 0, serve_id: null, loading_job: null,
       launched_at: "2026-11-01T04:48:19Z", stale_config: false,
-      container_reported_gb: 44.0,
+      container_reported_gb: 44.0, state: "serving",
     };
     const rowCost = (id) => {
       for (const tr of findAll(document.getElementById("sh-main"), "tr")) {
@@ -667,7 +667,7 @@ const driver = `
     ...fixtures["/har/status"],
     slots: [{ category: "WORK", index: 0, model: "staleone", port: 8111, pid: 1,
       need_gib: 4.0, idle_s: 0, serve_id: null, loading_job: null,
-      launched_at: launchedStamp, stale_config: true }],
+      launched_at: launchedStamp, stale_config: true, state: "serving" }],
     models: [
       { id: "staleone", engine: "llama", category: "WORK", vram_gb: 4, cost: "fixed",
         launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
@@ -707,6 +707,46 @@ const driver = `
   check("unloaded row prints no launch stamp",
     !nameCells["unloadedone"].includes("launched"),
     nameCells["unloadedone"]);
+
+  // Releasing (operator ruling 2026-11-04): the server's slots[].state wins
+  // where present. A committed release renders the releasing pill and row dot
+  // with honest text; a payload without a state field (an older harness)
+  // keeps today's derivation. Falsifier: page-side derivation only (drop the
+  // server read in app.js) and the releasing checks stay "serving"; delete
+  // the fallback and the legacy-row checks lose their dot state.
+  {
+    const relModel = {
+      id: "relone", engine: "llama", category: "WORK", vram_gb: 4, cost: "fixed",
+      launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+      model_ref: "F:/r.gguf", serve_model: null, cpu_offload: false,
+    };
+    const relSlot = { category: "WORK", index: 0, model: "relone", port: 8122, pid: 1,
+      need_gib: 4.0, idle_s: 0, serve_id: null, loading_job: 9,
+      launched_at: "2026-11-04T00:00:00Z", stale_config: false, state: "releasing" };
+    applyState({ ...fixtures["/har/status"], slots: [relSlot], models: [relModel] });
+    const relPill = findAll(document.getElementById("sh-header"), "span", "sh-tab-item")[0];
+    const relPillDot = findAll(relPill, "span", "sh-dot")[0];
+    check("the pill dot follows the server's releasing state",
+      !!relPillDot && relPillDot.attrs["data-state"] === "releasing",
+      relPillDot ? JSON.stringify(relPillDot.attrs) : "no pill dot");
+    check("the releasing pill says releasing, not serving",
+      textOf(relPill).includes("releasing"), textOf(relPill));
+    const relRowDot = findAll(document.getElementById("sh-main"), "span", "sh-dot")[0];
+    check("the releasing model row paints its dot releasing",
+      !!relRowDot && relRowDot.attrs["data-state"] === "releasing",
+      relRowDot ? JSON.stringify(relRowDot.attrs) : "no row dot");
+    const legacy = { ...relSlot };
+    delete legacy.state;
+    applyState({ ...fixtures["/har/status"], slots: [legacy], models: [relModel] });
+    const legacyPillDot =
+      findAll(findAll(document.getElementById("sh-header"), "span", "sh-tab-item")[0],
+        "span", "sh-dot")[0];
+    const legacyRowDot = findAll(document.getElementById("sh-main"), "span", "sh-dot")[0];
+    check("a payload without state keeps today's derivation",
+      !!legacyPillDot && legacyPillDot.attrs["data-state"] === "serving" &&
+        !!legacyRowDot && legacyRowDot.attrs["data-state"] === "serving",
+      JSON.stringify([legacyPillDot && legacyPillDot.attrs, legacyRowDot && legacyRowDot.attrs]));
+  }
 
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
 

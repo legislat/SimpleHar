@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [HTTP control API contract, error codes, memory provenance]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-04
 review_trigger: behavior-change, release
 ---
 
@@ -38,6 +38,23 @@ model. When nothing is loaded, the harness loads that category's
 | `POST /har/config/default` | `{category, model \| null}`. `model` is required. A string sets the default, stored as its canonical name, and `null` clears it. The change persists to the config file. |
 | `POST /har/config/logging` | `{enabled: bool}`. Toggles the verbose harness log. |
 | `POST /har/config/model` | `{model, category?, cpu?}`. Writes back to the model yaml. |
+
+## Slot state field (`slots[].state`)
+
+Every slot in `/har/status` and in the SSE `har_state` document carries
+`state`. The server derives it; the page renders the value verbatim.
+The values are:
+
+- `empty`: no occupant and no job.
+- `loading`: a job is attached and no occupant is installed yet.
+- `serving`: an occupant serves the slot with no release in flight.
+- `releasing`: a committed release is in flight. The slot keeps the occupant
+  installed and visible. The value stays `releasing` until the driver
+  confirms the release. If the release times out, the job goes terminal,
+  the occupant stays, and the slot reads `serving` again.
+
+A `200` reply from `POST /har/unload` is an acceptance, not a release proof.
+Read `slots[].state` and the job ledger for the release truth.
 
 ## Memory provenance fields
 

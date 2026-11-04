@@ -683,6 +683,7 @@
    "port": 18109,
    "serve_id": "qwen3.8-flash-next-fp4local",
    "stale_config": false,
+   "state": "serving",
    "container_reported_gb": 31.2
   },
   {
@@ -697,6 +698,7 @@
    "port": null,
    "serve_id": null,
    "stale_config": null,
+   "state": "empty",
    "container_reported_gb": null
   },
   {
@@ -711,6 +713,7 @@
    "port": null,
    "serve_id": null,
    "stale_config": null,
+   "state": "empty",
    "container_reported_gb": null
   },
   {
@@ -725,8 +728,9 @@
    "port": null,
    "serve_id": null,
    "stale_config": null,
+   "state": "empty",
    "container_reported_gb": null
   }
  ],
- "version": "1.1.2"
+ "version": "1.1.3"
 }

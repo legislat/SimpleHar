@@ -9,6 +9,7 @@
   --sh-accent-solid: #2ea043;
   --sh-warn: #d89b1d;
   --sh-bad: #c0392b;
+  --sh-releasing: #a16207;
   --sh-radius: 10px;
   --sh-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
 }
@@ -277,6 +278,10 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
 }
 .sh-dot[data-state="serving"] { background: var(--sh-accent-solid); }
 .sh-dot[data-state="loading"] { background: var(--sh-warn); }
+/* Releasing (operator ruling 2026-11-04): a committed release whose driver
+   confirmation has not landed. Burnt amber — the release family of loading's
+   amber, kept a clear shade apart from the loading dot and the failed red. */
+.sh-dot[data-state="releasing"] { background: var(--sh-releasing); }
 .sh-dot[data-state="failed"] { background: var(--sh-bad); }
 /* Axis 2 (ruling 2026-10-29): a serving row whose config file moved since launch.
    The tray's listener amber is a different palette; this is the config one. */

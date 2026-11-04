@@ -1494,6 +1494,10 @@ impl ActorState {
                     }),
                     serve_id: s.occupant.as_ref().and_then(|o| o.serve_id.clone()),
                     loading_job: s.job,
+                    // The one derivation of the slot label (see
+                    // `ActorState::slot_state`): a committed release reads
+                    // `releasing` until the driver confirms it.
+                    state: self.slot_state(s).to_string(),
                     launched_at: s
                         .occupant
                         .as_ref()

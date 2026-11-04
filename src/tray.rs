@@ -937,6 +937,7 @@ mod tests {
             idle_s: model.map(|_| 0),
             serve_id: None,
             loading_job: None,
+            state: model.map_or_else(|| "empty".to_string(), |_| "serving".to_string()),
             launched_at: None,
             stale_config: None,
             container_reported_gb: None,

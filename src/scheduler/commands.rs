@@ -7,8 +7,8 @@ use crate::ownership::SpawnTicket;
 use std::time::{Duration, Instant};
 
 use super::{
-    state_last_used, ActorState, Job, JobId, JobKind, JobTimings, Reply, SchedulerError, SwapState,
-    Victim, Waiter,
+    state_last_used, ActorState, Job, JobId, JobKind, JobTimings, Reply, SchedulerError, Slot,
+    SwapState, Victim, Waiter,
 };
 
 impl ActorState {
@@ -20,13 +20,42 @@ impl ActorState {
     /// decided to empty. A terminal job is not a commitment: its unconfirmed
     /// victim stays installed on purpose (G12) and a later swap or restart
     /// re-owns the ticket, so `Already` for it is the point-in-time truth.
-    /// `O(slots x live jobs)` against the ledger; both counts are tiny.
+    /// This predicate is also the single source of the `releasing` value of
+    /// the `/har/status` label below. `O(slots x live jobs)` against the
+    /// ledger; both counts are tiny.
     fn is_committed_release_target(&self, ticket: &SpawnTicket) -> bool {
         self.jobs.iter().any(|(_, job)| {
             !job.terminal
                 && (job.victim.as_ref().is_some_and(|v| &v.ticket == ticket)
                     || job.victims.iter().any(|v| &v.ticket == ticket))
         })
+    }
+
+    /// The single derivation of the `/har/status` `slots[].state` label
+    /// (operator ruling 2026-11-04; the only writer is `ActorState::snapshot`).
+    /// Rules, in order:
+    /// - `releasing`: the slot still shows its occupant and
+    ///   [`ActorState::is_committed_release_target`] names that occupant — the
+    ///   same predicate the `Already` denial uses, so the label and the
+    ///   receipts can never disagree about a committed release. It covers the
+    ///   plain unload (the job's own `victim`) and cross-slot eviction victims
+    ///   (the loading job's queued `victims`) with one read. The window closes
+    ///   at driver-confirmed release; a terminal job is not a commitment
+    ///   (G12), so a timed-out release reads `serving`, never a stuck
+    ///   `releasing`.
+    /// - `serving`: an occupant with no release in flight.
+    /// - `loading`: a job attached to a slot that has no occupant yet.
+    /// - `empty`: neither an occupant nor a job.
+    #[must_use]
+    pub(super) fn slot_state(&self, slot: &Slot) -> &'static str {
+        match (&slot.occupant, slot.job) {
+            (Some(occupant), _) if self.is_committed_release_target(&occupant.ticket) => {
+                "releasing"
+            }
+            (Some(_), _) => "serving",
+            (None, Some(_)) => "loading",
+            (None, None) => "empty",
+        }
     }
 
     pub(super) fn on_swap(&mut self, model: String, category: CategoryId, reply: Waiter) {
