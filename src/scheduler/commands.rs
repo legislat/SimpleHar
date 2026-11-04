@@ -407,7 +407,7 @@ impl ActorState {
             error: None,
             need: None,
             cost: crate::model::CostClass::Fixed,
-            launch_floor: None,
+            vram_gate: crate::model::VramGate::default(),
             load_timeout_s: None,
             gate_target: None,
             free_at_admit: None,

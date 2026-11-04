@@ -93,6 +93,66 @@ pub enum CostClass {
     Exact,
 }
 
+/// The VRAM admission gate one row selects with
+/// `launch_only_with_at_least_vram_free:` — one key, two value shapes
+/// (operator ruling 2026-11-04). A number is the launch floor in GiB:
+/// the load is refused before spawn unless free VRAM reaches it. The keyword
+/// `whole` (any case) selects the whole-machine gate: the row is admitted
+/// only while the card is fully free; the request waits and never evicts to
+/// get there (`crate::budget::AdmissionError::WholeMachineBusy`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub enum VramGate {
+    /// No numeric floor (the key is absent). A `greedy` row without a floor
+    /// inherits the global `greedy_launch_min_free_gb`; a floor of 0 is the
+    /// documented greedy opt-out.
+    Floor(Option<f64>),
+    /// `whole`: admit only when the card is fully free; wait, never evict.
+    Whole,
+}
+
+/// Absence of the key is absence of a gate: the row-level default is
+/// `Floor(None)` (a data-carrying variant cannot carry `#[default]`, so the
+/// impl is manual and the meaning is spelled here once).
+impl Default for VramGate {
+    fn default() -> Self {
+        VramGate::Floor(None)
+    }
+}
+
+impl VramGate {
+    /// Parses the row key's raw value: the keyword `whole` under ASCII case
+    /// mixing and surrounding whitespace, else a finite non-negative GiB
+    /// number through `parse_gib`. Any other value is a catalog error
+    /// naming it (`ModelError::BadNumber`, the same honest voice as every
+    /// other numeric key).
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::BadNumber`] when the value is neither the keyword nor a
+    /// finite non-negative number; the error names the field and the verbatim
+    /// value.
+    pub fn parse(raw: &str) -> Result<Self, ModelError> {
+        if raw.trim().eq_ignore_ascii_case("whole") {
+            return Ok(VramGate::Whole);
+        }
+        Ok(VramGate::Floor(Some(parse_gib(
+            "launch_only_with_at_least_vram_free",
+            raw,
+        )?)))
+    }
+
+    /// The numeric launch floor in GiB: `Some` only for a numeric floor row.
+    /// `Whole` carries no number — a page or log shows the keyword, never an
+    /// invented figure.
+    #[must_use]
+    pub fn floor(&self) -> Option<f64> {
+        match self {
+            VramGate::Floor(floor) => *floor,
+            VramGate::Whole => None,
+        }
+    }
+}
+
 /// How a measured footprint figure was obtained, and therefore whether it may book
 /// (R1, DECISIONS LOCKED 2026-10-30). Written by `on_measured` as the
 /// `measured_attribution:` stamp and read back at scan; never upgraded post-hoc.
@@ -176,10 +236,13 @@ pub struct ModelEntry {
     pub gguf_size_gb: Option<f64>,
     /// How `vram_gb` participates in admission (`cost:` key, default `fixed`).
     pub cost: CostClass,
-    /// `launch_only_with_at_least_vram_free:` — refuse the load **before spawn**
-    /// unless VRAM free at decision time reaches this floor in GiB. The guard for
-    /// greedy offloaders: launching a huge quant onto a busy card thrashes RAM/SSD.
-    pub launch_floor_gb: Option<f64>,
+    /// `launch_only_with_at_least_vram_free:` — the row's VRAM admission gate
+    /// ([`VramGate`]): a numeric floor in GiB (refuse the load **before spawn**
+    /// unless VRAM free at decision time reaches it — the guard for greedy
+    /// offloaders, since launching a huge quant onto a busy card thrashes
+    /// RAM/SSD), or the keyword `whole` (admit only while the card is fully
+    /// free; the request waits, never evicts).
+    pub vram_gate: VramGate,
     /// Per-model readiness deadline in seconds (`load_timeout:`); `None` uses the
     /// config default. Strata-class cold starts run for many minutes and would
     /// otherwise be cut off by the global gate (v3.3 parity).
@@ -731,9 +794,9 @@ impl ModelEntry {
             },
             None => CostClass::Fixed,
         };
-        let launch_floor_gb = match keys.get("launch_only_with_at_least_vram_free") {
-            Some(raw) => Some(parse_gib("launch_only_with_at_least_vram_free", raw)?),
-            None => None,
+        let vram_gate = match keys.get("launch_only_with_at_least_vram_free") {
+            Some(raw) => VramGate::parse(raw)?,
+            None => VramGate::default(),
         };
         // u64 parse rejects nan/inf/1e400 outright; the ceiling guards a typo that
         // would park a load job in readiness forever.
@@ -815,7 +878,7 @@ impl ModelEntry {
             vram_gb,
             gguf_size_gb: None,
             cost,
-            launch_floor_gb,
+            vram_gate,
             load_timeout_s,
             min_turn_s,
             measured_gb: measured.max,
@@ -1976,7 +2039,8 @@ mod tests {
         )
         .expect("greedy parses");
         assert_eq!(entry.cost, CostClass::Greedy);
-        assert_eq!(entry.launch_floor_gb, Some(6.0));
+        assert_eq!(entry.vram_gate, VramGate::Floor(Some(6.0)));
+        assert_eq!(entry.vram_gate.floor(), Some(6.0));
 
         let exact = ModelEntry::from_flat(&flat(&[("name", "e"), ("cost", "exact")]), "e")
             .expect("exact parses");
@@ -1984,7 +2048,7 @@ mod tests {
 
         let fixed = ModelEntry::from_flat(&flat(&[("name", "f")]), "f").expect("default cost");
         assert_eq!(fixed.cost, CostClass::Fixed);
-        assert_eq!(fixed.launch_floor_gb, None);
+        assert_eq!(fixed.vram_gate, VramGate::Floor(None));
 
         let bad = ModelEntry::from_flat(&flat(&[("name", "x"), ("cost", "hoarder")]), "x")
             .expect_err("unknown cost class is a scan error, never a silent default");
@@ -2030,7 +2094,7 @@ mod tests {
             "g",
         )
         .expect("zero is the floor's explicit opt-out, not a typo");
-        assert_eq!(opt_out.launch_floor_gb, Some(0.0));
+        assert_eq!(opt_out.vram_gate, VramGate::Floor(Some(0.0)));
         let full = ModelEntry::from_flat(
             &flat(&[
                 ("name", "full"),
@@ -2047,5 +2111,55 @@ mod tests {
         .expect("a full valid yaml still parses under the new rule");
         assert_eq!(full.vram_gb, Some(6.5));
         assert_eq!(full.cost_source(), CostSource::Declared);
+    }
+
+    /// The `whole` keyword of the same key (operator ruling 2026-11-04):
+    /// case-insensitive, whitespace-tolerant, and the raw map keeps the
+    /// verbatim line so write-back never rewrites the operator's bytes
+    /// (the same round-trip leg `min_turn_parses_and_bounds` pins). A value
+    /// that is neither the keyword nor a finite number must name the bad
+    /// value in the error — never a silent default.
+    /// Falsifier: compare the keyword case-sensitively and `Whole`/`WHOLE`
+    /// fall through to `parse_gib` and fail the scan.
+    #[test]
+    fn whole_machine_keyword_parses_and_keeps_the_raw_line() {
+        for value in ["whole", "Whole", "WHOLE", " whole "] {
+            let entry = ModelEntry::from_flat(
+                &flat(&[
+                    ("name", "w"),
+                    ("launch_only_with_at_least_vram_free", value),
+                ]),
+                "w",
+            )
+            .expect("{value} is the whole-machine keyword");
+            assert_eq!(entry.vram_gate, VramGate::Whole, "{value}");
+            assert_eq!(
+                entry
+                    .raw
+                    .get("launch_only_with_at_least_vram_free")
+                    .map(String::as_str),
+                Some(value),
+                "the raw map must keep the verbatim line for write-back"
+            );
+        }
+        assert_eq!(
+            ModelEntry::from_flat(&flat(&[("name", "n"), ("vram_gb", "2")]), "n")
+                .expect("a row with no gate key")
+                .vram_gate,
+            VramGate::Floor(None),
+            "absence is no gate, never a silent `whole`"
+        );
+        for bad in ["whol", "wholel", "-3", "abc", "nan", "inf", "1e400"] {
+            let err = ModelEntry::from_flat(
+                &flat(&[("name", "x"), ("launch_only_with_at_least_vram_free", bad)]),
+                "x",
+            )
+            .expect_err("{bad} is neither the keyword nor a finite number");
+            assert!(
+                matches!(&err, ModelError::BadNumber { field, value }
+                    if field == "launch_only_with_at_least_vram_free" && value == bad),
+                "the scan error must name the field and the bad value: {err}"
+            );
+        }
     }
 }

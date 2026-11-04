@@ -1640,7 +1640,7 @@ Start Port    End Port
             vram_gb: None,
             gguf_size_gb: None,
             cost: simplehar_se::model::CostClass::Fixed,
-            launch_floor_gb: None,
+            vram_gate: simplehar_se::model::VramGate::default(),
             load_timeout_s: None,
             min_turn_s: None,
             measured_gb: None,

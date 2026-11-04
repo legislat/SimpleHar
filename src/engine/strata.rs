@@ -1085,7 +1085,7 @@ mod tests {
             vram_gb: Some(55.0),
             gguf_size_gb: None,
             cost: crate::model::CostClass::Fixed,
-            launch_floor_gb: None,
+            vram_gate: crate::model::VramGate::default(),
             load_timeout_s: None,
             min_turn_s: None,
             measured_gb: None,
@@ -1465,10 +1465,16 @@ mod tests {
     #[test]
     fn a_missing_or_non_directory_cwd_is_refused_at_spec_time() {
         let base = fixture_pairs();
+        // The interpreter is validated before the cwd, so leaving `strata_python`
+        // to the adapter default made this test pass only on a machine where
+        // C:\Strata\.venv exists; name an existing .exe stand-in so the cwd
+        // refusal under test is reached on any machine.
+        let python = real_file_with_extension("cwd-python-stand-in", "exe");
         let not_a_dir = real_file_with_extension("cwd-not-a-dir", "json");
         for value in ["Z:\\no-such-dir", path_text(&not_a_dir)] {
             let mut pairs: Vec<(&str, &str)> =
                 base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            pairs.push(("strata_python", path_text(&python)));
             pairs.push(("strata_cwd", value));
             let err = StrataAdapter::default()
                 .spec(&entry(&pairs), 18109)

@@ -155,7 +155,8 @@ const DISAGREE_GIB: f64 = 0.05;
 
 /// What the refusal knows about WAITING, beside the named holders: an estimate
 /// and a queue place, each `None` when the harness has no basis to quote it.
-/// The two memory refusals carry this struct; the API renders `Some` figures
+/// The three memory refusals (`BelowLaunchFloor`, `Insufficient`,
+/// `WholeMachineBusy`) carry this struct; the API renders `Some` figures
 /// as structured JSON fields. Neither figure is a promise: the harness runs no
 /// wait queue, so both describe the decision moment only (operator ruling
 /// 2026-11-04: "an estimate, never a promise").
@@ -263,6 +264,46 @@ pub enum AdmissionError {
         /// evictable resident, never foreign occupancy — would not reach the floor.
         /// The refusal says so and the load was refused BEFORE any release.
         no_releases_reach: bool,
+        /// What the decision knows about waiting (estimate + place), computed
+        /// at refusal time beside these numbers.
+        wait_hint: WaitHint,
+    },
+    /// The row requested the whole machine
+    /// (`launch_only_with_at_least_vram_free: whole`, operator ruling
+    /// 2026-11-04) and the card is not **fully free**. Fully free, defined
+    /// once here: no harness slot other than the request's own holds an
+    /// occupant (the own-slot occupant is the explicit replacement the
+    /// request asked for, already credited in the compared figure); no other
+    /// load has booked room (the in-flight debit of the same figure, and
+    /// those rows are named beside it); and what no release the harness may
+    /// perform can reclaim stays within the configured `vram_reserve_gb` —
+    /// the credited witness reading reaches the whole budget minus the
+    /// reserve, read exactly as the numeric launch-floor leg reads it. This
+    /// is a WAIT posture: the refusal names every holder and evicts nothing
+    /// — no victim is planned and nothing is released to get there; the
+    /// client retries.
+    #[error(
+        "whole machine requested: at least {required} free required, free {free}, reserve {reserve}{detail}{tail}",
+        detail = .facts.detail(*free),
+        tail = insufficient_tail(&[], .blockers)
+    )]
+    WholeMachineBusy {
+        /// The auto target the gate compared: `total - 2 * reserve` GiB —
+        /// the whole-machine floor in the same units as `free` (B5R-02: a
+        /// holderless refusal must print what was required, like both
+        /// numeric siblings print theirs).
+        required: Gibibytes,
+        /// The figure the gate actually compared (G13).
+        free: Gibibytes,
+        /// Reserve subtracted before the gate; also the allowance for what
+        /// no release can reclaim (the driver baseline).
+        reserve: Gibibytes,
+        /// The inputs `free` was derived from (ledger / observed).
+        facts: Box<BudgetFacts>,
+        /// Every current harness holder, each with the reason "whole machine
+        /// requested". A foreign resident the harness cannot name rides the
+        /// `unreleasable` figure in the message instead.
+        blockers: Vec<BlockerInfo>,
         /// What the decision knows about waiting (estimate + place), computed
         /// at refusal time beside these numbers.
         wait_hint: WaitHint,

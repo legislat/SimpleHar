@@ -116,7 +116,14 @@ One harness process, one tokio runtime, plus OS-level children:
   refuses before spawn; when no release the harness can perform would reach
   the floor the refusal reads "No releases allow for the VRAM floor. Check
   foreign residents." (in `budget.rs`). Foreign occupancy never counts
-  toward meeting a floor.
+  toward meeting a floor. The key also takes the keyword `whole`: a
+  whole-machine gate that waits instead of evicting (operator ruling
+  2026-11-04). A `whole` load admits only when the rest of the card is
+  free — its own slot's occupant may be replaced, credited as the
+  request's named target — and the refusal names every holder and evicts
+  nothing. On a `greedy` row `whole` replaces the numeric floor leg; the
+  global default never applies to it. `VramGate` (in `src/model/mod.rs`)
+  is the typed form: `Floor(Option<f64>)` or `Whole`.
 - Cost sources (`model::CostSource`, `MeasuredAttribution`): a measured
   figure books only for trusted provenance (`engine_report`, `engine_status`,
   `per_process`); a `total_diff` figure displays but never books

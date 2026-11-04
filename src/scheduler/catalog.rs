@@ -181,7 +181,7 @@ impl ActorState {
             || old.engine != new.engine
             || old.category != new.category
             || old.gguf_size_gb != new.gguf_size_gb
-            || old.launch_floor_gb != new.launch_floor_gb
+            || old.vram_gate != new.vram_gate
             || old.load_timeout_s != new.load_timeout_s
             || old.model_ref != new.model_ref
             || old.serve_model != new.serve_model
@@ -445,7 +445,7 @@ impl ActorState {
     /// are the `stale_config` companion round's ground.
     ///
     /// The predicate is the yaml fingerprint captured at registration and nothing
-    /// else: every fact a parked row freezes (`cost`, `launch_floor`, `engine`,
+    /// else: every fact a parked row freezes (`cost`, `vram_gate`, `engine`,
     /// `category`, `load_timeout_s`) is derived from that one file, and the only
     /// catalog re-read an armed row still consults ([`ActorState::start_pending`] →
     /// a fresh entry) derives its numbers from the same bytes — so bytes unchanged

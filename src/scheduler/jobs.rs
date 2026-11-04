@@ -173,8 +173,10 @@ pub(super) struct Job {
     pub(super) need: Option<Gibibytes>,
     /// Cost class from the model yaml (fixed|greedy|exact) — drives the gate shape.
     pub(super) cost: crate::model::CostClass,
-    /// Model's `launch_only_with_at_least_vram_free` in GiB, if set.
-    pub(super) launch_floor: Option<f64>,
+    /// The row's VRAM gate, frozen at registration with the other derived
+    /// keys (`launch_only_with_at_least_vram_free:`): a numeric floor in GiB
+    /// or the `whole` keyword.
+    pub(super) vram_gate: crate::model::VramGate,
     /// Model's per-load readiness deadline (`load_timeout:`); `None` = config default.
     pub(super) load_timeout_s: Option<u64>,
     /// The `available` value (free_at_admit + released, each credit counted once) the

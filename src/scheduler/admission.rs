@@ -73,7 +73,7 @@ impl ActorState {
             warnings: Vec::new(),
             slot: Some(slot),
             cost: entry.cost,
-            launch_floor: entry.launch_floor_gb,
+            vram_gate: entry.vram_gate,
             load_timeout_s: entry.load_timeout_s,
             gate_target: None,
             // The yaml as the catalog saw it, statted inline once per
@@ -269,21 +269,32 @@ impl ActorState {
             job.observed_at_admit = observed_free;
         }
         self.set_timing(job_id, |t| &mut t.admit_ms);
-        let (greedy, model_floor) = {
+        let (greedy, vram_gate) = {
             let job = &self.jobs[&job_id];
-            (
-                job.cost == crate::model::CostClass::Greedy,
-                job.launch_floor,
-            )
+            (job.cost == crate::model::CostClass::Greedy, job.vram_gate)
         };
-        // Launch floor: the model's key, else the global greedy default — a
-        // greedy quant spawned onto a card already busy with foreign processes
-        // thrashes RAM/SSD for minutes before serving (operator note 2026-10-26).
-        let floor = model_floor.or(if greedy {
-            Some(self.cfg.greedy_launch_min_free_gb)
-        } else {
-            None
-        });
+        let whole = matches!(vram_gate, crate::model::VramGate::Whole);
+        // Launch floor: the model's numeric key, else the global greedy
+        // default — a greedy quant spawned onto a card already busy with
+        // foreign processes thrashes RAM/SSD for minutes before serving
+        // (operator note 2026-10-26). `whole` REPLACES this leg (operator
+        // ruling 2026-11-04): the auto floor below is the whole-machine gate
+        // expressed in this leg's own units — `free` already nets the
+        // reserve, so "the card holds nothing beyond the reserve and the
+        // credited same-slot replacement" reads as `free >= total -
+        // 2 * reserve` on the same credited witness reading the numeric
+        // floor leg compares ([`AdmissionError::WholeMachineBusy`] owns the
+        // full "fully free" definition). A greedy `whole` row keeps no
+        // numeric floor: the global default never consults it, `whole`
+        // replaces the greedy floor leg exactly as it replaces the row one.
+        let floor = match vram_gate {
+            crate::model::VramGate::Whole => Some(total_gib - 2.0 * self.cfg.vram_reserve_gb),
+            crate::model::VramGate::Floor(model_floor) => model_floor.or(if greedy {
+                Some(self.cfg.greedy_launch_min_free_gb)
+            } else {
+                None
+            }),
+        };
         // The card itself can be misread: `nvidia-smi` parses `NaN` as a number, and
         // every comparison against NaN is false, which would silently read as
         // "fits". An unreadable reading is named as one (fail closed, §0.3).
@@ -305,6 +316,48 @@ impl ActorState {
             self.log_refusal(job_id, &error, "bad-size");
             self.finish(job_id, Err(error), "under-specified");
             return;
+        }
+        // The whole-machine leg (operator ruling 2026-11-04): a WAIT posture
+        // on top of the auto floor — refuse naming every holder, never evict
+        // to get there. The numeric-deficit machinery below is never reached
+        // while the card is not fully free, so the planner is never asked for
+        // victims on a `whole` refusal and the B1 `min_turn` interplay is
+        // trivially safe. The settle-window re-check posture is unchanged:
+        // the auto floor rides `gate_target` like any numeric floor, and an
+        // explicit same-slot replacement still re-gates on the physical card
+        // after its release ([`ActorState::spawn_settle_task`]).
+        if whole {
+            let required = floor.expect("invariant: the whole gate always carries its auto floor");
+            let holders = self.whole_machine_holders(job_id);
+            if free.0 < required || !holders.is_empty() {
+                self.step(job_id, SwapState::AdmitFail);
+                let mut facts = facts;
+                if observed_free.is_some() {
+                    // R3 figures beside the named holders: the whole path may
+                    // release nothing but the credited same-slot replacement,
+                    // so everything else the card holds is unreleasable here
+                    // (the reserve band is the operator's allowance for the
+                    // driver baseline — see the variant doc).
+                    facts.unreleasable = Some(Gibibytes((occupied - victim_need).max(0.0)));
+                    facts.used_gib = Some(Gibibytes(occupied));
+                    facts.booked_total = Some(self.ledger_sum());
+                }
+                let error = AdmissionError::WholeMachineBusy {
+                    required: Gibibytes(required),
+                    free,
+                    reserve: Gibibytes(self.cfg.vram_reserve_gb),
+                    facts: Box::new(facts),
+                    blockers: holders,
+                    wait_hint: self.wait_hint(job_id),
+                };
+                self.log_refusal(job_id, &SchedulerError::Admission(error.clone()), "gate");
+                self.finish(
+                    job_id,
+                    Err(SchedulerError::Admission(error)),
+                    "admission refused",
+                );
+                return;
+            }
         }
         // One truth now: `free` already is the physical reading, credited and
         // debited. `facts` carries the originals so a refusal can name which bound.
@@ -333,7 +386,16 @@ impl ActorState {
         if deficit > 0.0 {
             // Step 6: try to cover the deficit with evictable cross-category
             // victims before refusing — cheapest sufficient set, hard filters.
-            match self.plan_victims(job_id, deficit) {
+            // A `whole` row that stands here has already passed the whole-
+            // machine leg, so the planner provably has no candidate to find —
+            // and must never be asked: the whole gate never evicts (operator
+            // ruling 2026-11-04).
+            let planned = if whole {
+                Err((Vec::new(), Vec::new()))
+            } else {
+                self.plan_victims(job_id, deficit)
+            };
+            match planned {
                 Ok(victims) => {
                     if let Some(job) = self.jobs.get_mut(&job_id) {
                         job.victims = victims;
@@ -538,6 +600,49 @@ impl ActorState {
             expected_release_s: self.release_samples.median_s(),
             queue_position: (ahead > 0).then(|| ahead as u32 + 1),
         }
+    }
+
+    /// Every holder that keeps a `whole` row from the machine: an occupant of
+    /// a slot other than the load's own, and every other non-terminal load
+    /// that has booked room (`SwapState::reserves_vram`). The request's own
+    /// slot is deliberately not a holder there: an explicit same-slot load of
+    /// a whole row IS a replacement of that occupant (pinned behavior,
+    /// operator ruling 2026-11-04 — replacing the named target of the request
+    /// is the request itself, never an eviction to get room; its booked need
+    /// is already credited in the compared figure). Each holder rides
+    /// [`AdmissionError::WholeMachineBusy`] as a named blocker with the
+    /// reason "whole machine requested"; a foreign resident the harness
+    /// cannot name rides the `unreleasable` figure instead.
+    fn whole_machine_holders(&self, job_id: JobId) -> Vec<crate::budget::BlockerInfo> {
+        let own_slot = self.jobs[&job_id].slot;
+        let mut holders = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if Some(index) == own_slot {
+                continue;
+            }
+            if let Some(occupant) = &slot.occupant {
+                holders.push(crate::budget::BlockerInfo {
+                    model: occupant.model.clone(),
+                    category: slot.category.to_string(),
+                    reason: "whole machine requested".to_string(),
+                });
+            }
+        }
+        for (id, job) in self.jobs.iter() {
+            if *id == job_id
+                || job.kind != JobKind::Load
+                || job.terminal
+                || !job.state.reserves_vram()
+            {
+                continue;
+            }
+            holders.push(crate::budget::BlockerInfo {
+                model: job.model.clone(),
+                category: job.category.to_string(),
+                reason: "whole machine requested".to_string(),
+            });
+        }
+        holders
     }
 
     /// Step 6 planner: among occupants evictable by this job's category, pick the

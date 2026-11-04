@@ -2955,6 +2955,43 @@ mod tests {
         assert!(!within_one_edit("context", "context"));
     }
 
+    /// The `whole` keyword of the VRAM-gate key must ride the real scan with
+    /// zero reports (the key is consumed, so never `UnknownKey`), keep its
+    /// raw line verbatim for write-back, and land typed as the whole-machine
+    /// gate (operator ruling 2026-11-04). The golden fixture stays numeric on
+    /// purpose: this pin owns the keyword shape.
+    /// Falsifier: a parse that rejects the keyword at scan time surfaces an
+    /// error or drops the entry, and this pin goes red.
+    #[test]
+    fn a_whole_machine_row_scans_and_keeps_its_line() {
+        let dir = crate::testutil::temp_dir("scan-whole");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("wholerow.yaml"),
+            "engine: mock\ncost: fixed\nvram_gb: 12\nlaunch_only_with_at_least_vram_free: whole\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .all(|e| e.kind != ScanKind::UnknownKey),
+            "the keyword must not make its key unknown: {:?}",
+            catalog.errors
+        );
+        let m = &catalog.models[0];
+        assert_eq!(m.vram_gate, crate::model::VramGate::Whole);
+        assert_eq!(
+            m.raw
+                .get("launch_only_with_at_least_vram_free")
+                .map(String::as_str),
+            Some("whole"),
+            "write-back must see the operator's line unchanged"
+        );
+    }
+
     /// The golden fixture pins the const from the front: every consumed key appears
     /// in a real file, and the whole file scans with ZERO unknown-key errors.
     /// Every engine knob rides the `engine: mock` file deliberately: mock reads

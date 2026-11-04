@@ -927,7 +927,7 @@ mod tests {
             vram_gb: Some(34.0),
             gguf_size_gb: None,
             cost: CostClass::Fixed,
-            launch_floor_gb: None,
+            vram_gate: crate::model::VramGate::default(),
             load_timeout_s: Some(600),
             min_turn_s: None,
             measured_gb: None,

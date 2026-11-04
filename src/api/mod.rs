@@ -164,8 +164,9 @@ impl ApiError {
         }
     }
 
-    /// The wait hint a client may branch on, present only on the two memory
-    /// refusal classes that a refusal decision produced with one. `Some` here
+    /// The wait hint a client may branch on, present only on the three memory
+    /// refusals (`below_launch_floor`, insufficient, whole machine busy) that
+    /// a refusal decision produced one for. `Some` here
     /// says the harness can name a queue place or quote an estimate — the
     /// per-field `None`s still stand (no place, or no release sample).
     pub fn wait_hint(&self) -> Option<crate::budget::WaitHint> {
@@ -297,7 +298,7 @@ impl From<SchedulerError> for ApiError {
             SchedulerError::Admission(admission) => {
                 // The message keeps carrying every number (the pins below and in
                 // `tests/api_surface.rs` prove it); the structured wait hint rides
-                // beside it on the two memory refusals that compute one.
+                // beside it on the memory refusals that compute one.
                 let reason = admission.to_string();
                 match admission {
                     crate::budget::AdmissionError::BelowLaunchFloor { wait_hint, .. } => {
@@ -307,6 +308,16 @@ impl From<SchedulerError> for ApiError {
                         }
                     }
                     crate::budget::AdmissionError::Insufficient { wait_hint, .. } => {
+                        ApiError::Unavailable {
+                            reason,
+                            wait_hint: Some(wait_hint),
+                        }
+                    }
+                    // The whole-machine refusal (ruling 2026-11-04) is the same wait
+                    // posture as plain over-commit: the client retries, and the B2
+                    // hint rides it. `below_launch_floor` would quote a `min_free`
+                    // figure the `whole` value never had.
+                    crate::budget::AdmissionError::WholeMachineBusy { wait_hint, .. } => {
                         ApiError::Unavailable {
                             reason,
                             wait_hint: Some(wait_hint),
@@ -1743,7 +1754,7 @@ fn model_json(entry: &ModelEntry, loaded: Option<&LoadedRow>, fit_validated: boo
             .then_some(entry.measured_gb)
             .flatten(),
         "cost": entry.cost,
-        "launch_floor_gb": entry.launch_floor_gb,
+        "launch_floor_gb": entry.vram_gate.floor(),
         "load_timeout_s": entry.load_timeout_s,
         "cpu_offload": entry
             .raw
@@ -3474,7 +3485,7 @@ mod tests {
             vram_gb: Some(4.0),
             gguf_size_gb: None,
             cost: crate::model::CostClass::Fixed,
-            launch_floor_gb: None,
+            vram_gate: crate::model::VramGate::default(),
             load_timeout_s: None,
             min_turn_s: None,
             measured_gb: None,
@@ -3534,7 +3545,7 @@ mod tests {
                 vram_gb: Some(24.0),
                 gguf_size_gb: None,
                 cost: crate::model::CostClass::Fixed,
-                launch_floor_gb: None,
+                vram_gate: crate::model::VramGate::default(),
                 load_timeout_s: None,
                 min_turn_s: None,
                 measured_gb: None,
@@ -3584,7 +3595,7 @@ mod tests {
                 vram_gb: None,
                 gguf_size_gb: None,
                 cost: crate::model::CostClass::Fixed,
-                launch_floor_gb: None,
+                vram_gate: crate::model::VramGate::default(),
                 load_timeout_s: None,
                 min_turn_s: None,
                 measured_gb: None,
@@ -3633,7 +3644,7 @@ mod tests {
             vram_gb: None,
             gguf_size_gb: Some(23.0),
             cost: crate::model::CostClass::Fixed,
-            launch_floor_gb: None,
+            vram_gate: crate::model::VramGate::default(),
             load_timeout_s: None,
             min_turn_s: None,
             measured_gb: None,
@@ -3711,6 +3722,55 @@ mod tests {
             "no place is a stated null, not a missing key: {body}"
         );
         assert!(body.get("expected_release_s").is_none(), "{body}");
+    }
+
+    /// The `whole` refusal's wire shape (ruling 2026-11-04): it rides the
+    /// existing `unavailable` wait posture — no new code, no `min_free`
+    /// figure — and the B2 hint fields behave exactly as on `Insufficient`.
+    /// Falsifier: map it to `below_launch_floor` instead and the code pin
+    /// goes red.
+    #[test]
+    fn a_whole_machine_refusal_travels_as_unavailable() {
+        let admission = crate::budget::AdmissionError::WholeMachineBusy {
+            required: crate::budget::Gibibytes(68.0),
+            free: crate::budget::Gibibytes(40.0),
+            reserve: crate::budget::Gibibytes(2.0),
+            facts: Box::new(crate::budget::BudgetFacts::default()),
+            blockers: vec![crate::budget::BlockerInfo {
+                model: "aux-resident".to_string(),
+                category: "AUX".to_string(),
+                reason: "whole machine requested".to_string(),
+            }],
+            wait_hint: crate::budget::WaitHint {
+                expected_release_s: None,
+                queue_position: Some(3),
+            },
+        };
+        let msg = admission.to_string();
+        assert!(
+            msg.contains("whole machine requested") && msg.contains("aux-resident"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("at least 68.0 GiB free required"),
+            "the refusal must print the target it needs (B5R-02): {msg}"
+        );
+        let err = ApiError::from(SchedulerError::Admission(admission));
+        assert_eq!(err.code(), "unavailable");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = error_body(&err);
+        assert_eq!(body["code"], "unavailable");
+        assert_eq!(body["queue_position"], json!(3));
+        assert!(
+            body.get("expected_release_s").is_none(),
+            "no release basis stays silent, never zero: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("whole machine requested")),
+            "{body}"
+        );
     }
 
     #[test]

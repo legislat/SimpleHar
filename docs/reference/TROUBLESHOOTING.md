@@ -34,6 +34,13 @@ diagnosis. Log retention counts live in the Log retention section of
   nothing thrashed. Free VRAM, or lower the model's
   `launch_only_with_at_least_vram_free`. The printed `free` is the number
   the gate compared: reserve deducted, same-slot replacement credited.
+- **`whole machine requested`** (code `unavailable`). The model's row sets
+  `launch_only_with_at_least_vram_free: whole`, and the card is not free:
+  the refusal names every holder, and foreign occupancy rides the printed
+  `unreleasable` figure. The harness evicts nothing for a `whole` load —
+  it waits. Unload the named holders, or start the model when the card is
+  free. A `whole` load may still replace the occupant of the slot it loads
+  onto: that occupant is the request itself, not a holder.
 - **A second instance.** A single-instance guard makes a duplicate exit
   immediately.
 - **Logs.** Logs live in `logs/` next to the exe. The harness streaming log

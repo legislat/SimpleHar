@@ -1427,7 +1427,7 @@ impl ActorState {
             need_gib = job.need.map(|need| need.0),
             free_gib = job.free_at_admit.map(|free| free.0),
             observed_at_admit_gib = job.observed_at_admit,
-            floor_gib = job.launch_floor,
+            floor_gib = job.vram_gate.floor(),
             gate_gib = job.gate_target,
             error = %error,
             "admission refused"
@@ -2280,7 +2280,7 @@ mod tests {
                 error: None,
                 need: Some(Gibibytes(2.0)),
                 cost: entry.cost,
-                launch_floor: entry.launch_floor_gb,
+                vram_gate: entry.vram_gate,
                 load_timeout_s: entry.load_timeout_s,
                 gate_target: Some(2.0),
                 free_at_admit: Some(Gibibytes(20.0)),
@@ -6258,7 +6258,7 @@ mod tests {
                 error: None,
                 need: Some(Gibibytes(2.0)),
                 cost: crate::model::CostClass::Fixed,
-                launch_floor: None,
+                vram_gate: crate::model::VramGate::default(),
                 load_timeout_s: None,
                 gate_target: None,
                 free_at_admit: None,
@@ -7009,7 +7009,7 @@ mod tests {
         state.cfg.vram_reserve_gb = 2.0;
         let entry = rescan_entry(&yaml, "greedy");
         assert_eq!(
-            entry.launch_floor_gb,
+            entry.vram_gate.floor(),
             Some(60.0),
             "the floor key must survive the real parser"
         );
@@ -7081,7 +7081,7 @@ mod tests {
         state.cfg.vram_total_gb = 72.0;
         state.cfg.vram_reserve_gb = 2.0;
         let entry = rescan_entry(&yaml, "big");
-        assert_eq!(entry.launch_floor_gb, None, "this row carries no floor");
+        assert_eq!(entry.vram_gate.floor(), None, "this row carries no floor");
         state.catalog = vec![entry.clone()];
         let ticket = fold_ticket(19_050);
         seat_spawn(&mut state, &entry, &ticket, 19_050);
@@ -7115,6 +7115,493 @@ mod tests {
         );
         assert!(!job.terminal, "release-first proceeds, it does not refuse");
         assert_eq!(job.state, SwapState::Dispose);
+    }
+
+    /// A `whole` row (operator ruling 2026-11-04): admits on a fully-free
+    /// card — here the card holds exactly the driver baseline and that
+    /// baseline sits inside the reserve band, so the credited reading reaches
+    /// the whole budget minus the reserve (68 = 72 - 2 * 2). The settle twin
+    /// rides `gate_target`: after a release the window must see the card at
+    /// least `total - reserve` free.
+    /// Falsifier: drop the `whole` leg's auto floor and a key-less-shaped row
+    /// gates on need alone — `gate_target` reads 12 and this pin fails.
+    #[tokio::test]
+    async fn a_whole_row_admits_on_a_fully_free_card() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("whole-free");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("whole.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncategory: work\nvram_gb: 12\nlaunch_only_with_at_least_vram_free: whole\n",
+        )
+        .expect("seed");
+        let mut state = fold_state(&dir);
+        state.cfg.vram_total_gb = 72.0;
+        state.cfg.vram_reserve_gb = 2.0;
+        let entry = rescan_entry(&yaml, "whole");
+        assert_eq!(
+            entry.vram_gate,
+            crate::model::VramGate::Whole,
+            "the keyword must survive the real parser"
+        );
+        state.catalog = vec![entry.clone()];
+        state.slots = vec![Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_120,
+            occupant: None,
+            job: None,
+        }];
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 2.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(
+            !job.terminal,
+            "a fully-free card admits the whole row: {:?}",
+            job.error
+        );
+        assert_eq!(
+            job.gate_target,
+            Some(68.0),
+            "the settle twin of the whole gate is total - 2 * reserve"
+        );
+        assert!(
+            !matches!(
+                job.error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::WholeMachineBusy { .. }
+                ))
+            ),
+            "{:?}",
+            job.error
+        );
+    }
+
+    /// The wait posture (operator ruling 2026-11-04): any other holder and
+    /// the `whole` row refuses, naming it with the reason
+    /// "whole machine requested" — and evicts nothing: no victim was planned
+    /// (the planner is never asked on this path), no unload job is minted,
+    /// and the holder is still loaded after the refusal.
+    /// Falsifier: drop the holder scan from the whole leg and the clean-
+    /// sample leg admits beside the holder; drop the whole leg itself and
+    /// the refusal arrives as the numeric floor class — both pins go red.
+    /// (The `plan_victims` skip above is defense-in-depth: the holder scan
+    /// already guarantees an empty candidate set, so removing only the skip
+    /// cannot manifest — verified by mutation, suite stayed green.)
+    #[tokio::test]
+    async fn a_whole_row_waits_for_every_other_holder_and_evicts_nothing() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("whole-holder");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("whole.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncategory: work\nvram_gb: 12\nlaunch_only_with_at_least_vram_free: whole\n",
+        )
+        .expect("seed");
+        let mut state = fold_state(&dir);
+        state.cfg.vram_total_gb = 72.0;
+        state.cfg.vram_reserve_gb = 2.0;
+        let entry = rescan_entry(&yaml, "whole");
+        state.catalog = vec![entry.clone()];
+        let holder_ticket = fold_ticket(18_122);
+        state.slots = vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_121,
+                occupant: None,
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_122,
+                occupant: Some(Occupant {
+                    model: "aux-resident".to_string(),
+                    need: Gibibytes(6.0),
+                    port: 18_122,
+                    ticket: holder_ticket.clone(),
+                    loaded_at: Instant::now(),
+                    launched_at_wall: std::time::SystemTime::now(),
+                    spawn_config: None,
+                    stale_config: false,
+                    serve_id: None,
+                    measure: None,
+                }),
+                job: None,
+            },
+        ];
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 8.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(job.terminal, "any holder must refuse the whole row");
+        let error = job
+            .error
+            .as_ref()
+            .expect("the refusal travels with the row");
+        let msg = error.to_string();
+        assert!(
+            msg.contains("whole machine requested") && msg.contains("aux-resident"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("at least 68.0 GiB free required"),
+            "the refusal must print the target it needs (B5R-02): {msg}"
+        );
+        match error {
+            SchedulerError::Admission(AdmissionError::WholeMachineBusy {
+                blockers,
+                wait_hint,
+                ..
+            }) => {
+                assert!(
+                    blockers.iter().any(|b| b.model == "aux-resident"
+                        && b.reason == "whole machine requested"),
+                    "the holder must be named with the ruling's reason: {blockers:?}"
+                );
+                // The B2 hint rides the new refusal like any other memory
+                // refusal: nothing ahead quotes no place, and with no
+                // confirmed release yet the estimate is absent, never zero.
+                assert_eq!(wait_hint.queue_position, None, "{wait_hint:?}");
+                assert_eq!(wait_hint.expected_release_s, None, "{wait_hint:?}");
+            }
+            other => panic!("the wait refusal has its own class: {other:?}"),
+        }
+        assert!(
+            !msg.contains("considered evicting"),
+            "the whole path never plans victims: {msg}"
+        );
+        assert!(
+            job.victim.is_none() && job.victims.is_empty() && !job.release_first,
+            "no victim of any kind was queued"
+        );
+        assert!(
+            !msg.contains("No releases allow"),
+            "the row-10 guard sentence belongs to the floor refusal only: {msg}"
+        );
+        assert!(
+            state.jobs.values().all(|j| j.kind != JobKind::Unload),
+            "the refusal names holders; it mints no unload job"
+        );
+        assert!(
+            state.slots[1].occupant.is_some(),
+            "the holder the refusal protects is still loaded"
+        );
+        // The holder scan is a separate reason from the arithmetic: a sample
+        // that momentarily shows the card clean (attribution Unavailable —
+        // exactly when the numeric floor leg would wave the row through)
+        // still refuses while another slot holds a model.
+        // Falsifier: drop `!holders.is_empty()` from the whole leg and this
+        // leg admits — the pin goes red.
+        let mut state = fold_state(&dir);
+        state.cfg.vram_total_gb = 72.0;
+        state.cfg.vram_reserve_gb = 2.0;
+        state.catalog = vec![entry.clone()];
+        state.slots = vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_121,
+                occupant: None,
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_122,
+                occupant: Some(Occupant {
+                    model: "aux-resident".to_string(),
+                    need: Gibibytes(6.0),
+                    port: 18_122,
+                    ticket: holder_ticket.clone(),
+                    loaded_at: Instant::now(),
+                    launched_at_wall: std::time::SystemTime::now(),
+                    spawn_config: None,
+                    stale_config: false,
+                    serve_id: None,
+                    measure: None,
+                }),
+                job: None,
+            },
+        ];
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 0.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        assert!(
+            matches!(
+                state.jobs[&job_id].error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::WholeMachineBusy { .. }
+                ))
+            ),
+            "a momentarily-clean sample must not admit beside a holder: {:?}",
+            state.jobs[&job_id].error
+        );
+    }
+
+    /// The pinned same-slot behavior (operator ruling 2026-11-04, decided
+    /// for B5): an explicit same-slot load of a `whole` row IS a replacement
+    /// of its own slot's occupant — the request named that target, and the
+    /// occupant is never an eviction "to get there". It admits when the rest
+    /// of the card is free; the moment ANY other slot holds something the
+    /// same load refuses, still evicting nothing.
+    /// Falsifier: count the own-slot occupant as a holder and leg 1 goes red;
+    /// skip the holder scan and leg 2 goes red.
+    #[tokio::test]
+    async fn a_whole_row_replaces_its_own_slot_and_waits_for_the_rest() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("whole-sameslot");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("whole.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncategory: work\nvram_gb: 40\nlaunch_only_with_at_least_vram_free: whole\n",
+        )
+        .expect("seed");
+        let entry = rescan_entry(&yaml, "whole");
+        let seat = |state: &mut ActorState, aux: Option<&str>| {
+            state.slots = vec![
+                Slot {
+                    category: CategoryId::Work,
+                    index: 0,
+                    engine_port: 18_123,
+                    occupant: Some(Occupant {
+                        model: "old".to_string(),
+                        need: Gibibytes(30.0),
+                        port: 18_123,
+                        ticket: fold_ticket(18_123),
+                        loaded_at: Instant::now(),
+                        launched_at_wall: std::time::SystemTime::now(),
+                        spawn_config: None,
+                        stale_config: false,
+                        serve_id: None,
+                        measure: None,
+                    }),
+                    job: None,
+                },
+                Slot {
+                    category: CategoryId::Aux,
+                    index: 1,
+                    engine_port: 18_124,
+                    occupant: aux.map(|name| Occupant {
+                        model: name.to_string(),
+                        need: Gibibytes(6.0),
+                        port: 18_124,
+                        ticket: fold_ticket(18_124),
+                        loaded_at: Instant::now(),
+                        launched_at_wall: std::time::SystemTime::now(),
+                        spawn_config: None,
+                        stale_config: false,
+                        serve_id: None,
+                        measure: None,
+                    }),
+                    job: None,
+                },
+            ];
+        };
+        let whole_state = |aux: Option<&str>| {
+            let mut state = fold_state(&dir);
+            state.cfg.vram_total_gb = 72.0;
+            state.cfg.vram_reserve_gb = 2.0;
+            state.catalog = vec![entry.clone()];
+            seat(&mut state, aux);
+            state
+        };
+        // Leg 1: only the replacement target (30) plus the baseline (2) hold
+        // the card — the credited reading reaches 68 — so the load admits and
+        // disposes its own victim, nothing else.
+        let mut state = whole_state(None);
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 32.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(
+            !job.terminal,
+            "the own slot may be replaced: {:?}",
+            job.error
+        );
+        assert_eq!(job.state, SwapState::Dispose);
+        assert_eq!(job.gate_target, Some(68.0));
+        assert_eq!(
+            job.victim.as_ref().map(|v| v.model.as_str()),
+            Some("old"),
+            "the same-slot replacement is the only release a whole load may perform"
+        );
+        assert!(job.victims.is_empty(), "never a cross-slot victim");
+        // Leg 2: the same load one Aux holder later refuses naming it, and
+        // both occupants survive the refusal. The sample still shows only the
+        // own occupant's bytes (attribution Unavailable: the reading alone
+        // would pass the numeric auto floor), so this leg pins the holder
+        // scan as a SEPARATE reason — a clean-looking sample must not admit
+        // a row while another slot holds a model.
+        let mut state = whole_state(Some("aux-resident"));
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 32.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(
+            matches!(
+                job.error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::WholeMachineBusy { .. }
+                ))
+            ),
+            "one foreign slot is enough to wait: {:?}",
+            job.error
+        );
+        let msg = job.error.as_ref().expect("refusal").to_string();
+        assert!(msg.contains("aux-resident"), "{msg}");
+        assert!(
+            msg.contains("at least 68.0 GiB free required"),
+            "the refusal must print the target it needs (B5R-02): {msg}"
+        );
+        assert!(
+            state.slots[0].occupant.is_some() && state.slots[1].occupant.is_some(),
+            "the wait posture kills nothing: both holders are still loaded"
+        );
+        assert!(
+            state.jobs.values().all(|j| j.kind != JobKind::Unload),
+            "the refusal names holders; it mints no unload job"
+        );
+    }
+
+    /// `whole` on a greedy row is legal and REPLACES the greedy floor leg
+    /// (ruling 2026-11-04, documented in MODELS.md): the global
+    /// `greedy_launch_min_free_gb` never applies to it. Leg 1 pins the
+    /// stricter verdict that replacement buys — a driver baseline above the
+    /// reserve denies the launch although the numeric greedy floor (6) would
+    /// pass the same reading; leg 2 admits on a card the reserve covers.
+    /// Falsifier: let `whole` fall through to the greedy default floor and
+    /// leg 1 admits — the pin goes red.
+    #[tokio::test]
+    async fn whole_replaces_the_greedy_floor_leg() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("whole-greedy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("greedy.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncategory: work\ncost: greedy\nvram_gb: 20\nlaunch_only_with_at_least_vram_free: whole\n",
+        )
+        .expect("seed");
+        let entry = rescan_entry(&yaml, "greedy");
+        assert_eq!(entry.vram_gate, crate::model::VramGate::Whole);
+        let whole_state = || {
+            let mut state = fold_state(&dir);
+            state.cfg.vram_total_gb = 72.0;
+            state.cfg.vram_reserve_gb = 2.0;
+            state.cfg.greedy_launch_min_free_gb = 6.0;
+            state.catalog = vec![entry.clone()];
+            state.slots = vec![Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_125,
+                occupant: None,
+                job: None,
+            }];
+            state
+        };
+        // Leg 1: the card holds only a 4 GiB baseline. The greedy floor of 6
+        // would let this through (66 >= 6); the whole gate demands the
+        // baseline live inside the 2 GiB reserve band, so the row waits.
+        let mut state = whole_state();
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 4.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(
+            matches!(
+                job.error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::WholeMachineBusy { .. }
+                ))
+            ),
+            "the greedy floor must NOT stand in for the whole gate: {:?}",
+            job.error
+        );
+        // The holderless refusal (the reviewer's B5R-02 case: a baseline
+        // above the reserve, nothing to name) must print the target, so the
+        // operator sees why 66.0 waited.
+        let msg = job.error.as_ref().expect("refusal").to_string();
+        assert!(
+            msg.contains("at least 68.0 GiB free required") && msg.contains("free 66.0 GiB"),
+            "{msg}"
+        );
+        // Leg 2: a baseline the reserve covers is a fully-free card.
+        let mut state = whole_state();
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 2.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(
+            !job.terminal,
+            "the reserve-covered card admits the greedy whole row: {:?}",
+            job.error
+        );
     }
 
     fn job(id: u64, kind: JobKind, model: &str, error: Option<&str>, outcome: &str) -> JobStatus {
