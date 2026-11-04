@@ -93,6 +93,21 @@ category: {category}
     dir
 }
 
+/// `AppConfig::default()` whose llama binary exists: a missing
+/// [`AppConfig::llama_server_exe`] surfaces as a config-level
+/// `engine_binary_missing` catalog error on every scan whatever the rows say, so a
+/// test asserting `catalog_errors` is EMPTY must not inherit the host's default
+/// path (a runner without `C:\Inference\llama.cpp` sees one there). `tag` keeps
+/// each test's stand-in directory attributable and isolated.
+fn config_with_existing_llama(tag: &str) -> AppConfig {
+    let stand_in = simplehar_se::testutil::temp_dir(tag).join("llama-server.exe");
+    std::fs::write(&stand_in, b"test stand-in").expect("llama stand-in file");
+    AppConfig {
+        llama_server_exe: stand_in,
+        ..AppConfig::default()
+    }
+}
+
 /// [`app`] with extra engine adapters (ids `mock-a`/`mock-b` carrying distinct
 /// `/v1/models` ids, `mock-nodiscovery`, …).
 #[allow(clippy::type_complexity)]
@@ -2552,7 +2567,7 @@ async fn retagging_an_embedding_model_out_of_emb_keeps_it_in_the_catalog() {
     // its row vanishes, and the endpoint answered success. The removal must ride
     // the same atomic rewrite as the category write.
     let (control, _, _, _, _, modelconf) = app(
-        AppConfig::default(),
+        config_with_existing_llama("retag-emb"),
         &[("plain", "mock", CategoryId::Work, Some(4.0))],
     );
     let emb_file = modelconf.join("gemma-emb.yaml");
@@ -2682,7 +2697,7 @@ async fn retagging_a_bom_prefixed_embedding_model_keeps_it_in_the_catalog() {
     // EmbeddingCategoryConflict. Pre-fix this fails: the alias line survives the
     // retag and the rescan reports models=2 with the conflict naming the file.
     let (control, _, _, _, _, modelconf) = app(
-        AppConfig::default(),
+        config_with_existing_llama("retag-bom"),
         &[("plain", "mock", CategoryId::Work, Some(4.0))],
     );
     let bom_file = modelconf.join("gemma-bom.yaml");
