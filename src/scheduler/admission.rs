@@ -2,7 +2,7 @@
 //! the ledger-row registration, the booking-need decision, the admit arming and
 //! decision paths, and the victim planner. The state stays owned by `mod.rs`.
 
-use crate::budget::{self, AdmissionError, BudgetFacts, Gibibytes};
+use crate::budget::{self, AdmissionError, BudgetFacts, Gibibytes, WaitHint};
 use crate::config::CategoryId;
 use crate::model::ModelEntry;
 use std::sync::Arc;
@@ -399,6 +399,11 @@ impl ActorState {
                         // An unreachable floor is always shaped as the floor
                         // refusal: the guard sentence is the actionable fact even
                         // when a (smaller) need deficit also bound.
+                        // Decision-time facts ride the refusal as structured
+                        // fields beside the named holders (the estimate is a
+                        // rolling median of our own measured releases, never a
+                        // promise — see [`ActorState::wait_hint`]).
+                        let wait_hint = self.wait_hint(job_id);
                         let error = if (floor_deficit > 0.0 && floor_deficit >= need_deficit)
                             || no_releases_reach
                         {
@@ -413,6 +418,7 @@ impl ActorState {
                                 victims_considered: considered,
                                 blockers,
                                 no_releases_reach,
+                                wait_hint,
                             }
                         } else {
                             AdmissionError::Insufficient {
@@ -423,6 +429,7 @@ impl ActorState {
                                 facts: Box::new(facts),
                                 victims_considered: considered,
                                 blockers,
+                                wait_hint,
                             }
                         };
                         self.log_refusal(job_id, &SchedulerError::Admission(error.clone()), "gate");
@@ -497,6 +504,39 @@ impl ActorState {
             self.spawn_kill_confirm(job_id);
         } else {
             self.begin_spawn(job_id);
+        }
+    }
+
+    /// What this refusal honestly knows about waiting, computed at decision
+    /// time beside the numbers the gate compared.
+    ///
+    /// The queue rule, defined once here: `queue_position` is the one-based
+    /// place behind the loads already ahead of the refused request — every
+    /// other non-terminal `Load` ledger row in the refused job's category,
+    /// whether in flight or parked, plus this request itself. `None` when
+    /// nothing is ahead: a refusal that got no queue place returns null,
+    /// because the harness placed this request nowhere and quoting "position
+    /// 1" would describe a queue that does not exist. Unload jobs are not
+    /// loads and never count.
+    ///
+    /// `expected_release_s` is the ring's median release duration (seconds).
+    /// `None` until the first driver-confirmed release: the estimate is then
+    /// absent from the refusal, never invented from a default.
+    pub(super) fn wait_hint(&self, refused: JobId) -> WaitHint {
+        let category = self.jobs[&refused].category;
+        let ahead = self
+            .jobs
+            .iter()
+            .filter(|(id, job)| {
+                **id != refused
+                    && job.kind == JobKind::Load
+                    && !job.terminal
+                    && job.category == category
+            })
+            .count();
+        WaitHint {
+            expected_release_s: self.release_samples.median_s(),
+            queue_position: (ahead > 0).then(|| ahead as u32 + 1),
         }
     }
 

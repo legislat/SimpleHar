@@ -3166,6 +3166,167 @@ async fn below_launch_floor_gets_its_own_error_code() {
 }
 
 #[tokio::test]
+async fn a_first_refusal_names_no_estimate_and_no_place() {
+    // The honesty floor for the wait hint: a refusal before ANY driver-confirmed
+    // release omits `expected_release_s` (falsifier: fabricate a default 0.0
+    // estimate in `error_body` and this leg goes red — the harness must stay
+    // silent when it has no basis), and a refusal with nothing ahead states
+    // `queue_position: null` instead of quoting a place it did not grant
+    // (falsifier: drop the no-ahead guard in `ActorState::wait_hint` and the
+    // null leg goes red). The message still carries every number exactly as
+    // before. 90 GiB over a 70 GiB capacity, with nothing loaded, refuses.
+    let (control, _, _, _, _, _) = app(
+        AppConfig::default(),
+        &[("huge-a", "mock", CategoryId::Work, Some(90.0))],
+    );
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"huge-a"}"#).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert_eq!(body["code"], "unavailable");
+    assert_eq!(body["error"]["code"], "unavailable");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("need 90.0 GiB"),
+        "the numbers must still ride the message: {body}"
+    );
+    assert!(
+        body.get("expected_release_s").is_none(),
+        "no confirmed release yet: the estimate must be absent, not invented: {body}"
+    );
+    assert_eq!(
+        body.get("queue_position"),
+        Some(&Value::Null),
+        "nothing is ahead and this refusal got no place: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_confirmed_release_lands_the_estimate_and_a_place_on_the_next_refusal() {
+    // The full path through the real actor: a REAL unload runs to a
+    // driver-confirmed release (`mock` engine; the WORK slot reads `empty` only
+    // once the confirmation lands — the occupant clears at the confirmed
+    // release, never at the acceptance), so the ring holds a measured sample.
+    // A load that never becomes ready (`mock-never`, in-flight and non-terminal
+    // until its 120 s deadline) then stands ahead in the refused category, and
+    // the refusal must quote the estimate and the documented place.
+    let (control, _, _, _, _, _) = app(
+        aux_slots(3),
+        &[
+            ("rel", "mock", CategoryId::Work, Some(4.0)),
+            ("aux-a", "mock", CategoryId::Aux, Some(30.0)),
+            ("aux-slow", "mock-never", CategoryId::Aux, Some(30.0)),
+            ("aux-over", "mock", CategoryId::Aux, Some(20.0)),
+        ],
+    );
+
+    // Leg 1: a real unload, confirmed. `/har/unload` 200 is an acceptance, so
+    // wait for the slot to actually empty (the occupant clears on the
+    // confirmation) — that confirmation is the measured release the median runs
+    // on. Falsifier: never feed the ring in the `Released(Ok)` arm and the
+    // estimate leg at the end goes red.
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"rel"}"#).await;
+    assert_eq!(status, StatusCode::OK, "load rel: {body}");
+    let (status, body) = post_json(&control, "/har/unload", r#"{"model":"rel"}"#).await;
+    assert_eq!(status, StatusCode::OK, "unload accepted: {body}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (_, status_doc) = get_json(&control, "/har/status").await;
+        let work = status_doc["slots"]
+            .as_array()
+            .expect("slots array")
+            .iter()
+            .find(|slot| slot["category"] == "WORK")
+            .expect("WORK slot present");
+        if work["state"] == "empty" && work["model"].is_null() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rel release never reached the confirmed window: {status_doc}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Leg 2: one AUX occupant booked, one AUX load in flight and never ready.
+    // Its POST parks on the load's reply (readiness never lands), so it runs on
+    // a task while the refusal is judged.
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"aux-a"}"#).await;
+    assert_eq!(status, StatusCode::OK, "load aux-a: {body}");
+    let slow_post = {
+        let control = control.clone();
+        tokio::spawn(
+            async move { post_json(&control, "/har/load", r#"{"model":"aux-slow"}"#).await },
+        )
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (_, jobs) = get_json(&control, "/har/jobs").await;
+        let flying = jobs["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .any(|job| job["model"] == "aux-slow" && job["terminal"] == false);
+        if flying {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the never-ready AUX load never became an in-flight row: {jobs}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Leg 3: the refusal. `aux-over` (20 GiB) arms on the third, empty AUX
+    // slot; the ledger already holds aux-a plus the in-flight debit for
+    // aux-slow, and nothing same-category is evictable, so the gate refuses in
+    // `finish_admit` — with the hint born beside the numbers.
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"aux-over"}"#).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert_eq!(body["code"], "unavailable");
+    assert_eq!(
+        body["error"]["code"], "unavailable",
+        "the OpenAI envelope keeps today's shape"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("need 20.0 GiB"),
+        "the message keeps the numbers: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("blocked by: aux-a"),
+        "the named holders still ride the tail: {body}"
+    );
+    let estimate = body["expected_release_s"]
+        .as_f64()
+        .expect("the confirmed rel release must land a measurable estimate");
+    assert!(
+        (0.0..30.0).contains(&estimate),
+        "a mock release is seconds, not geological time: {estimate}"
+    );
+    assert_eq!(
+        body["queue_position"], 2,
+        "the in-flight aux-slow load is ahead in AUX: this refusal sits at place 2"
+    );
+
+    // Teardown honestly: cancelling the never-ready swap releases its engine
+    // and resolves the parked POST (409 cancelled) before the test ends.
+    let (status, body) = post_json(&control, "/har/unload", r#"{"model":"aux-slow"}"#).await;
+    assert_eq!(status, StatusCode::OK, "cancel accepted: {body}");
+    let (slow_status, slow_body) = slow_post.await.expect("slow task joined");
+    assert_eq!(
+        slow_status,
+        StatusCode::CONFLICT,
+        "the cancelled swap answers conflict, not a receipt: {slow_body}"
+    );
+}
+
+#[tokio::test]
 async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
     let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
 

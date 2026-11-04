@@ -98,6 +98,22 @@ scanner would refuse to publish), `method_not_allowed` (405),
 `internal` (500). A refusal that carries numbers puts them in `message` and
 in the job ledger, never in a bare status.
 
+An admission refusal that answers `unavailable` or `below_launch_floor` also
+carries two wait fields at the flat envelope top level:
+
+- `queue_position`: an integer, or an explicit `null`. It is the one-based
+  place behind the loads that are already ahead in the refused category.
+  A `null` means the refusal got no queue place and no load is ahead.
+- `expected_release_s`: a number of seconds, to one decimal. It is a rolling
+  median of the harness's own measured releases. It is an estimate, never a
+  promise. The harness omits the field when it has no measured release to
+  quote; an absent field means the harness has no basis to quote it.
+
+Other refusals that answer `unavailable` omit both fields, like every other
+error class. Neither field appears inside the OpenAI `error` sub-object.
+Both describe the decision moment only. The harness runs no wait queue and
+keeps no promise about a later load.
+
 An unknown route and a wrong method answer this same envelope on every
 listener. A body over the limit answers `400 bad_request`, not `413`
 (64 KiB on the `/har/*` control routes, 64 MiB on the proxy routes). The

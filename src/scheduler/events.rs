@@ -39,7 +39,8 @@ impl ActorState {
             return;
         }
         match (state, event) {
-            (SwapState::Dispose, Event::Released(Ok(()))) => {
+            (SwapState::Dispose, Event::Released(Ok(elapsed))) => {
+                self.release_samples.push(elapsed);
                 self.set_timing(job_id, |t| &mut t.release_ms);
                 self.clear_released_victim_slot(job_id);
                 if let Some(victim) = self.jobs[&job_id].victim.clone() {
@@ -160,8 +161,11 @@ impl ActorState {
                 // arm is the last moment anything in the scheduler still knows the
                 // ticket — hand it to the one bounded late watch (option B). A confirmed
                 // release needs no watch, and a job that never spawned owed none.
-                if release.is_err() {
-                    self.spawn_late_release_watch(job_id);
+                // A confirmed release is a measured release whatever state reaped it:
+                // it belongs in the wait-estimate ring like a Dispose one.
+                match release {
+                    Ok(elapsed) => self.release_samples.push(elapsed),
+                    Err(_) => self.spawn_late_release_watch(job_id),
                 }
                 self.step(job_id, SwapState::Reap);
                 self.step(job_id, SwapState::Idle);
@@ -171,10 +175,12 @@ impl ActorState {
                     .unwrap_or_else(|| SchedulerError::Spawn("unknown failure".to_string()));
                 self.finish(job_id, Err(error), "failed");
             }
-            (SwapState::CancelRequested, Event::Released(Ok(()))) => {
+            (SwapState::CancelRequested, Event::Released(Ok(elapsed))) => {
                 // The release this job's own (aborted) reap task never proved: now the
                 // victim's engine is gone, so its slot must go the way a completed
                 // Dispose release takes it, or the ledger debits a corpse forever.
+                // Confirmed means measured: the duration joins the wait-estimate ring.
+                self.release_samples.push(elapsed);
                 self.clear_released_victim_slot(job_id);
                 self.finish_cancelled(job_id);
             }

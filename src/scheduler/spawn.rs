@@ -367,6 +367,12 @@ impl ActorState {
             );
             return;
         }
+        // Accept-to-confirmed clock for the wait-estimate ring: stamped at the
+        // accept of this reap (the moment the release was committed), elapsed
+        // inside the task at the driver confirmation, so the actor itself never
+        // touches wall clock for the sample (the median it quotes is measured,
+        // not reconstructed).
+        let accepted = Instant::now();
         let tx = self.tx.clone();
         let runtime = Arc::clone(&self.runtime);
         let timeout = Duration::from_secs(self.cfg.release_timeout_s);
@@ -418,7 +424,10 @@ impl ActorState {
             };
             let _ = tx.send(ActorMsg::Event {
                 job: job_id,
-                event: Event::Released(outcome),
+                event: Event::Released(match outcome {
+                    Ok(()) => Ok(accepted.elapsed()),
+                    Err(error) => Err(error),
+                }),
             });
         });
         self.jobs

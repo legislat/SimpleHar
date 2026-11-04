@@ -153,6 +153,24 @@ pub fn grade_card_occupancy(
 /// How far apart two GiB figures must be before the refusal bothers naming both.
 const DISAGREE_GIB: f64 = 0.05;
 
+/// What the refusal knows about WAITING, beside the named holders: an estimate
+/// and a queue place, each `None` when the harness has no basis to quote it.
+/// The two memory refusals carry this struct; the API renders `Some` figures
+/// as structured JSON fields. Neither figure is a promise: the harness runs no
+/// wait queue, so both describe the decision moment only (operator ruling
+/// 2026-11-04: "an estimate, never a promise").
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WaitHint {
+    /// Rolling median of the harness's own measured release durations in
+    /// seconds (accept to driver-confirmed), one decimal when rendered. `None`
+    /// when no release has been confirmed since boot: absent, never invented.
+    pub expected_release_s: Option<f64>,
+    /// One-based place behind the loads already ahead in the refused category,
+    /// per the rule documented on `ActorState::wait_hint`. `None` when nothing
+    /// is ahead and this refusal got no queue place — null, never a lie.
+    pub queue_position: Option<u32>,
+}
+
 /// Refusal reasons of the admission gate, with the numbers used (G13).
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum AdmissionError {
@@ -209,6 +227,9 @@ pub enum AdmissionError {
         victims_considered: Vec<VictimInfo>,
         /// Models that cannot be evicted, with reasons.
         blockers: Vec<BlockerInfo>,
+        /// What the decision knows about waiting (estimate + place), computed
+        /// at refusal time beside these numbers.
+        wait_hint: WaitHint,
     },
     /// The model's launch floor was not met: the physical free VRAM seen at decision
     /// time sits below `launch_only_with_at_least_vram_free`, so the
@@ -242,6 +263,9 @@ pub enum AdmissionError {
         /// evictable resident, never foreign occupancy — would not reach the floor.
         /// The refusal says so and the load was refused BEFORE any release.
         no_releases_reach: bool,
+        /// What the decision knows about waiting (estimate + place), computed
+        /// at refusal time beside these numbers.
+        wait_hint: WaitHint,
     },
 }
 
@@ -577,6 +601,7 @@ mod tests {
             victims_considered: Vec::new(),
             blockers: Vec::new(),
             no_releases_reach: false,
+            wait_hint: WaitHint::default(),
         }
         .to_string();
         assert!(
@@ -617,6 +642,7 @@ mod tests {
             victims_considered: Vec::new(),
             blockers: Vec::new(),
             no_releases_reach: true,
+            wait_hint: WaitHint::default(),
         }
         .to_string();
         assert!(
@@ -641,6 +667,7 @@ mod tests {
             }),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
+            wait_hint: WaitHint::default(),
         }
         .to_string();
         assert!(clamped.contains("free 1.8 GiB"), "{clamped}");
@@ -658,6 +685,7 @@ mod tests {
             }),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
+            wait_hint: WaitHint::default(),
         }
         .to_string();
         assert!(!plain.contains('('), "{plain}");
@@ -696,6 +724,7 @@ mod tests {
             }),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
+            wait_hint: WaitHint::default(),
         }
         .to_string();
         assert!(
@@ -711,6 +740,7 @@ mod tests {
             facts: Box::default(),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
+            wait_hint: WaitHint::default(),
         }
         .to_string();
         assert!(!quiet.contains("unreleasable"), "{quiet}");

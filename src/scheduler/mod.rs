@@ -616,8 +616,11 @@ impl Clone for ActorMsg {
 /// Result of an async step, sent back to the actor by the spawned step task.
 #[derive(Debug)]
 enum Event {
-    /// Kill + release-evidence poll finished (G12).
-    Released(Result<(), SpawnError>),
+    /// Kill + release-evidence poll finished (G12). `Ok` carries the measured
+    /// accept-to-confirmed duration of that release, stamped by
+    /// [`ActorState::spawn_kill_confirm`] and elapsed inside the step task, so
+    /// the actor records the sample without ever consulting wall clock itself.
+    Released(Result<Duration, SpawnError>),
     /// Engine start finished.
     Spawned(Result<Spawned, SpawnError>),
     /// Readiness loop finished (terminal tri-state only) plus the engine's
@@ -741,6 +744,10 @@ struct ActorState {
     /// Waiters attached to rescans whose off-thread scan has not landed yet, each
     /// stamped with the dispatch sequence of the scan they wait behind.
     pending_reload: Vec<(u64, Waiter)>,
+    /// Rolling median source for refusal wait estimates: every driver-confirmed
+    /// release appends its accept-to-confirmed duration here (memory-only,
+    /// [`ReleaseSamples`]); a refusal quotes the median or nothing.
+    release_samples: ReleaseSamples,
     /// Dispatch counter for reload scans; the apply side records the newest
     /// sequence it honored, so an out-of-order completion never replaces the
     /// catalog with an older filesystem snapshot.
@@ -757,6 +764,54 @@ struct Slot {
     engine_port: u16,
     occupant: Option<Occupant>,
     job: Option<JobId>,
+}
+
+/// How many recent confirmed releases the wait-estimate ring keeps. Bounded by
+/// design (same posture as the log ring): the median answers a refusal, and 32
+/// confirmed releases describe recent release behavior as well as a longer
+/// window without letting one old swap dominate.
+const RELEASE_SAMPLE_CAP: usize = 32;
+
+/// Rolling ring of the harness's own measured release durations, in seconds
+/// (accept to driver-confirmed). Memory-only by ruling: nothing is persisted,
+/// so a fresh process has no sample and quotes no estimate — the honest
+/// starting state, not a missing cache (operator ruling 2026-11-04).
+struct ReleaseSamples {
+    seconds: std::collections::VecDeque<f64>,
+}
+
+impl ReleaseSamples {
+    fn new() -> Self {
+        Self {
+            seconds: std::collections::VecDeque::with_capacity(RELEASE_SAMPLE_CAP),
+        }
+    }
+
+    /// Appends one confirmed release, dropping the oldest sample past the cap.
+    fn push(&mut self, elapsed: Duration) {
+        if self.seconds.len() == RELEASE_SAMPLE_CAP {
+            self.seconds.pop_front();
+        }
+        self.seconds.push_back(elapsed.as_secs_f64());
+    }
+
+    /// The median release duration in seconds. Odd count: the middle value.
+    /// Even count: the mean of the two middle values (the exact-even rule —
+    /// it never invents a sample that was not measured). `None` on an empty
+    /// ring: with no confirmed release there is no basis to quote an estimate.
+    fn median_s(&self) -> Option<f64> {
+        if self.seconds.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.seconds.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let mid = sorted.len() / 2;
+        Some(if sorted.len() % 2 == 1 {
+            sorted[mid]
+        } else {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        })
+    }
 }
 
 /// The occupant's last use: the proxy-side hint when present, else load time.
@@ -1067,6 +1122,7 @@ impl ActorState {
             pending: HashMap::new(),
             unload_after_finish: HashSet::new(),
             pending_reload: Vec::new(),
+            release_samples: ReleaseSamples::new(),
             // Reloads are sequenced from 1: `last_reload_applied` starts at 0 and
             // the newest-wins gate is `seq > last`, so the very first reload (the
             // only scan whose completion may replace the boot catalog) must clear
@@ -8071,6 +8127,116 @@ mod tests {
             ActorState::booking_need(&row),
             Ok(None),
             "a greedy basalt row without a nominal books the room at admit"
+        );
+    }
+
+    /// The wait-estimate ring quotes exact medians: the middle sample for an odd
+    /// count, and the mean of the two middle samples for an even count — the
+    /// estimate a refusal carries is computed over the real set, never rounded
+    /// to one of its members. Falsifier: make the even branch answer
+    /// `sorted[mid]` and the last leg goes red.
+    #[test]
+    fn release_median_is_the_middle_sample_or_the_mean_of_the_two_middles() {
+        let mut ring = super::ReleaseSamples::new();
+        assert_eq!(
+            ring.median_s(),
+            None,
+            "no confirmed release: no estimate, never an invented default"
+        );
+        for secs in [4.0, 1.0, 9.0, 3.0, 7.0] {
+            ring.push(Duration::from_secs_f64(secs));
+        }
+        assert_eq!(ring.median_s(), Some(4.0), "odd count: middle of 1,3,4,7,9");
+        ring.push(Duration::from_secs(2));
+        assert_eq!(
+            ring.median_s(),
+            Some(3.5),
+            "even count: mean of the two middles of 1,2,3,4,7,9"
+        );
+    }
+
+    /// The ring is bounded: a push past the cap drops the oldest sample, and the
+    /// median then runs over the newest `RELEASE_SAMPLE_CAP` releases only — a
+    /// swap that stopped long ago must not anchor today's estimate forever.
+    /// Falsifier: delete the `pop_front` and both legs go red.
+    #[test]
+    fn the_release_ring_keeps_only_the_newest_samples() {
+        let mut ring = super::ReleaseSamples::new();
+        for secs in 1..=super::RELEASE_SAMPLE_CAP as u64 + 1 {
+            ring.push(Duration::from_secs(secs));
+        }
+        assert_eq!(
+            ring.seconds.len(),
+            super::RELEASE_SAMPLE_CAP,
+            "the 33rd sample must evict the first, not grow the ring"
+        );
+        // Kept: 2..=33 — even count, middles 17 and 18.
+        assert_eq!(ring.median_s(), Some(17.5));
+    }
+
+    /// The queue rule as documented on `ActorState::wait_hint`: a one-based
+    /// place behind the loads really ahead in the refused category, and `None`
+    /// when nothing is ahead — the harness never quotes a place it did not
+    /// grant. Falsifiers: drop the `+ 1` and the Work leg goes red; drop the
+    /// category filter and the RP leg goes red; drop the `> 0` guard and the
+    /// no-ahead leg goes red.
+    #[test]
+    fn a_refusal_quotes_a_place_only_behind_real_loads() {
+        let dir = crate::testutil::temp_dir("waithint");
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        adapters.insert("mock".to_string(), Arc::new(MockAdapter));
+        let mut state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            dir,
+            adapters,
+            Arc::new(NeverRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        );
+        let entry = |name: &str, category: CategoryId| -> ModelEntry {
+            let (map, _) = crate::model::scan::parse_flat_yaml("engine: mock\nvram_gb: 2\n");
+            let mut entry = ModelEntry::from_flat(&map, name).expect("entry");
+            entry.category = category;
+            entry
+        };
+        let refused =
+            state.register_queued_load(0, &entry("refused", CategoryId::Work), Vec::new());
+        let ahead_a =
+            state.register_queued_load(0, &entry("ahead-a", CategoryId::Work), Vec::new());
+        let ahead_b =
+            state.register_queued_load(1, &entry("ahead-b", CategoryId::Work), Vec::new());
+        state.register_queued_load(2, &entry("other", CategoryId::Rp), Vec::new());
+
+        let hint = state.wait_hint(refused);
+        assert_eq!(
+            hint.queue_position,
+            Some(3),
+            "two Work loads are ahead: the refusal places itself third"
+        );
+        assert_eq!(
+            hint.expected_release_s, None,
+            "no confirmed release yet: the estimate stays absent"
+        );
+
+        // A category with nothing ahead got no place: null, never a quoted "1".
+        let empty_job =
+            state.register_queued_load(3, &entry("refused-emb", CategoryId::Emb), Vec::new());
+        assert_eq!(
+            state.wait_hint(empty_job).queue_position,
+            None,
+            "an empty ahead-set is not a queue"
+        );
+
+        // A terminal row is not "ahead": finishing the two Work loads empties the
+        // set without deleting the rows (the ledger never deletes).
+        for id in [ahead_a, ahead_b] {
+            state.jobs.get_mut(&id).expect("row").terminal = true;
+        }
+        assert_eq!(
+            state.wait_hint(refused).queue_position,
+            None,
+            "terminal rows describe history, not a queue"
         );
     }
 }

@@ -71,13 +71,22 @@ pub enum ApiError {
     #[error("bad request: {reason}")]
     BadRequest { reason: String },
     /// Admission refusal or under-specified model; the message carries the numbers.
+    /// A memory refusal may additionally carry the decision's wait hint
+    /// ([`crate::budget::WaitHint`]), rendered as flat envelope fields.
     #[error("service unavailable: {reason}")]
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+        wait_hint: Option<crate::budget::WaitHint>,
+    },
     /// The model's `launch_only_with_at_least_vram_free` floor was not met — the
     /// load is refused before spawn (greedy-offload thrash guard). Distinct code
     /// so clients can tell "card busy with foreigners" from plain over-commit.
+    /// Carries the same optional wait hint as [`Self::Unavailable`].
     #[error("service unavailable: {reason}")]
-    BelowLaunchFloor { reason: String },
+    BelowLaunchFloor {
+        reason: String,
+        wait_hint: Option<crate::budget::WaitHint>,
+    },
     /// The card could not be read at all, so admission refused rather than guessed
     /// (503). Distinct from `unavailable` (over-commit) so a client can tell a dead
     /// witness from a busy card.
@@ -152,6 +161,18 @@ impl ApiError {
             ApiError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             ApiError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             ApiError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// The wait hint a client may branch on, present only on the two memory
+    /// refusal classes that a refusal decision produced with one. `Some` here
+    /// says the harness can name a queue place or quote an estimate — the
+    /// per-field `None`s still stand (no place, or no release sample).
+    pub fn wait_hint(&self) -> Option<crate::budget::WaitHint> {
+        match self {
+            ApiError::Unavailable { wait_hint, .. }
+            | ApiError::BelowLaunchFloor { wait_hint, .. } => *wait_hint,
+            _ => None,
         }
     }
 
@@ -242,7 +263,20 @@ fn error_body(error: &ApiError) -> Value {
         other => other.to_string(),
     };
     let code = error.code();
-    router_error_body(code, message)
+    let mut body = router_error_body(code, message);
+    // A refusal that knows about waiting adds its two structured fields at the
+    // flat envelope top level, beside `code`/`message`. `queue_position` is an
+    // integer or an explicit null (null: the refusal got no queue place).
+    // `expected_release_s` is seconds, one decimal, and absent when the
+    // harness has no measured release to base it on — never a fabricated
+    // default. The OpenAI `error` sub-object keeps exactly today's shape.
+    if let Some(hint) = error.wait_hint() {
+        body["queue_position"] = json!(hint.queue_position);
+        if let Some(seconds) = hint.expected_release_s {
+            body["expected_release_s"] = json!((seconds * 10.0).round() / 10.0);
+        }
+    }
+    body
 }
 
 impl IntoResponse for ApiError {
@@ -260,29 +294,36 @@ impl From<SchedulerError> for ApiError {
             SchedulerError::UnknownJob(job) => ApiError::NotFound {
                 what: format!("job {job}"),
             },
-            SchedulerError::Admission(reason) => {
-                if matches!(
-                    reason,
-                    crate::budget::AdmissionError::BelowLaunchFloor { .. }
-                ) {
-                    ApiError::BelowLaunchFloor {
-                        reason: reason.to_string(),
+            SchedulerError::Admission(admission) => {
+                // The message keeps carrying every number (the pins below and in
+                // `tests/api_surface.rs` prove it); the structured wait hint rides
+                // beside it on the two memory refusals that compute one.
+                let reason = admission.to_string();
+                match admission {
+                    crate::budget::AdmissionError::BelowLaunchFloor { wait_hint, .. } => {
+                        ApiError::BelowLaunchFloor {
+                            reason,
+                            wait_hint: Some(wait_hint),
+                        }
                     }
-                } else if matches!(
-                    reason,
-                    crate::budget::AdmissionError::WitnessUnavailable { .. }
-                ) {
-                    ApiError::WitnessUnavailable {
-                        reason: reason.to_string(),
+                    crate::budget::AdmissionError::Insufficient { wait_hint, .. } => {
+                        ApiError::Unavailable {
+                            reason,
+                            wait_hint: Some(wait_hint),
+                        }
                     }
-                } else {
-                    ApiError::Unavailable {
-                        reason: reason.to_string(),
+                    crate::budget::AdmissionError::WitnessUnavailable { .. } => {
+                        ApiError::WitnessUnavailable { reason }
                     }
+                    _ => ApiError::Unavailable {
+                        reason,
+                        wait_hint: None,
+                    },
                 }
             }
             SchedulerError::Engine(reason) => ApiError::Unavailable {
                 reason: reason.to_string(),
+                wait_hint: None,
             },
             SchedulerError::Spawn(reason) | SchedulerError::EngineFailed(reason) => {
                 ApiError::Upstream { reason }
@@ -295,6 +336,7 @@ impl From<SchedulerError> for ApiError {
             },
             SchedulerError::SettleTimeout { .. } => ApiError::Unavailable {
                 reason: error.to_string(),
+                wait_hint: None,
             },
             SchedulerError::ActorGone => ApiError::Internal {
                 reason: "scheduler is not running".to_string(),
@@ -3589,6 +3631,47 @@ mod tests {
         assert_eq!(body["error"]["type"], "simplehar_error");
         assert_eq!(body["error"]["code"], "not_found");
         assert_eq!(body["error"]["message"], body["message"]);
+        // An error without a wait hint grows neither field (falsifier: render
+        // the hint for every class and the `not_found` body goes red here).
+        assert!(body.get("queue_position").is_none());
+        assert!(body.get("expected_release_s").is_none());
+    }
+
+    #[test]
+    fn error_body_renders_the_wait_hint_as_flat_fields_only() {
+        // Both fields present: place + estimate at the flat top level, seconds
+        // rounded to one decimal, the OpenAI sub-object untouched.
+        let err = ApiError::Unavailable {
+            reason: "insufficient VRAM".to_string(),
+            wait_hint: Some(crate::budget::WaitHint {
+                expected_release_s: Some(4.249),
+                queue_position: Some(2),
+            }),
+        };
+        let body = error_body(&err);
+        assert_eq!(body["queue_position"], json!(2));
+        assert_eq!(body["expected_release_s"], json!(4.2));
+        assert_eq!(body["error"]["message"], body["message"]);
+        assert_eq!(body["error"]["type"], "simplehar_error");
+        assert!(body["error"].get("queue_position").is_none());
+        assert!(body["error"].get("expected_release_s").is_none());
+
+        // A refusal that got no queue place renders an explicit null, and a
+        // hint without any release sample omits the estimate key entirely
+        // (falsifier: invent `expected_release_s: 0.0` and this leg goes red —
+        // the harness must stay silent when it has no basis).
+        let no_basis = ApiError::BelowLaunchFloor {
+            reason: "launch floor not met".to_string(),
+            wait_hint: Some(crate::budget::WaitHint::default()),
+        };
+        let body = error_body(&no_basis);
+        assert_eq!(body["code"], "below_launch_floor");
+        assert_eq!(
+            body.get("queue_position"),
+            Some(&Value::Null),
+            "no place is a stated null, not a missing key: {body}"
+        );
+        assert!(body.get("expected_release_s").is_none(), "{body}");
     }
 
     #[test]
@@ -3608,7 +3691,8 @@ mod tests {
         );
         assert_eq!(
             ApiError::Unavailable {
-                reason: "x".to_string()
+                reason: "x".to_string(),
+                wait_hint: None,
             }
             .status(),
             StatusCode::SERVICE_UNAVAILABLE
@@ -3660,12 +3744,24 @@ mod tests {
             }),
             victims_considered: Vec::new(),
             blockers: Vec::new(),
+            wait_hint: crate::budget::WaitHint {
+                expected_release_s: Some(4.0),
+                queue_position: Some(2),
+            },
         });
         let mapped = ApiError::from(admission);
         assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             mapped.to_string().contains("50.0 GiB"),
             "numbers must travel: {mapped}"
+        );
+        assert_eq!(
+            mapped.wait_hint(),
+            Some(crate::budget::WaitHint {
+                expected_release_s: Some(4.0),
+                queue_position: Some(2),
+            }),
+            "the decision's wait hint rides the typed error, not only the message"
         );
         assert_eq!(
             ApiError::from(SchedulerError::Spawn("boom".to_string())).status(),
@@ -5466,6 +5562,7 @@ mod tests {
         }
         let numbers = ApiError::Unavailable {
             reason: "the load needs 18.0 GiB free; 9.4 GiB is".to_string(),
+            wait_hint: None,
         };
         let body = error_body(&numbers);
         assert!(
