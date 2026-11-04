@@ -134,6 +134,27 @@ async fn wait_until(
     }
 }
 
+/// Polls the model's yaml until it carries every expected key. `await_measured`
+/// waits on the in-memory commit; the yaml write-back is a separate rename a few
+/// syscalls later, so reading right after the commit can still see the pre-fold
+/// bytes (the CI flake of `serving_window_folds_total_diff_into_the_yaml_measured_range`).
+/// Returns the file's text for further content assertions; on timeout the failure
+/// names the last observed bytes.
+async fn await_yaml_contains(path: &std::path::Path, wants: &[&str], secs: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let yaml = std::fs::read_to_string(path).expect("yaml readable");
+        if wants.iter().all(|want| yaml.contains(want)) {
+            return yaml;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "yaml never carried {wants:?} within {secs}s; last bytes: {yaml}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn admission_refuses_when_the_card_has_no_room() {
     // The card is 72 GiB and reports 70 used — whatever holds it (a foreign process
@@ -481,7 +502,12 @@ async fn serving_window_folds_total_diff_into_the_yaml_measured_range() {
     witness.set(sample(72.0, 50.0, vec![]));
     await_measured(&handle, "a", (Some(20.0), Some(10.0))).await;
 
-    let yaml = std::fs::read_to_string(dir.join("a.yaml")).expect("yaml readable");
+    let yaml = await_yaml_contains(
+        &dir.join("a.yaml"),
+        &["measured_gb: 20.0", "measured_gb_min: 10.0"],
+        10,
+    )
+    .await;
     assert!(yaml.contains("measured_gb: 20.0"), "was: {yaml}");
     assert!(yaml.contains("measured_gb_min: 10.0"), "was: {yaml}");
     assert!(
@@ -534,7 +560,7 @@ async fn the_measured_fold_never_ambers_its_own_resident() {
     // the swap and await one more publish after `await_measured` (the note handler
     // publishes), then reload.
     let path = dir.join("foldy.yaml");
-    let yaml = std::fs::read_to_string(&path).expect("yaml readable");
+    let yaml = await_yaml_contains(&path, &["measured_gb: 10.0"], 10).await;
     assert!(
         yaml.contains("measured_gb: 10.0"),
         "the fold really rewrote the resident's yaml (the pin would be vacuous otherwise): {yaml}"
@@ -646,7 +672,7 @@ async fn replacement_is_measured_against_the_post_release_baseline() {
     // the engine's true 10 GiB rather than a negative diff that is never recorded.
     witness.set(sample(72.0, 10.0, vec![]));
     await_measured(&handle, "next", (Some(10.0), Some(10.0))).await;
-    let yaml = std::fs::read_to_string(dir.join("next.yaml")).expect("yaml readable");
+    let yaml = await_yaml_contains(&dir.join("next.yaml"), &["measured_gb: 10.0"], 10).await;
     assert!(yaml.contains("measured_gb: 10.0"), "was: {yaml}");
 }
 
@@ -721,7 +747,9 @@ async fn a_nonsense_witness_reading_is_never_persisted() {
         Duration::from_secs(3),
     )
     .await;
-    let yaml = std::fs::read_to_string(dir.join("model.yaml")).expect("yaml readable");
+    // Wait for the honest fold to be on disk first, so the negative claim below
+    // is about the post-fold file and not about bytes that predate the fold.
+    let yaml = await_yaml_contains(&dir.join("model.yaml"), &["measured_gb: 10.0"], 10).await;
     assert!(
         !yaml.contains("measured_gb: 72"),
         "a wedged driver must not become the model's footprint: {yaml}"
