@@ -352,7 +352,7 @@ recorded here so dated references to ARCHIVED still resolve:
   (variant A) = Wave-C probe for display/audit only, never booking (post-spawn, trigger
   unverified b11669); hand-written GGUF formula REJECTED (upstream ships the calculator);
   quiescent `total_diff` re-mint demoted to the Wave-C cross-check that calibrates the
-  margin. Full design: `D:\WORKSPACE-VS\research\Search#40-llama-vram-booking-own-word.md` (external
+  margin. Full design: the operator's research note `Search#40-llama-vram-booking-own-word` (kept off-repo; external
    operator-machine reference, not part of this repository).
   **AMENDED same session (operator approved):** cache policy = warm **all** llama rows at
   boot/rescan (deferred serial queue, never near `first_bind`, cancelled+redone on rescan,

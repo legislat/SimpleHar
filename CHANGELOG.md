@@ -20,9 +20,9 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## v1.1.3 - 2026-11-04
 
-Commit: `ba7d3aa` (release prep). Artifact: `simplehar-se.exe`, SHA256
-`125603C84D1522C84B20430EE2ECA426D73DDE4246C186DDD5DF683A136FE7F3`, built
-2026-11-04 and staged at `C:\Inference\SimpleHar-SE_release_v1.1.3`.
+Tag: `v1.1.3`. Commit: `ba7d3aa` (release prep). Artifact: `simplehar-se.exe`,
+built 2026-11-04, SHA256
+`125603C84D1522C84B20430EE2ECA426D73DDE4246C186DDD5DF683A136FE7F3`.
 
 ### Added
 
@@ -30,8 +30,8 @@ Commit: `ba7d3aa` (release prep). Artifact: `simplehar-se.exe`, SHA256
   harness reads the footprint from the engine's own status snapshot (`/v1/status`
   for Basalt, `/status` for Strata) and stamps it `engine_status`. Above the
   declared `vram_gb` the measured figure books instead of it; the declared
-  value stays the floor. The card-window duty to capture the real status
-  bodies stays open.
+  value stays the floor. Capture of the status bodies on real hardware is
+  still pending.
 - A process engine that answers no status endpoint is measured from the
   witness over its own process tree: the engine's pid plus its direct
   children. That figure books as `per_process`. A `total_diff` figure stays
@@ -45,11 +45,11 @@ Commit: `ba7d3aa` (release prep). Artifact: `simplehar-se.exe`, SHA256
 - A Basalt row may declare `cost: greedy` (operator ruling 2026-11-04: the
   engine offloads experts to RAM dynamically). A greedy Basalt row may omit
   `vram_gb`: a greedy admit never refuses on the nominal size, and the
-  booking takes at most the room at admit; the launch floor is the gate.
-  The operator ruling sets the floor at 60 GiB; the operator writes
-  `launch_only_with_at_least_vram_free: 60` after this build deploys,
-  because a greedy edit ahead of the new binary drops the row from the
-  catalog. A `vram_gb` present on a greedy row is the last measured figure:
+  booking takes at most the room at admit; the launch floor is the gate. The
+  ruling sets the launch floor at 60 GiB. Note for owners of existing rows:
+  a `cost: greedy` edit made before this binary is in place drops the row
+  from the catalog, so set the row to greedy together with the new build.
+  A `vram_gb` present on a greedy row is the last measured figure:
   it never refuses the admit and books only up to the room at admit; the
   measured pair never books or re-books a greedy row. A `cost: fixed` row
   still requires `vram_gb`, and `cost: exact` still refuses with a message
@@ -86,27 +86,28 @@ Commit: `ba7d3aa` (release prep). Artifact: `simplehar-se.exe`, SHA256
 
 ## v1.1.2 - 2026-11-03
 
-Commit: `2583faf` (release prep). Artifact: `simplehar-se.exe`, SHA256
-`24F38CAE27E203D4A240F4341E3D0AB41E2D023D3511AE9F3CFF597E9628A425`, built
-2026-11-03 and staged at `C:\Inference\SimpleHar-SE_release_v1.1.2`.
+Tag: `v1.1.2`. Commit: `2583faf` (release prep). Artifact: `simplehar-se.exe`,
+built 2026-11-03, SHA256
+`24F38CAE27E203D4A240F4341E3D0AB41E2D023D3511AE9F3CFF597E9628A425`.
 
 ### Fixed
 
 - The Basalt child receives `USERPROFILE` and `HOME` so its Python server can
   resolve `Path.home()` for the model cache. The v1.1.1 release harness failed
-  Basalt loads without them.
+  Basalt loads without them. This is a regression that v1.1.1 introduced;
+  v1.1.2 fixes it.
 
 ## v1.1.1 - 2026-11-03
 
-Commit: `405505e` (release prep). Artifact: `simplehar-se.exe`, SHA256
-`E0B06DFF692B7AEF4406920DE805607B1BA81343FA0D9E449768FB3A828CB8C2`, built
-2026-11-03 and staged at `C:\Inference\SimpleHar-SE_release_v1.1.1`.
+Tag: `v1.1.1`. Commit: `405505e` (release prep). Artifact: `simplehar-se.exe`,
+built 2026-11-03, SHA256
+`E0B06DFF692B7AEF4406920DE805607B1BA81343FA0D9E449768FB3A828CB8C2`.
 
 ### Added
 
 - Basalt engine support: direct Python server launch with a harness-rendered
   server profile, `/health` loaded and `/v1/models` alias readiness, declared
-  `vram_gb` booking, and job-object release. The operator card run passed.
+  `vram_gb` booking, and job-object release. The card-window test run passed.
 
 ### Changed
 
@@ -131,10 +132,9 @@ Commit: `405505e` (release prep). Artifact: `simplehar-se.exe`, SHA256
 
 ## v1.1.0 - 2026-11-03
 
-Commit: `f6c6381` (release prep). Artifact: `simplehar-se.exe`, SHA256
-`031D94D827E407AB5A3B1B5E75B651E3FF108BE804B7C869A665EDD76D45A376`, built
-2026-11-03 and staged at `C:\Inference\SimpleHar-SE_release_v1.1.0`. The live
-harness remains on v1.0.1 until the operator switches it.
+Tag: `v1.1.0`. Commit: `f6c6381` (release prep). Artifact: `simplehar-se.exe`,
+built 2026-11-03, SHA256
+`031D94D827E407AB5A3B1B5E75B651E3FF108BE804B7C869A665EDD76D45A376`.
 
 ### Added
 
@@ -147,6 +147,7 @@ harness remains on v1.0.1 until the operator switches it.
 
 - The canonical ninfer launch now passes `--api-key` when `ninfer_key: true`.
   Before this fix the engine ran unauthenticated while the stamp said `key=on`.
+  If you relied on the stamp, treat earlier ninfer launches as unprotected.
 
 ### Fixed
 
@@ -175,13 +176,13 @@ harness remains on v1.0.1 until the operator switches it.
 
 ## v1.0.1 - 2026-11-02
 
-Commit: `c91e179`. The annotated tag `v1.0.1` was created, pushed, and deployed
-on 2026-11-02. The release covers the 12 commits between `446a3d3` and
+Tag: `v1.0.1`. Commit: `c91e179`. The annotated tag was created and pushed on
+2026-11-02. The release covers the 12 commits between `446a3d3` and
 `c91e179`. The commit log holds the change detail.
 
 ## v1.0.0 - 2026-10-29
 
-Commit: `11b60a1`. First release of SimpleHar SE.
+Tag: `v1.0.0`. Commit: `11b60a1`. First release of SimpleHar SE.
 
 ### Added
 
@@ -193,3 +194,9 @@ Commit: `11b60a1`. First release of SimpleHar SE.
 - A control page on the WORK listener.
 - Declarative configuration: one JSON config file for the harness and one YAML
   file per model, with write-back.
+
+## Operator notes (local)
+
+Internal release bookkeeping (build staging, deploy steps, and rollback
+handling) lives in this project's private handoff layer. It is not part of
+this changelog, and this file names no paths or steps for it.

@@ -101,11 +101,13 @@ A release is a task with acceptance criteria. Run the steps in this order:
    updates the webui fixture pin: `tests/webui/fixtures/status.json` quotes the same
    version (the parity test compares them; `release-check.ps1` check 8 enforces it).
 3. Write the dated `CHANGELOG.md` entry. Use the Keep a Changelog structure and record
-   user-visible changes only.
+   user-visible changes only. Public release notes carry no machine paths, no operator
+   instructions, and no local staging or rollback references. Internal runbook steps stay
+   in `handoff/`.
 4. Update the README release claim. It names the tag, never HEAD.
 5. Run `scripts/release-check.ps1 -Prepare` and require PASS. It checks the version, tag,
-   changelog, README claim, known stale phrases, `cargo doc` warnings, and the webui
-   fixture pin. In `-Prepare`
+   changelog, README claim, known stale phrases, `cargo doc` warnings, the webui fixture
+   pin, and that public docs carry no machine paths. In `-Prepare`
    mode the README claim must name the version being prepared.
 6. Create the annotated tag.
 7. Run `scripts/release-check.ps1` without `-Prepare` and require PASS. It confirms the
@@ -122,6 +124,10 @@ Rules:
 - `scripts/release-check.ps1 -SkipDoc` skips only the `cargo doc` leg. The release check
   requires zero doc warnings, so both release steps run without `-SkipDoc`. Do not use
   `-SkipDoc` to pass a release with known doc warnings.
+- `scripts/release-check.ps1` check 9 enforces the machine-path ban across the public
+  docs (`README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, and `docs/**`, including the
+  decision ledger). Documented engine defaults stay allowed. `docs/maintenance/` is the
+  one exemption: frozen historical audit records, scanned at their intake.
 
 ## Conflict resolution
 

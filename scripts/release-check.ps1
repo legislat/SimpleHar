@@ -13,6 +13,12 @@
 #   7. `cargo doc --no-deps` is warning-free (skip with -SkipDoc).
 #   8. The webui status fixture quotes the same version as Cargo.toml (a bump
 #      that forgets the fixture pin ships a red test; v1.1.3 proved the gap).
+#   9. Public docs carry no machine paths (README.md, CHANGELOG.md,
+#      CONTRIBUTING.md, docs/**). The ban targets personal locations on the
+#      operator machine; documented engine defaults stay allowed (the llama.cpp
+#      install default). docs/maintenance/ holds frozen historical audit
+#      records, scanned at their intake, so they are exempt. Rule home:
+#      docs/process/GIT_WORKFLOW.md (release section).
 #
 # Exit 0 only when every check passes.
 
@@ -164,6 +170,44 @@ if (Test-Path -LiteralPath $fixturePath) {
 } else {
   Report $false "webui fixture missing: $fixturePath"
 }
+
+# 9. Public docs carry no personal machine paths (operator ruling 2026-11-04,
+#    review follow-up: DECISIONS.md and DOCTRINE.md are scanned like every
+#    other live doc; the ledger line that leaked a research path was scrubbed
+#    to a name-only reference). The blocklist names personal locations on the
+#    operator machine: the repo roots, user homes, the scratch and backup
+#    volumes, and the staging and rollback directory names. Legitimate
+#    documented engine defaults are not personal and stay allowed: the
+#    llama.cpp install default lives under C:\Inference, so the ban exempts
+#    exactly that one subtree. docs/maintenance/** is the one exemption:
+#    frozen historical audit records, scanned at their intake.
+$personalPathPatterns = @(
+  'C:\\Inference\\(?!llama\.cpp)',
+  'C:\\Users\\',
+  'D:\\WORKSPACE-VS',
+  'D:\\SimpleHar-SE-backups',
+  '_release_v',
+  '_test-',
+  'SimpleHar-SE_release',
+  'SimpleHar-SE_test'
+)
+$publicDocs = @('README.md', 'CHANGELOG.md', 'CONTRIBUTING.md')
+if (Test-Path 'docs') {
+  # docs/maintenance/** holds frozen historical audit records (scanned at
+  # their intake), so the live-doc ban does not rewrite them here.
+  $publicDocs += (Get-ChildItem -LiteralPath 'docs' -Recurse -Filter '*.md' |
+    Where-Object { $_.FullName -notmatch '\\maintenance\\' } |
+    ForEach-Object { $_.FullName })
+}
+$machinePathHits = @()
+foreach ($pattern in $personalPathPatterns) {
+  $hits = Select-String -Path $publicDocs -Pattern $pattern -ErrorAction SilentlyContinue
+  foreach ($hit in $hits) {
+    $machinePathHits += ($hit.Path + ":" + $hit.LineNumber)
+  }
+}
+Report ($machinePathHits.Count -eq 0) ("public docs carry no machine paths" +
+  $(if ($machinePathHits.Count -gt 0) { ": " + (($machinePathHits | Sort-Object -Unique) -join "; ") } else { "" }))
 
 if ($script:allPass) {
   Write-Output "RELEASE CHECK PASS"
