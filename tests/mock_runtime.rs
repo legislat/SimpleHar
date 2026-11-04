@@ -30,12 +30,12 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
-use simplehar_se::engine::{
+use simpleharn::engine::{
     EngineAdapter, EngineError, EngineRuntime, LaunchSpec, Probe, ReadinessSpec, SpawnError,
     Spawned,
 };
-use simplehar_se::model::ModelEntry;
-use simplehar_se::ownership::SpawnTicket;
+use simpleharn::model::ModelEntry;
+use simpleharn::ownership::SpawnTicket;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -784,7 +784,7 @@ impl EngineRuntime for MockRuntime {
     }
 
     async fn probe(&self, port: u16, readiness: &ReadinessSpec) -> Probe {
-        simplehar_se::engine::http_probe(&self.client, port, readiness).await
+        simpleharn::engine::http_probe(&self.client, port, readiness).await
     }
 
     async fn discover_model_id(&self, port: u16) -> Option<String> {
@@ -842,7 +842,7 @@ impl EngineAdapter for MockIdAdapter {
     }
 
     fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
-        let mut spec = simplehar_se::engine::mock::MockAdapter.spec(model, port)?;
+        let mut spec = simpleharn::engine::mock::MockAdapter.spec(model, port)?;
         spec.env
             .insert("MOCK_MODEL_ID".to_string(), self.serve_id.to_string());
         Ok(spec)
@@ -868,7 +868,7 @@ impl EngineAdapter for MockLateIdAdapter {
     }
 
     fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
-        let mut spec = simplehar_se::engine::mock::MockAdapter.spec(model, port)?;
+        let mut spec = simpleharn::engine::mock::MockAdapter.spec(model, port)?;
         spec.env
             .insert("MOCK_MODEL_ID".to_string(), self.serve_id.to_string());
         spec.env
@@ -905,7 +905,7 @@ impl EngineAdapter for MockGenerationIdAdapter {
     }
 
     fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
-        let mut spec = simplehar_se::engine::mock::MockAdapter.spec(model, port)?;
+        let mut spec = simpleharn::engine::mock::MockAdapter.spec(model, port)?;
         spec.env
             .insert("MOCK_SPAWN_IDS".to_string(), self.ids.to_string());
         Ok(spec)

@@ -14,7 +14,7 @@
 //! `logs/<slug>-<epoch>.log`, the stem sanitized by `sanitize_slug` — the one
 //! forensic pool key shared with the container snapshots (R2-08-03). Engine
 //! children receive exactly an OS baseline plus
-//! `LaunchSpec.env` (§5, E3): harness secrets (`SIMPLEHAR_TOKEN`) and Python
+//! `LaunchSpec.env` (§5, E3): harness secrets (`SIMPLEHARN_TOKEN`) and Python
 //! import-hijack vars (`PYTHONPATH`, `VIRTUAL_ENV`) never leak into them. The
 //! harness-internal control commands spawned here (`wsl.exe` docker teardown and
 //! `docker ps`) are scrubbed the same way, because they execute *inside the
@@ -70,7 +70,7 @@ const CONTAINER_LOG_TAIL_LINES: usize = 20_000;
 /// Windows env var names (case-insensitive) an engine child may keep (§5 locked
 /// decision, E3): external engines obey only harness-owned configuration, so a
 /// child's environment is this baseline plus what [`LaunchSpec`] declares — never
-/// the harness's own environment with its plaintext `SIMPLEHAR_TOKEN`, its
+/// the harness's own environment with its plaintext `SIMPLEHARN_TOKEN`, its
 /// `PYTHONPATH`/`VIRTUAL_ENV` (strata is a Python child: import-hijack risk), and
 /// every other stray var.
 const OS_ENV_BASELINE: &[&str] = &[
@@ -169,7 +169,7 @@ where
 }
 
 /// What a harness-internal control command may carry: exactly the OS baseline
-/// ([`OS_ENV_BASELINE`]) and nothing else — no `SIMPLEHAR_TOKEN`, no `PYTHONPATH`,
+/// ([`OS_ENV_BASELINE`]) and nothing else — no `SIMPLEHARN_TOKEN`, no `PYTHONPATH`,
 /// no stray harness name (FINDINGS2-0910 [4]).
 ///
 /// The earlier ruling here was "control commands run harness code, not operator
@@ -773,7 +773,7 @@ fn excerpt(bytes: &[u8]) -> String {
 /// Best-effort `docker rm -f` inside WSL; every failure path warns and lets the
 /// caller proceed (the release poll is the arbiter). Built and run by
 /// [`run_control_command`]: hidden, kill-on-drop, and scrubbed to the OS baseline so
-/// the harness's `SIMPLEHAR_TOKEN` never rides into the operator's distro
+/// the harness's `SIMPLEHARN_TOKEN` never rides into the operator's distro
 /// (FINDINGS2-0910 [4]).
 ///
 /// # Returns
@@ -1198,7 +1198,7 @@ fn staging_driver(script: &str, file_name: &str, blob: &str) -> String {
          tmp=\"$dir/.staging.{slug}-{hash:x}.tmp\"\n\
          trap 'rm -f -- \"$tmp\" \"$tmp.b64\"' EXIT\n\
          rm -f -- \"$tmp\" \"$tmp.b64\"\n\
-         cat > \"$tmp.b64\" <<'SIMPLEHAR_B64'\n{blob}\nSIMPLEHAR_B64\n\
+         cat > \"$tmp.b64\" <<'SIMPLEHARN_B64'\n{blob}\nSIMPLEHARN_B64\n\
          base64 -d \"$tmp.b64\" > \"$tmp\"\n\
          rm -f -- \"$tmp.b64\"\n\
          test \"$(cksum < \"$tmp\")\" = \"{expected_crc} {expected_len}\" \\\n\
@@ -2628,6 +2628,12 @@ impl SingleInstanceGuard {
         // Safety: CreateMutexW with no security attributes and automatic ownership
         // reclaim; we only inspect the last error, never wait on the handle.
         unsafe {
+            // The mutex name keeps the PRE-rename spelling on purpose
+            // (TASK-RENAME-SIMPLEHARN, 2026-11-04): during the live-deployment
+            // switch window the pre-rename binary and `simpleharn.exe` must still
+            // see each other's lock, or two harnesses share one card and the
+            // single-instance rule (AGENTS.md §6) is silently broken.
+            // This is a compatibility shim: do not "clean up" the old name.
             let name = windows::core::w!("SimpleHarSE-SingleInstance");
             let handle = windows::Win32::System::Threading::CreateMutexW(None, false, name)
                 .map_err(|e| format!("cannot create mutex: {e}"))?;
@@ -2635,7 +2641,7 @@ impl SingleInstanceGuard {
                 == windows::Win32::Foundation::ERROR_ALREADY_EXISTS
             {
                 let _ = windows::Win32::Foundation::CloseHandle(handle);
-                return Err("another SimpleHar SE instance is already running".to_string());
+                return Err("another SimpleHarn instance is already running".to_string());
             }
             Ok(SingleInstanceGuard { handle })
         }
@@ -3017,7 +3023,7 @@ mod tests {
         let runtime = ProcessRuntime::new().with_profiles_root(&profiles);
         let spec = LaunchSpec {
             argv: vec![
-                "C:\\simplehar-absent\\no-such-engine.exe".to_string(),
+                "C:\\simpleharn-absent\\no-such-engine.exe".to_string(),
                 "-m".to_string(),
                 "serve.server".to_string(),
                 "--engine".to_string(),
@@ -3058,7 +3064,7 @@ mod tests {
             panic!("expected a spawn failure, got {error:?}");
         };
         assert!(
-            reason.contains("cannot spawn C:\\simplehar-absent"),
+            reason.contains("cannot spawn C:\\simpleharn-absent"),
             "the run must reach the spawn step: {reason}"
         );
         assert!(
@@ -4898,7 +4904,8 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
     /// A synthetic harness env carrying every baseline var (mixed spellings where
     /// Windows plausibly carries them) plus the vars that must never reach an
-    /// engine child: the plaintext control secret and the Python hijack vars.
+    /// engine child: the plaintext control secret, the harness log knob in both
+    /// spellings, and the Python hijack vars.
     fn secret_bearing_source() -> Vec<(String, String)> {
         pairs(&[
             ("SystemRoot", "C:\\Windows"),
@@ -4908,7 +4915,10 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             ("PATHEXT", ".COM;.EXE"),
             ("TEMP", "C:\\Temp"),
             ("TMP", "C:\\Temp"),
+            ("SIMPLEHARN_TOKEN", "plaintext-secret"),
             ("SIMPLEHAR_TOKEN", "plaintext-secret"),
+            ("SIMPLEHARN_LOG", "debug"),
+            ("SIMPLEHAR_LOG", "debug"),
             ("PYTHONPATH", "C:\\evil\\hijack"),
             ("VIRTUAL_ENV", "C:\\evil\\venv"),
             ("CARGO_MANIFEST_DIR", "C:\\src"),
@@ -4942,6 +4952,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             .collect();
         assert_eq!(actual, expected, "baseline carries exactly the OS names");
         for secret in [
+            "SIMPLEHARN_TOKEN",
             "SIMPLEHAR_TOKEN",
             "PYTHONPATH",
             "VIRTUAL_ENV",
@@ -5034,15 +5045,18 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
                 "baseline {name} missing: {keys:?}"
             );
         }
-        for secret in [
+        for forbidden in [
+            "SIMPLEHARN_TOKEN",
             "SIMPLEHAR_TOKEN",
+            "SIMPLEHARN_LOG",
+            "SIMPLEHAR_LOG",
             "PYTHONPATH",
             "VIRTUAL_ENV",
             "CARGO_MANIFEST_DIR",
         ] {
             assert!(
-                !keys.contains(&secret.to_string()),
-                "secret {secret} must never reach a child"
+                !keys.contains(&forbidden.to_string()),
+                "harness-only name {forbidden} must never reach a child"
             );
         }
         assert!(
@@ -5057,7 +5071,10 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         use std::os::windows::process::CommandExt as _;
         let mut source: Vec<(String, String)> = std::env::vars().collect();
         source.extend(pairs(&[
+            ("SIMPLEHARN_TOKEN", "plaintext-secret"),
             ("SIMPLEHAR_TOKEN", "plaintext-secret"),
+            ("SIMPLEHARN_LOG", "debug"),
+            ("SIMPLEHAR_LOG", "debug"),
             ("PYTHONPATH", "C:\\evil\\hijack"),
         ]));
         let assembled = engine_child_env(source, &spec_map(&[("PROBE_MARKER", "seen")]));
@@ -5080,8 +5097,20 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             "spec entry missing from the child: {text}"
         );
         assert!(
-            !has_child_var(&text, "SIMPLEHAR_TOKEN"),
+            !has_child_var(&text, "SIMPLEHARN_TOKEN"),
             "secret reached the child: {text}"
+        );
+        assert!(
+            !has_child_var(&text, "SIMPLEHAR_TOKEN"),
+            "the deprecated token name is a secret too: it may not reach the child: {text}"
+        );
+        assert!(
+            !has_child_var(&text, "SIMPLEHARN_LOG"),
+            "harness log knob reached the child: {text}"
+        );
+        assert!(
+            !has_child_var(&text, "SIMPLEHAR_LOG"),
+            "the deprecated log name is harness-only too: it may not reach the child: {text}"
         );
         assert!(
             !has_child_var(&text, "PYTHONPATH"),
@@ -5103,11 +5132,14 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
     /// Injects harness-process vars for one test and removes them on scope exit,
     /// including through an assertion panic. Only names no other test in this
-    /// binary reads may be injected: the crate reads just `SIMPLEHAR_LOG`,
-    /// `SIMPLEHAR_TOKEN` and `SIMPLEHAR_CONFIG`, never `PYTHONPATH`/`VIRTUAL_ENV`,
-    /// and integration suites are separate processes. `std::env::set_var` is a
-    /// safe call in edition 2021 — an `unsafe` block here would deny the build
-    /// with `unused_unsafe` under `-D warnings`.
+    /// binary reads may be injected: the crate reads just `SIMPLEHARN_LOG`,
+    /// `SIMPLEHARN_TOKEN` and `SIMPLEHARN_CONFIG` — plus the deprecated
+    /// `SIMPLEHAR_LOG`/`SIMPLEHAR_TOKEN`/`SIMPLEHAR_CONFIG` fallbacks (the log
+    /// knob is read only inside `observability::init`, which tests never call) —
+    /// never `PYTHONPATH`/`VIRTUAL_ENV`, and integration suites are separate
+    /// processes.
+    /// `std::env::set_var` is a safe call in edition 2021 — an `unsafe` block here
+    /// would deny the build with `unused_unsafe` under `-D warnings`.
     struct HarnessEnvGuard(Vec<String>);
 
     impl HarnessEnvGuard {
@@ -5153,12 +5185,14 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
     async fn engine_spawn_serves_only_the_declared_environment() {
         // The production path end to end: `ProcessRuntime::spawn` (the single
         // LaunchSpec-driven spawn site) must hand the child baseline + spec only.
-        // Neutralising its `env_clear()` fails the PYTHONPATH/VIRTUAL_ENV/CARGO_
-        // assertions below, because these markers genuinely live in the harness
-        // process while the child spawns.
+        // Neutralising its `env_clear()` fails the PYTHONPATH/VIRTUAL_ENV/
+        // SIMPLEHAR_LOG/CARGO_ assertions below, because these markers genuinely
+        // live in the harness process while the child spawns.
         let _markers = HarnessEnvGuard::set(&[
             ("PYTHONPATH", "C:\\evil\\hijack"),
             ("VIRTUAL_ENV", "C:\\evil\\venv"),
+            ("SIMPLEHARN_LOG", "debug"),
+            ("SIMPLEHAR_LOG", "debug"),
         ]);
         let dir = crate::testutil::temp_dir("enginespawn");
         let dump = dir.join("child-set.txt");
@@ -5201,10 +5235,17 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             has_child_var(&text, "Path"),
             "baseline Path missing from the engine child: {text}"
         );
-        for secret in ["SIMPLEHAR_TOKEN", "PYTHONPATH", "VIRTUAL_ENV"] {
+        for forbidden in [
+            "SIMPLEHARN_TOKEN",
+            "SIMPLEHAR_TOKEN",
+            "SIMPLEHARN_LOG",
+            "SIMPLEHAR_LOG",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+        ] {
             assert!(
-                !has_child_var(&text, secret),
-                "engine child inherited harness {secret}: {text}"
+                !has_child_var(&text, forbidden),
+                "engine child inherited harness {forbidden}: {text}"
             );
         }
         let inherited_toolchain: Vec<&str> = text
@@ -5227,7 +5268,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
     /// FINDINGS2-0910 [4], the assembly rule: a control command gets exactly the OS
     /// baseline. The test process genuinely carries `CARGO_*` (and a real harness run
-    /// carries `SIMPLEHAR_TOKEN`), so "exactly the baseline names" is a filter that
+    /// carries `SIMPLEHARN_TOKEN`), so "exactly the baseline names" is a filter that
     /// has to be working for this to hold.
     #[test]
     fn control_child_env_is_the_baseline_and_nothing_else() {
@@ -5245,7 +5286,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         assert_eq!(keys.len(), env.len(), "no case-duplicates: {keys:?}");
         for name in &keys {
             assert!(
-                !name.starts_with("SIMPLEHAR_") && !name.starts_with("CARGO_"),
+                !name.starts_with("SIMPLEHAR") && !name.starts_with("CARGO_"),
                 "secret/toolchain name {name} reached the control assembly"
             );
         }
@@ -5256,7 +5297,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
     /// a real child — exactly how the engine-child pin drives `ProcessRuntime::spawn`.
     /// The load-bearing marker is `CARGO_*`: cargo always sets those in the test
     /// process, they are not on the baseline, and reading them from the harness env
-    /// is something no other test does (unlike `SIMPLEHAR_TOKEN`, which the api layer
+    /// is something no other test does (unlike `SIMPLEHARN_TOKEN`, which the api layer
     /// reads). Falsifier: drop the `env_clear()` here and the toolchain assertions
     /// below fail.
     #[tokio::test]
@@ -5271,7 +5312,14 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             other => panic!("the control command could not run: {other:?}"),
         }
         let text = wait_for_child_env_dump(&dump).await;
-        for forbidden in ["SIMPLEHAR_TOKEN", "PYTHONPATH", "VIRTUAL_ENV"] {
+        for forbidden in [
+            "SIMPLEHARN_TOKEN",
+            "SIMPLEHAR_TOKEN",
+            "SIMPLEHARN_LOG",
+            "SIMPLEHAR_LOG",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+        ] {
             assert!(
                 !has_child_var(&text, forbidden),
                 "control child inherited harness {forbidden}: {text}"
@@ -5309,7 +5357,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
     #[tokio::test]
     async fn the_fit_probe_answers_stdout_when_the_tool_answers_and_none_when_it_cannot() {
         let runtime = ProcessRuntime::new();
-        let missing = std::path::Path::new("C:\\simplehar-absent-volume\\llama-fit-params.exe");
+        let missing = std::path::Path::new("C:\\simpleharn-absent-volume\\llama-fit-params.exe");
         assert_eq!(
             runtime
                 .run_probe_command(missing, &["--version".to_string()], Duration::from_secs(2))

@@ -9,13 +9,13 @@ use axum::http::{Method, Request, StatusCode};
 use axum::Router;
 use mock_runtime::MockRuntime;
 use serde_json::Value;
-use simplehar_se::api::{
+use simpleharn::api::{
     category_router, classify_send_failure, control_router, ApiState, BootMsStamp, BootTimings,
 };
-use simplehar_se::config::{AppConfig, CategoryConfig, CategoryId};
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime};
-use simplehar_se::scheduler::Scheduler;
+use simpleharn::config::{AppConfig, CategoryConfig, CategoryId};
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::{EngineAdapter, EngineRuntime};
+use simpleharn::scheduler::Scheduler;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tower::ServiceExt;
@@ -66,15 +66,15 @@ fn capture_lines() -> Arc<Mutex<Vec<String>>> {
 type Spec = (&'static str, &'static str, CategoryId, Option<f64>);
 
 /// The per-test stand-in for the boot config file (FINDINGS-18 [2]): `app()` points
-/// every `AppConfig` at `<modelconf dir>/simplehar-se.json` so the persisting
+/// every `AppConfig` at `<modelconf dir>/simpleharn.json` so the persisting
 /// endpoints (`/har/config/default`, the retag default-clear) write INSIDE the test's
 /// own temp dir. Before this they fell through to `default_config_path()` — the exe
 /// dir — so `cargo test` wrote a file the product reads at boot, outside any sandbox,
 /// and no test could read back what the endpoint had written.
-const TEST_CONFIG_NAME: &str = "simplehar-se.json";
+const TEST_CONFIG_NAME: &str = "simpleharn.json";
 
 fn write_modelconf(specs: &[Spec]) -> std::path::PathBuf {
-    let dir = simplehar_se::testutil::temp_dir("api-modelconf");
+    let dir = simpleharn::testutil::temp_dir("api-modelconf");
     for (name, engine, category, vram_gb) in specs {
         let mut yaml = format!(
             "name: {name}
@@ -100,7 +100,7 @@ category: {category}
 /// path (a runner without `C:\Inference\llama.cpp` sees one there). `tag` keeps
 /// each test's stand-in directory attributable and isolated.
 fn config_with_existing_llama(tag: &str) -> AppConfig {
-    let stand_in = simplehar_se::testutil::temp_dir(tag).join("llama-server.exe");
+    let stand_in = simpleharn::testutil::temp_dir(tag).join("llama-server.exe");
     std::fs::write(&stand_in, b"test stand-in").expect("llama stand-in file");
     AppConfig {
         llama_server_exe: stand_in,
@@ -146,14 +146,14 @@ fn build_app(
         dir.clone(),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
     );
     let state = Arc::new(ApiState::new(
         config,
         scheduler,
-        simplehar_se::listeners::ListenerRegistry::new(),
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
-        simplehar_se::api::BootTimings::default(),
+        simpleharn::listeners::ListenerRegistry::new(),
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
+        simpleharn::api::BootTimings::default(),
     ));
     let control = control_router(Arc::clone(&state));
     let work = category_router(Arc::clone(&state), CategoryId::Work);
@@ -220,7 +220,7 @@ async fn get_json(app: &Router, path: &str) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn control_token_gates_api_routes_but_never_the_page_itself() {
-    // The optional shared secret (`control_token` / `SIMPLEHAR_TOKEN`) is what makes
+    // The optional shared secret (`control_token` / `SIMPLEHARN_TOKEN`) is what makes
     // publishing `internal_host` to a segment defensible: without it any LAN host can
     // load, unload, reconfigure and read logs (deploy review, 2026-10-26).
     let config = AppConfig {
@@ -282,7 +282,7 @@ async fn control_token_gates_api_routes_but_never_the_page_itself() {
     // which meant a token-protected harness served an unstyled page (README review).
     // Iterating the guard's own list, not a copy, so adding an asset to the page without
     // exempting it can never pass here again.
-    for path in simplehar_se::api::PUBLIC_PATHS {
+    for path in simpleharn::api::PUBLIC_PATHS {
         let page = control
             .clone()
             .oneshot(
@@ -647,6 +647,20 @@ async fn models_are_filtered_per_listener() {
         .map(|m| m["id"].as_str().expect("id"))
         .collect();
     assert_eq!(ids, vec!["work-model"]);
+    // TASK-RENAME-SIMPLEHARN keep-pin (review R1R-02): `owned_by: "simplehar"`
+    // is a deliberate public wire contract — the operator ruling kept the
+    // legacy-stable identifier through the rename so OpenAI-compatible clients
+    // that branch on it do not break at v1.2.0; the earliest rename is v2.0 as
+    // a documented contract change. Falsifier: rename the wire literal and this
+    // pin goes red before any client can discover the drift.
+    for row in body["data"].as_array().expect("list") {
+        assert_eq!(
+            row["owned_by"].as_str(),
+            Some("simplehar"),
+            "owned_by is a public wire contract (TASK-RENAME-SIMPLEHARN ruling, \
+             renamed at v2.0 at the earliest): {row}"
+        );
+    }
 
     let (status, body) = get_json(&rp, "/v1/models").await;
     assert_eq!(status, StatusCode::OK);
@@ -3071,9 +3085,9 @@ async fn editing_an_ambiguous_alias_refuses_the_writeback_rather_than_picking_a_
 #[tokio::test]
 async fn defaults_persist_to_the_config_boot_loaded_even_under_a_custom_path() {
     // Operator finding #2 (2026-10-26): write-back must hit the file boot read
-    // (`SIMPLEHAR_CONFIG` aware), and a partial config with no `categories` key
+    // (`SIMPLEHARN_CONFIG` aware), and a partial config with no `categories` key
     // must still accept the patch instead of silently staying in memory.
-    let path = simplehar_se::testutil::temp_dir("api-config").join("simplehar-se.json");
+    let path = simpleharn::testutil::temp_dir("api-config").join("simpleharn.json");
     std::fs::write(&path, r#"{"modelconf_dir": "unused"}"#).expect("seed config");
     let mut config =
         AppConfig::parse(&std::fs::read_to_string(&path).expect("read")).expect("parses");
@@ -3139,7 +3153,7 @@ async fn a_default_that_never_landed_never_changes_memory() {
     // pre-fix shape inserted the override before the persist leg, so this
     // call answered `default_model: "new"` and `/har/status` served a default
     // the next boot will never see.
-    let dir = simplehar_se::testutil::temp_dir("api-config-never-landed");
+    let dir = simpleharn::testutil::temp_dir("api-config-never-landed");
     let config_path = dir.join(TEST_CONFIG_NAME);
     std::fs::create_dir(&config_path).expect("the boot path is an unwritable directory");
     let mut config = AppConfig::default();
@@ -3994,7 +4008,7 @@ async fn har_log_serves_the_ring() {
     let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
     // Push a marker entry straight into the ring (the test binary has no global
     // subscriber; the endpoint reads the same process-global storage).
-    simplehar_se::observability::ring_push(simplehar_se::observability::LogEntry::now(
+    simpleharn::observability::ring_push(simpleharn::observability::LogEntry::now(
         "ERROR",
         "test::har_log",
         "last load failed: need 50 GiB",
@@ -4130,7 +4144,7 @@ async fn timeout_class_is_502_and_never_restarts() {
     let err = classify_send_failure(&error, port).expect_err("timeouts never restart");
     assert_eq!(err.status(), StatusCode::BAD_GATEWAY, "exact class");
     let message = match err {
-        simplehar_se::api::ApiError::Upstream { reason } => reason,
+        simpleharn::api::ApiError::Upstream { reason } => reason,
         other => panic!("expected Upstream, got {other:?}"),
     };
     assert!(
@@ -4482,7 +4496,7 @@ async fn the_retag_reply_surfaces_the_slot_and_default_follow_ups() {
     // took the clear anyway; the operator ruling retires that memory-beats-file
     // shape, so this pin now demands the opposite.
     let mut broken = config_defaulting_work("qwen3");
-    let unwriteable = simplehar_se::testutil::temp_dir("api-retag-nopersist")
+    let unwriteable = simpleharn::testutil::temp_dir("api-retag-nopersist")
         .join("gone")
         .join(TEST_CONFIG_NAME);
     broken.source_path = Some(unwriteable.clone());

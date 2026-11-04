@@ -9,11 +9,11 @@ mod mock_runtime;
 
 use async_trait::async_trait;
 use mock_runtime::MockRuntime;
-use simplehar_se::budget::{parse_smi_sample, MemorySample, VramWitness};
-use simplehar_se::config::{AppConfig, CategoryId};
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime};
-use simplehar_se::scheduler::{Reply, Scheduler, SchedulerHandle};
+use simpleharn::budget::{parse_smi_sample, MemorySample, VramWitness};
+use simpleharn::config::{AppConfig, CategoryId};
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::{EngineAdapter, EngineRuntime};
+use simpleharn::scheduler::{Reply, Scheduler, SchedulerHandle};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -74,14 +74,14 @@ impl VramWitness for FakeWitness {
                 total_gib: 72.0,
                 used_gib: 0.0,
                 processes: vec![],
-                attribution: simplehar_se::budget::AttributionQuality::Unavailable,
+                attribution: simpleharn::budget::AttributionQuality::Unavailable,
             }))
         }
     }
 }
 
 fn sample(total: f64, used: f64, processes: Vec<(u32, f64)>) -> MemorySample {
-    let attribution = simplehar_se::budget::attribution_from_processes(&processes);
+    let attribution = simpleharn::budget::attribution_from_processes(&processes);
     MemorySample {
         total_gib: total,
         used_gib: used,
@@ -98,7 +98,7 @@ fn harness(
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let dir = simplehar_se::testutil::temp_dir("wit");
+    let dir = simpleharn::testutil::temp_dir("wit");
     for (name, category) in specs {
         std::fs::write(
             dir.join(format!("{name}.yaml")),
@@ -118,7 +118,7 @@ fn harness(
 async fn wait_until(
     handle: &SchedulerHandle,
     secs: u64,
-    cond: impl Fn(&simplehar_se::scheduler::SchedulerStatus) -> bool,
+    cond: impl Fn(&simpleharn::scheduler::SchedulerStatus) -> bool,
 ) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -233,7 +233,7 @@ async fn settle_passes_once_the_card_frees() {
     wait_until(&handle, 5, |status| {
         status.slots.iter().all(|slot| slot.model.is_none())
             && status.jobs.iter().any(|job| {
-                job.model == "b" && job.state == simplehar_se::scheduler::SwapState::Dispose
+                job.model == "b" && job.state == simpleharn::scheduler::SwapState::Dispose
             })
     })
     .await;
@@ -357,7 +357,7 @@ async fn same_slot_swap_releases_first_when_the_booked_credit_understates_the_ca
     wait_until(&handle, 5, |status| {
         status.slots.iter().all(|slot| slot.model.is_none())
             && status.jobs.iter().any(|job| {
-                job.model == "b" && job.state == simplehar_se::scheduler::SwapState::Dispose
+                job.model == "b" && job.state == simpleharn::scheduler::SwapState::Dispose
             })
     })
     .await;
@@ -398,7 +398,7 @@ async fn settle_fails_closed_when_the_witness_dies_mid_window() {
         status
             .jobs
             .iter()
-            .any(|job| job.model == "b" && job.state == simplehar_se::scheduler::SwapState::Dispose)
+            .any(|job| job.model == "b" && job.state == simpleharn::scheduler::SwapState::Dispose)
     })
     .await;
     witness.kill();
@@ -738,7 +738,7 @@ fn harness_models(
     let runtime = MockRuntime::new();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let catalog_dir = simplehar_se::testutil::temp_dir("wit-models");
+    let catalog_dir = simpleharn::testutil::temp_dir("wit-models");
     for (name, category, vram) in specs {
         std::fs::write(
             catalog_dir.join(format!("{name}.yaml")),
@@ -803,7 +803,7 @@ async fn unreadable_card_refuses_rather_than_guesses() {
     assert!(status
         .jobs
         .iter()
-        .any(|job| job.state == simplehar_se::scheduler::SwapState::AdmitFail));
+        .any(|job| job.state == simpleharn::scheduler::SwapState::AdmitFail));
 }
 
 #[tokio::test]
@@ -838,9 +838,10 @@ async fn concurrent_loads_cannot_double_spend_the_same_bytes() {
         tokio::spawn(async move { handle.swap("a1", CategoryId::Work).await })
     };
     wait_until(&handle, 10, |status| {
-        status.jobs.iter().any(|job| {
-            job.model == "a1" && job.state == simplehar_se::scheduler::SwapState::Dispose
-        })
+        status
+            .jobs
+            .iter()
+            .any(|job| job.model == "a1" && job.state == simpleharn::scheduler::SwapState::Dispose)
     })
     .await;
 
@@ -902,7 +903,7 @@ fn smi_parser_handles_csv_shapes() {
 
 #[tokio::test]
 async fn live_nvidia_witness_samples_or_skips() {
-    let witness = simplehar_se::witness::NvmlWitness::new();
+    let witness = simpleharn::witness::NvmlWitness::new();
     match witness.sample().await {
         Ok(sample) => {
             assert!(sample.total_gib > 0.0, "a GPU reports a positive total");

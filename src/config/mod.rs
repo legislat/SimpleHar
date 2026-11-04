@@ -1,4 +1,4 @@
-//! Typed config schema (`simplehar-se.json`), defaults, and per-field validation
+//! Typed config schema (`simpleharn.json`), defaults, and per-field validation
 //! (DESIGN Step 9/11).
 //!
 //! Boot rule (§0.2 step 1): a present-but-invalid file is reported per field and fails
@@ -287,14 +287,25 @@ fn default_categories() -> Vec<CategoryConfig> {
     CategoryConfig::four_defaults()
 }
 
-/// The file SE boots by default, beside the executable. Deliberately *not* v3.3's
-/// name: SE re-serializes the whole struct on every persist, and sharing a file
-/// means our write can strand the old exe — v3.3 reads `protected_ports` and exits
-/// when it clashes with its port bases (deploy review, 2026-10-26).
-pub const CONFIG_FILE: &str = "simplehar-se.json";
+/// The file the harness boots by default, beside the executable. Deliberately *not*
+/// v3.3's name: the harness re-serializes the whole struct on every persist, and
+/// sharing a file means our write can strand the old exe — v3.3 reads
+/// `protected_ports` and exits when it clashes with its port bases (deploy review,
+/// 2026-10-26). Since the 2026-11-04 product rename (TASK-RENAME-SIMPLEHARN) this is
+/// `simpleharn.json`; the previous primary name keeps loading as a compatibility
+/// fallback ([`PREVIOUS_CONFIG_FILE`]).
+pub const CONFIG_FILE: &str = "simpleharn.json";
 
-/// v3.3's config name. Read to migrate. SE never writes the legacy file unless the
-/// operator explicitly selects it as `SIMPLEHAR_CONFIG` — an explicit path is an
+/// The previous primary config name (the product was SimpleHar SE until the
+/// 2026-11-04 rename). Auto-discovered second, after [`CONFIG_FILE`], and loaded in
+/// place: `source_path` stamps the file that was actually read, so every write-back
+/// keeps landing in the existing deployment's file — the rename must never fork the
+/// operator's one true config into two files.
+pub const PREVIOUS_CONFIG_FILE: &str = "simplehar-se.json";
+
+/// v3.3's config name. Read to migrate (copied forward to the primary name, never
+/// loaded in place). The harness never writes the legacy file unless the operator
+/// explicitly selects it as `SIMPLEHARN_CONFIG` — an explicit path is an
 /// instruction and config file is king, so write-back follows the selected file
 /// (R2-14-04). Every auto-discovered boot leaves it untouched, so the rollback path
 /// keeps the file it expects.
@@ -312,6 +323,143 @@ pub fn default_config_path() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(CONFIG_FILE)))
+}
+
+/// Rename compatibility for auto-discovery (TASK-RENAME-SIMPLEHARN, 2026-11-04):
+/// given the default path (the exe's directory joined with [`CONFIG_FILE`]), return
+/// the file to load — that file when present, else the previous primary name
+/// [`PREVIOUS_CONFIG_FILE`] loaded **in place**. The caller stamps the returned path
+/// as `source_path`, so write-back stays on the file that was loaded and the rename
+/// can never fork a live deployment into two configs. `None` means neither exists:
+/// boot proceeds to the v3.3 migration copy ([`LEGACY_CONFIG_FILE`]) or first-start
+/// materialization.
+#[must_use]
+pub fn rename_compatible_default(default: &std::path::Path) -> Option<std::path::PathBuf> {
+    if default.exists() {
+        return Some(default.to_path_buf());
+    }
+    let previous = default.with_file_name(PREVIOUS_CONFIG_FILE);
+    previous.exists().then_some(previous)
+}
+
+/// The primary environment names are `SIMPLEHARN_TOKEN`, `SIMPLEHARN_CONFIG` and
+/// `SIMPLEHARN_LOG` (documented here once — every reader below uses the primary
+/// first). The old-product `SIMPLEHAR_*` spellings keep working as deprecated
+/// fallbacks: the value is honored, but only when the primary name is unset, and
+/// the first fallback use logs one warning naming both the fallback and its
+/// replacement (TASK-RENAME-SIMPLEHARN compatibility rule). The primary always
+/// wins when both are set — the fallback must never surprise an operator who has
+/// migrated.
+static TOKEN_FALLBACK_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static CONFIG_FALLBACK_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static LOG_FALLBACK_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Reads one renamed environment variable: the primary name wins, the deprecated
+/// name fills only absence, and filling it warns once per process. Kept tiny and
+/// shared so the readers cannot drift apart in name or warning behavior; the log
+/// knob shares the same pure decision core but defers its warning, because it is
+/// read before a subscriber exists (see [`log_level_from_env`]).
+fn read_renamed_env(
+    primary: &str,
+    deprecated: &str,
+    warned: &std::sync::OnceLock<()>,
+) -> Option<String> {
+    let (value, used_deprecated) =
+        pick_env_renamed(std::env::var(primary).ok(), std::env::var(deprecated).ok())?;
+    if used_deprecated {
+        warned.get_or_init(|| {
+            tracing::warn!(
+                primary = primary,
+                deprecated = deprecated,
+                "{deprecated} is a deprecated environment name: {primary} wins whenever both are \
+                 set — rename it to {primary}"
+            );
+        });
+    }
+    Some(value)
+}
+
+/// The pure decision behind [`read_renamed_env`]: primary wins, deprecated fills
+/// only absence (flagged), a set primary — even empty — shadows the deprecated
+/// name. Pure so the pins below drive every branch without mutating process env:
+/// other tests in this binary read the very same names through the api guard.
+fn pick_env_renamed(primary: Option<String>, deprecated: Option<String>) -> Option<(String, bool)> {
+    match primary {
+        Some(value) => Some((value, false)),
+        None => deprecated.map(|value| (value, true)),
+    }
+}
+
+/// The control token from the process environment: `SIMPLEHARN_TOKEN`, with the
+/// deprecated `SIMPLEHAR_TOKEN` as fallback (see the static TOKEN_FALLBACK_WARNED).
+#[must_use]
+pub fn token_from_env() -> Option<String> {
+    read_renamed_env(
+        "SIMPLEHARN_TOKEN",
+        "SIMPLEHAR_TOKEN",
+        &TOKEN_FALLBACK_WARNED,
+    )
+}
+
+/// The explicit config path from the process environment: `SIMPLEHARN_CONFIG`,
+/// with the deprecated `SIMPLEHAR_CONFIG` as fallback (warns once through the
+/// static CONFIG_FALLBACK_WARNED).
+#[must_use]
+pub fn config_path_from_env() -> Option<String> {
+    read_renamed_env(
+        "SIMPLEHARN_CONFIG",
+        "SIMPLEHAR_CONFIG",
+        &CONFIG_FALLBACK_WARNED,
+    )
+}
+
+/// The log-level knob from the process environment: `SIMPLEHARN_LOG`, with the
+/// deprecated `SIMPLEHAR_LOG` as fallback (TASK-RENAME-SIMPLEHARN, review
+/// R1R-01 — the compatibility rule covers every `SIMPLEHAR_*` name, and this
+/// knob is the forensic lever named by FINDINGS-15 [8]). The value alone is not
+/// enough for this reader: it is consumed inside `observability::init`, before a
+/// subscriber exists, where a `tracing::warn!` would reach the no-op dispatcher.
+/// The second element reports that the deprecated name supplied the value, so
+/// the caller can say so through [`warn_log_fallback`] once the subscriber is
+/// installed — still exactly one warning per process, still naming both names.
+#[must_use]
+pub fn log_level_from_env() -> (Option<String>, bool) {
+    log_knob_from_values(
+        std::env::var("SIMPLEHARN_LOG").ok(),
+        std::env::var("SIMPLEHAR_LOG").ok(),
+    )
+}
+
+/// The pure decision behind [`log_level_from_env`]: the same [`pick_env_renamed`]
+/// precedence as the token/config pair, reshaped to report the fallback use
+/// instead of warning in place. Pure so the pins drive every precedence leg
+/// without mutating process env.
+fn log_knob_from_values(
+    primary: Option<String>,
+    deprecated: Option<String>,
+) -> (Option<String>, bool) {
+    match pick_env_renamed(primary, deprecated) {
+        Some((value, used_deprecated)) => (Some(value), used_deprecated),
+        None => (None, false),
+    }
+}
+
+/// Reports a deprecated `SIMPLEHAR_LOG` use exactly once per process, naming both
+/// names like the token/config warnings do (TASK-RENAME-SIMPLEHARN compatibility
+/// rule). Pass the flag from [`log_level_from_env`], and only after a subscriber
+/// exists: an early call would spend the once-guard on a message reaching the
+/// no-op dispatcher (the FINDINGS-15 [8] silence this module refuses elsewhere).
+pub fn warn_log_fallback(used_deprecated: bool) {
+    if used_deprecated {
+        LOG_FALLBACK_WARNED.get_or_init(|| {
+            tracing::warn!(
+                primary = "SIMPLEHARN_LOG",
+                deprecated = "SIMPLEHAR_LOG",
+                "SIMPLEHAR_LOG is a deprecated environment name: SIMPLEHARN_LOG wins \
+                 whenever both are set — rename it to SIMPLEHARN_LOG"
+            );
+        });
+    }
 }
 
 /// Fallback strata interpreter when neither `engines.strata.python` nor a model
@@ -399,7 +547,7 @@ pub struct AppConfig {
     /// Address every listener binds on (operator note 2026-10-25): a loopback
     /// address (default 127.0.0.1) or `0.0.0.0` to publish to the local net.
     /// Any other address is refused by validation. Posture: the optional
-    /// `control_token` (env `SIMPLEHAR_TOKEN` overrides it) gates every route
+    /// `control_token` (env `SIMPLEHARN_TOKEN` overrides it) gates every route
     /// but the page assets; publishing to 0.0.0.0 with no token set trusts
     /// every machine on the segment.
     #[serde(default = "default_internal_host")]
@@ -466,10 +614,10 @@ pub struct AppConfig {
         deserialize_with = "trimmed_opt"
     )]
     pub wsl_user: Option<String>,
-    /// The file this config was loaded from (`SIMPLEHAR_CONFIG` or beside the exe),
+    /// The file this config was loaded from (`SIMPLEHARN_CONFIG` or beside the exe),
     /// stamped by the boot loader. `#[serde(skip)]` so it never enters the persisted
     /// JSON. `default_model` write-back targets this exact path — read and write must
-    /// be the same file, or a `SIMPLEHAR_CONFIG` run silently loses its defaults on
+    /// be the same file, or a `SIMPLEHARN_CONFIG` run silently loses its defaults on
     /// restart (operator finding, 2026-10-26).
     #[serde(skip, default)]
     pub source_path: Option<std::path::PathBuf>,
@@ -477,7 +625,7 @@ pub struct AppConfig {
     /// `X-Har-Token` or `Authorization: Bearer`. Absent means open — safe only on
     /// loopback, because publishing `internal_host` to a segment otherwise hands every
     /// machine there load/unload/config power (deploy review, 2026-10-26).
-    /// `SIMPLEHAR_TOKEN` overrides it so the secret can stay out of the file entirely;
+    /// `SIMPLEHARN_TOKEN` overrides it so the secret can stay out of the file entirely;
     /// the value is never logged and never accepted in a URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_token: Option<String>,
@@ -1101,7 +1249,7 @@ impl AppConfig {
                 field: "internal_host".to_string(),
                 reason: format!(
                     "must be a loopback address or 0.0.0.0 (publishing to the local net: \
-                     `control_token`/SIMPLEHAR_TOKEN gate every route but the page assets; \
+                     `control_token`/SIMPLEHARN_TOKEN gate every route but the page assets; \
                      with no token set the segment is trusted); got {}",
                     self.internal_host
                 ),
@@ -1388,7 +1536,7 @@ mod tests {
             greedy_launch_min_free_gb: 6.5,
             wsl_distro: "Ubuntu-24.04".to_string(),
             wsl_user: Some("operator".to_string()),
-            source_path: Some(std::path::PathBuf::from("F:/simplehar-se.json")),
+            source_path: Some(std::path::PathBuf::from("F:/simpleharn.json")),
             control_token: Some("SENTINEL-B".to_string()),
             allow_mock_engine: true,
             ..AppConfig::default()
@@ -1411,7 +1559,7 @@ mod tests {
             ("greedy_launch_min_free_gb", "6.5"),
             ("wsl_distro", "Ubuntu-24.04"),
             ("wsl_user", "operator"),
-            ("source_path", "simplehar-se.json"),
+            ("source_path", "simpleharn.json"),
             ("allow_mock_engine", "true"),
         ] {
             assert!(
@@ -2249,5 +2397,175 @@ mod tests {
     fn write_back_text(config: &AppConfig) -> String {
         let root = serde_json::to_value(config).expect("invariant: config serializes");
         serde_json::to_string_pretty(&root).expect("invariant: JSON serializes")
+    }
+
+    /// TASK-RENAME-SIMPLEHARN pin (a): the renamed primary name is the first name
+    /// auto-discovery finds — beside a stale previous-name file the boot must read
+    /// `simpleharn.json`. Falsifier: drop the `default.exists()` arm of
+    /// `rename_compatible_default` and this boot reads the previous name instead.
+    #[test]
+    fn the_primary_config_name_wins_auto_discovery() {
+        let dir = crate::testutil::temp_dir("cfg-discovery-primary");
+        let primary = dir.join(CONFIG_FILE);
+        std::fs::write(&primary, "{}").expect("primary config");
+        std::fs::write(dir.join(PREVIOUS_CONFIG_FILE), "{}").expect("previous-name config");
+        assert_eq!(
+            rename_compatible_default(&primary).as_deref(),
+            Some(primary.as_path()),
+            "the primary name must win even when the previous name sits beside it"
+        );
+    }
+
+    /// TASK-RENAME-SIMPLEHARN pin (b): with only the previous primary name on disk
+    /// it is discovered and returned **in place** — the caller stamps it as
+    /// `source_path` (`main.rs::boot_config`) and write-back follows
+    /// `source_path` (`api::config_write_path`), so the write lands in exactly the
+    /// file the boot loaded. Falsifier: return the primary path anyway (a silent
+    /// copy-forward) and this assertion names a file that was never on disk.
+    #[test]
+    fn the_previous_config_name_loads_in_place_when_primary_is_absent() {
+        let dir = crate::testutil::temp_dir("cfg-discovery-previous");
+        let previous = dir.join(PREVIOUS_CONFIG_FILE);
+        std::fs::write(&previous, "{}").expect("previous-name config");
+        assert_eq!(
+            rename_compatible_default(&dir.join(CONFIG_FILE)).as_deref(),
+            Some(previous.as_path()),
+            "an existing deployment keeps its file; the rename must not fork the config"
+        );
+    }
+
+    /// The third rung is NOT in-place loading: with neither new name present the
+    /// discovery answers `None` so boot reaches the v3.3 migration copy (which
+    /// copies `simplehar.json` forward) or first-start materialization. Falsifier:
+    /// return the missing primary path unconditionally and a fresh install never
+    /// migrates or materializes — it boots on silent defaults.
+    #[test]
+    fn discovery_stops_when_no_new_name_config_exists() {
+        let dir = crate::testutil::temp_dir("cfg-discovery-none");
+        std::fs::write(dir.join(LEGACY_CONFIG_FILE), "{}").expect("v3.3 config");
+        assert_eq!(rename_compatible_default(&dir.join(CONFIG_FILE)), None);
+    }
+
+    /// TASK-RENAME-SIMPLEHARN pin (c, pure half): the primary env name wins
+    /// whenever it is set; the deprecated name fills only absence and is flagged
+    /// so the reader can warn. Falsifier: flip the match arms and the deprecated
+    /// `SIMPLEHAR_TOKEN` silently outranks `SIMPLEHARN_TOKEN` for every operator
+    /// who set both. Pinned pure on purpose: other tests in this binary read the
+    /// same names through the api guard, so mutating process env here would race.
+    #[test]
+    fn the_primary_env_name_wins_and_the_deprecated_one_fills_absence() {
+        assert_eq!(
+            pick_env_renamed(Some("new".into()), Some("old".into())),
+            Some(("new".to_string(), false)),
+            "primary wins when both are set"
+        );
+        assert_eq!(
+            pick_env_renamed(None, Some("old".into())),
+            Some(("old".to_string(), true)),
+            "the deprecated name still gates when the primary is absent"
+        );
+        assert_eq!(
+            pick_env_renamed(Some(String::new()), Some("old".into())),
+            Some((String::new(), false)),
+            "a set primary — even empty — shadows the deprecated name: the reader's \
+             trim-and-drop turns `SIMPLEHARN_TOKEN=` into no-token, never a fallback surprise"
+        );
+        assert_eq!(pick_env_renamed(None, None), None);
+    }
+
+    /// TASK-RENAME-SIMPLEHARN pin (review R1R-01 fix): the log knob keeps the
+    /// same precedence as the token/config pair — the primary wins, the
+    /// deprecated name fills only absence and is flagged for the deferred
+    /// warning, and an empty primary shadows it (`observability::init` then
+    /// reports the empty value as an invalid filter and uses the documented
+    /// default — a set knob is never quietly replaced). Falsifier: route the
+    /// reader through a deprecated-first arm and `SIMPLEHAR_LOG=trace` silently
+    /// outranks `SIMPLEHARN_LOG=off` for every operator who set both. Pinned
+    /// pure on purpose: the reader is only consumed inside `init`, which tests
+    /// must never call (a second subscriber registration would panic).
+    #[test]
+    fn the_log_knob_keeps_primary_wins_deprecated_fills_precedence() {
+        assert_eq!(
+            log_knob_from_values(Some("debug".into()), Some("trace".into())),
+            (Some("debug".to_string()), false),
+            "SIMPLEHARN_LOG wins when both are set"
+        );
+        assert_eq!(
+            log_knob_from_values(None, Some("trace".into())),
+            (Some("trace".to_string()), true),
+            "the deprecated SIMPLEHAR_LOG fills absence and is flagged for the warning"
+        );
+        assert_eq!(
+            log_knob_from_values(Some(String::new()), Some("trace".into())),
+            (Some(String::new()), false),
+            "a set primary — even empty — shadows the deprecated name: the knob is \
+             honored as-set and reported, never silently swapped for the fallback"
+        );
+        assert_eq!(
+            log_knob_from_values(None, None),
+            (None, false),
+            "unset means the documented default, not a fallback surprise"
+        );
+    }
+
+    /// TASK-RENAME-SIMPLEHARN pin (d): each reader pairs its primary name with its
+    /// deprecated name in the right order, and the warning rides only the
+    /// fallback arm — an honest one-time log naming the deprecated name. The
+    /// readers are one-line delegations, so the pairing order is the behavior.
+    /// Falsifier: swap one argument pair and that env's fallback silently becomes
+    /// the primary without any test touching process env.
+    #[test]
+    fn the_env_readers_pair_primary_before_deprecated() {
+        let source = include_str!("mod.rs");
+        let body = |name: &str| {
+            source
+                .split(format!("pub fn {name}").as_str())
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} must stay"))
+                .split("\n}")
+                .next()
+                .unwrap_or_else(|| panic!("{name} must close"))
+                .replace(char::is_whitespace, "")
+        };
+        assert!(
+            body("token_from_env").contains(r#""SIMPLEHARN_TOKEN","SIMPLEHAR_TOKEN""#),
+            "the token reader must name the primary first"
+        );
+        assert!(
+            body("config_path_from_env").contains(r#""SIMPLEHARN_CONFIG","SIMPLEHAR_CONFIG""#),
+            "the config-path reader must name the primary first"
+        );
+        assert!(
+            body("log_level_from_env")
+                .contains(r#""SIMPLEHARN_LOG").ok(),std::env::var("SIMPLEHAR_LOG""#),
+            "the log-knob reader must name the primary first"
+        );
+        let reader = source
+            .split("fn read_renamed_env(")
+            .nth(1)
+            .expect("the shared reader must stay")
+            .split("\n}\n")
+            .next()
+            .expect("the shared reader must close");
+        assert!(
+            reader.contains("if used_deprecated") && reader.contains("tracing::warn!"),
+            "the fallback arm must warn exactly once (the OnceLock) and name the \
+             deprecated variable in the message"
+        );
+        let log_warn = source
+            .split("pub fn warn_log_fallback(")
+            .nth(1)
+            .expect("the deferred log warning must stay")
+            .split("\n}")
+            .next()
+            .expect("the deferred log warning must close");
+        assert!(
+            log_warn.contains("if used_deprecated")
+                && log_warn.contains("tracing::warn!")
+                && log_warn.contains("SIMPLEHARN_LOG")
+                && log_warn.contains("SIMPLEHAR_LOG"),
+            "the log fallback must warn exactly once (the OnceLock), only on the \
+             fallback arm, naming both names"
+        );
     }
 }

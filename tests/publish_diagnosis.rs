@@ -8,11 +8,11 @@
 mod mock_runtime;
 
 use mock_runtime::MockRuntime;
-use simplehar_se::config::{AppConfig, CategoryId};
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime, LaunchSpec};
-use simplehar_se::model::ModelEntry;
-use simplehar_se::scheduler::{Reply, Scheduler, SchedulerHandle};
+use simpleharn::config::{AppConfig, CategoryId};
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::{EngineAdapter, EngineRuntime, LaunchSpec};
+use simpleharn::model::ModelEntry;
+use simpleharn::scheduler::{Reply, Scheduler, SchedulerHandle};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ impl EngineAdapter for CarryAdapter {
         &self,
         model: &ModelEntry,
         port: u16,
-    ) -> Result<LaunchSpec, simplehar_se::engine::EngineError> {
+    ) -> Result<LaunchSpec, simpleharn::engine::EngineError> {
         let mut spec = MockAdapter.spec(model, port)?;
         if let Some(container) = self.container {
             spec.container = Some(container.to_string());
@@ -52,7 +52,7 @@ fn harness(rows: &[(&str, &'static str)]) -> (SchedulerHandle, MockRuntime, Path
         ("mock-hold-never", Some("ninfer-doomed")),
         ("mock-never", None),
     ];
-    let dir = simplehar_se::testutil::temp_dir("publish-diagnosis");
+    let dir = simpleharn::testutil::temp_dir("publish-diagnosis");
     for (name, engine) in rows {
         std::fs::write(
             dir.join(format!("{name}.yaml")),
@@ -80,7 +80,7 @@ fn harness(rows: &[(&str, &'static str)]) -> (SchedulerHandle, MockRuntime, Path
         dir.clone(),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
     );
     (handle, runtime, dir)
 }

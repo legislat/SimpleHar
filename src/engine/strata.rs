@@ -19,7 +19,7 @@
 //! flags ahead of any profile key) — so ruling 22\[1] holds by rendering, not
 //! by policing. The external `strata_config` mode is SUPERSEDED: a row that
 //! still declares it is refused with the migration sentence, and
-//! `simplehar-se import strata <profile.json>` turns a manual profile into the
+//! `simpleharn import strata <profile.json>` turns a manual profile into the
 //! row yaml. `C:\Strata` stays the manual-launch home the serve path never
 //! reads.
 //!
@@ -213,7 +213,7 @@ fn is_absolute_shape(text: &str) -> bool {
 pub(crate) fn superseded_sentence(path: &str) -> String {
     format!(
         "`strata_config` ({path}) is superseded by the rendered-profile template: run \
-         `simplehar-se import strata \"{path}\"`, merge its output into this row, and delete \
+         `simpleharn import strata \"{path}\"`, merge its output into this row, and delete \
          the `strata_config` line"
     )
 }
@@ -1279,7 +1279,7 @@ mod tests {
             .expect_err("external mode is superseded (row 19)");
         assert!(
             matches!(&err, EngineError::Rejected { reason, .. }
-                if reason.contains("simplehar-se import strata") && reason.contains("superseded")),
+                if reason.contains("simpleharn import strata") && reason.contains("superseded")),
             "{err}"
         );
     }

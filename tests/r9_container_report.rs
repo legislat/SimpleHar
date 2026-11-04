@@ -8,13 +8,13 @@
 mod mock_runtime;
 
 use mock_runtime::MockRuntime;
-use simplehar_se::config::{AppConfig, CategoryId};
-use simplehar_se::engine::llama::LlamaAdapter;
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::ninfer::NinferAdapter;
-use simplehar_se::engine::strata::StrataAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime};
-use simplehar_se::scheduler::{Reply, Scheduler, SchedulerHandle};
+use simpleharn::config::{AppConfig, CategoryId};
+use simpleharn::engine::llama::LlamaAdapter;
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::ninfer::NinferAdapter;
+use simpleharn::engine::strata::StrataAdapter;
+use simpleharn::engine::{EngineAdapter, EngineRuntime};
+use simpleharn::scheduler::{Reply, Scheduler, SchedulerHandle};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,7 +46,7 @@ type Spec = (
 );
 
 fn write_modelconf(specs: &[Spec]) -> PathBuf {
-    let dir = simplehar_se::testutil::temp_dir("r9-report");
+    let dir = simpleharn::testutil::temp_dir("r9-report");
     for (name, engine, category, vram_gb, extra) in specs {
         let mut yaml = format!("name: {name}\nengine: {engine}\ncategory: {category}\n");
         if let Some(vram) = vram_gb {
@@ -93,7 +93,7 @@ fn harness(specs: &[Spec]) -> (SchedulerHandle, MockRuntime, PathBuf) {
         dir.clone(),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
     );
     (handle, runtime, dir)
 }
@@ -124,9 +124,9 @@ impl EngineAdapter for ContainerMockAdapter {
 
     fn spec(
         &self,
-        model: &simplehar_se::model::ModelEntry,
+        model: &simpleharn::model::ModelEntry,
         port: u16,
-    ) -> Result<simplehar_se::engine::LaunchSpec, simplehar_se::engine::EngineError> {
+    ) -> Result<simpleharn::engine::LaunchSpec, simpleharn::engine::EngineError> {
         let mut spec = MockAdapter.spec(model, port)?;
         spec.container = Some(self.container.to_string());
         Ok(spec)
@@ -439,7 +439,7 @@ struct TrustHarness {
 }
 
 fn trust_harness(container: &'static str) -> TrustHarness {
-    let dir = simplehar_se::testutil::temp_dir("r9-trust");
+    let dir = simpleharn::testutil::temp_dir("r9-trust");
     std::fs::write(
         dir.join("r9-trust.yaml"),
         "name: r9-trust\nengine: ninfer\ncategory: Work\nvram_gb: 20\n\
@@ -465,7 +465,7 @@ fn trust_harness(container: &'static str) -> TrustHarness {
         dir.clone(),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
     );
     TrustHarness {
         handle,
@@ -560,7 +560,7 @@ async fn a_failed_launch_snapshots_its_container_log_and_can_snapshot_again() {
         dir.clone(),
         adapters,
         Arc::new(runtime.clone()) as Arc<dyn EngineRuntime>,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
     );
     runtime.set_container_report("ninfer-doomed", "engine crashed on startup\n");
 

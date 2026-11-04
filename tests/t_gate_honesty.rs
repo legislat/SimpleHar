@@ -84,8 +84,8 @@ fn mid_gguf() -> PathBuf {
 /// gate books what would really land on the card (same rule as the T-suite).
 fn booked_gib(path: &std::path::Path) -> String {
     let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-    let size = simplehar_se::budget::Gibibytes(bytes as f64 / 1024.0_f64.powi(3));
-    simplehar_se::budget::need_gb(None, Some(size))
+    let size = simpleharn::budget::Gibibytes(bytes as f64 / 1024.0_f64.powi(3));
+    simpleharn::budget::need_gb(None, Some(size))
         .map(|need| format!("{:.2}", need.0))
         .unwrap_or_else(|_| "12".to_string())
 }
@@ -118,9 +118,9 @@ fn harness_exe() -> PathBuf {
         deps_dir
             .parent()
             .expect("profile dir")
-            .join("simplehar-se.exe")
+            .join("simpleharn.exe")
     } else {
-        deps_dir.join("simplehar-se.exe")
+        deps_dir.join("simpleharn.exe")
     }
 }
 
@@ -159,7 +159,7 @@ impl<'a> Entry<'a> {
 /// `aux_slots` sizes the AUX category (2 for unload-all tests, 1 for the
 /// same-slot supersede tests).
 fn spawn_raw(entries: &[Entry], sentinel: &str, aux_slots: usize) -> (Child, PathBuf) {
-    let work_dir = simplehar_se::testutil::temp_dir(&format!(
+    let work_dir = simpleharn::testutil::temp_dir(&format!(
         "gate-honesty-{}",
         NONCE_SEQ.fetch_add(1, Ordering::SeqCst)
     ));
@@ -188,7 +188,7 @@ fn spawn_raw(entries: &[Entry], sentinel: &str, aux_slots: usize) -> (Child, Pat
     )
     .expect("sentinel yaml");
 
-    let mut config = serde_json::to_value(simplehar_se::config::AppConfig::default())
+    let mut config = serde_json::to_value(simpleharn::config::AppConfig::default())
         .expect("invariant: config serializes");
     config["modelconf_dir"] = json!(modelconf.display().to_string());
     config["internal_host"] = json!("127.0.0.1");
@@ -199,14 +199,15 @@ fn spawn_raw(entries: &[Entry], sentinel: &str, aux_slots: usize) -> (Child, Pat
             }
         }
     }
-    let config_path = work_dir.join("simplehar.json");
+    let config_path = work_dir.join("simpleharn.json");
     std::fs::write(&config_path, config.to_string()).expect("config");
 
     let child = Command::new(harness_exe())
-        .env("SIMPLEHAR_CONFIG", &config_path)
+        .env("SIMPLEHARN_CONFIG", &config_path)
+        .env_remove("SIMPLEHARN_TOKEN")
         .env_remove("SIMPLEHAR_TOKEN")
         .spawn()
-        .expect("spawn simplehar-se.exe");
+        .expect("spawn simpleharn.exe");
     (child, work_dir)
 }
 
@@ -336,7 +337,7 @@ impl Harness {
     /// exactly this path: same exe, same config, so the only thing that can refuse
     /// it is the single-instance guard.
     fn config_path(&self) -> PathBuf {
-        self._work_dir.join("simplehar.json")
+        self._work_dir.join("simpleharn.json")
     }
 
     async fn get(&self, path: &str) -> Value {
@@ -1180,7 +1181,8 @@ async fn g10_second_harness_is_refused_while_first_serves() {
         .expect("verified harness");
     let models_before = harness.get("/har/models").await;
     let mut second = Command::new(harness_exe())
-        .env("SIMPLEHAR_CONFIG", harness.config_path())
+        .env("SIMPLEHARN_CONFIG", harness.config_path())
+        .env_remove("SIMPLEHARN_TOKEN")
         .env_remove("SIMPLEHAR_TOKEN")
         .spawn()
         .expect("spawn the second instance of the same exe on the same config");

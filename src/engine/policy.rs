@@ -679,7 +679,7 @@ pub(crate) fn fit_capable(engine: &str) -> bool {
 /// final echo is the machine-readable launch stamp the harness's readiness
 /// forensics read.
 pub(crate) const CANONICAL_NINFER_SCRIPT: &str = r#"#!/usr/bin/env bash
-# simplehar-se canonical ninfer autostart — rendered by the harness from its embedded
+# simpleharn canonical ninfer autostart — rendered by the harness from its embedded
 # template; staged content-addressed and launched INSTEAD of any operator script.
 # Do not edit the staged copy: it is rewritten from the model yaml before every load.
 # Profile {{PROFILE}} ({{PROFILE_SOURCE}}): ctx={{MAX_CTX}} kv={{KV_CAP}} conc={{CONC}} kv_dtype={{KV_DTYPE}}

@@ -7,11 +7,11 @@ mod mock_runtime;
 
 use async_trait::async_trait;
 use mock_runtime::MockRuntime;
-use simplehar_se::budget::{MemorySample, VramWitness};
-use simplehar_se::config::{AppConfig, CategoryId};
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime};
-use simplehar_se::scheduler::{Reply, Scheduler, SchedulerHandle};
+use simpleharn::budget::{MemorySample, VramWitness};
+use simpleharn::config::{AppConfig, CategoryId};
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::{EngineAdapter, EngineRuntime};
+use simpleharn::scheduler::{Reply, Scheduler, SchedulerHandle};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -56,7 +56,7 @@ impl VramWitness for FakeWitness {
                     total_gib: 72.0,
                     used_gib: 0.0,
                     processes: vec![],
-                    attribution: simplehar_se::budget::AttributionQuality::Unavailable,
+                    attribution: simpleharn::budget::AttributionQuality::Unavailable,
                 })
             }
         };
@@ -72,7 +72,7 @@ fn sample(total: f64, used: f64) -> MemorySample {
         total_gib: total,
         used_gib: used,
         processes: vec![],
-        attribution: simplehar_se::budget::AttributionQuality::Unavailable,
+        attribution: simpleharn::budget::AttributionQuality::Unavailable,
     }
 }
 
@@ -80,7 +80,7 @@ type Spec = (&'static str, &'static str, CategoryId, f64);
 
 /// Writes model yamls into a fresh temp ModelConf dir (with per-model VRAM).
 fn write_modelconf(specs: &[Spec]) -> PathBuf {
-    let dir = simplehar_se::testutil::temp_dir("evict");
+    let dir = simpleharn::testutil::temp_dir("evict");
     for (name, engine, category, vram) in specs {
         std::fs::write(
             dir.join(format!("{name}.yaml")),
@@ -197,7 +197,7 @@ fn harness_rt_idle(
 async fn wait_until(
     handle: &SchedulerHandle,
     secs: u64,
-    cond: impl Fn(&simplehar_se::scheduler::SchedulerStatus) -> bool,
+    cond: impl Fn(&simpleharn::scheduler::SchedulerStatus) -> bool,
 ) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -214,7 +214,7 @@ async fn wait_until(
 }
 
 fn model_of(
-    status: &simplehar_se::scheduler::SchedulerStatus,
+    status: &simpleharn::scheduler::SchedulerStatus,
     category: CategoryId,
 ) -> Option<String> {
     status
@@ -226,9 +226,9 @@ fn model_of(
 
 /// The newest ledger row of `model`'s job.
 fn job_row<'a>(
-    status: &'a simplehar_se::scheduler::SchedulerStatus,
+    status: &'a simpleharn::scheduler::SchedulerStatus,
     model: &str,
-) -> &'a simplehar_se::scheduler::JobStatus {
+) -> &'a simpleharn::scheduler::JobStatus {
     status
         .jobs
         .iter()
@@ -238,7 +238,7 @@ fn job_row<'a>(
 }
 
 /// Every AUX occupant currently installed.
-fn aux_models(status: &simplehar_se::scheduler::SchedulerStatus) -> Vec<Option<String>> {
+fn aux_models(status: &simpleharn::scheduler::SchedulerStatus) -> Vec<Option<String>> {
     status
         .slots
         .iter()
@@ -278,7 +278,7 @@ async fn work_load_evicts_aux_victim_when_short() {
     // of the 50 GiB this load is gated on.
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work50" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work50" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -359,7 +359,7 @@ async fn a_stale_resident_is_evicted_like_any_other() {
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work50" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work50" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -421,7 +421,7 @@ async fn eviction_picks_the_cheapest_sufficient_victim() {
     // Held in the settle window until the card reports the victim's bytes back.
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work53" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work53" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -480,7 +480,7 @@ async fn equal_cost_victims_evict_the_less_protected_category() {
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work35" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work35" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -565,7 +565,7 @@ async fn equal_total_victims_evict_the_fewer_victims() {
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work50" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work50" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -808,7 +808,7 @@ async fn a_successful_eviction_leaves_the_hard_filtered_occupant_untouched() {
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "rp35" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "rp35" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -846,7 +846,7 @@ async fn a_successful_eviction_leaves_the_hard_filtered_occupant_untouched() {
 
 /// ModelConf writer with raw extra lines per model (cost/floor keys).
 fn write_modelconf_ext(entries: &[(&str, &[&str])]) -> PathBuf {
-    let dir = simplehar_se::testutil::temp_dir("observed");
+    let dir = simpleharn::testutil::temp_dir("observed");
     for (name, lines) in entries {
         std::fs::write(dir.join(format!("{name}.yaml")), lines.join("\n")).expect("model yaml");
     }
@@ -1021,7 +1021,7 @@ async fn settle_refuses_when_observed_card_stays_busy() {
     assert!(job.terminal, "{job:?}");
     assert_eq!(
         job.kind,
-        simplehar_se::scheduler::JobKind::Load,
+        simpleharn::scheduler::JobKind::Load,
         "the refused load stays a load row: {job:?}"
     );
     assert_eq!(
@@ -1031,7 +1031,7 @@ async fn settle_refuses_when_observed_card_stays_busy() {
     );
     assert_eq!(
         job.state,
-        simplehar_se::scheduler::SwapState::Idle,
+        simpleharn::scheduler::SwapState::Idle,
         "the fail funnel (no spawn) walks Failed -> Reap -> Idle: {job:?}"
     );
     assert!(
@@ -1237,7 +1237,7 @@ async fn a_load_two_victims_short_releases_both_least_disposable_first() {
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work62" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work62" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -1359,7 +1359,7 @@ async fn the_release_loop_stops_only_when_the_single_counted_credit_covers_the_g
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work56" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work56" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -1480,7 +1480,7 @@ async fn a_swap_of_a_model_committed_to_eviction_never_answers_already() {
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work55" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work55" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -1505,7 +1505,7 @@ async fn a_swap_of_a_model_committed_to_eviction_never_answers_already() {
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "doom20" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "doom20" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -1628,13 +1628,13 @@ async fn the_idle_sweep_skips_a_cross_slot_eviction_victim() {
             !status
                 .jobs
                 .iter()
-                .any(|job| job.kind == simplehar_se::scheduler::JobKind::Unload
+                .any(|job| job.kind == simpleharn::scheduler::JobKind::Unload
                     && job.model == "rp-doomed"),
             "the doomed model may never earn an Unload row: {:?}",
             status.jobs
         );
         let parked = status.jobs.iter().any(|job| {
-            job.model == "work-55" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work-55" && job.state == simpleharn::scheduler::SwapState::Dispose
         }) && runtime
             .held_kills()
             .iter()
@@ -1660,7 +1660,7 @@ async fn the_idle_sweep_skips_a_cross_slot_eviction_victim() {
             !status
                 .jobs
                 .iter()
-                .any(|job| job.kind == simplehar_se::scheduler::JobKind::Unload
+                .any(|job| job.kind == simpleharn::scheduler::JobKind::Unload
                     && job.model == "rp-doomed"),
             "R2-20-01 falsifier: the idle sweep started its own unload of the \
              doomed model while the eviction's kill of that same engine was \
@@ -1673,7 +1673,7 @@ async fn the_idle_sweep_skips_a_cross_slot_eviction_victim() {
             "the victim stays installed while its release is unproven"
         );
         if status.jobs.iter().any(|job| {
-            job.kind == simplehar_se::scheduler::JobKind::Unload
+            job.kind == simpleharn::scheduler::JobKind::Unload
                 && job.model == "canary"
                 && job.outcome.as_deref() == Some("idle timeout")
         }) {
@@ -1723,7 +1723,7 @@ async fn the_idle_sweep_skips_a_cross_slot_eviction_victim() {
         !status
             .jobs
             .iter()
-            .any(|job| job.kind == simplehar_se::scheduler::JobKind::Unload
+            .any(|job| job.kind == simpleharn::scheduler::JobKind::Unload
                 && job.model == "rp-doomed"),
         "no Unload job or ledger row ever named the doomed model: {:?}",
         status.jobs
@@ -1763,7 +1763,7 @@ async fn the_idle_sweep_skips_a_cross_slot_eviction_victim() {
         );
         assert_ne!(
             job.kind,
-            simplehar_se::scheduler::JobKind::Unload,
+            simpleharn::scheduler::JobKind::Unload,
             "no sweep unload row may name the eviction victim beside the \
              eviction's own release: {job:?}"
         );
@@ -1848,7 +1848,7 @@ async fn a_stale_victim_never_aborts_the_reap_of_the_own_spawn() {
     };
     wait_until(&handle, 10, |status| {
         status.jobs.iter().any(|job| {
-            job.model == "work60" && job.state == simplehar_se::scheduler::SwapState::Dispose
+            job.model == "work60" && job.state == simpleharn::scheduler::SwapState::Dispose
         })
     })
     .await;
@@ -1879,7 +1879,7 @@ async fn a_stale_victim_never_aborts_the_reap_of_the_own_spawn() {
     assert!(job.terminal, "{job:?}");
     assert_eq!(
         job.state,
-        simplehar_se::scheduler::SwapState::Idle,
+        simpleharn::scheduler::SwapState::Idle,
         "the failure still walked Failed -> Reap -> Idle: {job:?}"
     );
     assert_eq!(

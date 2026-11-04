@@ -5,11 +5,11 @@
 mod mock_runtime;
 
 use mock_runtime::MockRuntime;
-use simplehar_se::budget::LedgerOnlyWitness;
-use simplehar_se::config::{AppConfig, CategoryId};
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime};
-use simplehar_se::scheduler::{JobKind, Scheduler, SchedulerHandle};
+use simpleharn::budget::LedgerOnlyWitness;
+use simpleharn::config::{AppConfig, CategoryId};
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::{EngineAdapter, EngineRuntime};
+use simpleharn::scheduler::{JobKind, Scheduler, SchedulerHandle};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,7 +23,7 @@ fn harness(config: AppConfig) -> SchedulerHandle {
     // guard was untested anywhere. `mock-slow` gives a 2.5 s readiness window to
     // collide with the 2 s tick.
     adapters.insert("mock-slow".to_string(), Arc::new(MockAdapter));
-    let dir = simplehar_se::testutil::temp_dir("idle");
+    let dir = simpleharn::testutil::temp_dir("idle");
     for (name, category, engine) in [
         ("idle-me", CategoryId::Rp, "mock"),
         ("stayer", CategoryId::Work, "mock"),
@@ -61,7 +61,7 @@ fn config(rp_idle_s: u64) -> AppConfig {
 async fn wait_until(
     handle: &SchedulerHandle,
     secs: u64,
-    cond: impl Fn(&simplehar_se::scheduler::SchedulerStatus) -> bool,
+    cond: impl Fn(&simpleharn::scheduler::SchedulerStatus) -> bool,
 ) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {

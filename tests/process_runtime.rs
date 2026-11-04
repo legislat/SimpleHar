@@ -3,9 +3,9 @@
 //! Python HTTP server (`python` is present on this box); the test skips with a note
 //! when it is not.
 
-use simplehar_se::engine::{EngineRuntime, LaunchSpec, Probe, ReadinessSpec, SpawnError, Spawned};
-use simplehar_se::ownership::{ResourceKind, SpawnTicket};
-use simplehar_se::process::ProcessRuntime;
+use simpleharn::engine::{EngineRuntime, LaunchSpec, Probe, ReadinessSpec, SpawnError, Spawned};
+use simpleharn::ownership::{ResourceKind, SpawnTicket};
+use simpleharn::process::ProcessRuntime;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -370,14 +370,14 @@ fn single_instance_guard_refuses_a_second_holder() {
     // cross-process case is covered by the product's own boot (t-suite) and by the
     // gate-honesty suite's second harness (g03); this test pins the four things the
     // unit can see.
-    let first = match simplehar_se::process::SingleInstanceGuard::acquire() {
+    let first = match simpleharn::process::SingleInstanceGuard::acquire() {
         Ok(guard) => guard,
         Err(reason) => {
-            eprintln!("skipping guard test: a SimpleHar SE instance holds the mutex ({reason})");
+            eprintln!("skipping guard test: a SimpleHarn instance holds the mutex ({reason})");
             return;
         }
     };
-    let error = match simplehar_se::process::SingleInstanceGuard::acquire() {
+    let error = match simpleharn::process::SingleInstanceGuard::acquire() {
         Ok(_) => panic!("a second holder of the named mutex must be refused (A10)"),
         Err(reason) => reason,
     };
@@ -388,7 +388,7 @@ fn single_instance_guard_refuses_a_second_holder() {
     // The refused acquire closed ITS OWN handle only: the object survived, so the
     // guard is still held and a third attempt is refused too.
     assert!(
-        simplehar_se::process::SingleInstanceGuard::acquire().is_err(),
+        simpleharn::process::SingleInstanceGuard::acquire().is_err(),
         "a refused acquire must not disturb the holder's mutex"
     );
     drop(first);
@@ -397,7 +397,7 @@ fn single_instance_guard_refuses_a_second_holder() {
     // retry because an unrelated test binary may grab the free name in the window.
     let reacquired = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        match simplehar_se::process::SingleInstanceGuard::acquire() {
+        match simpleharn::process::SingleInstanceGuard::acquire() {
             Ok(_released_the_guard) => break,
             Err(reason) => {
                 assert!(

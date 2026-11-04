@@ -1,4 +1,4 @@
-//! The one-shot strata profile migration (`simplehar-se import strata
+//! The one-shot strata profile migration (`simpleharn import strata
 //! <profile.json>`, operator ruling 2026-11-02 row 19c; `--apply`, ruling
 //! 2026-11-03): read a manual profile, emit the row yaml the harness renders
 //! from, and — only under `--apply <row.yaml>` — merge that block into the live
@@ -373,7 +373,7 @@ fn strata_import(profile_path: &Path) -> Result<StrataImport, String> {
 fn render_yaml(profile_path: &Path, import: &StrataImport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "# strata template row rendered by `simplehar-se import strata {}` (ruling 2026-11-02).\n\
+        "# strata template row rendered by `simpleharn import strata {}` (ruling 2026-11-02).\n\
          # The harness now RENDERS this profile from the row: the strata_* keys below are\n\
          # the whole engine config. Copy the scheduling keys (`category`, `vram_gb`,\n\
          # `cost`, `load_timeout`, `launch_only_with_at_least_vram_free`, `context`)\n\
@@ -471,7 +471,7 @@ impl std::fmt::Display for ApplyOutcome {
 }
 
 /// Merges the emitted template block into the live row file (ruling 2026-11-03:
-/// `simplehar-se import strata <profile.json> --apply <row.yaml>`).
+/// `simpleharn import strata <profile.json> --apply <row.yaml>`).
 ///
 /// The merge contract:
 ///

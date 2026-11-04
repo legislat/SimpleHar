@@ -3,13 +3,13 @@
 //! before any engine work (there is none: preload is scrapped), zero engine spawns
 //! at boot.
 
-use simplehar_se::api::{category_router, control_router, ApiState, BootMsStamp};
-use simplehar_se::budget::VramWitness;
-use simplehar_se::config::{self, firstrun, AppConfig, ConfigError};
-use simplehar_se::engine::EngineRuntime;
-use simplehar_se::observability;
-use simplehar_se::process::{ContainerCandidate, ProcessRuntime, SingleInstanceGuard};
-use simplehar_se::scheduler::{Scheduler, SchedulerHandle};
+use simpleharn::api::{category_router, control_router, ApiState, BootMsStamp};
+use simpleharn::budget::VramWitness;
+use simpleharn::config::{self, firstrun, AppConfig, ConfigError};
+use simpleharn::engine::EngineRuntime;
+use simpleharn::observability;
+use simpleharn::process::{ContainerCandidate, ProcessRuntime, SingleInstanceGuard};
+use simpleharn::scheduler::{Scheduler, SchedulerHandle};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,21 +21,37 @@ use std::time::Duration;
 /// A missing file yields defaults ("no config file" is usable, §0.1); an invalid file
 /// or any validation failure is fatal and every problem is logged (never silently
 /// defaulted — defect D1). `env_config_path` is the effective value of
-/// `SIMPLEHAR_CONFIG` (passed in, not read here, so tests never mutate process env):
-/// naming a path that is not an existing file is fatal (FINDINGS-14 [3]), and a
-/// legacy-migration copy that fails is fatal too — the operator has a config the
-/// boot cannot honour (FINDINGS-14 [2]).
+/// `SIMPLEHARN_CONFIG` — or its deprecated `SIMPLEHAR_CONFIG` fallback, resolved by
+/// `config::config_path_from_env` at boot (passed in, not read here, so tests never
+/// mutate process env): naming a path that is not an existing file is fatal
+/// (FINDINGS-14 [3]), and a legacy-migration copy that fails is fatal too — the
+/// operator has a config the boot cannot honour (FINDINGS-14 [2]). With no env name
+/// the load order is `simpleharn.json`, then the previous primary name
+/// `simplehar-se.json` loaded in place (TASK-RENAME-SIMPLEHARN), then the v3.3
+/// migration copy of `simplehar.json`.
 fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigError>> {
     // The test harness (and operators) can point at a config anywhere; otherwise
     // the config lives beside the executable.
     let explicit = env_config_path.map(PathBuf::from);
-    let path = match &explicit {
+    let mut path = match &explicit {
         Some(path) => Some(path.clone()),
         None => config::default_config_path(),
     };
+    // Rename compatibility (TASK-RENAME-SIMPLEHARN, 2026-11-04): when the env names
+    // nothing and no file carries the primary name beside the exe, the previous
+    // primary name loads **in place** — `source_path` (stamped below from `path`)
+    // keeps every write-back on the file that was loaded, so switching binaries
+    // never forks a live deployment into two configs. An explicit path is an
+    // instruction: it never falls back, a missing one stays fatal (14 [3]).
+    if explicit.is_none() {
+        if let Some(default) = path.as_deref() {
+            path =
+                config::rename_compatible_default(default).or_else(|| Some(default.to_path_buf()));
+        }
+    }
     // One-time migration from the shared v3.3 name. The legacy file is copied, never
     // moved or rewritten: the rollback exe must still find what it expects there
-    // (deploy review, 2026-10-26 — SE's full-struct persist writes `protected_ports`,
+    // (deploy review, 2026-10-26 — our full-struct persist writes `protected_ports`,
     // which makes v3.3 exit on its own port-namespace check).
     if let Some(path) = path.as_ref() {
         if !path.exists()
@@ -72,7 +88,7 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
         // FINDINGS-14 [3]: an explicit env path is an instruction, not an absence.
         if !path.is_file() {
             return Err(vec![ConfigError::Invalid {
-                field: "SIMPLEHAR_CONFIG".to_string(),
+                field: "SIMPLEHARN_CONFIG".to_string(),
                 reason: format!("no configuration file at {}", path.display()),
             }]);
         }
@@ -86,7 +102,7 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
         {
             tracing::warn!(
                 file = %path.display(),
-                "SIMPLEHAR_CONFIG selects the legacy config name: every config \
+                "SIMPLEHARN_CONFIG selects the legacy config name: every config \
                  write-back rewrites this file, and v3.3 reads `protected_ports` and \
                  may exit on its own port-namespace check — the rollback exe can be \
                  stranded; keep an untouched copy if a rollback is planned"
@@ -98,7 +114,7 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
             // R2-14-01: the fatal line must name the file this boot actually read.
             // `AppConfig::parse` names the schema root (`CONFIG_FILE`) because a bare
             // parse call knows no file; here the path is known, so re-stamp the field
-            // with it — an operator typo in a `SIMPLEHAR_CONFIG` file must not send a
+            // with it — an operator typo in a `SIMPLEHARN_CONFIG` file must not send a
             // hunt to the healthy default beside the exe. `parse` itself stays as-is.
             AppConfig::load(path).map_err(|error| {
                 let reason = match error {
@@ -116,7 +132,7 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
         }
     };
     // Stamp where the config came from (or where it will live) so `default_model`
-    // write-back targets the same file boot read — a `SIMPLEHAR_CONFIG` run must not
+    // write-back targets the same file boot read — a `SIMPLEHARN_CONFIG` run must not
     // persist defaults into a file it never loads (operator finding, 2026-10-26).
     // REV6-04: remember the file that was actually read — a semantic refusal must
     // name it in the fatal output too, the way the parse arm already does.
@@ -161,7 +177,7 @@ fn run_cli(mut words: impl Iterator<Item = String>) -> Option<ExitCode> {
     let path = words.next().unwrap_or_default();
     let usage = || {
         tracing::error!(
-            "usage: simplehar-se import strata <profile.json> [--apply <row.yaml>] \
+            "usage: simpleharn import strata <profile.json> [--apply <row.yaml>] \
              (prints the row yaml and writes nothing, or merges the block into the row)"
         );
     };
@@ -185,10 +201,10 @@ fn run_cli(mut words: impl Iterator<Item = String>) -> Option<ExitCode> {
         }
     };
     let outcome = match row {
-        None => simplehar_se::import::strata_yaml(std::path::Path::new(path.trim()))
+        None => simpleharn::import::strata_yaml(std::path::Path::new(path.trim()))
             .map(|yaml| print!("{yaml}")),
         Some(row) => {
-            let outcome = simplehar_se::import::apply_strata_row(
+            let outcome = simpleharn::import::apply_strata_row(
                 std::path::Path::new(path.trim()),
                 std::path::Path::new(row.trim()),
             );
@@ -208,7 +224,7 @@ fn run_cli(mut words: impl Iterator<Item = String>) -> Option<ExitCode> {
 async fn main() -> ExitCode {
     let boot_started = std::time::Instant::now();
     observability::init();
-    // `simplehar-se import strata <profile.json>` (operator ruling 2026-11-02
+    // `simpleharn import strata <profile.json>` (operator ruling 2026-11-02
     // row 19c): the one-shot migration tool — read a manual strata profile,
     // print the row yaml, delete nothing. It is a command, not a serve: no
     // guard, no config, no listener, and the only sanctioned reader of a
@@ -221,7 +237,7 @@ async fn main() -> ExitCode {
     // which build and which process died. Non-secret facts only — the token is
     // reported as presence alone, never its value (the 15[9] posture).
     tracing::info!(
-        target: "simplehar_se::boot",
+        target: "simpleharn::boot",
         version = env!("CARGO_PKG_VERSION"),
         pid = std::process::id(),
         exe = %std::env::current_exe()
@@ -237,7 +253,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut config = match boot_config(std::env::var("SIMPLEHAR_CONFIG").ok()) {
+    let mut config = match boot_config(config::config_path_from_env()) {
         Ok(config) => config,
         Err(errors) => {
             for error in &errors {
@@ -251,7 +267,7 @@ async fn main() -> ExitCode {
     // against the numbers that produced it without opening the JSON — the coordinates
     // I had to reverse-engineer from a silent release package today.
     tracing::info!(
-        target: "simplehar_se::boot",
+        target: "simpleharn::boot",
         config = %config
             .source_path
             .as_ref()
@@ -266,18 +282,17 @@ async fn main() -> ExitCode {
             .control_token
             .as_deref()
             .is_some_and(|token| !token.trim().is_empty()),
-        token_from_env = std::env::var("SIMPLEHAR_TOKEN")
-            .ok()
+        token_from_env = config::token_from_env()
             .is_some_and(|token| !token.trim().is_empty()),
         "boot configuration"
     );
-    let witness = simplehar_se::witness::NvmlWitness::new();
+    let witness = simpleharn::witness::NvmlWitness::new();
     let witness = Arc::new(witness);
     // First-start materialization (operator ruling 2026-10-29): with no config file,
     // derive values from the real system and create the file beside the exe — the
     // documented defaults (notably `vram_total_gb` = 72.0, THIS box's card) must not
     // silently ship as everyone's ceiling. Fires only for the beside-the-exe path;
-    // a missing SIMPLEHAR_CONFIG file already failed boot as an instruction (14 [3]).
+    // a missing SIMPLEHARN_CONFIG file already failed boot as an instruction (14 [3]).
     let first_run = first_run_target(&config);
     let mut observed_total: Option<f64> = None;
     if let Some(path) = first_run {
@@ -347,12 +362,12 @@ async fn main() -> ExitCode {
                     observed,
                     tolerance,
                     "config vram_total_gb disagrees with the card's own reading (never auto-repaired): \
-                     edit simplehar-se.json if the card is right"
+                     edit simpleharn.json if the card is right"
                 );
             }
         });
     }
-    let adapters = simplehar_se::engine::default_adapters(&config);
+    let adapters = simpleharn::engine::default_adapters(&config);
     // Witness/runtime/scheduler are bind-cheap (FINDINGS-14 [1]): the NVML witness
     // defers Nvml::init to its first sample (or the priming task below) and the
     // scheduler defers the catalog scan to its actor task, so no driver or
@@ -381,7 +396,7 @@ async fn main() -> ExitCode {
         adapters,
         runtime,
         // Unsized coercion of the shared concrete witness to the trait object.
-        Arc::clone(&witness) as Arc<dyn simplehar_se::budget::VramWitness>,
+        Arc::clone(&witness) as Arc<dyn simpleharn::budget::VramWitness>,
     );
     if !config.modelconf_dir.exists() {
         // Friendly default: a missing ModelConf dir is created, not reported —
@@ -412,17 +427,17 @@ async fn main() -> ExitCode {
             log_boot_banner(&handle, &exe, &conf_dir, wsl_account.as_deref()).await;
         });
     }
-    let listeners = simplehar_se::listeners::ListenerRegistry::new();
-    let boot = simplehar_se::api::BootTimings {
+    let listeners = simpleharn::listeners::ListenerRegistry::new();
+    let boot = simpleharn::api::BootTimings {
         config_ms,
         scheduler_spawn_ms,
-        ..simplehar_se::api::BootTimings::default()
+        ..simpleharn::api::BootTimings::default()
     };
     let state = Arc::new(ApiState::new(
         config.clone(),
         scheduler.clone(),
         listeners.clone(),
-        Arc::clone(&witness) as Arc<dyn simplehar_se::budget::VramWitness>,
+        Arc::clone(&witness) as Arc<dyn simpleharn::budget::VramWitness>,
         boot,
     ));
 
@@ -431,7 +446,7 @@ async fn main() -> ExitCode {
     let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
     if config.tray_enabled {
         let control_url = format!("http://{}/", state.control_addr);
-        simplehar_se::tray::spawn(
+        simpleharn::tray::spawn(
             scheduler,
             listeners,
             control_url,
@@ -459,8 +474,8 @@ const LISTENER_RETRY: Duration = Duration::from_secs(5);
 const FIRST_RUN_PROBE_BUDGET: Duration = Duration::from_secs(3);
 
 /// First-start gate: materialization fires only for the beside-the-exe
-/// `simplehar-se.json` that is absent — never for a legacy name, and never for a
-/// `SIMPLEHAR_CONFIG` path (an explicit env file is an instruction: boot already
+/// `simpleharn.json` that is absent — never for a legacy name, and never for a
+/// `SIMPLEHARN_CONFIG` path (an explicit env file is an instruction: boot already
 /// failed when it was missing, FINDINGS-14 [3]; if it exists it is not a target).
 fn first_run_target(config: &AppConfig) -> Option<PathBuf> {
     config.source_path.clone().filter(|path| {
@@ -474,7 +489,7 @@ fn first_run_target(config: &AppConfig) -> Option<PathBuf> {
 /// card total via the synchronous NVML-only witness leg (a wedged driver can park
 /// one blocking thread, never the boot), engine binary via PATH + the known dir.
 /// Each leg answers `None` on failure and logs why; callers degrade to defaults.
-async fn probe_system(witness: &Arc<simplehar_se::witness::NvmlWitness>) -> firstrun::ProbeResults {
+async fn probe_system(witness: &Arc<simpleharn::witness::NvmlWitness>) -> firstrun::ProbeResults {
     let probing = Arc::clone(witness);
     let total = match tokio::time::timeout(
         FIRST_RUN_PROBE_BUDGET,
@@ -630,14 +645,14 @@ async fn log_boot_banner(
     for (entry, marker) in catalog.models.iter().zip(markers) {
         let path = entry.model_ref.as_deref().unwrap_or("-");
         tracing::info!(
-            target: "simplehar_se::boot",
+            target: "simpleharn::boot",
             "{}",
             format!("{marker}/{}/{}/{path}", entry.category, entry.engine),
         );
     }
     for error in &catalog.errors {
         tracing::warn!(
-            target: "simplehar_se::boot",
+            target: "simpleharn::boot",
             "{}",
             format!("! {}: {}", error.file, error.reason),
         );
@@ -651,7 +666,7 @@ async fn log_boot_banner(
 /// sentinels (model/mod.rs:57) and other engines may load file-less, so both
 /// print the neutral marker instead of a false alarm.
 fn banner_marker(
-    entry: &simplehar_se::model::ModelEntry,
+    entry: &simpleharn::model::ModelEntry,
     modelconf_dir: &std::path::Path,
 ) -> &'static str {
     match entry.model_ref.as_deref() {
@@ -685,8 +700,8 @@ fn banner_marker(
 /// dead process (G11, §0.2 failure contract) — even for the control listener.
 async fn supervise_listener(
     state: Arc<ApiState>,
-    category: simplehar_se::config::CategoryConfig,
-    listeners: simplehar_se::listeners::ListenerRegistry,
+    category: simpleharn::config::CategoryConfig,
+    listeners: simpleharn::listeners::ListenerRegistry,
     boot_started: std::time::Instant,
     first_bind: BootMsStamp,
 ) {
@@ -865,7 +880,7 @@ struct GateVerdict {
     /// Categories that are bound and serving.
     serving: usize,
     /// Categories with no verdict yet, in canonical order.
-    pending: Vec<simplehar_se::config::CategoryId>,
+    pending: Vec<simpleharn::config::CategoryId>,
 }
 
 impl GateVerdict {
@@ -878,14 +893,14 @@ impl GateVerdict {
 /// The ready gate's verdict for one snapshot of the listener registry.
 fn gate_verdict(
     snapshot: &std::collections::BTreeMap<
-        simplehar_se::config::CategoryId,
-        simplehar_se::listeners::ListenerState,
+        simpleharn::config::CategoryId,
+        simpleharn::listeners::ListenerState,
     >,
 ) -> GateVerdict {
     GateVerdict {
         serving: snapshot
             .values()
-            .filter(|state| matches!(state, simplehar_se::listeners::ListenerState::Serving))
+            .filter(|state| matches!(state, simpleharn::listeners::ListenerState::Serving))
             .count(),
         pending: snapshot
             .iter()
@@ -908,7 +923,7 @@ async fn run(
 ) -> anyhow::Result<()> {
     tracing::info!(
         control = %state.control_addr,
-        "simplehar-se booting: listeners before engines, zero engine spawns (§0.2)"
+        "simpleharn booting: listeners before engines, zero engine spawns (§0.2)"
     );
     let host = state.config.internal_host;
     if !host.is_loopback() {
@@ -923,7 +938,7 @@ async fn run(
         } else {
             tracing::warn!(
                 %host,
-                "publishing to the local network with NO authentication: every device on the segment can load models and drive the GPUs — set `control_token` or `SIMPLEHAR_TOKEN`"
+                "publishing to the local network with NO authentication: every device on the segment can load models and drive the GPUs — set `control_token` or `SIMPLEHARN_TOKEN`"
             );
         }
     }
@@ -1058,10 +1073,10 @@ async fn run(
         _ = tokio::signal::ctrl_c() => {},
         _ = shutdown_rx.changed() => {},
     }
-    // Carries the `simplehar_se::shutdown` target so "clean exit or killed?" is
+    // Carries the `simpleharn::shutdown` target so "clean exit or killed?" is
     // answerable from the file alone — the question today's incident could not answer.
     tracing::info!(
-        target: "simplehar_se::shutdown",
+        target: "simpleharn::shutdown",
         uptime_s = boot_started.elapsed().as_secs(),
         log_write_failures = observability::log_write_failures(),
         "shutdown requested; stopping listeners"
@@ -1088,9 +1103,9 @@ mod tests {
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use simplehar_se::api::{control_router, ApiState};
-    use simplehar_se::config::{self, AppConfig, CategoryConfig, CategoryId, ConfigError};
-    use simplehar_se::engine::EngineRuntime;
+    use simpleharn::api::{control_router, ApiState};
+    use simpleharn::config::{self, AppConfig, CategoryConfig, CategoryId, ConfigError};
+    use simpleharn::engine::EngineRuntime;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1121,7 +1136,7 @@ mod tests {
                 "not an import line must boot the harness: {words:?}"
             );
         }
-        let dir = simplehar_se::testutil::temp_dir("cli-import");
+        let dir = simpleharn::testutil::temp_dir("cli-import");
         let profile = dir.join("profile.json");
         std::fs::write(
             &profile,
@@ -1174,7 +1189,7 @@ mod tests {
     /// row on disk and answers success; emit-only prints and creates nothing.
     #[test]
     fn run_cli_apply_merges_the_row_and_emit_only_touches_nothing() {
-        let dir = simplehar_se::testutil::temp_dir("cli-import-apply");
+        let dir = simpleharn::testutil::temp_dir("cli-import-apply");
         let profile = dir.join("profile.json");
         std::fs::write(
             &profile,
@@ -1243,7 +1258,7 @@ mod tests {
 
     #[test]
     fn first_run_target_fires_only_for_a_missing_beside_exe_config() {
-        let root = simplehar_se::testutil::temp_dir("first-run-target");
+        let root = simpleharn::testutil::temp_dir("first-run-target");
         let mut cfg = AppConfig {
             source_path: None,
             ..AppConfig::default()
@@ -1269,7 +1284,7 @@ mod tests {
             "an existing file is never a target (never overwrite)"
         );
 
-        // An explicit SIMPLEHAR_CONFIG path — existing or not — is an instruction,
+        // An explicit SIMPLEHARN_CONFIG path — existing or not — is an instruction,
         // never a materialization target (FINDINGS-14 [3]).
         let named = root.join("operator-spelled.json");
         std::fs::write(&named, "{}").expect("write env config");
@@ -1292,7 +1307,7 @@ mod tests {
         // FINDINGS-14 [2]: a present-but-uncopiable legacy config must fail the boot,
         // never warn and fall through to built-in defaults. The legacy path is a
         // directory: `exists()` passes but `std::fs::copy` fails deterministically.
-        let dir = simplehar_se::testutil::temp_dir("legacy-copy-fail");
+        let dir = simpleharn::testutil::temp_dir("legacy-copy-fail");
         let target = dir.join(config::CONFIG_FILE);
         let legacy = dir.join(config::LEGACY_CONFIG_FILE);
         std::fs::create_dir(&legacy).expect("legacy dir");
@@ -1310,19 +1325,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_named_by_simplehar_config_is_fatal() {
+    fn missing_file_named_by_simpleharn_config_is_fatal() {
         // FINDINGS-14 [3]: the env var is an instruction, not an absence.
-        let dir = simplehar_se::testutil::temp_dir("env-missing");
+        let dir = simpleharn::testutil::temp_dir("env-missing");
         let requested = dir.join("operator-typo.json");
         let errors = boot_config(Some(requested.display().to_string()))
-            .expect_err("a missing file named by SIMPLEHAR_CONFIG must be fatal");
+            .expect_err("a missing file named by SIMPLEHARN_CONFIG must be fatal");
         let text = error_text(&errors);
         assert!(
             text.contains(&requested.display().to_string()),
             "the error must name the requested path: {text}"
         );
         assert!(
-            !text.contains("simplehar-se.json"),
+            !text.contains("simpleharn.json"),
             "the honest report names the requested path, not the default file: {text}"
         );
     }
@@ -1331,11 +1346,18 @@ mod tests {
     fn missing_default_config_still_defaults() {
         // Regression pin for [2]/[3]: unset env + no file beside the exe keeps the
         // §0.1 defaults path untouched. Guarded: a stray config beside the test
-        // exe is not the case under test.
+        // exe is not the case under test. Since the 2026-11-04 rename the stray
+        // that can exist beside a test exe includes the previous primary name
+        // (`rename_compatible_default` would load it) and the v3.3 name.
         let Some(default) = config::default_config_path() else {
             return;
         };
-        if default.exists() || default.with_file_name(config::LEGACY_CONFIG_FILE).exists() {
+        if default.exists()
+            || default
+                .with_file_name(config::PREVIOUS_CONFIG_FILE)
+                .exists()
+            || default.with_file_name(config::LEGACY_CONFIG_FILE).exists()
+        {
             return;
         }
         let loaded = boot_config(None).expect("unset env with no file must boot defaults");
@@ -1347,8 +1369,8 @@ mod tests {
     }
 
     #[test]
-    fn simplehar_config_pointing_at_a_present_file_loads_it() {
-        let dir = simplehar_se::testutil::temp_dir("env-present");
+    fn simpleharn_config_pointing_at_a_present_file_loads_it() {
+        let dir = simpleharn::testutil::temp_dir("env-present");
         let path = dir.join("custom-name.json");
         std::fs::write(&path, r#"{"vram_total_gb": 42.0}"#).expect("config file");
         let loaded =
@@ -1361,9 +1383,9 @@ mod tests {
     fn invalid_env_named_config_names_the_file_that_failed() {
         // R2-14-01: a fatal invalid-config boot exits before the `boot configuration
         // config=<path>` line ever runs, so the fatal error is the only failure output
-        // — it must name the file this boot loaded, not `simplehar-se.json` it never
+        // — it must name the file this boot loaded, not `simpleharn.json` it never
         // read. Falsifier: revert the `boot_config` path re-stamp and both asserts fail.
-        let dir = simplehar_se::testutil::temp_dir("env-invalid");
+        let dir = simpleharn::testutil::temp_dir("env-invalid");
         let path = dir.join("custom-name.json");
         std::fs::write(&path, r#"{"wrok_port": 9}"#).expect("invalid config file");
         let errors = boot_config(Some(path.display().to_string()))
@@ -1385,7 +1407,7 @@ mod tests {
         // explicitly selects it". Both legs pinned at the boot decision: `source_path`
         // is exactly what `api::config_write_path` writes back to (pinned by the
         // api-side test), so what boot stamps IS the write target (doctrine 1).
-        let dir = simplehar_se::testutil::temp_dir("env-legacy-name");
+        let dir = simpleharn::testutil::temp_dir("env-legacy-name");
         let explicit = dir.join(config::LEGACY_CONFIG_FILE);
         std::fs::write(&explicit, r#"{"vram_total_gb": 24.0}"#).expect("legacy-named config");
         let loaded = boot_config(Some(explicit.display().to_string()))
@@ -1398,13 +1420,19 @@ mod tests {
              write-back target — config file is king"
         );
 
-        // Fallback leg: with no env and no file beside the exe, boot stamps the SE
-        // name — never the legacy name. Guarded like `missing_default_config_still_defaults`:
-        // a stray config beside the test exe is not the case under test.
+        // Fallback leg: with no env and no file beside the exe, boot stamps the
+        // default name — never a legacy or previous-rename name. Guarded like
+        // `missing_default_config_still_defaults`: a stray config beside the test
+        // exe (either compatibility name) is not the case under test.
         let Some(default) = config::default_config_path() else {
             return;
         };
-        if default.exists() || default.with_file_name(config::LEGACY_CONFIG_FILE).exists() {
+        if default.exists()
+            || default
+                .with_file_name(config::PREVIOUS_CONFIG_FILE)
+                .exists()
+            || default.with_file_name(config::LEGACY_CONFIG_FILE).exists()
+        {
             return;
         }
         let fallback = boot_config(None).expect("unset env with no file must boot defaults");
@@ -1420,6 +1448,39 @@ mod tests {
                 .and_then(|path| path.file_name()),
             Some(std::ffi::OsStr::new(config::LEGACY_CONFIG_FILE)),
             "fallback boot never stamps the legacy name, so write-back never writes it"
+        );
+    }
+
+    /// TASK-RENAME-SIMPLEHARN pin (b, boot half): a config that still carries the
+    /// previous primary name is loaded **in place** and stamped as `source_path` —
+    /// and `source_path` IS the write-back target (`api::config_write_path`, pinned
+    /// on the api side), so the write lands in exactly the file this boot loaded.
+    /// Auto-discovery itself is pinned in `config` (`rename_compatible_default`);
+    /// this pin covers the stamping `boot_config` does with whatever discovery
+    /// returns. Falsifier: copy-forward to the primary name instead of loading in
+    /// place, and the stamp names a file this boot never read while a second
+    /// config silently forks beside the operator's one.
+    #[test]
+    fn previous_name_config_stamps_source_path_as_the_write_target() {
+        let dir = simpleharn::testutil::temp_dir("env-previous-name");
+        let path = dir.join(config::PREVIOUS_CONFIG_FILE);
+        std::fs::write(&path, r#"{"vram_total_gb": 41.0}"#).expect("previous-name config");
+        let loaded = boot_config(Some(path.display().to_string()))
+            .expect("the previous primary name is a valid file to load");
+        assert_eq!(
+            loaded.vram_total_gb, 41.0,
+            "the loaded file's value must survive"
+        );
+        assert_eq!(
+            loaded.source_path.as_deref(),
+            Some(path.as_path()),
+            "write-back must follow the previous-name file, never fork to a new name"
+        );
+        assert_eq!(
+            first_run_target(&loaded),
+            None,
+            "an existing previous-name file is a legacy name: materialization must \
+             not create a competing primary-name file beside it"
         );
     }
 
@@ -1464,7 +1525,7 @@ mod tests {
             captured
         }
 
-        let dir = simplehar_se::testutil::temp_dir("env-legacy-warn");
+        let dir = simpleharn::testutil::temp_dir("env-legacy-warn");
         let legacy = dir.join(config::LEGACY_CONFIG_FILE);
         std::fs::write(&legacy, "{}").expect("legacy-named config");
         let text = capture(&legacy);
@@ -1493,7 +1554,7 @@ mod tests {
         // REV6-04: a present env file that parses but fails validation must also name
         // the loaded file in the fatal output — the shape-error arm alone was not
         // enough. Falsifier: revert the validate re-stamp and the first assert fails.
-        let dir = simplehar_se::testutil::temp_dir("env-invalid-semantic");
+        let dir = simpleharn::testutil::temp_dir("env-invalid-semantic");
         let path = dir.join("custom-name.json");
         std::fs::write(&path, r#"{"load_timeout_s": 0}"#).expect("config file");
         let errors = boot_config(Some(path.display().to_string()))
@@ -1545,7 +1606,7 @@ mod tests {
         // A seeded (all-`Pending`) registry must withhold both `bind_ms` and the word
         // "resolved", and must be named category by category. Falsifier: count
         // `snapshot().len()` instead of `pending()` and the first two assertions fail.
-        let registry = simplehar_se::listeners::ListenerRegistry::new();
+        let registry = simpleharn::listeners::ListenerRegistry::new();
         let verdict = gate_verdict(&registry.snapshot());
         assert!(!verdict.resolved(), "no supervisor has spoken yet");
         assert_eq!(
@@ -1631,16 +1692,16 @@ Start Port    End Port
     #[test]
     fn banner_marker_is_honest_in_both_directions() {
         use super::banner_marker;
-        use simplehar_se::config::CategoryId;
-        use simplehar_se::model::ModelEntry;
+        use simpleharn::config::CategoryId;
+        use simpleharn::model::ModelEntry;
         let entry = |engine: &str, model_ref: Option<&str>| ModelEntry {
             name: "m".to_string(),
             engine: engine.to_string(),
             category: CategoryId::Work,
             vram_gb: None,
             gguf_size_gb: None,
-            cost: simplehar_se::model::CostClass::Fixed,
-            vram_gate: simplehar_se::model::VramGate::default(),
+            cost: simpleharn::model::CostClass::Fixed,
+            vram_gate: simpleharn::model::VramGate::default(),
             load_timeout_s: None,
             min_turn_s: None,
             measured_gb: None,
@@ -1654,7 +1715,7 @@ Start Port    End Port
             file: None,
             raw: Default::default(),
         };
-        let dir = simplehar_se::testutil::temp_dir("banner");
+        let dir = simpleharn::testutil::temp_dir("banner");
         assert_eq!(
             banner_marker(&entry("llama", None), &dir),
             "!",
@@ -1694,28 +1755,28 @@ Start Port    End Port
     impl EngineRuntime for NeverRuntime {
         async fn spawn(
             &self,
-            _spec: &simplehar_se::engine::LaunchSpec,
-            _ticket: simplehar_se::ownership::SpawnTicket,
-        ) -> Result<simplehar_se::engine::Spawned, simplehar_se::engine::SpawnError> {
+            _spec: &simpleharn::engine::LaunchSpec,
+            _ticket: simpleharn::ownership::SpawnTicket,
+        ) -> Result<simpleharn::engine::Spawned, simpleharn::engine::SpawnError> {
             panic!("FINDINGS-14 [5]: boot spawned an engine before the listeners bound");
         }
         async fn kill(
             &self,
-            _ticket: &simplehar_se::ownership::SpawnTicket,
-        ) -> Result<(), simplehar_se::engine::SpawnError> {
+            _ticket: &simpleharn::ownership::SpawnTicket,
+        ) -> Result<(), simpleharn::engine::SpawnError> {
             panic!("FINDINGS-14 [5]: boot killed an engine before the listeners bound");
         }
         async fn release_confirmed(
             &self,
-            _ticket: &simplehar_se::ownership::SpawnTicket,
-        ) -> Result<bool, simplehar_se::engine::SpawnError> {
+            _ticket: &simpleharn::ownership::SpawnTicket,
+        ) -> Result<bool, simpleharn::engine::SpawnError> {
             panic!("FINDINGS-14 [5]: boot released an engine slot before the listeners bound");
         }
         async fn probe(
             &self,
             _port: u16,
-            _readiness: &simplehar_se::engine::ReadinessSpec,
-        ) -> simplehar_se::engine::Probe {
+            _readiness: &simpleharn::engine::ReadinessSpec,
+        ) -> simpleharn::engine::Probe {
             panic!("FINDINGS-14 [5]: boot probed an engine port before the listeners bound");
         }
         async fn discover_model_id(&self, _port: u16) -> Option<String> {
@@ -1729,21 +1790,21 @@ Start Port    End Port
     fn boot_wiring(
         config: &AppConfig,
         runtime: Arc<dyn EngineRuntime>,
-    ) -> (simplehar_se::scheduler::SchedulerHandle, Arc<ApiState>) {
-        let scheduler = simplehar_se::scheduler::Scheduler::start(
+    ) -> (simpleharn::scheduler::SchedulerHandle, Arc<ApiState>) {
+        let scheduler = simpleharn::scheduler::Scheduler::start(
             config.clone(),
             config.modelconf_dir.clone(),
-            simplehar_se::engine::default_adapters(config),
+            simpleharn::engine::default_adapters(config),
             runtime,
-            Arc::new(simplehar_se::budget::LedgerOnlyWitness)
-                as Arc<dyn simplehar_se::budget::VramWitness>,
+            Arc::new(simpleharn::budget::LedgerOnlyWitness)
+                as Arc<dyn simpleharn::budget::VramWitness>,
         );
         let state = Arc::new(ApiState::new(
             config.clone(),
             scheduler.clone(),
-            simplehar_se::listeners::ListenerRegistry::new(),
-            Arc::new(simplehar_se::budget::LedgerOnlyWitness),
-            simplehar_se::api::BootTimings::default(),
+            simpleharn::listeners::ListenerRegistry::new(),
+            Arc::new(simpleharn::budget::LedgerOnlyWitness),
+            simpleharn::api::BootTimings::default(),
         ));
         (scheduler, state)
     }
@@ -1753,7 +1814,7 @@ Start Port    End Port
     /// harness that may be serving, and without ever naming a container.
     fn ephemeral_boot_config(tag: &str) -> AppConfig {
         AppConfig {
-            modelconf_dir: simplehar_se::testutil::temp_dir(tag),
+            modelconf_dir: simpleharn::testutil::temp_dir(tag),
             ..AppConfig::default()
         }
     }
@@ -1847,7 +1908,7 @@ Start Port    End Port
         // The registry is seeded `Pending`, so "has an entry" is no longer a wait —
         // this must poll for the actual `Serving` verdict the supervisor publishes.
         while state.listeners.snapshot().get(&CategoryId::Work)
-            != Some(&simplehar_se::listeners::ListenerState::Serving)
+            != Some(&simpleharn::listeners::ListenerState::Serving)
         {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1896,7 +1957,7 @@ Start Port    End Port
             category.public_port = 0;
         }
         let (_scheduler, state) = boot_wiring(&config, Arc::new(NeverRuntime));
-        let boot_runtime = simplehar_se::process::ProcessRuntime::new();
+        let boot_runtime = simpleharn::process::ProcessRuntime::new();
         let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
         let running = tokio::spawn(run(
             Arc::clone(&state),

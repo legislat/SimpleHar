@@ -424,7 +424,7 @@ fn write_entry(entry: &LogEntry) {
 }
 
 /// The layer keeping the on-disk post-mortem artifact (G6/G13): same captured shape
-/// as the ring, its own level floor so a `SIMPLEHAR_LOG` mistake cannot leave the
+/// as the ring, its own level floor so a `SIMPLEHARN_LOG` mistake cannot leave the
 /// forensic file empty when it is needed most.
 struct FileLayer;
 
@@ -438,7 +438,7 @@ where
 }
 
 /// The level floor of the file sink: never quieter than `INFO`, whatever the operator
-/// asked the console for. A mistyped or deliberately narrowing `SIMPLEHAR_LOG` must
+/// asked the console for. A mistyped or deliberately narrowing `SIMPLEHARN_LOG` must
 /// not empty the one artifact that explains a dead harness; a more verbose request is
 /// honoured in the file too.
 fn file_filter(parsed: &EnvFilter) -> EnvFilter {
@@ -523,11 +523,14 @@ pub(crate) fn file_sink_path_for_test() -> Option<PathBuf> {
 
 /// Initializes the global tracing subscriber.
 ///
-/// Filter level comes from the `SIMPLEHAR_LOG` environment variable; when unset it
-/// defaults to `DEFAULT_LOG_LEVEL`. A value that does not parse is **not** silently
+/// Filter level comes from the `SIMPLEHARN_LOG` environment variable — or, as a
+/// deprecated fallback (TASK-RENAME-SIMPLEHARN, review R1R-01), `SIMPLEHAR_LOG`,
+/// honored only when the primary name is unset and reported once through the
+/// subscriber installed below; when neither name is set it defaults to
+/// `DEFAULT_LOG_LEVEL`. A value that does not parse is **not** silently
 /// accepted: `EnvFilter::new` is `parse_lossy`, which drops unparseable directives and
 /// defaults to `ERROR` (tracing-subscriber-0.3.23 src/filter/env/mod.rs:350-354) — so
-/// `SIMPLEHAR_LOG=verbose`, or a mistyped directive typed while debugging a boot
+/// `SIMPLEHARN_LOG=verbose`, or a mistyped directive typed while debugging a boot
 /// failure, produced an errors-only ring with no diagnostic, and `parse_lossy`'s own
 /// warning fired before a subscriber existed, going to the no-op dispatcher
 /// (FINDINGS-15 \[8]). An invalid value now falls back to `info` and says so, into the
@@ -535,7 +538,12 @@ pub(crate) fn file_sink_path_for_test() -> Option<PathBuf> {
 /// Called once from `main`; tests never call it (the default subscriber would
 /// reject a second registration).
 pub fn init() {
-    let env = std::env::var("SIMPLEHAR_LOG").unwrap_or_else(|_| DEFAULT_LOG_LEVEL.to_string());
+    // The knob reads through the centralized rename-aware reader (R1R-01):
+    // SIMPLEHARN_LOG wins, the deprecated SIMPLEHAR_LOG fills only absence, and
+    // the fallback is reported after the subscriber exists — warning here would
+    // reach the no-op dispatcher, the exact FINDINGS-15 [8] silence.
+    let (env_value, used_deprecated_log) = crate::config::log_level_from_env();
+    let env = env_value.unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
     let (filter, invalid) = log_filter(&env);
     let console_filter = filter.clone();
     // Taken before `filter` moves into the ring layer: the file keeps its own floor.
@@ -547,6 +555,10 @@ pub fn init() {
         .with(ring_layer)
         .with(file_layer)
         .init();
+    // After `init` for the same reason as the invalid-level report below: the
+    // deprecated-name warning must ride the real subscriber, not the no-op
+    // dispatcher (R1R-01; the FINDINGS-15 [8] silence this function refuses).
+    crate::config::warn_log_fallback(used_deprecated_log);
     // After `init`, so a failure can be reported through the subscriber that now exists.
     if let Err(error) = attach_file_sink(&crate::process::harness_logs_dir()) {
         tracing::warn!(
@@ -559,9 +571,9 @@ pub fn init() {
         // Emitted AFTER `init`: before it there is no subscriber to hear the warning,
         // which is exactly how the lossy parse managed to be silent.
         tracing::warn!(
-            simplehar_log = %env,
+            simpleharn_log = %env,
             error = %error,
-            "SIMPLEHAR_LOG is not a valid filter; using `{DEFAULT_LOG_LEVEL}` \
+            "SIMPLEHARN_LOG is not a valid filter; using `{DEFAULT_LOG_LEVEL}` \
              (a mistyped level used to mean errors-only)"
         );
     }
@@ -569,15 +581,15 @@ pub fn init() {
     // backs the post-mortem artifact.
 }
 
-/// The level the harness logs at when `SIMPLEHAR_LOG` is unset or unusable.
+/// The level the harness logs at when `SIMPLEHARN_LOG` is unset or unusable.
 const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// Builds the `SIMPLEHAR_LOG` filter strictly, so a bad value is visible instead of
+/// Builds the `SIMPLEHARN_LOG` filter strictly, so a bad value is visible instead of
 /// quietly downgrading the operator to errors-only.
 ///
 /// # Arguments
 ///
-/// * `env` - the raw `SIMPLEHAR_LOG` value.
+/// * `env` - the raw `SIMPLEHARN_LOG` value.
 ///
 /// # Returns
 ///
@@ -624,8 +636,46 @@ mod tests {
         assert_eq!(tail.last().expect("non-empty").message, "event 509");
     }
 
+    /// TASK-RENAME-SIMPLEHARN pin (review R1R-01, wiring half): `init` reads the
+    /// knob only through `config::log_level_from_env` — the name pair and the
+    /// precedence legs are pinned in `config`, so a raw `std::env::var` here
+    /// would silently drop the deprecated `SIMPLEHAR_LOG` fallback — and the
+    /// fallback report rides after the subscriber exists: a `tracing::warn!`
+    /// before `init` reaches the no-op dispatcher, the exact silence FINDINGS-15
+    /// [8] documents. Falsifier: restore the raw env read (fallback gone) or
+    /// hoist the report above the subscriber install, and this pin goes red
+    /// without an operator-visible symptom for any other test to catch.
+    #[test]
+    fn the_log_knob_reads_only_through_the_renamed_reader_and_warns_after_the_subscriber() {
+        let source = include_str!("observability.rs");
+        let body = source
+            .split("pub fn init()")
+            .nth(1)
+            .expect("init must stay")
+            .split("\n}")
+            .next()
+            .expect("init must close");
+        assert!(
+            body.contains("config::log_level_from_env()"),
+            "the knob must read through the primary/fallback pair, not one raw name: {body}"
+        );
+        assert!(
+            !body.contains(r#"env::var("SIMPLEHAR"#),
+            "a raw SIMPLEHAR* env read in init bypasses the rename reader: {body}"
+        );
+        let subscriber_at = body.find(".init();").expect("the subscriber must install");
+        let warn_at = body
+            .find("config::warn_log_fallback(")
+            .expect("the deprecated-name report must stay");
+        assert!(
+            warn_at > subscriber_at,
+            "the fallback warning must fire after the subscriber exists — before it, \
+             tracing::warn! reaches the no-op dispatcher (FINDINGS-15 [8])"
+        );
+    }
+
     /// FINDINGS-15 [8]: `EnvFilter::new` is `parse_lossy` and defaults to `ERROR`, so a
-    /// mistyped `SIMPLEHAR_LOG` — `verbose`, a slipped key — silently produced an
+    /// mistyped `SIMPLEHARN_LOG` — `verbose`, a slipped key — silently produced an
     /// errors-only ring, the opposite of what the operator asked for, with no
     /// diagnostic (the lossy parse's own warning fires before a subscriber exists).
     /// Falsifier: build the filter with `EnvFilter::new(env)` and the mistyped legs
@@ -642,18 +692,18 @@ mod tests {
 
         for mistyped in [
             "!!!not-a-directive!!!",
-            "simplehar_se=nonsense",
+            "simpleharn=nonsense",
             "level=banana",
         ] {
             let (filter, warning) = log_filter(mistyped);
             assert!(
                 warning.is_some(),
-                "`SIMPLEHAR_LOG={mistyped}` must be reported, not swallowed"
+                "`SIMPLEHARN_LOG={mistyped}` must be reported, not swallowed"
             );
             assert_eq!(
                 filter.max_level_hint(),
                 Some(tracing::Level::INFO.into()),
-                "`SIMPLEHAR_LOG={mistyped}` must fall back to the documented default — \
+                "`SIMPLEHARN_LOG={mistyped}` must fall back to the documented default — \
                  never to errors-only, which is what the lossy parse handed back"
             );
         }
@@ -754,14 +804,14 @@ mod tests {
                     // One event carries a token-shaped field. No downstream sink
                     // may redact it: redaction is upstream's job (15[9]).
                     tracing::warn!(
-                        target: "simplehar_se::scheduler",
+                        target: "simpleharn::scheduler",
                         min_free = %format!("{index}.0 GiB"),
                         api_key = %"sk-test-not-a-real-secret",
                         "launch floor not met {index}"
                     );
                 } else {
                     tracing::warn!(
-                        target: "simplehar_se::scheduler",
+                        target: "simpleharn::scheduler",
                         min_free = %format!("{index}.0 GiB"),
                         "launch floor not met {index}"
                     );
@@ -1037,13 +1087,13 @@ mod tests {
             "structured fields must survive the flatten to JSON: {lines}"
         );
         assert!(
-            lines.contains("simplehar_se::observability"),
+            lines.contains("simpleharn::observability"),
             "the target is recorded, so a refusal is attributable: {lines}"
         );
     }
 
     /// The file keeps an INFO floor whatever the console was asked for, so a narrowed
-    /// `SIMPLEHAR_LOG` cannot leave the artifact empty in the one moment it is read.
+    /// `SIMPLEHARN_LOG` cannot leave the artifact empty in the one moment it is read.
     /// Falsifier: hand the file the console's filter and the `error` leg drops to
     /// `ERROR`.
     #[test]

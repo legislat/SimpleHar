@@ -2225,7 +2225,7 @@ mod tests {
                     .any(|e| e.kind == ScanKind::PolicyRefused
                         && e.file.contains(file)
                         && e.reason.contains("superseded")
-                        && e.reason.contains("simplehar-se import strata")),
+                        && e.reason.contains("simpleharn import strata")),
                 "{file} must be refused with the migration sentence: {:?}",
                 catalog.errors
             );
@@ -2240,7 +2240,7 @@ mod tests {
                 .any(|e| e.kind == ScanKind::PolicyRefused
                     && e.file.contains("both.yaml")
                     && e.reason.contains("mutually exclusive")
-                    && !e.reason.contains("simplehar-se import strata")),
+                    && !e.reason.contains("simpleharn import strata")),
             "both-sources row must meet the mutual-exclusion sentence: {:?}",
             catalog.errors
         );

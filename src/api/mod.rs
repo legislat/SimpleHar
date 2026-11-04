@@ -582,7 +582,7 @@ pub struct ApiState {
     /// Last-use hints per model (fallback MRU for AUX x N; eviction LRU later).
     usage: Arc<Mutex<HashMap<String, Instant>>>,
     /// Shared secret for API/proxy routes when configured (`control_token` or
-    /// `SIMPLEHAR_TOKEN`). Private: only the guard reads it, and it is never logged.
+    /// `SIMPLEHARN_TOKEN`). Private: only the guard reads it, and it is never logged.
     control_token: Option<String>,
     /// Guard-refusal evidence state, shared by every clone of this state (one per
     /// process).
@@ -929,7 +929,7 @@ impl ApiState {
     }
 
     /// Sets (or clears, with `None`) the category default and persists it to
-    /// `simplehar-se.json` atomically (temp file + rename). Memory applies only
+    /// `simpleharn.json` atomically (temp file + rename). Memory applies only
     /// after the bytes landed: a write that never landed leaves the effective
     /// default at its previous value, so the config file stays king between the
     /// failed call and the next boot (R2-07-03). When `persisted: false` names a
@@ -1051,7 +1051,7 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Where a config write-back belongs: the file boot actually loaded (`SIMPLEHAR_CONFIG`
+/// Where a config write-back belongs: the file boot actually loaded (`SIMPLEHARN_CONFIG`
 /// included), else the default beside the executable — taken from
 /// [`crate::config::default_config_path`] so the file SE reads and the file SE writes can
 /// never drift apart.
@@ -1060,7 +1060,7 @@ async fn health() -> Json<Value> {
 /// resolve its own executable path: `boot_config` always stamps `source_path`, so this is
 /// reached in practice only by a hand-built `AppConfig`. It used to name `simplehar.json`,
 /// the older app's file. SE never writes the legacy file unless the operator explicitly
-/// selects it as `SIMPLEHAR_CONFIG` (ruling 2026-11-03, `TASK-DEBT-LEFTOVERS`):
+/// selects it as `SIMPLEHARN_CONFIG` (ruling 2026-11-03, `TASK-DEBT-LEFTOVERS`):
 /// auto-discovery and migration only read it, and boot warns once about the
 /// rollback-strand hazard when the operator selects it (`main.rs::boot_config`). The
 /// fallback itself must therefore name [`crate::config::CONFIG_FILE`] — naming the
@@ -1967,11 +1967,12 @@ pub const ROUTINE_POLL_PATHS: [&str; 3] = ["/har/status", "/har/log", "/har/mode
 
 /// The control token, if any: the environment wins so the secret can stay out of the
 /// config file entirely (AGENTS.md — secrets live in the environment, not in
-/// code/config). Whitespace-only values mean "no token" at read time; `validate`
-/// rejects them in the file, so a typo can never silently disable auth.
+/// code/config). The env name is `SIMPLEHARN_TOKEN`, with the deprecated
+/// `SIMPLEHAR_TOKEN` as a fallback that warns once (`config::token_from_env`,
+/// TASK-RENAME-SIMPLEHARN). Whitespace-only values mean "no token" at read time;
+/// `validate` rejects them in the file, so a typo can never silently disable auth.
 fn resolve_control_token(config: &AppConfig) -> Option<String> {
-    std::env::var("SIMPLEHAR_TOKEN")
-        .ok()
+    crate::config::token_from_env()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| {
@@ -2373,7 +2374,7 @@ async fn har_models(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, A
 
 /// `POST /har/config/default {"category": …, "model": name|null}` — set the
 /// category's default model (Step 11 fallback); validated against the catalog and
-/// persisted to `simplehar-se.json` atomically.
+/// persisted to `simpleharn.json` atomically.
 ///
 /// `model` is required: a string sets the default, `null` clears it, and an absent
 /// key is a caller mistake (400), never an implicit clear. The persisted value is the
@@ -3443,7 +3444,7 @@ mod tests {
             config_write_path(&no_source).file_name(),
             Some(std::ffi::OsStr::new(crate::config::LEGACY_CONFIG_FILE)),
             "on the fallback, SE never writes the older app's config file (an explicit \
-             SIMPLEHAR_CONFIG selection at that name is the operator-instruction exception)"
+             SIMPLEHARN_CONFIG selection at that name is the operator-instruction exception)"
         );
 
         let loaded = std::path::PathBuf::from(r"C:\Configs\lan.json");
@@ -3469,7 +3470,7 @@ mod tests {
         assert_eq!(
             config_write_path(&explicit_legacy),
             legacy,
-            "an explicit SIMPLEHAR_CONFIG selection is honored as the write target, \
+            "an explicit SIMPLEHARN_CONFIG selection is honored as the write target, \
              even at the legacy name"
         );
     }
@@ -5615,6 +5616,33 @@ mod tests {
         );
     }
 
+    /// TASK-RENAME-SIMPLEHARN pin (c, wiring half): the guard's only env read is
+    /// `crate::config::token_from_env` — the name pair (`SIMPLEHARN_TOKEN` first,
+    /// deprecated `SIMPLEHAR_TOKEN` second) and the once-per-process warning are
+    /// pinned in `config`; a direct `std::env::var` here would silently drop the
+    /// fallback or the warning while the guard stays green. Falsifier: revert this
+    /// line to `std::env::var("SIMPLEHARN_TOKEN")` and the assert fires.
+    #[test]
+    fn the_control_token_reads_env_only_through_the_renamed_reader() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("fn resolve_control_token(")
+            .nth(1)
+            .expect("the resolver must stay")
+            .split("\n}")
+            .next()
+            .expect("the resolver must close");
+        assert!(
+            body.contains("crate::config::token_from_env()"),
+            "the env read must go through the primary/fallback pair, not one raw name: {body}"
+        );
+        assert!(
+            !body.contains("std::env::var"),
+            "a second raw env read here bypasses the deprecated-name fallback and its \
+             warning: {body}"
+        );
+    }
+
     /// FINDINGS-05 [6]: the two harness-failure classes carry OS-level failure
     /// text — paths into model yamls, log files, the engine exe. The class stays
     /// legible (`code` and message prefix unchanged, both envelope shapes equal),
@@ -5776,7 +5804,7 @@ mod tests {
     #[test]
     fn config_persistence_is_answered_only_after_the_bytes_read_back() {
         let dir = crate::testutil::temp_dir("api-config-readback");
-        let path = dir.join("simplehar-se.json");
+        let path = dir.join("simpleharn.json");
         let config = AppConfig {
             source_path: Some(path.clone()),
             ..AppConfig::default()
@@ -6506,7 +6534,7 @@ mod tests {
         // unique temp every write answers true and no category can fall back to its seed.
         const ROUNDS: usize = 24;
         let dir = crate::testutil::temp_dir("api-persist-race");
-        let path = dir.join("simplehar-se.json");
+        let path = dir.join("simpleharn.json");
         let mut config = AppConfig::default();
         for category in &mut config.categories {
             category.default_model = Some(format!("seed-{}", category.id));
@@ -6610,7 +6638,7 @@ mod tests {
     #[test]
     fn a_landed_write_back_validates_the_published_boot_file_per_field() {
         let dir = crate::testutil::temp_dir("api-config-verdict");
-        let path = dir.join("simplehar-se.json");
+        let path = dir.join("simpleharn.json");
         let config = AppConfig {
             source_path: Some(path.clone()),
             ..AppConfig::default()
@@ -6705,7 +6733,7 @@ mod tests {
     #[tokio::test]
     async fn a_write_back_that_lands_a_boot_invalid_file_names_it_in_config_errors() {
         let dir = crate::testutil::temp_dir("api-config-e2e");
-        let path = dir.join("simplehar-se.json");
+        let path = dir.join("simpleharn.json");
         let mut config = AppConfig::default();
         let mut root = serde_json::to_value(&config).expect("seed serializes");
         root["load_timeout_s"] = json!(0);
@@ -6777,7 +6805,7 @@ mod tests {
     #[tokio::test]
     async fn a_landed_but_unverified_write_restates_the_recorded_config_verdict() {
         let dir = crate::testutil::temp_dir("api-config-unverified-e2e");
-        let path = dir.join("simplehar-se.json");
+        let path = dir.join("simpleharn.json");
         let config = AppConfig {
             source_path: Some(path.clone()),
             ..AppConfig::default()

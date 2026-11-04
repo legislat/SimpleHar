@@ -9,12 +9,12 @@
 mod mock_runtime;
 
 use mock_runtime::MockRuntime;
-use simplehar_se::budget::LedgerOnlyWitness;
-use simplehar_se::config::{AppConfig, CategoryId};
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime, LaunchSpec, ReadinessSpec, Spawned};
-use simplehar_se::ownership::{ResourceKind, SpawnTicket};
-use simplehar_se::scheduler::{Reply, Scheduler, SchedulerHandle};
+use simpleharn::budget::LedgerOnlyWitness;
+use simpleharn::config::{AppConfig, CategoryId};
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::{EngineAdapter, EngineRuntime, LaunchSpec, ReadinessSpec, Spawned};
+use simpleharn::ownership::{ResourceKind, SpawnTicket};
+use simpleharn::scheduler::{Reply, Scheduler, SchedulerHandle};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use std::time::Duration;
 fn write_modelconf(
     specs: &[(&'static str, &'static str, CategoryId, f64, Option<&str>)],
 ) -> PathBuf {
-    let dir = simplehar_se::testutil::temp_dir("discover");
+    let dir = simpleharn::testutil::temp_dir("discover");
     for (name, engine, category, vram, serve_model) in specs {
         let mut yaml =
             format!("name: {name}\nengine: {engine}\ncategory: {category}\nvram_gb: {vram}\n");
@@ -78,7 +78,7 @@ async fn post(
     handle: &SchedulerHandle,
     model: &str,
     category: CategoryId,
-) -> simplehar_se::scheduler::SwapReceipt {
+) -> simpleharn::scheduler::SwapReceipt {
     match handle.swap(model, category).await.expect("swap succeeds") {
         Reply::Loaded(receipt) => receipt,
         other => panic!("expected Loaded, got {other:?}"),

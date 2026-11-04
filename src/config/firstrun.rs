@@ -1,6 +1,6 @@
 //! First-start config materialization (operator ruling 2026-10-29).
 //!
-//! A fresh install has no `simplehar-se.json`; until now it booted on hardcoded
+//! A fresh install has no `simpleharn.json`; until now it booted on hardcoded
 //! defaults, which fossilize THIS machine (notably `vram_total_gb` = 72.0 — this
 //! box's card). The ruling: when no config file exists, the harness probes the real
 //! system, materializes the file beside the exe, and from then on the file is the
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn created_file_is_the_truth_and_never_overwrites() {
         let root = temp_dir("create");
-        let path = root.join("simplehar-se.json");
+        let path = root.join("simpleharn.json");
         let cfg = AppConfig {
             vram_total_gb: 23.6,
             ..AppConfig::default()
@@ -376,7 +376,7 @@ mod tests {
         );
 
         // A missing parent directory is an Err, not a panic, and writes no file.
-        assert!(ensure_created(&cfg, &root.join("gone").join("simplehar-se.json")).is_err());
+        assert!(ensure_created(&cfg, &root.join("gone").join("simpleharn.json")).is_err());
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
         // publish runs. Without the arm, hard_link would error and the caller's
         // whole-suite-green would be a lie (GOTCHAS pass-both-ways).
         let root = temp_dir("publish");
-        let target = root.join("simplehar-se.json");
+        let target = root.join("simpleharn.json");
         std::fs::write(&target, "OPERATOR BYTES").expect("pre-existing target");
         let tmp = root.join("staging.tmp");
         std::fs::write(&tmp, "HARNESS BYTES").expect("temp");

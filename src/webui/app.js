@@ -1,4 +1,4 @@
-// SimpleHar SE — control page logic (Step 14). Vanilla JS, no framework: the page
+// SimpleHarn — control page logic (Step 14). Vanilla JS, no framework: the page
 // only renders /har/* JSON; every action is an API call that also exists headless.
 "use strict";
 
@@ -27,7 +27,7 @@ let state = {
 
 // ---------- tiny helpers ----------
 
-// Optional control token (server: `control_token` / `SIMPLEHAR_TOKEN`). Stored in
+// Optional control token (server: `control_token` / `SIMPLEHARN_TOKEN`). Stored in
 // localStorage so a reload does not re-prompt, and sent as a header only — never in a
 // URL, where it would land in the harness request log.
 const TOKEN_KEY = "sh-control-token";
@@ -404,7 +404,7 @@ function renderHeader(status) {
   const headline = el(
     "div",
     { class: "sh-headline" },
-    el("h1", { class: "sh-title" }, text("SimpleHar SE")),
+    el("h1", { class: "sh-title" }, text("SimpleHarn")),
     el(
       "span",
       { class: "sh-badge", "data-tone": loaded > 0 ? "ok" : "none" },
@@ -880,7 +880,7 @@ function renderUnreachableHeader(error) {
     el(
       "div",
       { class: "sh-headline" },
-      el("h1", { class: "sh-title" }, text("SimpleHar SE")),
+      el("h1", { class: "sh-title" }, text("SimpleHarn")),
       el(
         "span",
         { class: "sh-badge", "data-tone": "none" },
@@ -957,7 +957,7 @@ function render() {
     el(
       "footer",
       { class: "sh-footer" },
-      text("SimpleHar SE — slots, jobs and refusals straight from /har/*"),
+      text("SimpleHarn — slots, jobs and refusals straight from /har/*"),
     ),
   );
   window.scrollTo(0, savedScroll);

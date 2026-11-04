@@ -7,30 +7,30 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use simplehar_se::api::{control_router, ApiState};
-use simplehar_se::config::AppConfig;
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::{EngineAdapter, EngineRuntime};
-use simplehar_se::scheduler::Scheduler;
+use simpleharn::api::{control_router, ApiState};
+use simpleharn::config::AppConfig;
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::{EngineAdapter, EngineRuntime};
+use simpleharn::scheduler::Scheduler;
 
 fn app() -> axum::Router {
     let config = AppConfig::default();
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert("mock".to_string(), Arc::new(MockAdapter));
-    let modelconf = simplehar_se::testutil::temp_dir("smoke");
+    let modelconf = simpleharn::testutil::temp_dir("smoke");
     let scheduler = Scheduler::start(
         config.clone(),
         modelconf,
         adapters,
-        Arc::new(simplehar_se::process::ProcessRuntime::new()) as Arc<dyn EngineRuntime>,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        Arc::new(simpleharn::process::ProcessRuntime::new()) as Arc<dyn EngineRuntime>,
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
     );
     control_router(Arc::new(ApiState::new(
         config,
         scheduler,
-        simplehar_se::listeners::ListenerRegistry::new(),
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
-        simplehar_se::api::BootTimings::default(),
+        simpleharn::listeners::ListenerRegistry::new(),
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
+        simpleharn::api::BootTimings::default(),
     )))
 }
 

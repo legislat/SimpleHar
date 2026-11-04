@@ -6,14 +6,14 @@
 mod mock_runtime;
 
 use mock_runtime::MockRuntime;
-use simplehar_se::budget::{MemorySample, VramWitness};
-use simplehar_se::config::{AppConfig, CategoryId};
-use simplehar_se::engine::llama::LlamaAdapter;
-use simplehar_se::engine::mock::MockAdapter;
-use simplehar_se::engine::ninfer::NinferAdapter;
-use simplehar_se::engine::strata::StrataAdapter;
-use simplehar_se::engine::EngineAdapter;
-use simplehar_se::scheduler::{
+use simpleharn::budget::{MemorySample, VramWitness};
+use simpleharn::config::{AppConfig, CategoryId};
+use simpleharn::engine::llama::LlamaAdapter;
+use simpleharn::engine::mock::MockAdapter;
+use simpleharn::engine::ninfer::NinferAdapter;
+use simpleharn::engine::strata::StrataAdapter;
+use simpleharn::engine::EngineAdapter;
+use simpleharn::scheduler::{
     booking_gibs, JobId, JobKind, Reply, Scheduler, SchedulerError, SchedulerHandle,
     SchedulerStatus, SwapState,
 };
@@ -48,7 +48,7 @@ fn to5(specs: &[Spec]) -> Vec<Spec5> {
 /// Writes flat model yamls into a fresh temp ModelConf dir; returns its path.
 /// The 5th spec element appends raw extra lines (cost:, floor keys...).
 fn write_modelconf5(specs: &[Spec5]) -> std::path::PathBuf {
-    let dir = simplehar_se::testutil::temp_dir("modelconf");
+    let dir = simpleharn::testutil::temp_dir("modelconf");
     for (name, engine, category, vram_gb, extra) in specs {
         let mut yaml = format!(
             "name: {name}
@@ -74,11 +74,7 @@ category: {category}
 }
 
 fn harness5(cfg: AppConfig, specs: &[Spec5]) -> (SchedulerHandle, MockRuntime) {
-    harness5_witness(
-        cfg,
-        specs,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
-    )
+    harness5_witness(cfg, specs, Arc::new(simpleharn::budget::LedgerOnlyWitness))
 }
 
 /// `harness5` against a caller-supplied witness, for the cases that must control when
@@ -90,7 +86,7 @@ fn harness5_witness(
 ) -> (SchedulerHandle, MockRuntime) {
     let runtime = MockRuntime::new();
     let mut adapters = BTreeMap::new();
-    let adapter: Arc<dyn simplehar_se::engine::EngineAdapter> = Arc::new(MockAdapter);
+    let adapter: Arc<dyn simpleharn::engine::EngineAdapter> = Arc::new(MockAdapter);
     adapters.insert("mock".to_string(), adapter);
     for engine in [
         "mock-slow",
@@ -102,7 +98,7 @@ fn harness5_witness(
     ] {
         adapters.insert(
             engine.to_string(),
-            Arc::new(MockAdapter) as Arc<dyn simplehar_se::engine::EngineAdapter>,
+            Arc::new(MockAdapter) as Arc<dyn simpleharn::engine::EngineAdapter>,
         );
     }
     // The real adapters, under the ids they themselves serve: a launch validation
@@ -119,7 +115,7 @@ fn harness5_witness(
         cfg,
         write_modelconf5(specs),
         adapters,
-        Arc::new(runtime.clone()) as Arc<dyn simplehar_se::engine::EngineRuntime>,
+        Arc::new(runtime.clone()) as Arc<dyn simpleharn::engine::EngineRuntime>,
         witness,
     );
     (handle, runtime)
@@ -133,7 +129,7 @@ fn harness(cfg: AppConfig, specs: &[Spec]) -> (SchedulerHandle, MockRuntime) {
 async fn wait_until(
     handle: &SchedulerHandle,
     secs: u64,
-    cond: impl Fn(&simplehar_se::scheduler::SchedulerStatus) -> bool,
+    cond: impl Fn(&simpleharn::scheduler::SchedulerStatus) -> bool,
 ) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -161,7 +157,7 @@ async fn submit_and_vanish(handle: &SchedulerHandle, model: &str, category: Cate
 }
 
 fn slot_model(
-    status: &simplehar_se::scheduler::SchedulerStatus,
+    status: &simpleharn::scheduler::SchedulerStatus,
     category: CategoryId,
 ) -> Vec<Option<String>> {
     status
@@ -173,13 +169,13 @@ fn slot_model(
 }
 
 fn terminal_jobs(
-    status: &simplehar_se::scheduler::SchedulerStatus,
-) -> Vec<&simplehar_se::scheduler::JobStatus> {
+    status: &simpleharn::scheduler::SchedulerStatus,
+) -> Vec<&simpleharn::scheduler::JobStatus> {
     status.jobs.iter().filter(|j| j.terminal).collect()
 }
 
 fn slot_state(
-    status: &simplehar_se::scheduler::SchedulerStatus,
+    status: &simpleharn::scheduler::SchedulerStatus,
     category: CategoryId,
 ) -> Vec<String> {
     status
@@ -678,7 +674,7 @@ fn hold_kill_harness(cfg: AppConfig) -> (SchedulerHandle, MockRuntime) {
 }
 
 /// Loads [`HOLD_MODEL`] into WORK and returns its engine's receipt.
-async fn serve_hold_model(handle: &SchedulerHandle) -> simplehar_se::scheduler::SwapReceipt {
+async fn serve_hold_model(handle: &SchedulerHandle) -> simpleharn::scheduler::SwapReceipt {
     let Reply::Loaded(receipt) = handle
         .swap(HOLD_MODEL, CategoryId::Work)
         .await
@@ -850,7 +846,7 @@ async fn second_unload_of_a_slow_unload_kills_the_victim_and_empties_its_slot() 
     wait_until(&handle, 5, |s| {
         s.jobs.iter().any(|j| {
             j.model == HOLD_MODEL
-                && j.kind == simplehar_se::scheduler::JobKind::Unload
+                && j.kind == simpleharn::scheduler::JobKind::Unload
                 && j.state == SwapState::Dispose
         })
     })
@@ -889,7 +885,7 @@ async fn second_unload_of_a_slow_unload_kills_the_victim_and_empties_its_slot() 
     let job = status
         .jobs
         .iter()
-        .find(|j| j.model == HOLD_MODEL && j.kind == simplehar_se::scheduler::JobKind::Unload)
+        .find(|j| j.model == HOLD_MODEL && j.kind == simpleharn::scheduler::JobKind::Unload)
         .expect("the cancelled unload is in the ledger");
     assert_eq!(job.outcome.as_deref(), Some("cancelled"), "{job:?}");
     assert_eq!(
@@ -1341,9 +1337,7 @@ async fn greedy_below_the_launch_floor_refuses_before_spawn() {
     assert!(
         matches!(
             error,
-            SchedulerError::Admission(
-                simplehar_se::budget::AdmissionError::BelowLaunchFloor { .. }
-            )
+            SchedulerError::Admission(simpleharn::budget::AdmissionError::BelowLaunchFloor { .. })
         ),
         "distinct typed error, got {error}"
     );
@@ -1525,7 +1519,7 @@ async fn exact_refuses_without_a_declared_number() {
     assert!(
         matches!(
             error,
-            SchedulerError::Admission(simplehar_se::budget::AdmissionError::ExactUndeclared)
+            SchedulerError::Admission(simpleharn::budget::AdmissionError::ExactUndeclared)
         ),
         "{error}"
     );
@@ -1560,7 +1554,7 @@ async fn exact_with_a_number_gates_like_fixed() {
 ///   (the same-slot replacement or the planned cross-category victim).
 /// * `names` - the fragment of the error that must name the refused key or value.
 fn assert_refused_without_damage(
-    status: &simplehar_se::scheduler::SchedulerStatus,
+    status: &simpleharn::scheduler::SchedulerStatus,
     bad_model: &str,
     resident_category: CategoryId,
     resident_model: &str,
@@ -1821,7 +1815,7 @@ fn parked_swap_harness() -> (SchedulerHandle, MockRuntime) {
 /// holds its slot and a live engine when the operator's cancel lands.
 async fn serve_and_submit_frozen_swap(
     handle: &SchedulerHandle,
-) -> simplehar_se::scheduler::SwapReceipt {
+) -> simpleharn::scheduler::SwapReceipt {
     let victim = serve_hold_model(handle).await;
     submit_and_vanish(handle, INCOMING_MODEL, CategoryId::Work).await;
     wait_until(handle, 5, |s| {
@@ -3230,7 +3224,7 @@ async fn a_nameless_yaml_loads_by_its_file_stem_end_to_end() {
     // FINDINGS-13 [3]/[7] end-to-end: the yaml carries no `name:` key at all.
     // The file stem is the identity the client loads by, the identity the actor
     // books into the slot, and (through `ModelEntry::name`) the engine log name.
-    let dir = simplehar_se::testutil::temp_dir("modelconf");
+    let dir = simpleharn::testutil::temp_dir("modelconf");
     std::fs::write(
         dir.join("stemonly.yaml"),
         "engine: mock\ncategory: work\nvram_gb: 4\n",
@@ -3243,8 +3237,8 @@ async fn a_nameless_yaml_loads_by_its_file_stem_end_to_end() {
         config(5),
         dir,
         adapters,
-        Arc::new(runtime.clone()) as Arc<dyn simplehar_se::engine::EngineRuntime>,
-        Arc::new(simplehar_se::budget::LedgerOnlyWitness),
+        Arc::new(runtime.clone()) as Arc<dyn simpleharn::engine::EngineRuntime>,
+        Arc::new(simpleharn::budget::LedgerOnlyWitness),
     );
     let reply = handle
         .swap("stemonly", CategoryId::Work)
@@ -3317,7 +3311,7 @@ fn drift_harness(
         cfg,
         dir.clone(),
         adapters,
-        Arc::new(runtime.clone()) as Arc<dyn simplehar_se::engine::EngineRuntime>,
+        Arc::new(runtime.clone()) as Arc<dyn simpleharn::engine::EngineRuntime>,
         witness,
     );
     (handle, runtime, dir, gate)
@@ -3360,7 +3354,7 @@ async fn drift_park(
     queued: &str,
     category: CategoryId,
 ) -> (
-    simplehar_se::scheduler::SwapReceipt,
+    simpleharn::scheduler::SwapReceipt,
     tokio::task::JoinHandle<Result<Reply, SchedulerError>>,
 ) {
     let Reply::Loaded(resident_receipt) = handle
@@ -3423,13 +3417,13 @@ async fn rescan_supersedes_a_queued_load_whose_yaml_changed() {
     )
     .await;
     let path = dir.join(format!("{DRIFT_QUEUED}.yaml"));
-    let before = simplehar_se::model::fingerprint(&path).expect("queued yaml readable");
+    let before = simpleharn::model::fingerprint(&path).expect("queued yaml readable");
     std::fs::write(
         &path,
         "name: drift-queued\nengine: mock\ncategory: WORK\nvram_gb: 44\n",
     )
     .expect("edit the queued yaml");
-    let after = simplehar_se::model::fingerprint(&path).expect("edited yaml readable");
+    let after = simpleharn::model::fingerprint(&path).expect("edited yaml readable");
     assert_ne!(
         before, after,
         "the fixture must move real bytes (this pin's same-bytes twin is \
@@ -3529,7 +3523,7 @@ async fn rescan_supersedes_a_queued_load_when_only_the_clock_moves() {
     )
     .await;
     let path = dir.join(format!("{DRIFT_QUEUED}.yaml"));
-    let before = simplehar_se::model::fingerprint(&path).expect("queued yaml readable");
+    let before = simpleharn::model::fingerprint(&path).expect("queued yaml readable");
     let original = std::fs::read(&path).expect("read the original bytes");
     std::fs::write(&path, &original).expect("rewrite the SAME bytes");
     let file = std::fs::OpenOptions::new()
@@ -3548,7 +3542,7 @@ async fn rescan_supersedes_a_queued_load_when_only_the_clock_moves() {
     )
     .expect("force the mtime forward");
     drop(file);
-    let after = simplehar_se::model::fingerprint(&path).expect("rewritten yaml readable");
+    let after = simpleharn::model::fingerprint(&path).expect("rewritten yaml readable");
     assert_eq!(
         (before.size, after.size),
         (original.len() as u64, original.len() as u64),

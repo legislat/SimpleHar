@@ -245,8 +245,8 @@ fn require_free_vram(tag: &str) {
 /// compute in production (`need_gb`, src/budget.rs:193) rather than a hand-written guess.
 fn booked_gib(path: &std::path::Path) -> String {
     let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-    let size = simplehar_se::budget::Gibibytes(bytes as f64 / 1024.0_f64.powi(3));
-    simplehar_se::budget::need_gb(None, Some(size))
+    let size = simpleharn::budget::Gibibytes(bytes as f64 / 1024.0_f64.powi(3));
+    simpleharn::budget::need_gb(None, Some(size))
         .map(|need| format!("{:.2}", need.0))
         .unwrap_or_else(|_| "12".to_string())
 }
@@ -275,7 +275,7 @@ impl Harness {
         // later with a FAIL the driver re-runs as a flake; the anchored BLOCKED
         // line must be printed here, where the driver can still see it.
         require_files(&t_label(tag), &[emb_gguf()]);
-        let work_dir = simplehar_se::testutil::temp_dir(&format!("t14-{tag}"));
+        let work_dir = simpleharn::testutil::temp_dir(&format!("t14-{tag}"));
         let modelconf = work_dir.join("ModelConf");
         std::fs::create_dir_all(&modelconf).expect("temp ModelConf");
 
@@ -350,7 +350,7 @@ impl Harness {
         // `<exe dir>/ModelConf`, i.e. target/debug/ModelConf, which on this box exists
         // and is empty - so omitting it gave every test "catalog scanned models=0"
         // and a `not found: model` assertion (T-suite Run 3).
-        let config_path = work_dir.join("simplehar.json");
+        let config_path = work_dir.join("simpleharn.json");
         std::fs::write(
             &config_path,
             json!({
@@ -363,12 +363,13 @@ impl Harness {
 
         let exe = harness_exe();
         let mut child = Command::new(&exe)
-            .env("SIMPLEHAR_CONFIG", &config_path)
+            .env("SIMPLEHARN_CONFIG", &config_path)
             // An ambient token would authenticate every harness we spawn and then 401
             // the whole suite, because our client never sends one (review, 2026-10-27).
+            .env_remove("SIMPLEHARN_TOKEN")
             .env_remove("SIMPLEHAR_TOKEN")
             .spawn()
-            .expect("spawn simplehar-se.exe");
+            .expect("spawn simpleharn.exe");
 
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
@@ -723,7 +724,7 @@ fn serial_lock() {
 /// The harness exe every test drives. Integration test binaries run from
 /// `target/<profile>/deps/`, so the exe sits one level up. `Harness::spawn` and the T1
 /// guard must agree on that, so the derivation exists exactly once here: T-suite Run 3
-/// found a second, divergent copy pointing at `deps/simplehar-se.exe`, which made t01
+/// found a second, divergent copy pointing at `deps/simpleharn.exe`, which made t01
 /// report "build the exe first" while the exe was in fact built and serving.
 fn harness_exe() -> PathBuf {
     let deps_dir = std::env::current_exe()
@@ -739,9 +740,9 @@ fn harness_exe() -> PathBuf {
         deps_dir
             .parent()
             .expect("profile dir")
-            .join("simplehar-se.exe")
+            .join("simpleharn.exe")
     } else {
-        deps_dir.join("simplehar-se.exe")
+        deps_dir.join("simpleharn.exe")
     }
 }
 
@@ -1721,7 +1722,7 @@ async fn t14_soak() {
 #[test]
 fn missing_files_earn_an_anchored_blocked_line() {
     let missing = std::env::temp_dir().join(format!(
-        "simplehar-se-r2-17-01-missing-{}.gguf",
+        "simpleharn-r2-17-01-missing-{}.gguf",
         std::process::id()
     ));
     assert!(!missing.exists(), "the fixture path must not exist");

@@ -60,7 +60,7 @@ const BOOT_GRACE: Duration = Duration::from_millis(2_000);
 /// Hover text for a tick with no scheduler verdict (FINDINGS-15 [1]). Kept inside the
 /// 128 wchar `szTip` cap the tray-icon crate enforces.
 const NO_VERDICT_TIP: &str =
-    "SimpleHar — scheduler gave no verdict; listener states still decide the colour";
+    "SimpleHarn — scheduler gave no verdict; listener states still decide the colour";
 
 /// Menu item ids.
 mod menu_id {
@@ -182,7 +182,7 @@ pub fn spawn(
         shutdown,
     };
     std::thread::Builder::new()
-        .name("simplehar-tray".to_string())
+        .name("simpleharn-tray".to_string())
         .spawn(move || {
             if let Err(error) = run(ctx) {
                 tracing::error!(error = %error, "tray unavailable; continuing headless");
@@ -246,7 +246,7 @@ fn run(ctx: TrayCtx) -> Result<(), String> {
         // ours is, so a misclick opened the menu whose items act on the fleet. The
         // right-click menu is the only entry point the operator was told about.
         .with_menu_on_left_click(false)
-        .with_tooltip("SimpleHar")
+        .with_tooltip("SimpleHarn")
         .with_icon(icon)
         .build()
         .map_err(|e| format!("cannot create tray icon: {e}"))?;
@@ -510,8 +510,8 @@ fn tick(
 /// # Examples
 ///
 /// ```
-/// use simplehar_se::tray::{tray_state, TraySignal, TrayState};
-/// use simplehar_se::scheduler::SchedulerStatus;
+/// use simpleharn::tray::{tray_state, TraySignal, TrayState};
+/// use simpleharn::scheduler::SchedulerStatus;
 /// let status = SchedulerStatus {
 ///     slots: vec![],
 ///     jobs: vec![],
@@ -674,7 +674,7 @@ fn category_line(status: &SchedulerStatus) -> String {
 ///   otherwise. It leads the text because red is the colour that needs explaining.
 #[must_use]
 pub fn tooltip(status: &SchedulerStatus, down_reason: Option<&str>) -> String {
-    let mut head = String::from("SimpleHar — ");
+    let mut head = String::from("SimpleHarn — ");
     if let Some(reason) = down_reason {
         head.push_str(&format!("{reason}\n"));
     }
@@ -754,7 +754,7 @@ fn pump_messages(tray: &TrayIcon) {
                 return;
             }
         };
-        let class_name = w!("SimpleHarTrayWnd");
+        let class_name = w!("SimpleHarnTrayWnd");
         // ABI shim: the class wants an `extern "system"` proc; `DefWindowProcW` is a
         // plain Rust fn in this crate version.
         unsafe extern "system" fn wnd_proc(
@@ -778,7 +778,7 @@ fn pump_messages(tray: &TrayIcon) {
         let _hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
-            w!("SimpleHar tray"),
+            w!("SimpleHarn tray"),
             WS_OVERLAPPEDWINDOW,
             0,
             0,
@@ -1256,7 +1256,7 @@ mod tests {
         assert!(text.contains("AUX: a, b"), "was: {text}");
         assert!(text.contains("RP: —"), "was: {text}");
         assert!(
-            text.starts_with("SimpleHar — WORK:"),
+            text.starts_with("SimpleHarn — WORK:"),
             "with nothing to explain the hover stays the one-line category list it \
              always was: {text}"
         );

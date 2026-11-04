@@ -1,4 +1,4 @@
-//! SimpleHar SE — one application managing local inference engines with a simple,
+//! SimpleHarn — one application managing local inference engines with a simple,
 //! reliable, adjustable swap mechanism for local LLM models (DESIGN.md G1).
 //!
 //! Crate layout follows DESIGN.md section 18, and all of it ships: `config` plus

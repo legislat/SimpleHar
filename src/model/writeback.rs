@@ -515,7 +515,7 @@ pub fn set_flags_on_file(
 /// both files truthfully — and only claiming a location its own read-back
 /// confirmed (FINDINGS-BATCH-2026-10-28 [1]/[3]). Called with [`write_gate`]
 /// already held. `pub(crate)` so the import merge (ruling 2026-11-03,
-/// `simplehar-se import strata --apply`) publishes through this same temp +
+/// `simpleharn import strata --apply`) publishes through this same temp +
 /// rename + revalidate machine instead of duplicating it — it validates its own
 /// merged text but owns no second write path.
 pub(crate) fn commit_verified(

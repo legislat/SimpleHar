@@ -13,12 +13,12 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use mock_runtime::{MockLateIdAdapter, MockRuntime};
 use serde_json::Value;
-use simplehar_se::api::{category_router, control_router, ApiState, BootTimings};
-use simplehar_se::budget::LedgerOnlyWitness;
-use simplehar_se::config::{AppConfig, CategoryId};
-use simplehar_se::engine::{EngineAdapter, EngineRuntime};
-use simplehar_se::listeners::ListenerRegistry;
-use simplehar_se::scheduler::Scheduler;
+use simpleharn::api::{category_router, control_router, ApiState, BootTimings};
+use simpleharn::budget::LedgerOnlyWitness;
+use simpleharn::config::{AppConfig, CategoryId};
+use simpleharn::engine::{EngineAdapter, EngineRuntime};
+use simpleharn::listeners::ListenerRegistry;
+use simpleharn::scheduler::Scheduler;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tower::ServiceExt;
@@ -76,14 +76,14 @@ fn app() -> (Router, Router, std::path::PathBuf) {
             serve_id: "engine-late",
         }),
     );
-    let dir = simplehar_se::testutil::temp_dir("serve-id-retry");
+    let dir = simpleharn::testutil::temp_dir("serve-id-retry");
     std::fs::write(
         dir.join("late.yaml"),
         "name: late\nengine: mock-late-discovery\ncategory: WORK\nvram_gb: 4.0\n",
     )
     .expect("model yaml");
     let config = AppConfig {
-        source_path: Some(dir.join("simplehar-se.json")),
+        source_path: Some(dir.join("simpleharn.json")),
         ..AppConfig::default()
     };
     let scheduler = Scheduler::start(
@@ -157,16 +157,16 @@ fn silent_app(model: &str) -> (Router, Router) {
     let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
     adapters.insert(
         "mock-nodiscovery".to_string(),
-        Arc::new(simplehar_se::engine::mock::MockAdapter) as Arc<dyn EngineAdapter>,
+        Arc::new(simpleharn::engine::mock::MockAdapter) as Arc<dyn EngineAdapter>,
     );
-    let dir = simplehar_se::testutil::temp_dir("serve-id-silent");
+    let dir = simpleharn::testutil::temp_dir("serve-id-silent");
     std::fs::write(
         dir.join(format!("{model}.yaml")),
         format!("name: {model}\nengine: mock-nodiscovery\ncategory: WORK\nvram_gb: 4.0\n"),
     )
     .expect("model yaml");
     let config = AppConfig {
-        source_path: Some(dir.join("simplehar-se.json")),
+        source_path: Some(dir.join("simpleharn.json")),
         ..AppConfig::default()
     };
     let scheduler = Scheduler::start(
