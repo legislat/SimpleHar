@@ -6,14 +6,14 @@
 //! is never published; its lines are named (D3, operator doctrine: "better not
 //! publish anything blindly"), while the scan itself stays non-fatal (§0.2 step 6).
 //!
-//! Catalog-trust rules (FINDINGS-13 [2]/[3]/[7]/[8]): identity is the yaml FILE
+//! Catalog-trust rules (FINDINGS-13 \[2]/\[3]/\[7]/\[8]): identity is the yaml FILE
 //! STEM — a `name:` key is legacy-optional and only legal when it equals the stem,
 //! because that value is the one component of a yaml that reaches a filesystem path
 //! (the engine log name); a llama entry whose local `model:` or declared `mmproj:`
 //! file is gone, and a
 //! strata entry whose profile JSON is unreadable or references a missing absolute
 //! path, are refused here with the file named, before admission can evict a resident
-//! engine for a doomed spawn; and a key outside [`CONSUMED_KEYS`] is reported
+//! engine for a doomed spawn; and a key outside `CONSUMED_KEYS` is reported
 //! (warn-only — README doctrine: unknown keys stay "preserved for reference").
 //! This module stays log-free: the actor reports every [`ScanError`] it applies.
 
@@ -43,16 +43,16 @@ pub enum ScanKind {
     /// The entry names an engine this harness has no adapter for; dropped by the
     /// actor (the scan cannot see the adapter map).
     EngineUnavailable,
-    /// A yaml key outside [`CONSUMED_KEYS`] (and outside [`SILENT_KEYS`], the one
+    /// A yaml key outside `CONSUMED_KEYS` (and outside `SILENT_KEYS`, the one
     /// reserved forensic class that stays silent by operator ruling); warn-only,
     /// the entry still publishes.
     UnknownKey,
-    /// A real harness key — a member of [`CONSUMED_KEYS`] — that only the rows
+    /// A real harness key — a member of `CONSUMED_KEYS` — that only the rows
     /// of *other* engines list in their `EnginePolicy` `knobs` cell, appearing
     /// on a model whose row does not read it. The opposite of
     /// [`ScanKind::UnknownKey`] (a key the harness owns nowhere, i.e. a typo):
     /// here the key is live config for a *different* engine, so it is not a
-    /// typo and cannot be silenced by [`CONSUMED_KEYS`] membership alone.
+    /// typo and cannot be silenced by `CONSUMED_KEYS` membership alone.
     /// Warn-only, exactly the retired `host:`/`port:` policy-hint posture: the
     /// entry still publishes. The mechanism is the knob table (slice 10c
     /// generalization of the 2026-10-28 `cpu_offload` ruling): every
@@ -63,11 +63,11 @@ pub enum ScanKind {
     /// A yaml file the scan refuses to publish (Fork C doctrine): it carried at
     /// least one problem line — then the `reason` names every offending line — or it
     /// parsed clean but yielded **no keys at all**, which the `reason` says outright
-    /// (FINDINGS2-13 [2]; the shape `commit_verified` refuses as `EmptyFile`).
+    /// (FINDINGS2-13 \[2]; the shape `commit_verified` refuses as `EmptyFile`).
     InvalidYaml,
     /// Two published rows collapse to one harness identity, so every name-keyed
     /// path — `/har/load`, the write-back, the measured fold — would silently prefer
-    /// whichever row the scan order happened to put first (FINDINGS-13 [3]). Warn-only
+    /// whichever row the scan order happened to put first (FINDINGS-13 \[3]). Warn-only
     /// like the other report classes: **both** files publish and **both** are reported,
     /// naming every claimant; the API's `409` stays the refusal, so nothing here is a
     /// boot-style rejection of a file that is otherwise loadable.
@@ -77,7 +77,7 @@ pub enum ScanKind {
     /// row's closed word surface, a policy field (`host`, `port`, key) inside the
     /// strata profile it points at, or a ninfer row still declaring the removed
     /// `ninfer_autostart` launch key (ruling 18b removal). Engine-side files
-    /// decide nothing (22[1]), so the refusal names the word/field and the
+    /// decide nothing (22\[1]), so the refusal names the word/field and the
     /// mechanism that owns the decision (chunk 10 slice 10c).
     PolicyRefused,
     /// Every pre-existing report shape: unreadable files or dirs, typed field
@@ -229,10 +229,10 @@ pub(crate) fn inert_key_reason(key: &str, engine: &str) -> String {
 /// single/double quotes stripped; ` # ...` inline comments removed outside quotes;
 /// blank/comment lines skipped; anything else is reported, never dropped silently.
 ///
-/// The comment rule, exactly ([`split_value_comment`] is the one owner of it):
+/// The comment rule, exactly (`split_value_comment` is the one owner of it):
 /// a `#` opens a comment only when an ASCII **space** precedes it outside quotes.
 /// Two deliberate consequences, symmetric on both sides of the reader/writer pair
-/// (FINDINGS-BATCH-2026-10-28B [1]/[7]): a **tab never opens a comment**
+/// (FINDINGS-BATCH-2026-10-28B \[1]/\[7]): a **tab never opens a comment**
 /// (`key:\t# note` publishes `# note` as the value), and leading whitespace is
 /// trimmed *before* the walk, so a `#` at the very start of the value text is
 /// value too (`key: # tail` publishes `# tail`). Quote such a value (`"# tail"`)
@@ -533,7 +533,7 @@ fn trace_under_yaml_dir(dir: &Path, raw: &str) -> std::path::PathBuf {
 
 /// Scans a ModelConf directory: every regular (non-symlink) `*.yaml` file becomes
 /// an entry or an error; `.yml` and every other name is **silently inert** (the
-/// 13[5] Fork B acceptance gate, [`is_accepted_config`]); a missing directory is
+/// 13\[5] Fork B acceptance gate, `is_accepted_config`); a missing directory is
 /// one error, not a panic.
 pub fn scan_dir(dir: &Path) -> Catalog {
     let mut catalog = Catalog::empty();

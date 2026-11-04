@@ -10,16 +10,16 @@
 //! case-insensitive — the narrower set is the pinned product rule (`GOTCHAS`), so
 //! `jinja: True` enables nothing here while the script would have enabled it. The
 //! pinned build also defaults jinja to *enabled*, so `jinja: false` cannot switch it
-//! off (`--no-jinja` is not [`EXTRA_ARGS_ALLOWED`], and a harness-emitted `--jinja`
+//! off (`--no-jinja` is not `EXTRA_ARGS_ALLOWED`, and a harness-emitted `--jinja`
 //! must not be flippable from yaml text); that is a known functional gap, not an
 //! enforcement claim.
 //!
-//! `extra_args` is an ALLOW-LIST (FINDINGS2-0910 [1], which inverted the old
+//! `extra_args` is an ALLOW-LIST (FINDINGS2-0910 \[1], which inverted the old
 //! ten-name `HARNESS_OWNED_FLAGS` denial list — ten exact words over an ~200-option
 //! parser were a semantic bypass of the LOCKED harness-owned-config rule, leaving
 //! `--api-key`, `--rpc`, `--path`, `--models-dir`, `--ssl-key-file`, `--model-url`,
 //! `--hf-repo` and `--gpu-layers` reachable from one yaml line). An operator word
-//! reaches the argv only if it is on [`EXTRA_ARGS_ALLOWED`], together with the value
+//! reaches the argv only if it is on `EXTRA_ARGS_ALLOWED`, together with the value
 //! tokens its arity consumes; every other word is refused with
 //! [`EngineError::Rejected`] naming it. That makes several former separate claims
 //! moot-by-construction rather than enforced: the harness-owned flags and *all*
@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 /// `internal_host` governs only the harness's own public listeners, so a
 /// `0.0.0.0` control page never exposes unauthenticated `llama-server` ports on
 /// the segment, and the IPv4-only readiness probe always dials what the engine
-/// actually bound (FINDINGS-09 [1]).
+/// actually bound (FINDINGS-09 \[1]).
 pub const LLAMA_ENGINE_HOST: &str = "127.0.0.1";
 
 /// The CLOSED allow-list of `extra_args` option words an operator may pass

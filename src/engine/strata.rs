@@ -16,7 +16,7 @@
 //! doctrine: engines obey only harness-owned locations). `host`, `port` and key
 //! fields are absent by construction — the bind is the forced loopback
 //! `--host` argv and the port the forced `--port` (server.py resolves both
-//! flags ahead of any profile key) — so ruling 22[1] holds by rendering, not
+//! flags ahead of any profile key) — so ruling 22\[1] holds by rendering, not
 //! by policing. The external `strata_config` mode is SUPERSEDED: a row that
 //! still declares it is refused with the migration sentence, and
 //! `simplehar-se import strata <profile.json>` turns a manual profile into the
@@ -27,10 +27,10 @@
 //! yamls carry no autostart keys: a strata engine spawns only when an operator
 //! loads the model by name.
 //!
-//! What the adapter validates (FINDINGS2-0910 [5] floor, 2026-10-29):
+//! What the adapter validates (FINDINGS2-0910 \[5] floor, 2026-10-29):
 //! `strata_python` must be an existing `.exe` **file** (it is the launched
 //! program) and `strata_cwd` an existing directory. The rendered profile's
-//! contents are checked too — [`validate_profile_text`] runs at scan and again
+//! contents are checked too — `validate_profile_text` runs at scan and again
 //! at spec, so a value that references a path the disk lacks is refused before
 //! the child starts, never launched on.
 
@@ -272,7 +272,7 @@ fn well_formed_tokens(line: &str) -> Option<Vec<String>> {
 /// eq suffix that is not a figure, answers `None` — Ctx shows only what the
 /// engine will actually serve, never a flag and never a guess. A line with
 /// an empty comma entry never loads (the render refuses it,
-/// [`well_formed_tokens`]), so the display answers `None` for it too. The
+/// `well_formed_tokens`), so the display answers `None` for it too. The
 /// row `context:` key is the llama knob the strata engine never reads (the
 /// scan reports it as `InertKey`), so it is never a fallback: no token, no
 /// answer.

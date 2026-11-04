@@ -15,8 +15,8 @@
 //! Nothing on this thread may wait on the actor without a bound: the pump thread owns
 //! the hidden window, and the menu is shown by a modal `TrackPopupMenu` loop running
 //! on it, so an unbounded `block_on` freezes the icon, the menu and the Exit item
-//! together (FINDINGS-15 [3]). Every wait goes through [`bounded`], and Exit touches
-//! no runtime at all ([`signal_shutdown`]).
+//! together (FINDINGS-15 \[3]). Every wait goes through `bounded`, and Exit touches
+//! no runtime at all (`signal_shutdown`).
 //!
 //! The Win32 message pump is the module's documented `unsafe`: one dedicated thread
 //! owns a hidden window and pumps messages for the tray-icon crate; the safety
@@ -85,7 +85,7 @@ pub enum TrayState {
     /// A listener is down; the reason rides in the tooltip. Per-job errors are
     /// not red (operator decision 2026-10-25).
     Red,
-    /// No verdict: a category is still `Pending` after [`BOOT_GRACE`], or this tick's
+    /// No verdict: a category is still `Pending` after `BOOT_GRACE`, or this tick's
     /// status fetch returned nothing. The same word for both, per the 2026-10-28
     /// ruling.
     Amber,
@@ -96,10 +96,10 @@ pub enum TrayState {
 pub struct TraySignal {
     /// Some category carries an explicit `Down` verdict — red outranks everything.
     pub any_down: bool,
-    /// Some category is still `Pending` and [`BOOT_GRACE`] has elapsed — amber.
+    /// Some category is still `Pending` and `BOOT_GRACE` has elapsed — amber.
     pub pending_after_grace: bool,
     /// This tick could not read the scheduler at all. "No verdict" is the same
-    /// vocabulary as `Pending`, so it is the same colour (FINDINGS-15 [1]).
+    /// vocabulary as `Pending`, so it is the same colour (FINDINGS-15 \[1]).
     pub status_unreachable: bool,
 }
 
@@ -164,7 +164,7 @@ fn command_for(id: &str) -> Option<Command> {
 /// Spawns the tray thread. Returns nothing; the tray dies with the process.
 ///
 /// A tray that cannot be built — menu, icon, or window — logs one error line and
-/// the harness continues headless (FINDINGS-15 [6]): the icon is a view, and
+/// the harness continues headless (FINDINGS-15 \[6]): the icon is a view, and
 /// losing it never takes the serving process with it. The only panic is the
 /// thread-spawn invariant below.
 pub fn spawn(
@@ -498,13 +498,13 @@ fn tick(
 
 /// The tray colour for one tick, decided from the listener signal first and the
 /// snapshot second; precedence red > amber > yellow > green > gray (Step 15;
-/// operator ruling "A + amber" 2026-10-28; no-freeze rule FINDINGS-15 [1]).
+/// operator ruling "A + amber" 2026-10-28; no-freeze rule FINDINGS-15 \[1]).
 ///
 /// # Arguments
 ///
 /// * `status` - the scheduler snapshot, or `None` when this tick read produced no
 ///   verdict. It is consulted only after red and amber are ruled out, so a `None`
-///   can never freeze or soften the colour (FINDINGS-15 [1]).
+///   can never freeze or soften the colour (FINDINGS-15 \[1]).
 /// * `signal` - the listener verdicts, plus whether the status read failed.
 ///
 /// # Examples
@@ -670,7 +670,7 @@ fn category_line(status: &SchedulerStatus) -> String {
 /// # Arguments
 ///
 /// * `status` - this tick's scheduler snapshot.
-/// * `down_reason` - [`down_reason`]'s sentence when a listener is `Down`, `None`
+/// * `down_reason` - `down_reason`'s sentence when a listener is `Down`, `None`
 ///   otherwise. It leads the text because red is the colour that needs explaining.
 #[must_use]
 pub fn tooltip(status: &SchedulerStatus, down_reason: Option<&str>) -> String {

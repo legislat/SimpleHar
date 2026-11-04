@@ -19,7 +19,7 @@
 //! harness-internal control commands spawned here (`wsl.exe` docker teardown and
 //! `docker ps`) are scrubbed the same way, because they execute *inside the
 //! operator's distro*: inheriting there would carry the plaintext token across that
-//! very boundary (FINDINGS2-0910 [4], closing the asymmetry E3 left). Control
+//! very boundary (FINDINGS2-0910 \[4], closing the asymmetry E3 left). Control
 //! commands owned by other modules (`netsh` in `main.rs`, the `nvidia-smi` fallback
 //! in `witness.rs`, the Web UI opener in `tray.rs`) still inherit — none of them
 //! crosses into WSL — and are the smaller remaining half of that rule.
@@ -867,7 +867,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 /// The content address a staged script carries in its name. Public so the adapter's
-/// argv placeholder names exactly the file [`stage_script`] will have verified —
+/// argv placeholder names exactly the file `stage_script` will have verified —
 /// one hash, one naming rule, no drift between what the ledger shows and what runs.
 #[must_use]
 pub fn script_content_hash(script: &str) -> u64 {
@@ -1273,7 +1273,7 @@ async fn stage_script(distro: &str, user: &str, path: &str, script: &str) -> Res
 /// One catalog-declared container candidate for the boot reclaim: the declaring
 /// model's `engine:` plus its `ninfer_container:` value. Both travel together so
 /// [`boot_reap_decision`] can apply the engine gate and the name gate at boot,
-/// while the claim gate reads the ledger the spawn path wrote (chunk 10 [1]).
+/// while the claim gate reads the ledger the spawn path wrote (chunk 10 \[1]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerCandidate {
     /// The declaring model's `engine:` value.
@@ -1687,7 +1687,7 @@ impl ProcessRuntime {
         reap_container(&self.wsl_distro, &self.wsl_user, name).await
     }
 
-    /// Boot reconcile (deploy review, 2026-10-26; scoped by chunk 10 [1], 2026-10-27):
+    /// Boot reconcile (deploy review, 2026-10-26; scoped by chunk 10 \[1], 2026-10-27):
     /// a container this harness started in an earlier lifetime survives a crash holding
     /// tens of GiB, and observed-VRAM admission then refuses every later load with no
     /// pointer to the culprit. A running container is destroyed only when

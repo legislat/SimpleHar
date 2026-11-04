@@ -520,7 +520,7 @@ pub trait EngineRuntime: Send + Sync {
     /// non-zero exit, timeout: the caller warns and falls down the ladder,
     /// there is no invented number). The process runtime runs it through its
     /// ONE gated control-command builder (hidden, kill-on-drop, scrubbed
-    /// environment — the FINDINGS2-0910 [4] discipline); it is NOT an engine
+    /// environment — the FINDINGS2-0910 \[4] discipline); it is NOT an engine
     /// spawn: no ticket, no port, no log file, nothing registered. Default
     /// `None`: only the process runtime answers, so every mock is inert and
     /// `cargo test` never execs a real `llama-fit-params.exe`.
@@ -536,8 +536,8 @@ pub trait EngineRuntime: Send + Sync {
     /// The engine's own snapshot as JSON
     /// (`GET http://127.0.0.1:{port}{path}`): a generic loopback read with the
     /// runtime's short timeout and no engine knowledge — the per-engine parse
-    /// lives in the adapter ([`basalt::measurement_from_metrics`],
-    /// [`strata::measurement_from_metrics`], same split as the
+    /// lives in the adapter (`basalt::measurement_from_metrics`,
+    /// `strata::measurement_from_metrics`, same split as the
     /// [`Self::container_report`] / `ninfer::parse_startup_memory` pair).
     /// The sampler reads each process engine's real surface (`/metrics` —
     /// the 2026-11-04 capture proved `/status` is liveness only and
@@ -565,7 +565,7 @@ pub trait EngineRuntime: Send + Sync {
     }
 }
 
-/// Production boot's adapter map (FINDINGS-10 [3]): llama + strata + basalt +
+/// Production boot's adapter map (FINDINGS-10 \[3]): llama + strata + basalt +
 /// ninfer always, the test-facing `mock` adapter only on the config's explicit
 /// `allow_mock_engine` grant (its argv is the bare name `mock-engine`, which
 /// `CreateProcessW` resolves through the harness's own directories). A stray
@@ -577,7 +577,7 @@ pub trait EngineRuntime: Send + Sync {
 /// and no registry check can reject one today. When chunk 10's `EnginePolicy`
 /// validation can reject a config-referenced binary, that is the day this signature
 /// gains a `Result` — until then a documented `# Errors` section would describe a
-/// return type this function does not have (FINDINGS2-0910 [7]).
+/// return type this function does not have (FINDINGS2-0910 \[7]).
 #[must_use]
 pub fn default_adapters(
     config: &crate::config::AppConfig,

@@ -48,7 +48,7 @@ pub struct CustodyEntry {
     pub port: u16,
     /// Instance name: the harness model name this launch served.
     pub instance: String,
-    /// Engine id — must answer to a [`policy::engine_policy`] row, or the
+    /// Engine id — must answer to a `policy::engine_policy` row, or the
     /// entry is not a claim this harness could have made.
     pub engine: String,
     /// Wall-clock ms since the epoch when the claim was written.

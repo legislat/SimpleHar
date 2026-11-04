@@ -40,7 +40,7 @@ pub enum Command {
     Cancel { job: JobId },
     /// Unload every occupant of a category; a loading slot in it is cancelled
     /// first and unloaded when that cancel terminalizes (T8 semantics: unload
-    /// during load = cancel, cleanup completes; FINDINGS-02 [2]: never cancel
+    /// during load = cancel, cleanup completes; FINDINGS-02 \[2]: never cancel
     /// *or* unload, always both).
     Unload { category: CategoryId },
     /// Unload one model's slot (T12.1); a loading swap for it is cancelled, and

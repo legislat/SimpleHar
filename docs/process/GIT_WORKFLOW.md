@@ -116,10 +116,9 @@ Rules:
 - No tag without a changelog entry and a matching version.
 - Commits after a release are unreleased. The README release claim moves only with the
   next tag.
-- `scripts/release-check.ps1 -SkipDoc` skips only the `cargo doc` leg. While the DOC-WARN
-  row in `handoff/FINDINGS-OPEN.md` (local-only) is open, run both release checks with
-  `-SkipDoc` and record the DOC-WARN row as the accepted risk. Remove `-SkipDoc` when
-  DOC-WARN closes.
+- `scripts/release-check.ps1 -SkipDoc` skips only the `cargo doc` leg. The release check
+  requires zero doc warnings, so both release steps run without `-SkipDoc`. Do not use
+  `-SkipDoc` to pass a release with known doc warnings.
 
 ## Conflict resolution
 

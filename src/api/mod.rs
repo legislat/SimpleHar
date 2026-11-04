@@ -9,7 +9,7 @@
 //!   normal job, else `400` (operator rule 2026-10-24, resolves F-2);
 //! - `/har/unload` bodies are strict: unparseable is `400`, both scopes at once is
 //!   `400`, never an implicit unload-all (v3.3 CRITICAL fix); the reply reports what
-//!   the actor actually did, never a blanket `unloading` (FINDINGS-07 [5]/[6]);
+//!   the actor actually did, never a blanket `unloading` (FINDINGS-07 \[5]/\[6]);
 //! - proxy responses stream through byte-for-byte, SSE included;
 //! - `/har/*` lives on the one control listener; the control router has no request
 //!   timeout because `/har/load` deliberately waits through the load (Step 12
@@ -883,7 +883,7 @@ impl ApiState {
     /// write that never landed, the answer carries the still-effective value.
     ///
     /// A write that lands re-validates the published bytes against the boot schema
-    /// (07[11]): the landed tree is exactly what the next boot will read, so its
+    /// (07\[11]): the landed tree is exactly what the next boot will read, so its
     /// per-field verdict is recorded for `/har/status` `config_errors` — the field's
     /// only producer, replacing the last verdict on every write whose bytes reached
     /// the live file. A write that never landed leaves the field alone (the file
@@ -893,11 +893,11 @@ impl ApiState {
     /// file, so keeping the old verdict would re-assert a claim about bytes the file
     /// no longer holds.
     ///
-    /// The write-back runs on a blocking thread (FINDINGS-07 [8]): the handler's
+    /// The write-back runs on a blocking thread (FINDINGS-07 \[8]): the handler's
     /// async worker must not park on the gated read-patch-copy-rename, while the
     /// `persisted` answer still means what it always meant — the handler waits for
     /// the leg's verdict before replying, so `/har/config/default` keeps its
-    /// response honesty (06[5]). A blocking task that dies (panic/cancel) can only
+    /// response honesty (06\[5]). A blocking task that dies (panic/cancel) can only
     /// ever be answered `persisted: false`.
     pub async fn set_default_model(
         &self,
@@ -952,7 +952,7 @@ impl ApiState {
     /// Records the per-field validation verdict on the boot config file, replacing
     /// the previous one. Call only after a write-back's landed bytes have been
     /// re-validated — an empty vector is the claim "the file on disk now boots clean"
-    /// and must be earned the same way (07[11]).
+    /// and must be earned the same way (07\[11]).
     pub fn record_config_errors(&self, errors: Vec<ConfigError>) {
         *self
             .config_errors
@@ -1902,7 +1902,7 @@ pub const PUBLIC_PATHS: [&str; 5] = [
 
 /// The page's routine polls: GETs whose per-tick `request complete` line would evict
 /// real evidence from the ring while the operator merely leaves the control page open
-/// (FINDINGS-15 [10] for the log read, FINDINGS2-0507 [1] for the third poll).
+/// (FINDINGS-15 \[10] for the log read, FINDINGS2-0507 \[1] for the third poll).
 ///
 /// `pub`, and the guard + its pin both read THIS list, with the pin's teeth coming
 /// from an independent third source — the page's own `getJson("…")` literals in
@@ -1993,14 +1993,14 @@ fn token_matches(given: &[u8], expected: &[u8]) -> bool {
 ///   ports; a hostname, an address outside the bind, a foreign port or a missing
 ///   `Host` is refused `400` before any handler runs (DNS-rebinding guard; the
 ///   gate runs on every request, not only the ones that bother to declare a Host,
-///   FINDINGS-05 [4][5], FINDINGS-16 N[1]);
+///   FINDINGS-05 \[4]\[5], FINDINGS-16 N\[1]);
 /// - **Origin** (when the client sends one — browsers do on cross-site POSTs) must
 ///   match the request's Host authority, else `403` (CSRF guard);
 /// - a **POST** body must declare `application/json`, else `415` (Step 11);
 /// - the **request id** comes from the client's `x-request-id` only when it is
-///   short and printable (see [`accepted_request_id`]) and is generated otherwise,
+///   short and printable (see `accepted_request_id`) and is generated otherwise,
 ///   echoed in the response header, and logged at request completion (G6,
-///   FINDINGS-05 [7]).
+///   FINDINGS-05 \[7]).
 ///
 /// Applied in `main` on every listener router, so guards wrap uniformly.
 pub async fn guard(
@@ -2923,7 +2923,7 @@ fn classify_send_failure_flags(is_timeout: bool, is_connect: bool) -> SendFailur
     }
 }
 
-/// Classifies a `send()` failure for the crash-retry arm (FINDINGS-06 [2]).
+/// Classifies a `send()` failure for the crash-retry arm (FINDINGS-06 \[2]).
 ///
 /// Restart-and-retry ONLY when the request never got a response AND the engine is
 /// not listening — reqwest's `is_connect()` alone (refused/reset before response

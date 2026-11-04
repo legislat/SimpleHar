@@ -184,7 +184,7 @@ fn default_protected_ports() -> BTreeSet<u16> {
 
 /// One declarative category: slot count, listener, and policy as data (DESIGN Step 5).
 ///
-/// `deny_unknown_fields` (FINDINGS-11 [1]): the categories carry all the safety policy and
+/// `deny_unknown_fields` (FINDINGS-11 \[1]): the categories carry all the safety policy and
 /// the file is hand-edited, so a key typo must fail the boot like any other invalid value —
 /// silently defaulting `"max_model": 6` to `max_models: 1` or `"evictable": ["WORK"]` to an
 /// empty list is the D1 defect this file's module doc promises against.
@@ -392,7 +392,7 @@ pub struct LlamaEngineConfig {
 /// redaction marker that reports only whether auth is enforced (`REDACTED(present)`
 /// / `REDACTED(absent)`) — presence is reportable, the value never is, so no
 /// `?config` line can ever put the crown jewel into the `/har/log` ring
-/// (FINDINGS-15 [9]).
+/// (FINDINGS-15 \[9]).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -482,7 +482,7 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_token: Option<String>,
     /// Gate for the test-facing `mock` engine adapter: production boot registers it **only**
-    /// when this is true (chunk 10 [3]). The adapter's argv names the bare program
+    /// when this is true (chunk 10 \[3]). The adapter's argv names the bare program
     /// `mock-engine`, which `CreateProcessW` resolves through the harness's own directories,
     /// so setting this on a machine where untrusted parties can write beside the harness exe
     /// or its cwd is a code-execution grant, not a debugging knob. Tests never need it: each
@@ -503,7 +503,7 @@ impl fmt::Debug for AppConfig {
     /// `REDACTED(present)` / `REDACTED(absent)` — the posture the status surface
     /// already takes: report *whether* auth is enforced, never the secret.
     ///
-    /// `secrecy` was rejected (operator ruling 2026-10-28, FINDINGS-15 [9]): the fix
+    /// `secrecy` was rejected (operator ruling 2026-10-28, FINDINGS-15 \[9]): the fix
     /// for the class belongs at the owning type plus the guard below, and
     /// `expose_secret()` ceremony at each reader would buy no behavior change for a
     /// new dependency AGENTS.md itself polices.
@@ -652,7 +652,7 @@ impl AppConfig {
     /// reports missing categories separately). A category with a non-empty
     /// `engine_ports` keeps them — `validate` refuses every other length
     /// (R2-11-02) — and the rest are allocated sequentially from
-    /// [`ENGINE_PORT_BASE`]. Each present category advances the cursor by
+    /// `ENGINE_PORT_BASE`. Each present category advances the cursor by
     /// `max_models`, explicit or not. Validation checks the resolved plan for
     /// collisions.
     pub fn effective_engine_ports(&self) -> BTreeMap<CategoryId, Vec<u16>> {

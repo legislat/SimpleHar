@@ -13,8 +13,8 @@
 //! the `log` home) are reported as dropped, never obeyed; keys the renderer has
 //! no knob for are listed as not mapped — nothing is ever silently discarded.
 //!
-//! The mapping itself has exactly one writer: [`strata_import`] reads the
-//! profile into a structured field list; [`render_yaml`] turns that list into
+//! The mapping itself has exactly one writer: `strata_import` reads the
+//! profile into a structured field list; `render_yaml` turns that list into
 //! the stdout document (with its guidance comments) and [`apply_strata_row`]
 //! turns it into the row merge (without them). Neither command boots a
 //! listener, reads the live config, or touches the legacy v3.3 config.

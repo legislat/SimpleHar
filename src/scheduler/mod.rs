@@ -4,7 +4,7 @@
 //! Invariants encoded here:
 //! - single writer: only the actor task mutates slots, jobs, and the ledger;
 //! - the actor never performs engine I/O inline — every step runs as a spawned task
-//!   whose result returns as an [`Event`], so control-plane calls (`status`, `cancel`,
+//!   whose result returns as an `Event`, so control-plane calls (`status`, `cancel`,
 //!   `unload`) never queue behind a load (defect A1);
 //! - a dropped waiter is harmless (F-1) and a second identical load attaches to the
 //!   in-flight job instead of racing it (F-6);
@@ -138,19 +138,19 @@ pub enum Reply {
     /// The command was accepted with nothing further to report (cancel, reload).
     Done,
     /// An accepted unload command, reporting what the actor actually did at accept
-    /// (FINDINGS-07 [5]): never a blanket `Done` while nothing moved. The release
+    /// (FINDINGS-07 \[5]): never a blanket `Done` while nothing moved. The release
     /// itself stays job-verified — this is an acceptance ledger, not release proof.
     Unloaded {
         /// Slots whose occupant the actor committed to free: unload jobs started
         /// now, plus occupants armed to unload behind the in-flight job this
         /// command cancelled. A commitment counts only when it is new — a
         /// repeat command that would re-arm an already-armed slot reports `0`
-        /// (FINDINGS-09 [1]).
+        /// (FINDINGS-09 \[1]).
         unloading: usize,
         /// In-flight LOADS cancelled and parked loads dropped by this command.
         /// Cancelling an in-flight Unload job is not this: it removes an
         /// unloading commitment rather than a load, and rides `unloading`
-        /// instead (FINDINGS-09 [2]). A re-entered cancel of an already
+        /// instead (FINDINGS-09 \[2]). A re-entered cancel of an already
         /// cancel-requested job counts nowhere: it moved nothing.
         jobs_cancelled: usize,
     },
@@ -361,7 +361,7 @@ impl Scheduler {
     /// the scan of `models_dir` (§0.2 step 6, re-run by [`Command::Reload`]) happens
     /// **on the actor task, never on the boot thread** — `start()` returns while it
     /// is still pending, so the boot thread reaches `TcpListener::bind` unblocked
-    /// (FINDINGS-14 [1]: an operator-chosen `modelconf_dir` can live on a sleeping
+    /// (FINDINGS-14 \[1]: an operator-chosen `modelconf_dir` can live on a sleeping
     /// USB or a disconnected `\\NAS` volume, and a wedged pre-bind scan would stall
     /// the listeners and `/har/status` while the already-held single-instance guard
     /// refuses the operator's relaunch — the same stall the A6 precedent in

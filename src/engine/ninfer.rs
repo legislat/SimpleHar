@@ -8,7 +8,7 @@
 //! harness can check and expect (`--restart no`, loopback-only publish, bounded
 //! logs, pre-reap). The legacy `ninfer_autostart` operator-script path was removed
 //! after a green Wave C (ruling 18b): a row that still declares it is refused at
-//! scan and at launch with [`legacy_removed_sentence`], never published. Because
+//! scan and at launch with `legacy_removed_sentence`, never published. Because
 //! the container outlives the short-lived `wsl.exe` client, the spec carries the
 //! container name so the runtime reaps it with `docker rm -f` on release (v3.3
 //! `Proc::Container` parity), and readiness chains `/health` then `/v1/models`
@@ -137,7 +137,7 @@ fn resolve_internal_port(entry: &ModelEntry) -> Result<String, String> {
 }
 
 /// The internal port a ninfer row will bind, answered by the same
-/// [`resolve_internal_port`] authority the spawn render uses, for the
+/// `resolve_internal_port` authority the spawn render uses, for the
 /// scheduler-side namespace check. `None` for non-ninfer rows and for ninfer
 /// rows whose key does not parse — those die at spawn naming the key, so the
 /// check must not invent a number for them.
@@ -179,7 +179,7 @@ pub fn profile_stamp(raw: &BTreeMap<String, String>) -> Option<String> {
 
 /// The context a ninfer row actually serves: the max-context of the profile its
 /// launcher resolves — the built-in table or the `ninfer_profile_<name>`
-/// override line, answered by the same [`profile_override`] the spawn
+/// override line, answered by the same `profile_override` the spawn
 /// (`template_params`) and the void-rule identity ([`profile_stamp`]) use, so
 /// card, page and spawn can never disagree about what the container serves.
 /// `None` when nothing resolves (a dead built-in override key, an invalid

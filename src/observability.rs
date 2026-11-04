@@ -10,7 +10,7 @@
 //! and the shipped harness runs hidden (`autostart.vbs`, window style 0), so the
 //! console layer reaches nothing. A harness that exited — or was killed — left zero
 //! on-disk record of its own admissions, refusals and timings, which is exactly the
-//! evidence G6/G13 promise. [`FileLayer`] therefore appends every event it accepts to
+//! evidence G6/G13 promise. `FileLayer` therefore appends every event it accepts to
 //! `logs/harness-<epoch>.log` **as it happens**, one `write_all` per line with no
 //! userland buffer, so the bytes reach the kernel and survive a process kill. Flushing
 //! at exit was rejected: the failure mode that matters is the exit that never happens.
@@ -247,7 +247,7 @@ pub fn log_write_failures() -> u64 {
 /// harness log budget first.
 ///
 /// Called once from [`init`], which no lib test runs — so in tests the sink stays
-/// `None` and [`FileLayer`] is a no-op that cannot touch the real `logs/`.
+/// `None` and `FileLayer` is a no-op that cannot touch the real `logs/`.
 ///
 /// # Arguments
 ///
@@ -524,13 +524,13 @@ pub(crate) fn file_sink_path_for_test() -> Option<PathBuf> {
 /// Initializes the global tracing subscriber.
 ///
 /// Filter level comes from the `SIMPLEHAR_LOG` environment variable; when unset it
-/// defaults to [`DEFAULT_LOG_LEVEL`]. A value that does not parse is **not** silently
+/// defaults to `DEFAULT_LOG_LEVEL`. A value that does not parse is **not** silently
 /// accepted: `EnvFilter::new` is `parse_lossy`, which drops unparseable directives and
 /// defaults to `ERROR` (tracing-subscriber-0.3.23 src/filter/env/mod.rs:350-354) — so
 /// `SIMPLEHAR_LOG=verbose`, or a mistyped directive typed while debugging a boot
 /// failure, produced an errors-only ring with no diagnostic, and `parse_lossy`'s own
 /// warning fired before a subscriber existed, going to the no-op dispatcher
-/// (FINDINGS-15 [8]). An invalid value now falls back to `info` and says so, into the
+/// (FINDINGS-15 \[8]). An invalid value now falls back to `info` and says so, into the
 /// console and the ring. Installs the ring layer alongside the console formatter.
 /// Called once from `main`; tests never call it (the default subscriber would
 /// reject a second registration).

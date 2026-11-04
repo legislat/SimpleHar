@@ -25,7 +25,7 @@ fn ref_aliases(model_ref: &str) -> Vec<String> {
 ///
 /// The variants are exhaustive on purpose: a caller cannot reach an entry without
 /// handling [`Resolution::Ambiguous`] first, so a colliding catalog can never be
-/// answered by whichever yaml happened to sort first (FINDINGS-11 [4]). That is the
+/// answered by whichever yaml happened to sort first (FINDINGS-11 \[4]). That is the
 /// whole point of the type — an ambiguity is a catalog defect the operator must fix,
 /// not a tie for the harness to break silently.
 #[derive(Debug, Clone, PartialEq)]

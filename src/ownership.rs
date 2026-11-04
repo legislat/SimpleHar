@@ -8,12 +8,12 @@
 //!
 //! Containers outlive the process that started them, so their provenance must too:
 //! [`ContainerClaims`] is the persisted claim ledger, and [`boot_reap_decision`] is
-//! the single rule the boot reclaim evaluates against it (chunk 10 [1], 2026-10-27).
+//! the single rule the boot reclaim evaluates against it (chunk 10 \[1], 2026-10-27).
 //! Both reaping paths — the spawn-time pre-reap and the boot reclaim — address a
 //! name only if the ledger rules accept it: the pre-reap is gated on the shared
 //! [`valid_container_name`] rule alone (it must stay able to destroy a stale
 //! container from an earlier run before this one has a claim), while the kill reap
-//! and the boot reclaim require the positive claim (FINDINGS2-0910 [3], 2026-10-29:
+//! and the boot reclaim require the positive claim (FINDINGS2-0910 \[3], 2026-10-29:
 //! a claim is minted only once `command.spawn()` really started a client, and is
 //! retracted if the spawn is nevertheless reported as failed, so a load that never
 //! reached the engine leaves no ownership evidence behind). Both — with the adapter
@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// The engine id whose models may own docker containers: the **only** engine boot
-/// reclaim may ever address (operator policy, chunk 10 [1]). The ninfer adapter's
+/// reclaim may ever address (operator policy, chunk 10 \[1]). The ninfer adapter's
 /// `engine_id` returns this constant, so registry, scanner, and reclaim compare the
 /// same token.
 pub const NINFER_ENGINE: &str = "ninfer";
@@ -43,7 +43,7 @@ fn id_shaped(name: &str) -> bool {
 
 /// Docker's own name rule plus the ID-prefix-shape exclusion, applied as a
 /// defense-in-depth guard before the value ever reaches `docker rm -f` argv (review,
-/// 2026-10-26; chunk 10 [1] and [4], 2026-10-27). Lives here — not in the adapter —
+/// 2026-10-26; chunk 10 \[1] and \[4], 2026-10-27). Lives here — not in the adapter —
 /// because the spawn path (`NinferAdapter::spec`), the spawn-time pre-reap through
 /// [`ContainerClaims::claim`], and the boot reclaim decision must all validate through
 /// this one function, so no reaping path can accept a name another one refuses.
@@ -80,7 +80,7 @@ pub const SKIP_INVALID_NAME: &str =
 pub const SKIP_UNCLAIMED: &str = "no harness spawn claim on record for this name";
 
 /// The boot-reclaim rule, evaluated once per catalog-declared container name. Firing
-/// requires all three gates (chunk 10 [1], operator policy 2026-10-27): (a) the
+/// requires all three gates (chunk 10 \[1], operator policy 2026-10-27): (a) the
 /// declaring model runs on the ninfer engine, (b) the name passes the very validation
 /// the spawn path applies — docker-legal and not a container-ID shape, through
 /// [`valid_container_name`] — and (c) [`ContainerClaims`] positively records that this
@@ -119,7 +119,7 @@ pub fn boot_reap_decision(engine: &str, name: &str, claimed: bool) -> ReapDecisi
 /// The persisted record of container names this harness started: the ownership
 /// evidence behind [`boot_reap_decision`]. Written (atomically, temp + rename) when
 /// [`ProcessRuntime`](crate::process::ProcessRuntime) has a client *actually
-/// started* — never at spawn intent (FINDINGS2-0910 [3]) — cleared when a release is
+/// started* — never at spawn intent (FINDINGS2-0910 \[3]) — cleared when a release is
 /// confirmed or the spawn is reported as failed, and read at boot, so a container can
 /// only be reclaimed if an earlier lifetime of *this* harness started it and died
 /// before releasing it. A missing or corrupt ledger reads as no claims: absence of

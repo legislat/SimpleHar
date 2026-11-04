@@ -87,7 +87,7 @@ pub struct SlotStatus {
     /// |o| o.loaded_at)` policy of the scheduler's own LRU picks. Not serialized:
     /// an `Instant` has no wall-clock meaning outside the process, so `/har/status`
     /// keeps exposing `idle_s`. The no-`model` proxy fallback sorts untouched
-    /// occupants by this (FINDINGS-06 [1]: never fabricate an instant instead).
+    /// occupants by this (FINDINGS-06 \[1]: never fabricate an instant instead).
     #[serde(skip)]
     pub loaded_at: Instant,
 }

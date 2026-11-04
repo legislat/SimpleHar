@@ -31,9 +31,9 @@ const SMI_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// NVML init is **lazy**: the native `Nvml::init()` runs on the first sample, never
 /// in [`NvmlWitness::new`]. That keeps boot AND the first status poll off the hook
-/// in the normal case (FINDINGS-14 [1]: init was on the main thread before the
+/// in the normal case (FINDINGS-14 \[1]: init was on the main thread before the
 /// first bind, the same pre-bind stall the A6 banner precedent in `main.rs` moved
-/// off the critical path; FINDINGS-FIXROUND2 [3]: `main` pays the init on the
+/// off the critical path; FINDINGS-FIXROUND2 \[3]: `main` pays the init on the
 /// blocking pool via [`NvmlWitness::prime`] at boot, so normally no first poll
 /// pays it). The laziness is the honest worst case: a status poll arriving before
 /// priming completes still pays the init on that worker thread — the stall is
@@ -60,7 +60,7 @@ pub struct NvmlWitness {
 
 impl NvmlWitness {
     /// Creates the witness without touching the driver: allocation-cheap and bind-safe
-    /// (FINDINGS-14 [1]); NVML init failure is not an error — the fallback arms, on
+    /// (FINDINGS-14 \[1]); NVML init failure is not an error — the fallback arms, on
     /// the first [`VramWitness::sample`], never on the boot thread.
     pub fn new() -> Self {
         NvmlWitness {
@@ -91,8 +91,8 @@ impl NvmlWitness {
     }
 
     /// Runs the lazy `Nvml::init()` to completion, paying it off the async paths;
-    /// safe to call from `spawn_blocking` (FINDINGS-FIXROUND2 [3]). Concurrent
-    /// [`NvmlWitness::nvml`] callers block until it lands — documented `OnceLock`
+    /// safe to call from `spawn_blocking` (FINDINGS-FIXROUND2 \[3]). Concurrent
+    /// `NvmlWitness::nvml` callers block until it lands — documented `OnceLock`
     /// behaviour. `main` spawns this at boot so the first `/har/status` normally
     /// finds the init already done; if a poll wins the race, laziness still applies
     /// unchanged.

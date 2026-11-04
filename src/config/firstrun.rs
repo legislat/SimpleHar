@@ -5,7 +5,7 @@
 //! box's card). The ruling: when no config file exists, the harness probes the real
 //! system, materializes the file beside the exe, and from then on the file is the
 //! truth. Every probe degrades to the documented default with a loud log line —
-//! a wedged driver can neither fail boot nor stall the listeners (FINDINGS-14 [1]
+//! a wedged driver can neither fail boot nor stall the listeners (FINDINGS-14 \[1]
 //! bind-before-driver doctrine holds: the probe runs on the blocking pool behind a
 //! hard budget, and the bind itself happens later, in `run()`).
 //!
@@ -16,7 +16,7 @@
 //! - **what is written is what runs** — the same in-memory [`AppConfig`] is handed
 //!   to the scheduler and the API after filling, and the file is the pretty
 //!   serialization of exactly that config (`source_path` is `#[serde(skip)]`),
-//!   flushed and read back before it is published (DECISIONS 13[11]).
+//!   flushed and read back before it is published (DECISIONS 13\[11]).
 //!
 //! The cross-check warning runs on EVERY boot (file present or not): a pinned
 //! `vram_total_gb` that disagrees with the card's own reading beyond

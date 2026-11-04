@@ -9,13 +9,13 @@
 //! `split_value_comment`, and the incoming word is taken as it arrived), and a real
 //! change
 //! drops the line's own inline comment (a stale note beside a new value is a lie;
-//! operator ruling 2026-10-28, FINDINGS-13 [8] Fork B; FINDINGS-BATCH-2026-10-28B
-//! [1]/[4]). A real change also writes the new value in a form the reader confirms
+//! operator ruling 2026-10-28, FINDINGS-13 \[8] Fork B; FINDINGS-BATCH-2026-10-28B
+//! \[1]/\[4]). A real change also writes the new value in a form the reader confirms
 //! — `emit_form`'s three steps: as-is if faithful, one `"` pair if that is what
 //! makes it faithful, refusal if neither would read back (operator ruling
 //! 2026-10-28, closing the change-side non-round-trip seam).
 //! An edit whose result equals the input never reaches the disk at all —
-//! no temp, no rename, no mtime churn on a file nobody changed ([6]). The file is
+//! no temp, no rename, no mtime churn on a file nobody changed (\[6]). The file is
 //! replaced atomically (temp + rename, every publish write flushed with
 //! `File::sync_all` before its handle closes — volume submission, not durability:
 //! the drive's volatile write cache remains below the software line) and
@@ -26,13 +26,13 @@
 //! where the original bytes ended up (restored, backed up, believed to be at the
 //! copy, or nowhere). Fixes v3.3 defects D3/D4 (non-atomic, CRLF-normalizing,
 //! comment-clobbering write-back whose failure still answered 200) and
-//! FINDINGS-13 [5] (the restore was the one non-atomic write and its failure was
+//! FINDINGS-13 \[5] (the restore was the one non-atomic write and its failure was
 //! discarded behind an unconditional "original restored" claim).
 //!
-//! Failures are typed ([`WritebackError`], FINDINGS-13 [10]) and every variant's
+//! Failures are typed ([`WritebackError`], FINDINGS-13 \[10]) and every variant's
 //! `Display` is the exact sentence the module answered before typing, so nothing
 //! user-visible changed; the HTTP class is the api's call at
-//! [`crate::api::ApiError::from_writeback`] — a caller's impossible value or absent
+//! `crate::api::ApiError::from_writeback` — a caller's impossible value or absent
 //! key is a 4xx, never a 500.
 
 use crate::model::scan::{normalized_line, parse_flat_yaml, split_value_comment};
@@ -42,7 +42,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-/// Every failure this module answers with, typed (FINDINGS-13 [10]; the DEFERRED
+/// Every failure this module answers with, typed (FINDINGS-13 \[10]; the DEFERRED
 /// line in `DECISIONS.md` released it on the next writeback feature-touch, which
 /// the change-side quote ruling was — a refusal that is a caller error must not
 /// surface as a harness error).
@@ -56,7 +56,7 @@ use thiserror::Error;
 /// and no variant carries a field it does not display.
 ///
 /// The HTTP class is the consumer's call, made at
-/// [`crate::api::ApiError::from_writeback`]:
+/// `crate::api::ApiError::from_writeback`:
 ///
 /// | variant | api class | why |
 /// |---|---|---|
@@ -80,7 +80,7 @@ pub enum WritebackError {
         io: String,
     },
     /// The edited document has problem lines: writing it would produce a file the
-    /// scan gate refuses to publish, so the edit is refused (13[4] Fork C blanket).
+    /// scan gate refuses to publish, so the edit is refused (13\[4] Fork C blanket).
     #[error("edit would break the file: {}", .problems.join("; "))]
     WouldBreakFile {
         /// The scanner's own problem lines, in report order.
@@ -115,7 +115,7 @@ pub enum WritebackError {
     },
     /// The bytes just renamed did not read back as a valid file; the original was
     /// restored, or the detail says exactly where its bytes ended up (the anti-lie
-    /// contract of FINDINGS-13 [5]).
+    /// contract of FINDINGS-13 \[5]).
     #[error("post-write validation failed; {detail}")]
     PostWriteValidation {
         /// What happened to the original bytes and the incident copy, verbatim as
@@ -123,14 +123,14 @@ pub enum WritebackError {
         detail: String,
     },
     /// The caller's word has no form on one yaml line that
-    /// [`crate::model::scan::split_value_comment`] hands back unchanged, so
-    /// [`emit_form`] refused rather than writing a line that would misread.
+    /// `crate::model::scan::split_value_comment` hands back unchanged, so
+    /// `emit_form` refused rather than writing a line that would misread.
     #[error("cannot write `{key}`: the value {value:?} cannot be put on one yaml line in a form the scanner reads back unchanged")]
     UnrepresentableValue {
         /// The key the value was being written under.
         key: String,
         /// The caller's word, exactly as it arrived (there is no entry
-        /// normalization — FINDINGS2-13 [1]).
+        /// normalization — FINDINGS2-13 \[1]).
         value: String,
     },
 }
@@ -295,11 +295,11 @@ fn emit_form(key: &str, want: &str) -> Result<String, WritebackError> {
 /// - a matching key line (first one) is rewritten in place only when the value
 ///   actually changes. Identity is the **reader's published value compared
 ///   byte-exactly against the caller's word**: the line's value text goes through
-///   [`split_value_comment`] and that result must equal `value` as it arrived. So an
+///   `split_value_comment` and that result must equal `value` as it arrived. So an
 ///   identical-value write passes the line through
 ///   **byte-verbatim** — BOM, indentation, raw quoted value, inline comment and
 ///   trailing `\r` all stay exactly as authored, and the whole document comes back
-///   byte-identical (operator ruling 2026-10-28, FINDINGS-13 [8] Fork B: nothing
+///   byte-identical (operator ruling 2026-10-28, FINDINGS-13 \[8] Fork B: nothing
 ///   changes when the value does not change). A real change
 ///   harness-formats the line and drops the old inline comment (a stale note
 ///   beside a new value is a lie), and every later rewrite of the new value is
@@ -308,17 +308,17 @@ fn emit_form(key: &str, want: &str) -> Result<String, WritebackError> {
 ///   residual quote pairs (`"a b "` publishes `a b `), so canonical-equality called
 ///   a republish of the reader's own value a change and rewrote
 ///   `k: "a b " # tail` as `k: a b` — comment gone, value mutated
-///   (FINDINGS2-13 [1]);
+///   (FINDINGS2-13 \[1]);
 /// - `value` is never normalized: no trim, no peel, at entry or in the comparison
-///   (FINDINGS2-13 [1], superseding the entry-trim that
-///   FINDINGS-BATCH-2026-10-28B [4] introduced — its compare/emit symmetry was
+///   (FINDINGS2-13 \[1], superseding the entry-trim that
+///   FINDINGS-BATCH-2026-10-28B \[4] introduced — its compare/emit symmetry was
 ///   bought by destroying information the reader publishes, and the asymmetry it
 ///   fixed is now fixed the other way, by emitting exactly what was asked). The
 ///   harness's own vocabulary needs none of it: an enum name, `true`/`false` and a
 ///   `{:.1}` float are byte-faithful as-is, pinned by
 ///   `the_live_value_vocabulary_never_reaches_the_quote_or_refuse_branch`, so every
 ///   current caller is unaffected;
-/// - the change and append arms write the word through [`emit_form`], which asks
+/// - the change and append arms write the word through `emit_form`, which asks
 ///   the **reader** whether it survives (operator ruling 2026-10-28, closing the
 ///   open triage item FINDINGS-BATCH-2026-10-28B left): as-is when that is
 ///   faithful, one `"` pair when that is what makes it faithful, and a refusal
@@ -326,7 +326,7 @@ fn emit_form(key: &str, want: &str) -> Result<String, WritebackError> {
 ///   containing ` #` can no longer land a line that rescans to its pre-`#` prefix,
 ///   a word with edge whitespace lands quoted rather than trimmed, and a value
 ///   containing `\n` is refused rather than injecting lines. The keep
-///   branch is not involved: 13[8] Fork B's byte-verbatim pass-through stands, and a
+///   branch is not involved: 13\[8] Fork B's byte-verbatim pass-through stands, and a
 ///   write of the value the reader publishes never reaches `emit_form` at all — it is
 ///   identical under the byte-exact test above.
 /// - a matching key inside a *commented block* is never touched (v3.3 clobbered
@@ -471,7 +471,7 @@ pub fn set_flag_on_file(path: &Path, key: &str, value: Option<&str>) -> Result<(
 /// otherwise drop the whole model after a failure between two writes (review,
 /// 2026-10-27). A category retag is the same shape: the non-EMB category write and
 /// the `is_embedding_model` removal must land together, or the file between the two
-/// writes is a scan-time conflict that drops the model (FINDINGS-12 [1]).
+/// writes is a scan-time conflict that drops the model (FINDINGS-12 \[1]).
 ///
 /// # Arguments
 ///

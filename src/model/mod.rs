@@ -142,7 +142,7 @@ impl MeasuredAttribution {
     }
 
     /// The yaml/payload token for this provenance — the exact form
-    /// [`parse_measured_attribution`] accepts back, so writer and reader share one
+    /// `parse_measured_attribution` accepts back, so writer and reader share one
     /// spelling.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -156,7 +156,7 @@ impl MeasuredAttribution {
 }
 
 /// One model from `ModelConf/`, typed (Step 10: the harness name is canonical, and
-/// since FINDINGS-13 [3]/[7] it is the yaml file stem, which `scan` supplies as the
+/// since FINDINGS-13 \[3]/\[7] it is the yaml file stem, which `scan` supplies as the
 /// `name` argument of [`ModelEntry::from_flat`]).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ModelEntry {
@@ -201,7 +201,7 @@ pub struct ModelEntry {
     pub measured_min_gb: Option<f64>,
     /// The `cpu_offload` setting the range was measured under (`measured_offload:`),
     /// written with it on rows whose engine carries the `cpu_offload` knob
-    /// ([`crate::engine::llama::offload_live`]) only. An
+    /// (`crate::engine::llama::offload_live`) only. An
     /// offloaded launch has no comparable footprint, so a flip between then and now
     /// voids the pair at scan time (measured values verify, they never mislead); on
     /// engines that never read the key the flip cannot describe the launch, so it
@@ -613,11 +613,11 @@ impl ModelEntry {
     }
 
     /// The booking precedence: declared → measured (only where the cost class may
-    /// book it, per [`Self::may_book_measured`]) → the R11 Fit projection → GGUF
+    /// book it, per `Self::may_book_measured`) → the R11 Fit projection → GGUF
     /// estimate, with `exact`-without-`vram_gb`-and-without-a-real-source refused.
     /// A guarded engine-spoken report (`engine_report`, or a process engine's
     /// `engine_status` since the 2026-11-04 ruling) ABOVE the declared value books
-    /// instead of it ([`Self::engine_report_outranks_declared`]), and so does a Fit projection
+    /// instead of it (`Self::engine_report_outranks_declared`), and so does a Fit projection
     /// above it (rule 2026-11-01, the same amended-15(ii) max truth): the booking
     /// is what the engine itself will take, the declared number is a floor, never
     /// a ceiling.
