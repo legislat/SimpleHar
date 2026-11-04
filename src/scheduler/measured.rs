@@ -473,10 +473,16 @@ impl ActorState {
         };
         let Some(anchor) = anchor else { return };
         // The spawn's own verdict on provenance, decided before any arithmetic: a
-        // spawn that already folded the container's `engine_report` never takes a
-        // witness reading into its range again (the reserved figure is static — the
-        // total-diff could only corrupt it).
-        if anchor.attribution == Some(crate::model::MeasuredAttribution::EngineReport) {
+        // spawn that already folded the engine's own static figure — the
+        // container's `engine_report` or a process engine's `engine_status`
+        // reading (TASK-ENGINE-MEASUREMENT, ORCHESTRATION §4) — never takes a
+        // witness reading into its range again (both figures are static for the
+        // launch; the total-diff could only corrupt them).
+        if matches!(
+            anchor.attribution,
+            Some(crate::model::MeasuredAttribution::EngineReport)
+                | Some(crate::model::MeasuredAttribution::EngineStatus)
+        ) {
             return;
         }
         let booked_others: f64 = self
@@ -610,6 +616,66 @@ impl ActorState {
             attribution: crate::model::MeasuredAttribution::EngineReport,
             profile,
             // Static for the life of the launch: never averaged into witness history.
+            fold_range: false,
+        });
+    }
+
+    /// Folds one process-engine measurement (`TASK-ENGINE-MEASUREMENT`,
+    /// ORCHESTRATION §4): the footprint basalt/strata stated at their own status
+    /// endpoint, or the witness's process-tree sum of the engine's pid plus its
+    /// direct children. Same guard order as [`Self::on_engine_report`] — the
+    /// reading must still own an uncontested serving window (a drop is visible
+    /// because the sampler's one-shot does not retry; review 2026-10-31, M1),
+    /// and the figure must be one this card could carry. The two sources keep
+    /// their own provenance and never upgrade each other (doctrine 12): the
+    /// engine's status answer folds under `EngineStatus` with
+    /// `EngineReport`-class trust — above the declared floor as max truth per
+    /// the 2026-11-04 ruling — and the tree sum folds as the existing
+    /// `PerProcess` footprint. Neither averages into witness history
+    /// (`fold_range: false`): each is this launch's footprint, not a noisy
+    /// sample. Neither mints a profile stamp: the profile identity is ninfer's
+    /// alone (ORCHESTRATION §2). Booking then flows unchanged through
+    /// `cost_source()`'s max truth.
+    pub(super) fn on_process_measurement(
+        &mut self,
+        model: &str,
+        ticket: &SpawnTicket,
+        measurement: crate::engine::EngineMeasurement,
+        total_gib: f64,
+    ) {
+        if !self.serving_uncontested(model, ticket) {
+            tracing::warn!(
+                model,
+                "process measurement dropped: another spawn is in flight and this reading lost its uncontested window"
+            );
+            return;
+        }
+        let Some(rounded) = Self::measurable_figure(measurement.gpu_gib, total_gib) else {
+            tracing::warn!(
+                model,
+                gpu_gib = measurement.gpu_gib,
+                total_gib,
+                "process measurement refused: the figure is nonsense or sub-quantum for this card"
+            );
+            return;
+        };
+        let attribution = match measurement.source {
+            crate::engine::MeasurementSource::EngineStatus => {
+                crate::model::MeasuredAttribution::EngineStatus
+            }
+            crate::engine::MeasurementSource::ProcessTreeNvml => {
+                crate::model::MeasuredAttribution::PerProcess
+            }
+        };
+        self.fold(&FoldPlan {
+            model: model.to_string(),
+            ticket: ticket.clone(),
+            high: rounded,
+            low: rounded,
+            attribution,
+            profile: None,
+            // A footprint for this launch, not a point to be averaged into
+            // this spawn's witness history.
             fold_range: false,
         });
     }

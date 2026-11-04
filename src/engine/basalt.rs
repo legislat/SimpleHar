@@ -421,6 +421,17 @@ impl EngineAdapter for BasaltAdapter {
     }
 }
 
+/// Phase-2 stub of the Basalt status parse (TASK-ENGINE-MEASUREMENT,
+/// ORCHESTRATION §3): the future reader of `GET /v1/status` answers with
+/// `None` for every body, so the sampler falls back to the witness-based
+/// process-tree sum until phase 2 fills in the `engine.info.vram` parse.
+/// Phase 2 owns this file and will replace this body and nothing else.
+pub(crate) fn measurement_from_status(
+    _body: &serde_json::Value,
+) -> Option<crate::engine::EngineMeasurement> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

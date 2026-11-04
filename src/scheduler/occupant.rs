@@ -3,7 +3,7 @@
 //! container report, and the failed-launch log snapshot. The state and its
 //! fields stay owned by `mod.rs`.
 
-use crate::engine::EngineRuntime;
+use crate::engine::{EngineMeasurement, EngineRuntime, MeasurementSource};
 use crate::ownership::SpawnTicket;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -144,6 +144,92 @@ impl ActorState {
             container,
             required_to_free_gb = report.required_to_free_gb,
             "engine reported its reserved VRAM footprint"
+        );
+        Some(())
+    }
+
+    /// The one-shot process-engine measurement (`TASK-ENGINE-MEASUREMENT`,
+    /// ORCHESTRATION §3) for the non-container engines `basalt`/`strata`,
+    /// mirroring [`Self::report_container`]: fetch the engine's own status
+    /// snapshot once at readiness (basalt `/v1/status`, strata `/status`) and
+    /// hand the parsed figure to the actor; `Some(())` ends the sampler the
+    /// way ninfer's `engine_report` ends it. Every refusal returns `None` so
+    /// the witness loop stands in rather than losing the measurement outright
+    /// (review 2026-10-31 M1). The fall-through order is exact: the
+    /// process-tree fallback is attempted ONLY when the status path yielded no
+    /// measurement — a body the per-engine stub will not parse yet (phase 1
+    /// stubs answer `None` for every body) or an engine that never answers. A
+    /// PARSED figure that [`ActorState::measurable_figure`] would refuse is not
+    /// retried through the fallback: the one-shot returns `None` here and the
+    /// witness loop takes over, standing in with its own fresh readings. The
+    /// fallback sums the witness's per-process bytes over the engine's own pid
+    /// plus its direct children ([`EngineRuntime::descendant_pids`] — the
+    /// strata.exe -> strata-vision family) and carries `ProcessTreeNvml`
+    /// provenance; the engine's own status answer carries `EngineStatus`. The
+    /// witness is sampled on both paths because its live reading is the bound
+    /// the figure gate and the actor's fold both measure against (doctrine 4);
+    /// a witness that never answers is silence here too, and the sampler's own
+    /// loop ends on its first witness error, so nothing is silently lost.
+    pub(super) async fn report_measurement(
+        runtime: &Arc<dyn EngineRuntime>,
+        tx: &mpsc::UnboundedSender<ActorMsg>,
+        ctx: &SamplerCtx,
+        witness: &Arc<dyn crate::budget::VramWitness>,
+    ) -> Option<()> {
+        let status_path = match ctx.engine.as_str() {
+            "basalt" => "/v1/status",
+            "strata" => "/status",
+            _ => return None,
+        };
+        let sample = witness.sample().await.ok()?;
+        let status = runtime
+            .engine_status_json(ctx.ticket.port, status_path)
+            .await;
+        let parsed = status.as_ref().and_then(|body| {
+            if ctx.engine == "basalt" {
+                crate::engine::basalt::measurement_from_status(body)
+            } else {
+                crate::engine::strata::measurement_from_status(body)
+            }
+        });
+        let measurement = match parsed {
+            Some(measurement) => measurement,
+            None => {
+                // The witness-based process-tree sum: the engine's own pid plus
+                // its direct children (one generation — never grandchildren).
+                let mut pids = vec![ctx.ticket.pid];
+                pids.extend(runtime.descendant_pids(ctx.ticket.pid).await);
+                let own = sample.own_gib(&pids)?;
+                EngineMeasurement {
+                    gpu_gib: own,
+                    ram_gib: None,
+                    source: MeasurementSource::ProcessTreeNvml,
+                }
+            }
+        };
+        // Decide HERE whether the actor could ever book this figure: the
+        // one-shot does not retry after it sends, so consuming the sampler on
+        // a figure the actor would drop would silently skip the witness
+        // stand-in too (review 2026-10-31, M1 — the same gate
+        // `report_container` applies).
+        Self::measurable_figure(measurement.gpu_gib, sample.total_gib)?;
+        if tx
+            .send(ActorMsg::MeasuredProcessReport {
+                model: ctx.model.clone(),
+                ticket: ctx.ticket.clone(),
+                measurement,
+                total_gib: sample.total_gib,
+            })
+            .is_err()
+        {
+            return Some(()); // actor gone
+        }
+        tracing::info!(
+            model = %ctx.model,
+            engine = %ctx.engine,
+            gpu_gib = measurement.gpu_gib,
+            source = ?measurement.source,
+            "process engine measurement landed"
         );
         Some(())
     }

@@ -363,6 +363,48 @@ pub struct Spawned {
     pub pid: u32,
 }
 
+/// Where a process engine's measured memory footprint came from
+/// (`TASK-ENGINE-MEASUREMENT`, ORCHESTRATION 2026-11-04 §1). The source rides
+/// on every [`EngineMeasurement`] so the fold can stamp the provenance it
+/// persists: doctrine 12 — a measured figure books only if its provenance is
+/// trusted, and provenance is decided at the source, never upgraded post-hoc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeasurementSource {
+    /// The engine's own status endpoint answered with a footprint figure
+    /// (basalt `/v1/status`, strata `/status`): the engine speaking about
+    /// itself, the process-engine analog of ninfer's `engine_report`. It
+    /// books as `EngineReport`-class trust above the declared floor (the
+    /// 2026-11-04 ruling extends the amended-15(ii) max truth to it).
+    #[allow(dead_code)] // constructed when phases 2/3 fill in the parse stubs
+    EngineStatus,
+    /// The status endpoint refused, and the witness attributed concrete
+    /// bytes to the engine's pid plus its direct children (one Toolhelp32
+    /// generation: strata.exe and its `strata-vision` child). A footprint of
+    /// this launch, folded without averaging, persisted as the existing
+    /// `per_process` provenance.
+    ProcessTreeNvml,
+}
+
+/// One measured memory footprint of a process engine
+/// (`TASK-ENGINE-MEASUREMENT` phase 1; the shape is fixed by ORCHESTRATION
+/// §1 and phases may not re-decide it). The figure arrives unbounded on
+/// purpose: [`crate::scheduler::ActorState::measurable_figure`] is the single
+/// figure gate, and the sampler applies the same rule before sending so a
+/// refused figure never consumes the one-shot (review 2026-10-31, M1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct EngineMeasurement {
+    /// The GPU footprint in GiB as the source stated it.
+    pub gpu_gib: f64,
+    /// The RAM footprint in GiB where the engine states one. No booking path
+    /// reads it in phase 1: the contract carries it now so the phase 2/3
+    /// parsers can hand it over without a new type.
+    #[allow(dead_code)] // read when the RAM booking path lands (phase 4)
+    pub ram_gib: Option<f64>,
+    /// Which source produced `gpu_gib` — the provenance the fold stamps
+    /// (doctrine 12).
+    pub source: MeasurementSource,
+}
+
 /// Process-layer operations, driven by the scheduler actor but never executed inline
 /// in the actor loop (Step 2: no I/O in the actor; Step 8: one implementation).
 ///
@@ -464,6 +506,30 @@ pub trait EngineRuntime: Send + Sync {
         _timeout: std::time::Duration,
     ) -> Option<String> {
         None
+    }
+
+    /// The engine's own status snapshot as JSON
+    /// (`GET http://127.0.0.1:{port}{path}`): a generic loopback read with the
+    /// runtime's short timeout and no engine knowledge — the per-engine parse
+    /// lives in the adapter ([`basalt::measurement_from_status`],
+    /// [`strata::measurement_from_status`], same split as the
+    /// [`Self::container_report`] / `ninfer::parse_startup_memory` pair).
+    /// `None` for any failure (no answer, body that is not JSON): the sampler
+    /// then falls back to the witness-based process-tree sum rather than
+    /// guessing (`TASK-ENGINE-MEASUREMENT` ORCHESTRATION §1). Default `None`:
+    /// only the process runtime answers, so every mock stays inert.
+    async fn engine_status_json(&self, _port: u16, _path: &str) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// The DIRECT children of `pid` — one Toolhelp32 generation is enough
+    /// (strata.exe spawns strata-vision; the fallback sum must never reach
+    /// past the engine's own family, and never enumerates grandchildren).
+    /// Empty on any snapshot failure and for a pid already gone: absence is
+    /// reported, never a guess (`TASK-ENGINE-MEASUREMENT` ORCHESTRATION §1).
+    /// Default empty: only the process runtime answers.
+    async fn descendant_pids(&self, _pid: u32) -> Vec<u32> {
+        Vec::new()
     }
 }
 

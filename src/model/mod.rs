@@ -46,7 +46,7 @@ pub enum ModelError {
         value: String,
     },
     /// The `measured_attribution:` provenance token is not one this harness wrote.
-    #[error("field `{field}` is not one of engine_report|per_process|total_diff: `{value}`")]
+    #[error("field `{field}` is not one of engine_report|engine_status|per_process|total_diff: `{value}`")]
     BadAttribution {
         /// Field name.
         field: String,
@@ -102,6 +102,13 @@ pub enum MeasuredAttribution {
     /// The engine's own reserved-footprint self-report (ninfer startup
     /// `MemorySummary`): the authoritative over-reserved figure, books.
     EngineReport,
+    /// The process engine's own status endpoint stated the footprint (basalt
+    /// `/v1/status`, strata `/status`): the process-engine analog of
+    /// `EngineReport` and it books, above the declared value as max truth
+    /// (`TASK-ENGINE-MEASUREMENT`, operator ruling 2026-11-04). A
+    /// process-engine source: bound to no ninfer profile, so it is valid
+    /// without a profile stamp and voids on a ninfer row.
+    EngineStatus,
     /// Per-process attribution from the witness (`own_gib` returned bytes): books.
     PerProcess,
     /// A free-memory total-diff (per-process unavailable): displays, **never books**.
@@ -119,15 +126,18 @@ impl MeasuredAttribution {
     }
 
     /// Whether this provenance comes from the engine speaking about itself — its own
-    /// reserved budget, or concrete bytes the driver named as its pids. `exact` rows
-    /// accept only these (ruling 15 (ii)): a grandfathered stamp-less pair is not a
-    /// source for a class that forbids guessing, even though `fixed` may still charge
-    /// it.
+    /// reserved budget, the footprint its own status endpoint printed, or concrete
+    /// bytes the driver named as its pids. `exact` rows accept only these (ruling 15
+    /// (ii), extended to `engine_status` by the 2026-11-04 ruling): a grandfathered
+    /// stamp-less pair is not a source for a class that forbids guessing, even though
+    /// `fixed` may still charge it.
     #[must_use]
     pub fn self_reported(self) -> bool {
         matches!(
             self,
-            MeasuredAttribution::EngineReport | MeasuredAttribution::PerProcess
+            MeasuredAttribution::EngineReport
+                | MeasuredAttribution::EngineStatus
+                | MeasuredAttribution::PerProcess
         )
     }
 
@@ -138,6 +148,7 @@ impl MeasuredAttribution {
     pub fn as_str(self) -> &'static str {
         match self {
             MeasuredAttribution::EngineReport => "engine_report",
+            MeasuredAttribution::EngineStatus => "engine_status",
             MeasuredAttribution::PerProcess => "per_process",
             MeasuredAttribution::TotalDiff => "total_diff",
         }
@@ -407,15 +418,23 @@ fn read_measured(engine: &str, keys: &BTreeMap<String, String>) -> Result<Measur
         }
     }
     // An `engine:` flip in the same file outranks any stamp: an engine_report
-    // reservation describes a container's CUDA reservation and a per_process figure
-    // a driver-attributed child — neither crosses engines, and a stale ninfer
-    // profile on a llama row would otherwise "match" the built-in default silently
-    // (review 2026-10-31, M2). A ninfer row claiming per_process is the same
-    // impossibility seen from the other side (a container has no harness child).
+    // reservation describes a container's CUDA reservation, an engine_status
+    // figure a status endpoint only a process engine runs, and a per_process
+    // figure a driver-attributed child — none crosses the container/process
+    // boundary, and a stale ninfer profile on a llama row would otherwise
+    // "match" the built-in default silently (review 2026-10-31, M2). A ninfer
+    // row claiming per_process is the same impossibility seen from the other
+    // side (a container has no harness child), and so is one claiming
+    // engine_status: the harness reads `ninfer` through `docker logs`, never
+    // through a status endpoint (ruling 2026-11-04: `EngineReport` => !ninfer
+    // keeps, `EngineStatus` => ninfer voids — it is a process-engine source).
+    // The profile-comparability leg above never fires for an `engine_status`
+    // figure: the profile identity is ninfer's alone (ORCHESTRATION §2), so a
+    // process-engine figure is valid WITHOUT a profile stamp.
     let ninfer = engine == crate::ownership::NINFER_ENGINE;
     let stamp_describes_the_wrong_engine = match measured.attribution {
         Some(MeasuredAttribution::EngineReport) => !ninfer,
-        Some(MeasuredAttribution::PerProcess) => ninfer,
+        Some(MeasuredAttribution::EngineStatus | MeasuredAttribution::PerProcess) => ninfer,
         Some(MeasuredAttribution::TotalDiff) | None => false,
     };
     if stamp_describes_the_wrong_engine {
@@ -459,10 +478,11 @@ fn read_measured(engine: &str, keys: &BTreeMap<String, String>) -> Result<Measur
 }
 
 /// Strict reading of the `measured_attribution:` provenance token this harness wrote:
-/// only the three forms it emits, so a typo is a scan error rather than a silent false.
+/// only the forms it emits, so a typo is a scan error rather than a silent false.
 fn parse_measured_attribution(raw: &str) -> Result<MeasuredAttribution, ModelError> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "engine_report" => Ok(MeasuredAttribution::EngineReport),
+        "engine_status" => Ok(MeasuredAttribution::EngineStatus),
         "per_process" => Ok(MeasuredAttribution::PerProcess),
         "total_diff" => Ok(MeasuredAttribution::TotalDiff),
         _ => Err(ModelError::BadAttribution {
@@ -496,7 +516,9 @@ pub enum CostSource {
     Declared,
     /// The harness-measured footprint of an earlier run: the booking basis for
     /// `fixed`/`exact` rows without a binding declaration, and the override of a
-    /// declared value a guarded `engine_report` exceeds.
+    /// declared value a guarded `engine_report`/`engine_status` figure exceeds
+    /// (the amended-15(ii) max truth, extended to the process engines' status
+    /// figures by the 2026-11-04 ruling).
     Measured,
     /// The engine's own pre-spawn projection (`llama-fit-params --fit-print`,
     /// R11): books for `fixed`/`exact` rows without a binding declaration and
@@ -529,9 +551,11 @@ impl ModelEntry {
     /// `greedy` never books a measurement: a post-spill footprint is not a nominal
     /// size (the class exists to take the whole card). `exact` is the mirror image —
     /// it demands a real *source*, so only a figure the engine produced about itself
-    /// qualifies (`engine_report`/`per_process`); a grandfathered stamp-less pair and
-    /// a `total_diff` stand-in are both refused, since the GGUF-size fallback would
-    /// be a precision claim with no source. `fixed` accepts any bookable provenance.
+    /// qualifies (`engine_report`/`engine_status`/`per_process`, the middle form
+    /// admitted by the 2026-11-04 ruling: a status endpoint is the process engine
+    /// speaking, not a witness stand-in); a grandfathered stamp-less pair and a
+    /// `total_diff` stand-in are both refused, since the GGUF-size fallback would be
+    /// a precision claim with no source. `fixed` accepts any bookable provenance.
     #[must_use]
     fn may_book_measured(&self) -> bool {
         if !self.measured_bookable() {
@@ -549,17 +573,26 @@ impl ModelEntry {
     /// Whether the engine's own guarded report outranks the declared `vram_gb`:
     /// the container certified reserving MORE than the operator declared, and
     /// `read_measured` still certifies the report against the current profile
-    /// stamp. Operator ruling 2026-11-01 (amends the declared-always-wins leg of
-    /// the 2026-10-30 R9 design): the booking is the max truth — what admission
-    /// must keep free is what the container actually reserves. A declared value
-    /// at or above the report stays the operator's chosen floor.
+    /// stamp; since the 2026-11-04 ruling the same max truth covers a process
+    /// engine's guarded `engine_status` figure (its own status endpoint spoke,
+    /// and `read_measured` keeps it off ninfer rows), no profile stamp being
+    /// demanded there. Operator ruling 2026-11-01 (amends the declared-always-wins
+    /// leg of the 2026-10-30 R9 design): the booking is the max truth — what
+    /// admission must keep free is what the engine actually holds. A declared
+    /// value at or above the report stays the operator's chosen floor. The name
+    /// predates the extension (`DECISIONS` 2026-11-01 records it); it now answers
+    /// for both engine-spoken report provenances.
     #[must_use]
     fn engine_report_outranks_declared(&self) -> bool {
         let (Some(declared), Some(reported)) = (self.vram_gb, self.measured_gb) else {
             return false;
         };
-        self.measured_attribution == Some(MeasuredAttribution::EngineReport)
-            && self.may_book_measured()
+        self.measured_attribution.is_some_and(|attribution| {
+            matches!(
+                attribution,
+                MeasuredAttribution::EngineReport | MeasuredAttribution::EngineStatus
+            )
+        }) && self.may_book_measured()
             && reported > declared
     }
 
@@ -582,8 +615,9 @@ impl ModelEntry {
     /// The booking precedence: declared → measured (only where the cost class may
     /// book it, per [`Self::may_book_measured`]) → the R11 Fit projection → GGUF
     /// estimate, with `exact`-without-`vram_gb`-and-without-a-real-source refused.
-    /// A guarded `engine_report` ABOVE the declared value books instead of it
-    /// ([`Self::engine_report_outranks_declared`]), and so does a Fit projection
+    /// A guarded engine-spoken report (`engine_report`, or a process engine's
+    /// `engine_status` since the 2026-11-04 ruling) ABOVE the declared value books
+    /// instead of it ([`Self::engine_report_outranks_declared`]), and so does a Fit projection
     /// above it (rule 2026-11-01, the same amended-15(ii) max truth): the booking
     /// is what the engine itself will take, the declared number is a floor, never
     /// a ceiling.
@@ -1014,6 +1048,7 @@ mod tests {
     fn measured_attribution_parses_each_provenance() {
         for (raw, want) in [
             ("engine_report", MeasuredAttribution::EngineReport),
+            ("engine_status", MeasuredAttribution::EngineStatus),
             ("per_process", MeasuredAttribution::PerProcess),
             ("total_diff", MeasuredAttribution::TotalDiff),
             ("ENGINE_REPORT", MeasuredAttribution::EngineReport),
@@ -1058,6 +1093,10 @@ mod tests {
     fn only_total_diff_is_unbookable() {
         assert!(!MeasuredAttribution::TotalDiff.bookable());
         assert!(MeasuredAttribution::EngineReport.bookable());
+        // The 2026-11-04 ruling: the process engines' status figure books, and it
+        // is a figure the engine produced about itself, so `exact` may charge it.
+        assert!(MeasuredAttribution::EngineStatus.bookable());
+        assert!(MeasuredAttribution::EngineStatus.self_reported());
         assert!(MeasuredAttribution::PerProcess.bookable());
     }
 
@@ -1149,6 +1188,150 @@ mod tests {
                 .measured_gb,
             None,
             "an unparseable override line voids, never certifies"
+        );
+    }
+
+    /// Ruling 2026-11-04 (`TASK-ENGINE-MEASUREMENT`): a process engine's own
+    /// status figure above the declared `vram_gb` books instead of it — the same
+    /// amended-15(ii) max truth as the container's reservation. The live case:
+    /// Basalt declared 65, measured 67.4, and the stale declaration refused the
+    /// readmission the evidence recorded.
+    #[test]
+    fn the_engine_status_books_above_the_declared_value_as_max_truth() {
+        let entry = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "basalt"),
+                ("vram_gb", "65"),
+                ("measured_gb", "67.4"),
+                ("measured_gb_min", "67.4"),
+                ("measured_attribution", "engine_status"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(entry.measured_gb, Some(67.4));
+        assert_eq!(entry.cost_source(), CostSource::Measured);
+        assert!(
+            entry.measured_profile.is_none(),
+            "a status figure mints no profile stamp: profile identity is ninfer's alone"
+        );
+        let not_above = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "basalt"),
+                ("vram_gb", "68"),
+                ("measured_gb", "67.4"),
+                ("measured_gb_min", "67.4"),
+                ("measured_attribution", "engine_status"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            not_above.cost_source(),
+            CostSource::Declared,
+            "a declared value at or above the report stays the operator's floor"
+        );
+    }
+
+    /// Ruling 2026-11-04: the profile stamp stays ninfer-only, so an
+    /// `engine_status` figure is VALID without one — no profile key may void
+    /// what never had a profile to compare against.
+    #[test]
+    fn the_engine_status_is_valid_without_a_profile_stamp() {
+        let kept = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "strata"),
+                ("vram_gb", "67.8"),
+                ("measured_gb", "68.1"),
+                ("measured_gb_min", "68.1"),
+                ("measured_attribution", "engine_status"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            kept.measured_gb,
+            Some(68.1),
+            "there is no ninfer profile on a strata row, and none is demanded"
+        );
+        assert_eq!(kept.measured_profile, None);
+    }
+
+    /// Ruling 2026-11-04: an `engine_status` stamp describes a process engine's
+    /// status endpoint, so an `engine:` flip onto the container engine voids the
+    /// figure the same way `engine_report` voids when flipped OFF it — the
+    /// stamp survives the void as evidence of how the figure was taken.
+    #[test]
+    fn the_engine_status_voids_when_the_engine_flips_to_ninfer() {
+        let flipped = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "ninfer"),
+                ("cost", "exact"),
+                ("measured_gb", "30"),
+                ("measured_gb_min", "30"),
+                ("measured_attribution", "engine_status"),
+            ]),
+            "m",
+        )
+        .expect("the token parses on any engine, a scan error would eat the operator's file");
+        assert_eq!(
+            flipped.measured_gb, None,
+            "an engine_status stamp on a ninfer row must not book: a process-engine source"
+        );
+        assert_eq!(
+            flipped.measured_attribution,
+            Some(MeasuredAttribution::EngineStatus),
+            "the stamp survives the void"
+        );
+        assert_eq!(
+            flipped.cost_source(),
+            CostSource::Undeclared,
+            "an `exact` row with the figure voided has no source, and absence is refused"
+        );
+    }
+
+    /// Ruling 2026-11-04: `exact` demands a real source, and the engine's own
+    /// status answer is one (`self_reported`); a `total_diff` stand-in on the
+    /// very same row stays refused — provenance decides, never the number.
+    #[test]
+    fn the_engine_status_is_self_reported_so_exact_books_it() {
+        let entry = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "strata"),
+                ("cost", "exact"),
+                ("measured_gb", "67.8"),
+                ("measured_gb_min", "67.8"),
+                ("measured_attribution", "engine_status"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            entry.cost_source(),
+            CostSource::Measured,
+            "the exact class demands a source, and the status endpoint is the engine speaking"
+        );
+        let stand_in = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "strata"),
+                ("cost", "exact"),
+                ("measured_gb", "67.8"),
+                ("measured_gb_min", "67.8"),
+                ("measured_attribution", "total_diff"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            stand_in.cost_source(),
+            CostSource::Undeclared,
+            "the identical number under total_diff still never books"
         );
     }
 

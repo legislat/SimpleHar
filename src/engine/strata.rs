@@ -912,6 +912,17 @@ impl EngineAdapter for StrataAdapter {
     }
 }
 
+/// Phase-3 stub of the Strata status parse (TASK-ENGINE-MEASUREMENT,
+/// ORCHESTRATION §3): the future reader of `GET /status` (`info.vram`)
+/// answers `None` for every body, so the sampler falls back to the
+/// witness-based process-tree sum until phase 3 fills it in. Phase 3 owns
+/// this file and will replace this body and nothing else.
+pub(crate) fn measurement_from_status(
+    _body: &serde_json::Value,
+) -> Option<crate::engine::EngineMeasurement> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

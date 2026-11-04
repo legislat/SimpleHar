@@ -513,6 +513,19 @@ enum ActorMsg {
         required_to_free_gb: f64,
         total_gib: f64,
     },
+    /// A process engine's one-shot measured footprint (`TASK-ENGINE-MEASUREMENT`,
+    /// ORCHESTRATION §3): the figure basalt/strata stated at their own status
+    /// endpoint, or the witness's process-tree sum of the engine's pid plus its
+    /// direct children. One shot per launch like `MeasuredEngineReport`; the
+    /// measurement's `source` decides the provenance it folds under. `total_gib`
+    /// is the card total of the live witness sample the figure was bounded
+    /// against (doctrine 4: the witness is budget truth).
+    MeasuredProcessReport {
+        model: String,
+        ticket: SpawnTicket,
+        measurement: crate::engine::EngineMeasurement,
+        total_gib: f64,
+    },
     /// A detached failed-launch log snapshot (R9 C1) has finished; release its
     /// in-flight mark so a later failure of the same container name re-snapshots.
     SnapshotDone(String),
@@ -932,6 +945,12 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 required_to_free_gb,
                 total_gib,
             } => state.on_engine_report(&model, &ticket, required_to_free_gb, total_gib),
+            ActorMsg::MeasuredProcessReport {
+                model,
+                ticket,
+                measurement,
+                total_gib,
+            } => state.on_process_measurement(&model, &ticket, measurement, total_gib),
             ActorMsg::SnapshotDone(container) => {
                 state.snapshot_in_flight.remove(&container);
             }
@@ -2272,6 +2291,19 @@ mod tests {
             self.on_engine_report(model, ticket, required_gb, 72.0);
         }
 
+        /// The pin seam for the process engines' one-shot measurement
+        /// (`ActorMsg::MeasuredProcessReport`), on the same 72 GiB card the
+        /// `engine_report` seam assumes: a status figure counts what the
+        /// engine holds, not only bytes the witness was sampling at one tick.
+        fn process_measurement(
+            &mut self,
+            model: &str,
+            ticket: &SpawnTicket,
+            measurement: crate::engine::EngineMeasurement,
+        ) {
+            self.on_process_measurement(model, ticket, measurement, 72.0);
+        }
+
         /// The pin seam for the persist-failed reconcile: the disk refused exactly this
         /// figure, so the drain must land on exactly these values. Pair-only rows pass
         /// `attribution: None, profile: None` — the legacy shape a pre-provenance
@@ -3317,6 +3349,437 @@ mod tests {
             Some(crate::model::MeasuredAttribution::EngineReport)
         );
         assert_eq!(entry.cost_source(), crate::model::CostSource::Measured);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scripted witness for the sampler pins: one canned sample answers every
+    /// `sample()`. No engine, no driver — the SE fake-everything rule.
+    struct ScriptedWitness(crate::budget::MemorySample);
+
+    #[async_trait::async_trait]
+    impl crate::budget::VramWitness for ScriptedWitness {
+        async fn sample(&self) -> Result<crate::budget::MemorySample, String> {
+            Ok(self.0.clone())
+        }
+        fn source(&self) -> String {
+            "scripted".to_string()
+        }
+    }
+
+    /// Scripted runtime for the sampler pins: a canned status-snapshot answer
+    /// (or silence) and a canned direct-children list. Everything else keeps
+    /// the NeverRuntime posture — a load reaching this runtime is a test bug.
+    struct StatusRuntime {
+        status: Option<serde_json::Value>,
+        children: Vec<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::EngineRuntime for StatusRuntime {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: crate::ownership::SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            panic!("the measurement sampler pin must never load");
+        }
+        async fn kill(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<(), crate::engine::SpawnError> {
+            panic!("the measurement sampler pin must never load");
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            panic!("the measurement sampler pin must never load");
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            panic!("the measurement sampler pin must never load");
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("the measurement sampler pin must never load");
+        }
+        async fn engine_status_json(&self, _port: u16, _path: &str) -> Option<serde_json::Value> {
+            self.status.clone()
+        }
+        async fn descendant_pids(&self, _pid: u32) -> Vec<u32> {
+            self.children.clone()
+        }
+    }
+
+    /// Fake Basalt-shaped status JSON on an ephemeral port (the SE fake-server
+    /// rule, same posture as `serve_health` in `engine/mod.rs`).
+    async fn serve_status_json(body: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        let app = axum::Router::new().route(
+            "/v1/status",
+            axum::routing::get(move || async move { body }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        port
+    }
+
+    fn sampler_ctx(model: &str, engine: &str, ticket: SpawnTicket) -> super::measured::SamplerCtx {
+        super::measured::SamplerCtx {
+            model: model.to_string(),
+            ticket,
+            own_pids: Vec::new(),
+            container: None,
+            engine: engine.to_string(),
+        }
+    }
+
+    /// The witness shape the sampler pins share: a healthy 72 GiB card, one
+    /// scripted per-process table.
+    fn scripted_sample(processes: Vec<(u32, f64)>) -> ScriptedWitness {
+        let attribution = crate::budget::attribution_from_processes(&processes);
+        ScriptedWitness(crate::budget::MemorySample {
+            total_gib: 72.0,
+            used_gib: 40.0,
+            processes,
+            attribution,
+        })
+    }
+
+    /// Phase-1 pin (`TASK-ENGINE-MEASUREMENT`, ORCHESTRATION §3): a fake status
+    /// server answering Basalt-shaped JSON still reaches only the stub parse,
+    /// which answers `None` for every body — so the one-shot must NOT consume
+    /// the sampler: the process-tree fallback has no per-process bytes to sum
+    /// here either, `report_measurement` returns `None`, and the witness loop
+    /// keeps standing in (phases 2/3 flip the stub; this pin then flips with
+    /// them only by their own new pins, never by weakening this one).
+    #[tokio::test]
+    async fn a_stubbed_status_parse_falls_back_to_the_witness_loop() {
+        let port = serve_status_json(r#"{"engine":{"info":{"vram":67.4}}}"#).await;
+        let runtime = Arc::new(crate::process::ProcessRuntime::new())
+            as Arc<dyn crate::engine::EngineRuntime>;
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let witness = Arc::new(scripted_sample(Vec::new())) as Arc<dyn crate::budget::VramWitness>;
+        let ctx = sampler_ctx(
+            "stub",
+            "basalt",
+            SpawnTicket {
+                generation: 1,
+                kind: ResourceKind::ChildProcess,
+                pid: 4242,
+                port,
+            },
+        );
+        assert_eq!(
+            ActorState::report_measurement(&runtime, &tx, &ctx, &witness).await,
+            None,
+            "the phase-1 stub refuses the answered JSON, and the unattributable witness \
+             gives the fallback nothing: the sampler must stay alive for the witness loop"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused one-shot sends no MeasuredProcessReport"
+        );
+    }
+
+    /// The engine gate and the refused-figure gate of the same one-shot: a
+    /// non-process engine is never touched, and figures
+    /// `measurable_figure` would drop (sub-quantum, larger than the card)
+    /// return `None` WITHOUT a message — the M1 doctrine that a consumed
+    /// one-shot silently skips the witness stand-in (review 2026-10-31).
+    #[tokio::test]
+    async fn a_refused_measurement_never_consumes_the_sampler() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let runtime = Arc::new(StatusRuntime {
+            status: None,
+            children: Vec::new(),
+        }) as Arc<dyn crate::engine::EngineRuntime>;
+        let ticket = SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 4242,
+            port: 19_020,
+        };
+        // A llama row never gets a process-engine one-shot at all.
+        let llama_witness =
+            Arc::new(scripted_sample(vec![(4242, 30.0)])) as Arc<dyn crate::budget::VramWitness>;
+        let llama_ctx = sampler_ctx("plain", "llama", ticket.clone());
+        assert_eq!(
+            ActorState::report_measurement(&runtime, &tx, &llama_ctx, &llama_witness).await,
+            None,
+            "the one-shot belongs to basalt/strata only"
+        );
+        // A sub-quantum tree sum: absence, never a fake number and never a
+        // consumed sampler.
+        let tiny =
+            Arc::new(scripted_sample(vec![(4242, 0.02)])) as Arc<dyn crate::budget::VramWitness>;
+        let strata_ctx = sampler_ctx("tiny", "strata", ticket.clone());
+        assert_eq!(
+            ActorState::report_measurement(&runtime, &tx, &strata_ctx, &tiny).await,
+            None,
+            "a sub-quantum figure is refused here so the witness loop keeps standing in"
+        );
+        // A figure larger than the card: same fall-through.
+        let giant =
+            Arc::new(scripted_sample(vec![(4242, 80.0)])) as Arc<dyn crate::budget::VramWitness>;
+        let giant_ctx = sampler_ctx("giant", "strata", ticket.clone());
+        assert_eq!(
+            ActorState::report_measurement(&runtime, &tx, &giant_ctx, &giant).await,
+            None,
+            "a footprint beyond the card is nonsense, not a booking"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no refused figure may reach the actor as a MeasuredProcessReport"
+        );
+    }
+
+    /// When the status endpoint stays silent but the driver attributes concrete
+    /// bytes, the one-shot sums the engine pid plus its DIRECT children only
+    /// (the 9999 twin belongs to nobody here) and sends the `ProcessTreeNvml`
+    /// measurement ONCE with the live card total the witness just read
+    /// (ORCHESTRATION §1/§3, doctrine 4).
+    #[tokio::test]
+    async fn the_tree_fallback_sums_the_engine_and_its_direct_children() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let runtime = Arc::new(StatusRuntime {
+            status: None,
+            children: vec![4243],
+        }) as Arc<dyn crate::engine::EngineRuntime>;
+        let witness = Arc::new(scripted_sample(vec![
+            (4242, 20.0),
+            (4243, 10.0),
+            (9999, 5.0),
+        ])) as Arc<dyn crate::budget::VramWitness>;
+        let ctx = sampler_ctx(
+            "tree",
+            "strata",
+            SpawnTicket {
+                generation: 3,
+                kind: ResourceKind::ChildProcess,
+                pid: 4242,
+                port: 19_021,
+            },
+        );
+        assert_eq!(
+            ActorState::report_measurement(&runtime, &tx, &ctx, &witness).await,
+            Some(())
+        );
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the measurement reaches the actor")
+            .expect("channel open");
+        let ActorMsg::MeasuredProcessReport {
+            model,
+            ticket,
+            measurement,
+            total_gib,
+        } = msg
+        else {
+            panic!("expected the process-measurement message");
+        };
+        assert_eq!(model, "tree");
+        assert_eq!(ticket.generation, 3);
+        assert_eq!(
+            measurement.gpu_gib, 30.0,
+            "20.0 + 10.0, the foreign twin excluded"
+        );
+        assert_eq!(
+            measurement.source,
+            crate::engine::MeasurementSource::ProcessTreeNvml
+        );
+        assert_eq!(
+            total_gib, 72.0,
+            "the message carries the live witness card total"
+        );
+    }
+
+    /// Ruling 2026-11-04 (`TASK-ENGINE-MEASUREMENT`): a process engine's
+    /// `EngineStatus` figure books with `EngineReport`-class trust — it REPLACES
+    /// the spawn's persisted range (no averaging: a status figure is static for
+    /// the launch) and, as max truth, overrides the declared `vram_gb` it
+    /// exceeds. After it lands, witness readings can no longer fold into the
+    /// range (the guard `engine_report` always had, extended). Falsifiers: the
+    /// old single-variant witness guard (the 9.0 total-diff would clobber the
+    /// 67.0), and `engine_report_outranks_declared` without `EngineStatus`
+    /// (the declared 55 would keep booking).
+    #[tokio::test]
+    async fn an_engine_status_measurement_books_over_the_declared_value() {
+        let dir = crate::testutil::temp_dir("fold-engine-status");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("es.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: strata\ncost: fixed\nvram_gb: 55\nmeasured_gb: 50.0\nmeasured_gb_min: 40.0\n",
+        )
+        .expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "es");
+        let ticket = fold_ticket(19_022);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_022);
+
+        state.process_measurement(
+            "es",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 67.0,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::EngineStatus,
+            },
+        );
+        let entry = &state.catalog[0];
+        assert_eq!(
+            (entry.measured_gb, entry.measured_min_gb),
+            (Some(67.0), Some(67.0)),
+            "both ends are the footprint: the persisted 40.0 low end is replaced, not averaged"
+        );
+        assert_eq!(
+            entry.measured_attribution,
+            Some(crate::model::MeasuredAttribution::EngineStatus)
+        );
+        assert_eq!(
+            entry.cost_source(),
+            crate::model::CostSource::Measured,
+            "the engine's own status figure above the declared floor books instead of it"
+        );
+        assert!(
+            entry.measured_profile.is_none(),
+            "no ninfer profile on a strata row"
+        );
+
+        state.witness("es", &ticket, 9.0);
+        let entry = &state.catalog[0];
+        assert_eq!(
+            (entry.measured_gb, entry.measured_min_gb),
+            (Some(67.0), Some(67.0)),
+            "a total-diff cannot widen what the engine itself reported"
+        );
+        let written = await_yaml_keys(
+            &yaml,
+            &[
+                "measured_gb: 67.0",
+                "measured_gb_min: 67.0",
+                "measured_attribution: engine_status",
+            ],
+        )
+        .await;
+        assert!(
+            !written.contains("measured_profile"),
+            "the status fold mints no profile stamp: {written}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `ProcessTreeNvml` source folds as the existing `PerProcess`
+    /// footprint — persisted under the old token (ORCHESTRATION §2: no new yaml
+    /// keys), replacing the spawn's range outright, and NOT overriding the
+    /// declared value (only the engine-spoken reports get max truth).
+    #[tokio::test]
+    async fn a_process_tree_measurement_lands_as_per_process_and_replaces_the_range() {
+        let dir = crate::testutil::temp_dir("fold-tree-sum");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("ts.yaml");
+        std::fs::write(
+            &yaml,
+            "engine: strata\nvram_gb: 55\nmeasured_gb: 50.0\nmeasured_gb_min: 40.0\n",
+        )
+        .expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "ts");
+        let ticket = fold_ticket(19_023);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_023);
+
+        state.process_measurement(
+            "ts",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 30.0,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::ProcessTreeNvml,
+            },
+        );
+        let entry = &state.catalog[0];
+        assert_eq!(
+            (entry.measured_gb, entry.measured_min_gb),
+            (Some(30.0), Some(30.0)),
+            "a tree sum is this launch's footprint: it fixes both ends instead of averaging"
+        );
+        assert_eq!(
+            entry.measured_attribution,
+            Some(crate::model::MeasuredAttribution::PerProcess),
+            "the tree sum persists as the existing per_process provenance"
+        );
+        assert_eq!(
+            entry.cost_source(),
+            crate::model::CostSource::Declared,
+            "below the declared floor the operator's figure stays the booking"
+        );
+        await_yaml_keys(
+            &yaml,
+            &["measured_gb: 30.0", "measured_attribution: per_process"],
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The actor-side twin of the sampler's M1 gate: a figure
+    /// `measurable_figure` refuses (negative, beyond the card) and a reading
+    /// that lost its uncontested window are both visible drops that book
+    /// nothing — the one-shot does not retry, so silence here would be a lost
+    /// measurement (review 2026-10-31, M1 doctrine).
+    #[tokio::test]
+    async fn a_nonsense_process_measurement_books_nothing_and_names_itself() {
+        let capture = install_warn_capture();
+        let dir = crate::testutil::temp_dir("fold-nonsense-meas");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("nm.yaml");
+        std::fs::write(&yaml, "engine: strata\nvram_gb: 20\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let spawned = rescan_entry(&yaml, "nm");
+        let ticket = fold_ticket(19_024);
+        state.catalog = vec![spawned.clone()];
+        seat_spawn(&mut state, &spawned, &ticket, 19_024);
+
+        let measurement = |gpu_gib: f64| crate::engine::EngineMeasurement {
+            gpu_gib,
+            ram_gib: None,
+            source: crate::engine::MeasurementSource::EngineStatus,
+        };
+        state.process_measurement("nm", &ticket, measurement(-5.0));
+        state.process_measurement("nm", &ticket, measurement(80.0));
+        // A reading for a ticket that is not the live occupant's: dropped, and named.
+        state.process_measurement("nm", &fold_ticket(19_099), measurement(12.0));
+        let entry = &state.catalog[0];
+        assert_eq!(
+            (entry.measured_gb, entry.measured_attribution),
+            (None, None),
+            "nonsense never books and never persists"
+        );
+
+        let warns = capture.lock().expect("capture lock");
+        assert!(
+            warns
+                .iter()
+                .any(|(message, _)| message.contains("process measurement refused")),
+            "the refused figures must be named once: {warns:?}"
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|(message, _)| message.contains("process measurement dropped")),
+            "the race-loss drop must be named once: {warns:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

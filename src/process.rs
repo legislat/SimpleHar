@@ -624,6 +624,47 @@ fn published_elsewhere_evidence(container: &str, offered: u16, text: &str) -> Op
     ))
 }
 
+/// The DIRECT children of `pid` from one Toolhelp32 process snapshot
+/// (`TASK-ENGINE-MEASUREMENT` ORCHESTRATION §1): the witness fallback sums the
+/// engine and the children it spawned itself (strata.exe -> strata-vision)
+/// and must never reach past that first generation. Every failure path —
+/// snapshot refused, walk broken at any point — answers an empty Vec:
+/// absence is reported, never a guess (doctrine 4).
+#[must_use]
+fn direct_child_pids(pid: u32) -> Vec<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut children = Vec::new();
+    // Safety: a fresh process-list snapshot; `CreateToolhelp32Snapshot`
+    // answers Err for the invalid handle, and every entry buffer passed to
+    // the walk is owned here, zeroed, and carries its exact size in `dwSize`.
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return children;
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // Safety: `snapshot` is the live handle from above; `entry` is a writable,
+    // correctly sized PROCESSENTRY32W. A failed `First` is an empty or broken
+    // snapshot — the walk simply stops.
+    let mut walking = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while walking {
+        if entry.th32ParentProcessID == pid {
+            children.push(entry.th32ProcessID);
+        }
+        // Safety: the same live handle and entry as the `First` call;
+        // `Next` reports the end of the list (and any error) as a failed walk.
+        walking = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    // Safety: sole owner of the snapshot handle from above; this single close
+    // is the release on every path, mirroring the [`JobHandle`] discipline.
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(snapshot) };
+    children
+}
+
 /// Whether this kill must reap a container. A CONFIRMED reap retires the duty
 /// for good: a re-kill never re-runs `docker rm` for someone else's container
 /// (review, 2026-10-26). An UNCONFIRMED reap keeps the duty alive (REV7-01):
@@ -2258,6 +2299,21 @@ impl EngineRuntime for ProcessRuntime {
         let response = self.client.get(&url).send().await.ok()?;
         let body: serde_json::Value = response.json().await.ok()?;
         body["data"][0]["id"].as_str().map(str::to_string)
+    }
+
+    async fn engine_status_json(&self, port: u16, path: &str) -> Option<serde_json::Value> {
+        // Same posture and the same 2 s client as `discover_model_id`: a
+        // loopback GET, JSON in, `None` for any failure. Engine-blind by
+        // contract — the per-engine parse lives in the adapter and the
+        // sampler decides what absence means (witness fallback, never a
+        // guess; TASK-ENGINE-MEASUREMENT ORCHESTRATION §1).
+        let url = format!("http://127.0.0.1:{port}{path}");
+        let response = self.client.get(&url).send().await.ok()?;
+        response.json::<serde_json::Value>().await.ok()
+    }
+
+    async fn descendant_pids(&self, pid: u32) -> Vec<u32> {
+        direct_child_pids(pid)
     }
 
     async fn container_report(&self, container: &str) -> Option<String> {
@@ -4957,6 +5013,89 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
         assert!(
             answer.contains("CUDA0 1 2 3"),
             "stdout travels to the parser: {answer:?}"
+        );
+    }
+
+    /// Fake status fixtures on an ephemeral port (the SE fake-server rule, same
+    /// posture as `serve_health` in `engine/mod.rs`): one route answers JSON,
+    /// one answers plain text. No engine, no protected port.
+    async fn serve_status_fixtures() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        let app = axum::Router::new()
+            .route(
+                "/v1/status",
+                axum::routing::get(|| async { r#"{"engine":{"info":{"vram":67.4}}}"# }),
+            )
+            .route("/text", axum::routing::get(|| async { "not json at all" }));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        port
+    }
+
+    /// TASK-ENGINE-MEASUREMENT phase 1: `engine_status_json` is a generic
+    /// loopback read — an answered JSON body reaches the per-engine parser,
+    /// and every other outcome (body that is not JSON, nothing listening)
+    /// answers `None`, so the sampler falls back to the witness instead of
+    /// guessing (ORCHESTRATION §1, R9 `container_report` posture).
+    #[tokio::test]
+    async fn engine_status_json_answers_the_body_or_silence_never_a_guess() {
+        let runtime = ProcessRuntime::new();
+        let port = serve_status_fixtures().await;
+        let body = runtime
+            .engine_status_json(port, "/v1/status")
+            .await
+            .expect("the answered snapshot parses");
+        assert_eq!(body["engine"]["info"]["vram"].as_f64(), Some(67.4));
+        assert!(
+            runtime.engine_status_json(port, "/text").await.is_none(),
+            "a body that is not JSON is silence, not a snapshot"
+        );
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+            listener.local_addr().expect("addr").port()
+        };
+        assert!(
+            runtime
+                .engine_status_json(closed, "/v1/status")
+                .await
+                .is_none(),
+            "an engine that never answers is silence, not an empty snapshot"
+        );
+    }
+
+    /// `descendant_pids` enumerates DIRECT children of the asked pid only
+    /// (ORCHESTRATION §1: one generation is enough for strata.exe ->
+    /// strata-vision). The pin spawns one plain hidden `cmd.exe` child — no
+    /// engine execs here, the same stand-in class as the control-command pin —
+    /// and asks the live table where it hangs; an absent pid answers empty,
+    /// never a guess.
+    #[tokio::test]
+    async fn descendant_pids_lists_the_direct_children_of_the_asked_pid() {
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cmd.exe stands in for a child engine");
+        let children = direct_child_pids(std::process::id());
+        let found = children.contains(&child.id());
+        // The child is ours (spawned above), so reaping it is ours to do.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            found,
+            "the spawned child must appear under its own parent: {children:?}"
+        );
+        assert!(
+            direct_child_pids(u32::MAX).is_empty(),
+            "a pid with no children has none, never a guess"
         );
     }
 }
