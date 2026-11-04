@@ -18,6 +18,8 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## Unreleased
 
+## v1.1.3 - 2026-11-04
+
 ### Added
 
 - Strata and Basalt book a measured memory footprint. After readiness the
