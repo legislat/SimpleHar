@@ -510,6 +510,26 @@ const driver = `
     JSON.stringify(dots));
   check("latest failed load marks row red",
     dots["qwen3.8-27b-turbo-mtp-256k"] === "failed", JSON.stringify(dots));
+
+  // B6 admission rung (the Berth cost-ladder borrow): the jobs strip prints the
+  // server-owned path beside an admitted row, and prints nothing for a row
+  // that carries no rung. The fixture is the live document: three of its last
+  // five rows are admitted loads, two are unloads.
+  applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+  {
+    const strip = findAll(document.getElementById("sh-main"), "div", "sh-jobs")
+      .find((d) => findAll(d, "h3").map(textOf).includes("Recent jobs"));
+    const lines = strip ? findAll(strip, "div", "sh-job").map(textOf) : [];
+    const rungs = ["FitsNow", "ReleaseFirst", "Drain"];
+    const rungOf = (t) => rungs.find((rung) => t.endsWith("· " + rung));
+    const runged = lines.filter((t) => rungOf(t));
+    check("jobs strip prints the admission rung on admitted rows",
+      lines.length === 5 && runged.length === 3, lines.join(" | "));
+    const plain = lines.filter((t) => t.includes("ninfer-bonsai-heretic"));
+    check("a row without a path renders no rung",
+      plain.length === 1 && !rungs.some((rung) => plain[0].endsWith("· " + rung)),
+      plain.join(" | "));
+  }
   applyState({
     ...fixtures["/har/status"],
     models: [

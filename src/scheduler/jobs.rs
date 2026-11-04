@@ -37,6 +37,13 @@ pub struct JobStatus {
     pub id: JobId,
     /// Load or unload (A3: the headline fault only counts loads).
     pub kind: JobKind,
+    /// The admission rung the gate decided for this load (B6 cost ladder).
+    /// The rung names the decision, not the outcome: a load a later step
+    /// refused still names the rung the gate took. A load the gate refused
+    /// never reached a rung, and an unload row never made an admission
+    /// decision, so both omit the field on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<AdmissionPath>,
     /// Model the job acts on.
     pub model: String,
     /// Category the job targets.
@@ -161,8 +168,38 @@ pub enum JobKind {
     Unload,
 }
 
+/// The rung of the making-room ladder an admitted load actually took.
+///
+/// Shape borrowed from the Berth broker's making-room ladder (fits-now,
+/// beside-residual, lend, park, drain, cheapest first); the gate implements
+/// the three rungs below, derived at the one admission-decision site
+/// (`finish_admit` in `admission.rs`) — one derivation, no second truth.
+/// The rungs `beside-residual`, `lend`, and `park` are reserved for a
+/// future step: no code path derives them.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize)]
+pub enum AdmissionPath {
+    /// The gate passed the load with no release performed to make room. A
+    /// same-slot replacement belongs here: releasing the occupant the
+    /// request itself named is the request, not a rung. The gate shape
+    /// (numeric need, launch floor, `whole`) never changes the rung.
+    FitsNow,
+    /// The same-slot release-first door: no planned victim set covered the
+    /// deficit, a release could still fix it, and the load released its own
+    /// slot's occupant before re-gating on the physically re-sampled card.
+    ReleaseFirst,
+    /// The eviction planner queued cross-category victims and the load
+    /// admitted to drain them.
+    Drain,
+}
+
 pub(super) struct Job {
     pub(super) kind: JobKind,
+    /// The rung `finish_admit` recorded when this load passed the gate (B6
+    /// cost ladder). `None` until that decision and for every unload row:
+    /// the rung names a gate decision the row has not made. One derivation
+    /// (in `admission.rs`); the `/har/jobs` projection reads this field and
+    /// nothing else, so the ledger and the wire cannot disagree.
+    pub(super) path: Option<AdmissionPath>,
     pub(super) model: String,
     pub(super) engine: String,
     pub(super) category: CategoryId,

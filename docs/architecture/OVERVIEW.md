@@ -110,6 +110,17 @@ One harness process, one tokio runtime, plus OS-level children:
 - Refusals name facts, not just numbers: `BudgetFacts`, `VictimInfo`, and
   `BlockerInfo` carry `unreleasable`, `used_gib`, and `booked_total` into the
   refusal text and the job ledger (`GET /har/jobs`).
+- The accepted decision names its rung. `AdmissionPath` (`scheduler::jobs`,
+  derived once in `finish_admit`) answers `FitsNow`, `ReleaseFirst` (the
+  same-slot release-first door), or `Drain` (planned cross-category
+  victims). The rung rides the job ledger as `jobs[].path` and one
+  `admission path` log line. It names the gate decision, not the outcome: a
+  load the gate refused carries no rung; a load a later step refused keeps
+  the rung the gate decided. The ladder
+  shape follows the Berth broker: fits-now, beside-residual, lend, park,
+  drain, cheapest first. The gate implements three rungs. The rungs
+  `beside-residual`, `lend`, and `park` are reserved; no code path
+  produces them.
 - Cost classes (`src/model/mod.rs`, `CostClass`): `fixed` (size binds),
   `greedy` (offload; a launch floor is mandatory), `exact` (engine-computed
   number required). The launch floor `launch_only_with_at_least_vram_free`

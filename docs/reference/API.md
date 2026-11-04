@@ -38,7 +38,7 @@ slot on a read fails the pin.
 | `GET /health` | Liveness check. Once `control_token` is set, it requires the token like every other route. A probe that omits the token reads 401 and can look like a dead listener. |
 | `GET /har/status` | Full snapshot, including `mem`, `jobs`, `last_error`, and boot timings. |
 | `GET /har/events` | SSE state pushes. |
-| `GET /har/jobs`, `GET /har/jobs/{id}` | Job ledger. |
+| `GET /har/jobs`, `GET /har/jobs/{id}` | Job ledger. Each admitted load row names its admission rung in `path` (see "Job ledger rung field"). |
 | `GET /har/log?limit=n` | Ring buffer of harness events. |
 | `GET /har/models` | Full catalog (the page view; includes paths). The `context` field is the **effective served context**, never a stale row key. For llama it is the row `context` knob. For strata it is the context figure in the row's `strata_args` argv (the `--max-context` token or the `--max-context=` spelling, digits only; anything else answers `null`). For ninfer it is the max-context of the profile its launcher resolves (the built-in table or the `ninfer_profile_<name>` line, the identical resolution the spawn uses). Every other engine answers `null`, and so does any row whose effective context does not resolve. |
 | `POST /har/load` | `{model}`. Loads the model into its own category, from its yaml. |
@@ -64,6 +64,36 @@ The values are:
 
 A `200` reply from `POST /har/unload` is an acceptance, not a release proof.
 Read `slots[].state` and the job ledger for the release truth.
+
+## Job ledger rung field (`jobs[].path`)
+
+Every load the gate admitted carries `path`. The rows appear in
+`GET /har/jobs`, in `GET /har/jobs/{id}` (under `job`), and in the `jobs`
+array of `/har/status`. The value names the rung of the making-room ladder
+that the gate decided at admission:
+
+- `FitsNow`: the gate admitted the load as it stood. It decided to release
+  nothing to make room. A same-slot replacement is also `FitsNow`: the
+  request itself names that release, so it is not a rung.
+- `ReleaseFirst`: the gate decided to release the slot's own occupant
+  first, then to re-gate the load against the physical card.
+- `Drain`: the eviction planner queued cross-category victims and the gate
+  admitted the load to drain them.
+
+The rung names the decision, not the outcome. A later failure does not
+erase it: a release-timeout row still names the drain the gate decided.
+
+A row with no rung omits the field. An unload row never made an admission
+decision. A load the gate refused never reached a rung, so it carries the
+refusal and no rung. That covers every gate refusal class, the launch floor
+(`below_launch_floor`) included. A load the gate accepted keeps its rung
+even when a later step refuses it, such as the launch preflight refusal:
+the rung names the decision the gate took, which is exactly when that
+refusal runs — after the gate said yes.
+
+The gate implements these three rungs. The rungs `beside-residual`, `lend`,
+and `park` are reserved for a future step. No code path produces a reserved
+rung.
 
 ## Memory provenance fields
 

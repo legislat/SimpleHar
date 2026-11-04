@@ -692,6 +692,82 @@ async fn wrong_category_is_404_before_any_load() {
 }
 
 #[tokio::test]
+async fn the_job_ledger_names_the_admission_rung() {
+    // B6 wire contract: an admitted load row carries `path` — the rung of
+    // the making-room ladder the gate took — on `/har/jobs`, on
+    // `/har/jobs/{id}`, and inside the `jobs` array of `/har/status`; a row
+    // that never earned a rung omits the key, never sends null. The unit
+    // pins in `src/scheduler/mod.rs` hold the per-door derivation and the
+    // log field name; this pins the served bytes.
+    // Falsifier: drop the `job.path` assignment in `finish_admit` and leg 1
+    // finds no `path` on the load row; serialize `path` without
+    // `skip_serializing_if` and leg 2 reads `"path": null` on the unload row.
+    let (control, _, _, _, _, _) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(status, StatusCode::OK, "load: {body}");
+
+    let (_, jobs) = get_json(&control, "/har/jobs").await;
+    let row = jobs["jobs"]
+        .as_array()
+        .expect("jobs array")
+        .iter()
+        .find(|job| job["model"] == "qwen3" && job["kind"] == "Load")
+        .expect("the load row is on the ledger");
+    assert_eq!(
+        row["path"], "FitsNow",
+        "the roomy ledger admits on the cheapest rung: {row}"
+    );
+    let job_id = row["id"].as_u64().expect("the row carries its id");
+    let (_, one) = get_json(&control, &format!("/har/jobs/{job_id}")).await;
+    assert_eq!(one["job"]["path"], "FitsNow", "the single-row door agrees");
+    let (_, doc) = get_json(&control, "/har/status").await;
+    let embedded = doc["jobs"]
+        .as_array()
+        .expect("jobs embedded in /har/status")
+        .iter()
+        .find(|job| job["id"].as_u64() == Some(job_id))
+        .expect("the same row inside /har/status");
+    assert_eq!(embedded["path"], "FitsNow", "{embedded}");
+
+    // An unload row never stands before the gate: the field is absent on
+    // the wire, not a null the client must special-case.
+    let (status, body) = post_json(&control, "/har/unload", r#"{"model":"qwen3"}"#).await;
+    assert_eq!(status, StatusCode::OK, "unload accepted: {body}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ledger = loop {
+        let (_, jobs) = get_json(&control, "/har/jobs").await;
+        let rows = jobs["jobs"].as_array().expect("jobs array");
+        if rows.iter().any(|job| job["kind"] == "Unload") {
+            break rows.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the unload never reached the ledger: {jobs}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let unload = ledger
+        .iter()
+        .find(|job| job["kind"] == "Unload")
+        .expect("the unload row");
+    assert!(
+        unload.get("path").is_none(),
+        "a row with no rung omits the field: {unload}"
+    );
+    let load = ledger
+        .iter()
+        .find(|job| job["id"].as_u64() == Some(job_id))
+        .expect("the load row is still listed");
+    assert_eq!(
+        load["path"], "FitsNow",
+        "the rung describes the decision the load made, whatever came after: {load}"
+    );
+}
+
+#[tokio::test]
 async fn proxy_forwards_with_model_rewrite_and_streams_the_response() {
     let (control, work, _, _, runtime, _modelconf) = app(
         AppConfig::default(),
@@ -2208,10 +2284,38 @@ async fn the_webui_fixture_is_a_document_the_endpoint_can_actually_emit() {
         .and_then(|jobs| jobs.first())
         .cloned()
         .expect("the fixture carries job rows");
+    // B6: `path` is present only on a row that passed the admission gate —
+    // a refusal carries the refusal, an unload never stands before the
+    // gate, and the fixture's first row is a refusal while the mock load's
+    // is an admit. The key-set compare exempts it the same targeted way
+    // the models leg below exempts `launched_at`/`stale_config`; the rung
+    // VALUES are pinned by `scheduler::tests` and
+    // `the_job_ledger_names_the_admission_rung`. The fixture carries the
+    // rung on every admitted row, re-derived from each row's own
+    // free/gate/victims figures — it stays a document the endpoint can
+    // emit. Falsifier: add any OTHER field to one side of this pair and
+    // the exempt compare goes red.
+    let fixture_job_keys = keys(&fixture_job, "fixture.jobs[0]");
+    let live_job_keys = keys(&live_job, "/har/status.jobs[0]");
+    let rung_exempt = |job_keys: &[String]| -> Vec<String> {
+        job_keys
+            .iter()
+            .filter(|key| **key != "path")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        keys(&fixture_job, "fixture.jobs[0]"),
-        keys(&live_job, "/har/status.jobs[0]"),
+        rung_exempt(&fixture_job_keys),
+        rung_exempt(&live_job_keys),
         "the fixture's job ledger is not the ledger shape `JobStatus` serializes"
+    );
+    let rung_only: Vec<&String> = live_job_keys
+        .iter()
+        .filter(|key| !fixture_job_keys.contains(key))
+        .collect();
+    assert!(
+        rung_only.iter().all(|key| *key == "path"),
+        "the live row carries fields the fixture never has: {rung_only:?}"
     );
 
     // Same rule for the models table (review 2026-10-31): the DOM suite renders

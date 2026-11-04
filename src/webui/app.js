@@ -860,7 +860,10 @@ function renderJobs(status) {
   }
   for (const job of recent) {
     const line = el("div", { class: "sh-job" });
-    line.append(text(`${job.id} · ${job.model} · ${job.state}`));
+    // The rung (B6) is present only on admitted load rows; an absent field
+    // renders nothing, so refusals and unloads keep their plain line.
+    const rung = job.path ? ` · ${job.path}` : "";
+    line.append(text(`${job.id} · ${job.model} · ${job.state}${rung}`));
     if (job.error) line.append(el("span", { class: "sh-job-error" }, text(job.error)));
     wrap.append(line);
   }

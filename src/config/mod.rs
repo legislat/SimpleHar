@@ -416,7 +416,7 @@ pub fn config_path_from_env() -> Option<String> {
 /// The log-level knob from the process environment: `SIMPLEHARN_LOG`, with the
 /// deprecated `SIMPLEHAR_LOG` as fallback (TASK-RENAME-SIMPLEHARN, review
 /// R1R-01 — the compatibility rule covers every `SIMPLEHAR_*` name, and this
-/// knob is the forensic lever named by FINDINGS-15 [8]). The value alone is not
+/// knob is the forensic lever named by FINDINGS-15 \[8\]). The value alone is not
 /// enough for this reader: it is consumed inside `observability::init`, before a
 /// subscriber exists, where a `tracing::warn!` would reach the no-op dispatcher.
 /// The second element reports that the deprecated name supplied the value, so
@@ -448,7 +448,7 @@ fn log_knob_from_values(
 /// names like the token/config warnings do (TASK-RENAME-SIMPLEHARN compatibility
 /// rule). Pass the flag from [`log_level_from_env`], and only after a subscriber
 /// exists: an early call would spend the once-guard on a message reaching the
-/// no-op dispatcher (the FINDINGS-15 [8] silence this module refuses elsewhere).
+/// no-op dispatcher (the FINDINGS-15 \[8\] silence this module refuses elsewhere).
 pub fn warn_log_fallback(used_deprecated: bool) {
     if used_deprecated {
         LOG_FALLBACK_WARNED.get_or_init(|| {

@@ -949,6 +949,8 @@ mod tests {
         JobStatus {
             id: crate::scheduler::JobId(0),
             kind: crate::scheduler::JobKind::Load,
+            // The tray pins read the fault rule only; no admission ran here.
+            path: None,
             model: "m".to_string(),
             category: CategoryId::Work,
             state: if terminal {

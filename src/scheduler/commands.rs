@@ -398,6 +398,8 @@ impl ActorState {
         };
         let job = Job {
             kind: JobKind::Unload,
+            // An unload row never stands before the admission gate: no rung.
+            path: None,
             model: victim.model.clone(),
             engine: String::new(),
             category,

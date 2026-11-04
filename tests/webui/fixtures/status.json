@@ -122,6 +122,7 @@
    "need_gib": 34,
    "observed_at_admit_gib": 60.289241790771484,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -147,6 +148,7 @@
    "need_gib": 34,
    "observed_at_admit_gib": 25.96820068359375,
    "outcome": "memory did not settle after release",
+   "path": "FitsNow",
    "state": "Idle",
    "terminal": true,
    "timings": {
@@ -172,6 +174,7 @@
    "need_gib": 34,
    "observed_at_admit_gib": 68.33672332763672,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -197,6 +200,7 @@
    "need_gib": 34,
    "observed_at_admit_gib": 25.694046020507812,
    "outcome": "memory did not settle after release",
+   "path": "FitsNow",
    "state": "Idle",
    "terminal": true,
    "timings": {
@@ -222,6 +226,7 @@
    "need_gib": 34,
    "observed_at_admit_gib": 68.35393142700195,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -247,6 +252,7 @@
    "need_gib": 16,
    "observed_at_admit_gib": 25.93738555908203,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -272,6 +278,7 @@
    "need_gib": 2.3318617567420006,
    "observed_at_admit_gib": 24.620830535888672,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -322,6 +329,7 @@
    "need_gib": 26,
    "observed_at_admit_gib": 9.983711242675781,
    "outcome": "loaded",
+   "path": "ReleaseFirst",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -349,6 +357,7 @@
    "need_gib": 28.99132017791271,
    "observed_at_admit_gib": 22.111190795898438,
    "outcome": "memory did not settle after release",
+   "path": "Drain",
    "state": "Idle",
    "terminal": true,
    "timings": {
@@ -376,6 +385,7 @@
    "need_gib": 28.99132017791271,
    "observed_at_admit_gib": 37.890289306640625,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -401,6 +411,7 @@
    "need_gib": 55,
    "observed_at_admit_gib": 10.10715103149414,
    "outcome": "loaded",
+   "path": "Drain",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -453,6 +464,7 @@
    "need_gib": 55,
    "observed_at_admit_gib": 68.61577606201172,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -478,6 +490,7 @@
    "need_gib": 16,
    "observed_at_admit_gib": 13.406478881835938,
    "outcome": "loaded",
+   "path": "ReleaseFirst",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -503,6 +516,7 @@
    "need_gib": 2.6848608061671255,
    "observed_at_admit_gib": 66.62723922729492,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -553,6 +567,7 @@
    "need_gib": 28.99132058918476,
    "observed_at_admit_gib": 68.2135124206543,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -578,6 +593,7 @@
    "need_gib": 26,
    "observed_at_admit_gib": 40.36946105957031,
    "outcome": "loaded",
+   "path": "FitsNow",
    "state": "Serving",
    "terminal": true,
    "timings": {
@@ -605,6 +621,7 @@
    "need_gib": 55,
    "observed_at_admit_gib": 10.287799835205078,
    "outcome": "loaded",
+   "path": "Drain",
    "state": "Serving",
    "terminal": true,
    "timings": {

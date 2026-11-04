@@ -27,7 +27,8 @@ mod status;
 mod vocab;
 
 pub use jobs::{
-    booking_gibs, fault_of, headline_fault, JobKind, JobStatus, JobTimings, SwapReceipt,
+    booking_gibs, fault_of, headline_fault, AdmissionPath, JobKind, JobStatus, JobTimings,
+    SwapReceipt,
 };
 pub use status::{SchedulerStatus, SlotStatus};
 pub use vocab::{transition_allowed, Command, JobId, SwapState};
@@ -1569,6 +1570,7 @@ impl ActorState {
                 .map(|(id, j)| JobStatus {
                     id: *id,
                     kind: j.kind,
+                    path: j.path,
                     model: j.model.clone(),
                     category: j.category,
                     state: j.state,
@@ -1593,9 +1595,9 @@ impl ActorState {
 mod tests {
     use super::{
         gather_drift_stats, headline_fault, missing_binary_error, serve_model_warning, ActorMsg,
-        ActorState, DriftStats, FitEntry, Gibibytes, Job, JobId, JobKind, JobStatus, JobTimings,
-        MeasuredAnchor, Occupant, Reply, ResourceKind, ScanKind, Scheduler, Slot, SpawnTicket,
-        SwapState, RELEASE_POLL,
+        ActorState, AdmissionPath, DriftStats, FitEntry, Gibibytes, Job, JobId, JobKind, JobStatus,
+        JobTimings, MeasuredAnchor, Occupant, Reply, ResourceKind, ScanKind, Scheduler, Slot,
+        SpawnTicket, SwapState, RELEASE_POLL,
     };
     use crate::budget::LedgerOnlyWitness;
     use crate::config::CategoryId;
@@ -2271,6 +2273,8 @@ mod tests {
             job_id,
             Job {
                 kind: JobKind::Load,
+                // Seated directly, not admitted: the row never took a rung.
+                path: None,
                 model: entry.name.clone(),
                 engine: entry.engine.clone(),
                 category: CategoryId::Work,
@@ -6249,6 +6253,8 @@ mod tests {
             job_id,
             Job {
                 kind: JobKind::Load,
+                // Seated directly, not admitted: the row never took a rung.
+                path: None,
                 model: name.to_string(),
                 engine: "mock".to_string(),
                 category: CategoryId::Work,
@@ -7043,6 +7049,11 @@ mod tests {
         let job = &state.jobs[&job_id];
         assert!(job.terminal, "an unreachable floor must refuse at the gate");
         assert!(
+            job.path.is_none(),
+            "a refusal never names a rung the gate never accepted: {:?}",
+            job.path
+        );
+        assert!(
             !job.release_first,
             "the guard precedes release-first: no resident is doomed for a floor the card denies"
         );
@@ -7113,8 +7124,267 @@ mod tests {
             "a releasable deficit still re-gates on the physical card: {:?}",
             job.error
         );
+        assert_eq!(
+            job.path,
+            Some(AdmissionPath::ReleaseFirst),
+            "the release-first door records its own rung"
+        );
         assert!(!job.terminal, "release-first proceeds, it does not refuse");
         assert_eq!(job.state, SwapState::Dispose);
+    }
+
+    /// B6 rung pin, door 1: a load the card already holds admits on the
+    /// `FitsNow` rung — and the rung, once recorded, is what the `/har/jobs`
+    /// projection serves. A same-slot replacement alone never changes the
+    /// rung: releasing the occupant the request itself named is the request.
+    /// Falsifier: derive the rung before the planner arm (every admit reads
+    /// `FitsNow` and the drain pin goes red) or drop the `job.path`
+    /// assignment (this pin reads `None`).
+    #[tokio::test]
+    async fn a_fit_now_admission_records_the_fits_now_rung() {
+        let dir = crate::testutil::temp_dir("rung-fits");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("small.yaml");
+        std::fs::write(&yaml, "engine: mock\ncategory: work\nvram_gb: 4\n").expect("seed");
+        let mut state = fold_state(&dir);
+        state.cfg.vram_total_gb = 72.0;
+        state.cfg.vram_reserve_gb = 2.0;
+        let entry = rescan_entry(&yaml, "small");
+        state.catalog = vec![entry.clone()];
+        state.slots = vec![Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_130,
+            occupant: None,
+            job: None,
+        }];
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        assert_eq!(state.jobs[&job_id].path, None, "no decision yet, no rung");
+        state.start_queued_load(job_id, 0, entry.clone());
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 2.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(
+            !job.terminal,
+            "the roomy card admits the load: {:?}",
+            job.error
+        );
+        assert_eq!(job.path, Some(AdmissionPath::FitsNow));
+        // The ledger projection is the only source of the wire `path`, so
+        // the served row must carry the same rung the decision recorded.
+        let served = state
+            .snapshot()
+            .jobs
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("the row is on the ledger");
+        assert_eq!(served.path, Some(AdmissionPath::FitsNow));
+        assert_eq!(
+            serde_json::to_value(&served).expect("JobStatus serializes")["path"],
+            "FitsNow",
+            "the wire name of the rung is the variant name, like every other ledger enum"
+        );
+    }
+
+    /// B6 rung pin, door 2: a load short on its need whose room comes from
+    /// evictable cross-category victims admits on the `Drain` rung. The pin
+    /// reads the recorded rung, not `job.victims`: `dequeue_victim` moves the
+    /// planned victim out of the queue before the row is observed, so the
+    /// rung is the only honest trace left on the row.
+    /// Falsifier: derive the rung after the `dequeue_victim` step and this
+    /// row reads `FitsNow` — the pin goes red.
+    #[tokio::test]
+    async fn a_drained_admission_records_the_drain_rung() {
+        let dir = crate::testutil::temp_dir("rung-drain");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("big.yaml");
+        std::fs::write(&yaml, "engine: mock\ncategory: work\nvram_gb: 40\n").expect("seed");
+        let mut state = fold_state(&dir);
+        state.cfg.vram_total_gb = 72.0;
+        state.cfg.vram_reserve_gb = 2.0;
+        let entry = rescan_entry(&yaml, "big");
+        state.catalog = vec![entry.clone()];
+        state.slots = vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_131,
+                occupant: None,
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_132,
+                occupant: Some(Occupant {
+                    model: "aux-resident".to_string(),
+                    need: Gibibytes(30.0),
+                    port: 18_132,
+                    ticket: fold_ticket(18_132),
+                    loaded_at: Instant::now(),
+                    launched_at_wall: std::time::SystemTime::now(),
+                    spawn_config: None,
+                    stale_config: false,
+                    serve_id: None,
+                    measure: None,
+                }),
+                job: None,
+            },
+        ];
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        // free = 72 - 2 - 40 = 30 < need 40: the deficit is 10, and the AUX
+        // occupant (AUX is evictable by WORK in the shipped matrix) covers it.
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 40.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(
+            !job.terminal,
+            "the planner covers the deficit, so the load admits: {:?}",
+            job.error
+        );
+        assert_eq!(job.path, Some(AdmissionPath::Drain));
+        assert!(!job.release_first, "a drain is not the release-first door");
+        assert_eq!(
+            job.victim.as_ref().map(|v| v.model.as_str()),
+            Some("aux-resident"),
+            "the planned victim rides the row"
+        );
+        assert_eq!(job.state, SwapState::Dispose);
+    }
+
+    /// B6R-02 rung pin, the refusal the gate never made: a load the gate
+    /// admitted but the launch preflight refused still names the rung the
+    /// gate decided. `finish_admit` derives the rung after every gate
+    /// refusal arm and before `preflight_spec`, so a `launch refused` row
+    /// honestly carries refusal AND rung — the rung is the decision record,
+    /// not an outcome promise. Gate refusals stay the other class: they
+    /// return before the derivation and carry no rung (pinned by
+    /// `a_floor_no_release_can_reach_refuses_before_the_victim_dies`).
+    /// Falsifier: clear `job.path` in the preflight refusal arm, or derive
+    /// the rung after `preflight_spec` — either way this row reads `None`
+    /// and the pin goes red.
+    #[tokio::test]
+    async fn a_launch_refused_row_keeps_the_rung_the_gate_decided() {
+        let dir = crate::testutil::temp_dir("rung-launch-refused");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("small.yaml");
+        std::fs::write(&yaml, "engine: mock\ncategory: work\nvram_gb: 4\n").expect("seed");
+        let mut state = fold_state(&dir);
+        state.cfg.vram_total_gb = 72.0;
+        state.cfg.vram_reserve_gb = 2.0;
+        let entry = rescan_entry(&yaml, "small");
+        state.catalog = vec![entry.clone()];
+        state.slots = vec![Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_133,
+            occupant: None,
+            job: None,
+        }];
+        let job_id = state.register_queued_load(0, &entry, Vec::new());
+        state.start_queued_load(job_id, 0, entry.clone());
+        // The launch preflight (chunk 10 [2]) reads the catalog at refusal
+        // time, after the gate and the rung derivation: an emptied catalog
+        // drives the `SchedulerError::Spawn` refusal exactly like a row
+        // deleted between scan and spawn. The roomy card lets the gate
+        // pass untouched, so the refusal class is the preflight's alone.
+        state.catalog.clear();
+        state.finish_admit(
+            job_id,
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 2.0,
+                processes: Vec::new(),
+                attribution: crate::budget::AttributionQuality::Unavailable,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(job.terminal, "the launch refusal terminalizes the row");
+        assert_eq!(job.state, SwapState::AdmitFail);
+        assert_eq!(job.outcome.as_deref(), Some("launch refused"));
+        let error = job.error.as_ref().expect("the refusal rides the row");
+        assert!(
+            matches!(error, crate::scheduler::SchedulerError::Spawn(reason)
+                if reason.contains("vanished from the catalog mid-job")),
+            "the refusal is the preflight's, not a gate refusal: {error}"
+        );
+        assert_eq!(
+            job.path,
+            Some(AdmissionPath::FitsNow),
+            "the gate decided before the preflight refused: the rung names that decision"
+        );
+        let served = state
+            .snapshot()
+            .jobs
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .expect("the row is on the ledger");
+        assert_eq!(served.path, Some(AdmissionPath::FitsNow));
+        assert!(
+            served
+                .error
+                .as_ref()
+                .is_some_and(|reason| reason.contains("vanished from the catalog mid-job")),
+            "the served row carries refusal AND rung: {:?}",
+            served.error
+        );
+    }
+
+    /// B6 log pin, by source scan: the accepted-decision line inside
+    /// `finish_admit` must be an info event named `admission path` carrying
+    /// the rung under the field `path`. A `tracing`-capture pin would add a
+    /// callsite-interest flake to the suite (`GOTCHAS.md` tracing rows, the
+    /// D9 shape: the first touch wins process-wide), so this scans the
+    /// source text; the rung VALUES are pinned by the decision pins and the
+    /// wire shape by the `/har/jobs` integration pin.
+    /// Falsifier: rename the field (`rung = ?path`), demote the event out of
+    /// `info!`, or drop the line — each fails the scan.
+    #[test]
+    fn the_admission_path_log_line_names_the_rung_field() {
+        let source = include_str!("admission.rs");
+        let start = source
+            .find("fn finish_admit(")
+            .expect("finish_admit is still in this file");
+        let body = &source[start..];
+        let at = body
+            .find("\"admission path\"")
+            .expect("the accepted-decision line names the event `admission path`");
+        let macro_start = body[..at]
+            .rfind("tracing::info!(")
+            .expect("the admission path line is an info event");
+        let line = &body[macro_start..at];
+        assert!(
+            line.contains("path = ?path"),
+            "the rung must ride the log under the field `path`: {line}"
+        );
+        assert!(line.contains("model ="), "the line names the model: {line}");
+        assert!(
+            line.contains("category ="),
+            "the line names the category: {line}"
+        );
+        assert!(
+            !line.contains("need_gib") && !line.contains("free_gib"),
+            "the rung line quotes no numbers — the refusal and the extended \
+             decision lines already carry them: {line}"
+        );
     }
 
     /// A `whole` row (operator ruling 2026-11-04): admits on a fully-free
@@ -7608,6 +7878,9 @@ mod tests {
         JobStatus {
             id: JobId(id),
             kind,
+            // The rung is only meaningful with a real admission; these
+            // fixtures exercise the fault rule.
+            path: None,
             model: model.to_string(),
             category: CategoryId::Work,
             state: SwapState::Serving,

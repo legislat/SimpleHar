@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::{
-    ActorMsg, ActorState, Event, Job, JobId, JobKind, JobTimings, SchedulerError, SwapState,
-    Victim, Waiter,
+    ActorMsg, ActorState, AdmissionPath, Event, Job, JobId, JobKind, JobTimings, SchedulerError,
+    SwapState, Victim, Waiter,
 };
 
 impl ActorState {
@@ -44,6 +44,8 @@ impl ActorState {
         self.next_job += 1;
         let job = Job {
             kind: JobKind::Load,
+            // The rung arrives with the gate decision in `finish_admit`.
+            path: None,
             model: entry.name.clone(),
             engine: entry.engine.clone(),
             category: entry.category,
@@ -524,6 +526,31 @@ impl ActorState {
                 job.need = Some(Gibibytes(booked));
             }
         }
+        // The one rung derivation, at the single point where the gate has
+        // said yes: `release_first` marks the same-slot door, a planned
+        // victim set marks the drain, neither means the card already held
+        // room (a same-slot replacement alone is the request, not a rung).
+        // Refusal arms never reach here — each one already logs
+        // `admission refused` with its numbers through `log_refusal`, so
+        // this line names only the rung (B6: the decision quotes its rung,
+        // the numbers stay where they already live).
+        let path = if self.jobs[&job_id].release_first {
+            AdmissionPath::ReleaseFirst
+        } else if self.jobs[&job_id].victims.is_empty() {
+            AdmissionPath::FitsNow
+        } else {
+            AdmissionPath::Drain
+        };
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.path = Some(path);
+        }
+        tracing::info!(
+            %job_id,
+            path = ?path,
+            model = %self.jobs[&job_id].model,
+            category = ?self.jobs[&job_id].category,
+            "admission path"
+        );
         if crate::observability::extended_logging() {
             // Decision-level evidence for rehearsal post-checks (operator,
             // 2026-10-26): the exact numbers the gate compared on the pass path.
