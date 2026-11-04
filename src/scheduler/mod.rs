@@ -3452,15 +3452,19 @@ mod tests {
         })
     }
 
-    /// Phase-1 pin (`TASK-ENGINE-MEASUREMENT`, ORCHESTRATION §3): a fake status
-    /// server answering Basalt-shaped JSON still reaches only the stub parse,
-    /// which answers `None` for every body — so the one-shot must NOT consume
-    /// the sampler: the process-tree fallback has no per-process bytes to sum
-    /// here either, `report_measurement` returns `None`, and the witness loop
-    /// keeps standing in (phases 2/3 flip the stub; this pin then flips with
-    /// them only by their own new pins, never by weakening this one).
+    /// Phase-1 pin, kept honest by phase 2 (`TASK-ENGINE-MEASUREMENT`,
+    /// ORCHESTRATION §3): the fake status server answers with a body the
+    /// Basalt parse MUST refuse — `vram` is a scalar, not the snapshot
+    /// object with the three figures (the phase-1 stub answered `None` for
+    /// every body; the phase-2 parse refuses this one by shape, pinned in
+    /// `engine::basalt::tests::the_scalar_vram_body_stays_refused`) — so the
+    /// one-shot must NOT consume the sampler: the process-tree fallback has
+    /// no per-process bytes to sum here either, `report_measurement` returns
+    /// `None`, and the witness loop keeps standing in. A body the parse
+    /// ACCEPTS is pinned elsewhere (basalt fake-server chain); this pin
+    /// exists only for the fallback leg and must never be weakened.
     #[tokio::test]
-    async fn a_stubbed_status_parse_falls_back_to_the_witness_loop() {
+    async fn an_unparsable_status_shape_falls_back_to_the_witness_loop() {
         let port = serve_status_json(r#"{"engine":{"info":{"vram":67.4}}}"#).await;
         let runtime = Arc::new(crate::process::ProcessRuntime::new())
             as Arc<dyn crate::engine::EngineRuntime>;
@@ -3479,7 +3483,7 @@ mod tests {
         assert_eq!(
             ActorState::report_measurement(&runtime, &tx, &ctx, &witness).await,
             None,
-            "the phase-1 stub refuses the answered JSON, and the unattributable witness \
+            "the parse refuses the scalar-vram JSON, and the unattributable witness \
              gives the fallback nothing: the sampler must stay alive for the witness loop"
         );
         assert!(

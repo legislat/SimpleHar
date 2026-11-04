@@ -421,15 +421,82 @@ impl EngineAdapter for BasaltAdapter {
     }
 }
 
-/// Phase-2 stub of the Basalt status parse (TASK-ENGINE-MEASUREMENT,
-/// ORCHESTRATION §3): the future reader of `GET /v1/status` answers with
-/// `None` for every body, so the sampler falls back to the witness-based
-/// process-tree sum until phase 2 fills in the `engine.info.vram` parse.
-/// Phase 2 owns this file and will replace this body and nothing else.
+/// Reads the Basalt `GET /v1/status` snapshot into a measured footprint
+/// (`TASK-ENGINE-MEASUREMENT` phase 2, ORCHESTRATION §3). The sampler calls
+/// this once at readiness. Every refusal answers `None` — absence, never a
+/// guess — and the sampler then takes the witness-based process-tree
+/// fallback (doctrine 4).
+///
+/// The figure: `engine.info.vram` carries the three figures the 2026-11-04
+/// evidence line records (`ORCHESTRATION.md` §Endpoints reference): the
+/// expert cache the engine built, the free VRAM outside every holder, and
+/// the reserve the fill policy keeps. The harness books
+/// `expert_cache_mib + reserve_mib`: the bytes the engine took, plus the
+/// headroom it keeps and reclaims on demand (MODELS.md: "Basalt fills the
+/// card's free VRAM up to its reserve policy"). The reserve books with the
+/// cache because admission must never hand that slab to another engine — the
+/// fill takes it back the moment free VRAM appears. `vram_free_mib` is not
+/// in the sum (free bytes belong to nobody), but a snapshot missing any of
+/// the three is not a vram snapshot and the parse refuses it.
+///
+/// Derivation against this card (card run 2026-11-03, plus the 2026-11-04
+/// row): the card carries 73,415 MiB; the launch names `--vram-reserve-mib
+/// 3072`; the idle baseline sits at 2,384-2,843 MiB; while loaded the card
+/// read 70,867 MiB used (69.2 GiB). Fill budget = 73,415 - 3,072 - 2,843 =
+/// 67,500 MiB = 65.9 GiB; the operator's measured row figure is 67.4 GiB
+/// (`handoff/evidence/2026-11-04-basalt-v2-readmission/RESULTS.md`). The sum
+/// lands inside that band (65.9 .. 69.2 GiB). The evidence carries no raw
+/// status body — the field names come from the ORCHESTRATION evidence line —
+/// so if the card-run capture (task step 5) shows a different field set, fix
+/// this parse from that capture, never by widening a guess.
+///
+/// Refusal is always `None`: an error envelope (a top-level `error`), a body
+/// that is not the status shape, an empty or absent `vram` object, or any
+/// member of the three that is missing, non-numeric, negative, or
+/// non-finite. `EngineMeasurement::ram_gib` stays `None`: no evidence records
+/// a RAM figure in this snapshot (the 76.9 GiB load line of the 2026-11-03
+/// run is a server log line, not a status field).
+///
+/// Fall-through rule (task non-goal, ORCHESTRATION: "Basalt never use the
+/// Python parent's per-process figure"): when this parse refuses, the
+/// sampler's fallback sums the witness's per-process bytes over the engine
+/// pid **and its direct children** — the tree sum is allowed; the Python
+/// parent's per-process figure **alone** is banned.
 pub(crate) fn measurement_from_status(
-    _body: &serde_json::Value,
+    body: &serde_json::Value,
 ) -> Option<crate::engine::EngineMeasurement> {
-    None
+    if body.get("error").is_some() {
+        return None; // the engine's own refusal voice is absence, not a figure
+    }
+    let vram = body
+        .pointer("/engine/info/vram")
+        .and_then(serde_json::Value::as_object)?;
+    let mib = |key: &str| vram.get(key).and_then(serde_json::Value::as_f64);
+    let (Some(expert_cache_mib), Some(vram_free_mib), Some(reserve_mib)) = (
+        mib("expert_cache_mib"),
+        mib("vram_free_mib"),
+        mib("reserve_mib"),
+    ) else {
+        return None;
+    };
+    if !expert_cache_mib.is_finite()
+        || !vram_free_mib.is_finite()
+        || !reserve_mib.is_finite()
+        || expert_cache_mib < 0.0
+        || vram_free_mib < 0.0
+        || reserve_mib < 0.0
+    {
+        return None;
+    }
+    let gpu_gib = (expert_cache_mib + reserve_mib) / 1024.0;
+    if !gpu_gib.is_finite() {
+        return None; // two finite giants can sum to infinity: absence, never +inf
+    }
+    Some(crate::engine::EngineMeasurement {
+        gpu_gib,
+        ram_gib: None,
+        source: crate::engine::MeasurementSource::EngineStatus,
+    })
 }
 
 #[cfg(test)]
@@ -773,5 +840,181 @@ mod tests {
         let (_dir, model) = fixture(&[]);
         let row = validate_row(&model).expect("validates");
         assert_eq!(row.parallel, PARALLEL_MIN);
+    }
+
+    fn snapshot(
+        expert: serde_json::Value,
+        free: serde_json::Value,
+        reserve: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "engine": {
+                "name": "basalt",
+                "info": { "vram": {
+                    "expert_cache_mib": expert,
+                    "vram_free_mib": free,
+                    "reserve_mib": reserve,
+                } }
+            }
+        })
+    }
+
+    /// Phase-2 pin (a): a captured-realistic `/v1/status` body answers the
+    /// full chain — fake axum server on an ephemeral port, the runtime's
+    /// generic GET, then this parse. The figures are the card facts of the
+    /// 2026-11-03 run and the 2026-11-04 row: card 73,415 MiB, reserve flag
+    /// 3,072 MiB, free 2,548 MiB while loaded (73,415 - 70,867), and an
+    /// expert cache that filled the budget to cache+reserve = 69,120 MiB =
+    /// 67.5 GiB — inside the evidence band (fill budget 65.9 GiB .. used at
+    /// load 69.2 GiB) around the operator's measured 67.4 GiB. The fixture
+    /// is realistic, not captured: no raw status body is on file.
+    #[tokio::test]
+    async fn the_status_chain_lands_the_footprint_on_the_evidence_figures() {
+        use crate::engine::EngineRuntime as _;
+        let body: &'static str = r#"{"engine":{"name":"basalt","version":"0.2.1","info":{"model":"Qwen3.8-Flash-Next UD-Q4_K_XL","loaded":true,"vram":{"expert_cache_mib":66048,"vram_free_mib":2548,"reserve_mib":3072}}}}"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        let app = axum::Router::new().route(
+            "/v1/status",
+            axum::routing::get(move || async move { body }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let runtime = crate::process::ProcessRuntime::new();
+        let json = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.engine_status_json(port, "/v1/status"),
+        )
+        .await
+        .expect("status answers")
+        .expect("the body parses as JSON");
+        let measurement = measurement_from_status(&json).expect("the realistic snapshot parses");
+        assert_eq!(
+            measurement.source,
+            crate::engine::MeasurementSource::EngineStatus
+        );
+        assert!(
+            (measurement.gpu_gib - 67.5).abs() < 1e-9,
+            "cache+reserve = 69,120 MiB = 67.5 GiB"
+        );
+        assert_eq!(measurement.ram_gib, None, "no RAM figure in this snapshot");
+    }
+
+    /// Phase-2 pin (b): an empty or absent vram snapshot is absence — the
+    /// sampler keeps its fallback legs, never a zero-booked footprint.
+    #[test]
+    fn an_empty_or_absent_vram_snapshot_is_absence() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"engine": {"info": {"vram": {}}}}),
+            serde_json::json!({"engine": {"info": {"vram": null}}}),
+            serde_json::json!({"engine": {"info": {}}}),
+            serde_json::json!({"engine": {}}),
+            serde_json::json!({"engine": {"info": {"vram": 67.4}}}),
+            serde_json::json!({"vram": {"expert_cache_mib": 66048, "vram_free_mib": 2548, "reserve_mib": 3072}}),
+        ] {
+            assert_eq!(
+                measurement_from_status(&body),
+                None,
+                "a body without a vram snapshot object is absence: {body}"
+            );
+        }
+    }
+
+    /// Phase-2 pin (c): the engine's HTTP error envelope is absence, even
+    /// when it rides next to figures that would otherwise parse — a refusal
+    /// voice never doubles as a footprint. The error text is the real
+    /// 2026-11-04 v1-pack refusal.
+    #[test]
+    fn an_error_envelope_is_absence() {
+        assert_eq!(
+            measurement_from_status(
+                &serde_json::json!({"error": "RuntimeError: .basalt version 1, this build reads version 2"})
+            ),
+            None
+        );
+        let mut poisoned = snapshot(
+            serde_json::json!(66048),
+            serde_json::json!(2548),
+            serde_json::json!(3072),
+        );
+        poisoned["error"] = serde_json::json!("engine refused");
+        assert_eq!(
+            measurement_from_status(&poisoned),
+            None,
+            "error wins over figures"
+        );
+    }
+
+    /// Phase-2 pin: a partial or malformed vram snapshot is absence — every
+    /// member of the three must be a present, finite, non-negative number.
+    #[test]
+    fn a_partial_or_malformed_snapshot_is_absence() {
+        let good = snapshot(
+            serde_json::json!(66048),
+            serde_json::json!(2548),
+            serde_json::json!(3072),
+        );
+        assert!(
+            measurement_from_status(&good).is_some(),
+            "the full triple parses"
+        );
+        for key in ["expert_cache_mib", "vram_free_mib", "reserve_mib"] {
+            let mut missing = good.clone();
+            missing["engine"]["info"]["vram"]
+                .as_object_mut()
+                .expect("vram object")
+                .remove(key);
+            assert_eq!(
+                measurement_from_status(&missing),
+                None,
+                "`{key}` missing is absence"
+            );
+            for bad in [
+                serde_json::json!("3072"),
+                serde_json::json!(null),
+                serde_json::json!(-1),
+            ] {
+                let mut malformed = good.clone();
+                malformed["engine"]["info"]["vram"][key] = bad.clone();
+                assert_eq!(
+                    measurement_from_status(&malformed),
+                    None,
+                    "`{key}`={bad} is not a figure"
+                );
+            }
+        }
+    }
+
+    /// Review INFO (phase 2): each member is finite, yet two astronomical
+    /// ones can sum to infinity — the derived figure's own finiteness is the
+    /// last gate, so a giant never reaches the actor as `+inf`.
+    #[test]
+    fn two_finite_giant_fields_that_would_sum_to_infinity_answer_none() {
+        let giant = serde_json::json!(f64::MAX);
+        let body = snapshot(giant.clone(), serde_json::json!(2548), giant);
+        assert_eq!(
+            measurement_from_status(&body),
+            None,
+            "finite + finite must not book +inf"
+        );
+    }
+
+    /// The cross-file premise of the sampler's fallback pin
+    /// (`scheduler::tests::an_unparsable_status_shape_falls_back_to_the_witness_loop`):
+    /// the scalar `vram` body that fake answers with must stay refused by
+    /// this parse, so that pin keeps testing the fallback leg honestly now
+    /// that the phase-1 stub is gone.
+    #[test]
+    fn the_scalar_vram_body_stays_refused() {
+        assert_eq!(
+            measurement_from_status(&serde_json::json!({"engine": {"info": {"vram": 67.4}}})),
+            None
+        );
     }
 }

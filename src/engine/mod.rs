@@ -375,7 +375,6 @@ pub(crate) enum MeasurementSource {
     /// itself, the process-engine analog of ninfer's `engine_report`. It
     /// books as `EngineReport`-class trust above the declared floor (the
     /// 2026-11-04 ruling extends the amended-15(ii) max truth to it).
-    #[allow(dead_code)] // constructed when phases 2/3 fill in the parse stubs
     EngineStatus,
     /// The status endpoint refused, and the witness attributed concrete
     /// bytes to the engine's pid plus its direct children (one Toolhelp32
