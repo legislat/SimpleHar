@@ -748,6 +748,34 @@ const driver = `
       JSON.stringify([legacyPillDot && legacyPillDot.attrs, legacyRowDot && legacyRowDot.attrs]));
   }
 
+  // B3R-02 (review 2026-11-04): a multi-slot category with one serving and one
+  // releasing slot keeps the releasing DOT, but the pill TEXT must still name
+  // the serving occupant - "releasing…" alone is honest only when no serving
+  // occupant remains. Falsifier: restore the releasing-first text and the
+  // naming check goes red.
+  {
+    const mixModel = (id, ref) => ({
+      id, engine: "llama", category: "WORK", vram_gb: 4, cost: "fixed",
+      launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
+      model_ref: ref, serve_model: null, cpu_offload: false,
+    });
+    const mixReleasing = { category: "WORK", index: 0, model: "reltwo", port: 8123,
+      pid: 1, need_gib: 4.0, idle_s: 0, serve_id: null, loading_job: null,
+      launched_at: "2026-11-04T00:00:00Z", stale_config: false, state: "releasing" };
+    const mixServing = { ...mixReleasing, index: 1, model: "keepone", port: 8124,
+      pid: 2, state: "serving" };
+    applyState({ ...fixtures["/har/status"],
+      slots: [mixReleasing, mixServing], models: [mixModel("reltwo", "F:/t.gguf"), mixModel("keepone", "F:/k.gguf")] });
+    const mixPill = findAll(document.getElementById("sh-header"), "span", "sh-tab-item")[0];
+    const mixPillDot = findAll(mixPill, "span", "sh-dot")[0];
+    check("the mixed-slot pill keeps the releasing dot winning",
+      !!mixPillDot && mixPillDot.attrs["data-state"] === "releasing",
+      mixPillDot ? JSON.stringify(mixPillDot.attrs) : "no pill dot");
+    const mixPillText = textOf(mixPill);
+    check("the mixed-slot pill names the serving occupant, not releasing",
+      mixPillText.includes("keepone") && !mixPillText.includes("releasing"), mixPillText);
+  }
+
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
 
   // ---- N6 (2026-11-02): the Cost cell is a FUNCTION of the server verdicts ----

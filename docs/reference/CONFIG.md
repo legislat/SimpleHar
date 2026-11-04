@@ -101,7 +101,9 @@ one-way hard filter: a category yields only to the categories that list it.
   says.
 - A model row that sets `min_turn` stays unevictable for other categories
   until it has served that many seconds (see `MODELS.md`). The guard never
-  blocks same-slot replacement.
+  blocks same-slot replacement. It covers only the eviction that another
+  category's load requests. An idle-timeout unload and an explicit operator
+  unload still evict a young holder.
 - WORK is the most protected category, and nothing evicts it. AUX and EMB
   are the most disposable, and both WORK and RP evict them. Only WORK
   evicts RP.

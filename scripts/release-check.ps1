@@ -132,21 +132,35 @@ if (-not $SkipDoc) {
   }
 }
 
-# 8. The webui fixture quotes the crate version. The parity test
-#    `the_webui_fixture_is_a_document_the_endpoint_can_actually_emit` pins
-#    `fixture.version == CARGO_PKG_VERSION`; the release-check never runs
-#    tests, so the bump commit itself needs this mechanical guard.
+# 8. The webui fixture quotes the crate version in its TOP-LEVEL `version`
+#    property, compared case-sensitively - exactly the key the parity test
+#    `the_webui_fixture_is_a_document_the_endpoint_can_actually_emit` reads
+#    (serde exact-key lookup). A first-regex-match read would compare a nested
+#    decoy or a recased key instead (review B3R-01). The release-check never
+#    runs tests, so the bump commit itself needs this mechanical guard.
 $fixturePath = 'tests/webui/fixtures/status.json'
 $fixtureOk = $false
 if (Test-Path -LiteralPath $fixturePath) {
   $fixtureVersion = $null
-  $fm = Select-String -LiteralPath $fixturePath -Pattern '"version"\s*:\s*"([^"]+)"' |
-    Select-Object -First 1
-  if ($fm) { $fixtureVersion = $fm.Matches[0].Groups[1].Value }
-  $fixtureOk = ($fixtureVersion -eq $version)
-  Report $fixtureOk ("webui fixture quotes version " +
-    $(if ($fixtureVersion) { $fixtureVersion } else { "(none)" }) +
-    " matching Cargo.toml " + $version)
+  $fixtureError = $null
+  try {
+    $fixture = Get-Content -LiteralPath $fixturePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $prop = @($fixture.PSObject.Properties) |
+      Where-Object { $_.Name -ceq 'version' } |
+      Select-Object -First 1
+    if ($null -ne $prop) { $fixtureVersion = $prop.Value }
+  } catch {
+    $fixtureError = "$_"
+  }
+  if ($fixtureError) {
+    Report $false ("webui fixture is not valid JSON: " + $fixtureError)
+  } elseif ($null -eq $fixtureVersion) {
+    Report $false ("webui fixture has no top-level version property: " + $fixturePath)
+  } else {
+    $fixtureOk = ($fixtureVersion -ceq $version)
+    Report $fixtureOk ("webui fixture quotes top-level version " + $fixtureVersion +
+      " matching Cargo.toml " + $version)
+  }
 } else {
   Report $false "webui fixture missing: $fixturePath"
 }

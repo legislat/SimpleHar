@@ -198,6 +198,15 @@ function renderTabItem(status, category) {
   // slot (and no `state` field on an old payload) leaves today's derivation
   // untouched.
   const releasing = slots.some((slot) => slot.state === "releasing");
+  // The pill text names the first occupant OUTSIDE the releasing slots
+  // (review B3R-02, 2026-11-04): a slot releasing beside a serving one still
+  // names the serving model, and the releasing dot carries the in-flight
+  // release. A payload without `state` keeps every occupied slot here, so an
+  // older harness renders exactly as before.
+  const kept = slots
+    .filter((slot) => slot.state !== "releasing")
+    .map((slot) => slot.model)
+    .filter(Boolean);
   const dotState = releasing
     ? "releasing"
     : occupants.length > 0
@@ -222,13 +231,13 @@ function renderTabItem(status, category) {
     text(category),
   );
   if (entry) button.append(el("span", { class: "sh-tab-port" }, text(`:${entry.public_port}`)));
-  if (dotState === "releasing") {
+  if (releasing && kept.length === 0) {
     button.append(el("span", { class: "sh-tab-model sh-empty" }, text("releasing…")));
   } else if (loading && occupants.length === 0) {
     button.append(el("span", { class: "sh-tab-model sh-empty" }, text("loading…")));
-  } else if (occupants.length > 0) {
-    button.append(el("span", { class: "sh-tab-model" }, text(occupants[0])));
-    if (occupants.length > 1) button.append(text(` +${occupants.length - 1}`));
+  } else if (kept.length > 0) {
+    button.append(el("span", { class: "sh-tab-model" }, text(kept[0])));
+    if (kept.length > 1) button.append(text(` +${kept.length - 1}`));
   }
   const item = el("span", { class: "sh-tab-item" }, button);
   if (occupants.length > 0) {
