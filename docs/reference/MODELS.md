@@ -44,6 +44,7 @@ edit never leaves a half-written model file in use.
 | `is_embedding_model` | A truthy value forces category `EMB`. It conflicts with another explicit category. |
 | `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. |
 | `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. For the basalt 482B class, `load_timeout: 1200` is the recommended starting point. |
+| `min_turn` | Minimum seconds of service before a different model's request may evict this model. The harness refuses to evict a model that has served less than `min_turn` seconds for a different model's request. Omitting the key means no guard. An explicit request for the model's own slot is never blocked. Range 1-86400 seconds; scan refuses a value outside it. A measured swap runs 14-45 s, so the knob stops a ping-pong of swaps between two hot models. |
 | `strata_exe` | **Required for strata** (template mode): the absolute path of the engine binary that the harness-rendered profile names. Its presence selects template mode. `serve_model` is also required, and it becomes the profile's served model name. |
 | `strata_tokenizer` | **Required for strata**: the absolute tokenizer path that the rendered profile names. |
 | `strata_python` | Interpreter. It must be an existing `.exe` **file**; it is the program the harness launches (default `C:\Strata\.venv\Scripts\python.exe`). |
@@ -157,7 +158,7 @@ The external-profile mode is superseded (operator ruling 2026-11-02, row
 2026-11-03) to merge the block into the live row in one atomic write:
 strata-owned keys and `serve_model` are replaced; `strata_config` and stale
 `strata_*` keys are deleted; `category`, `vram_gb`, `cost`, `load_timeout`,
-`launch_only_with_at_least_vram_free`, `context`, `name`, `model`,
+`min_turn`, `launch_only_with_at_least_vram_free`, `context`, `name`, `model`,
 `strata_python`, comments, and key order are preserved. A missing,
 unreadable, duplicate-key, empty, or non-strata target is refused with a
 named reason, and nothing is written. The apply summary counts the row lines

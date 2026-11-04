@@ -91,14 +91,17 @@ the plan reaches `18117`.
 
 The `evictable_by` field is the eviction priority matrix: the "Evicted by"
 column of the matrix in `README.md` (Categories and ports). It is the only
-rule that decides which models the scheduler unloads to make room. When a
-load does not fit the free VRAM, the scheduler first unloads occupants of
-the **other** categories that may evict them. The matrix is a one-way hard
-filter: a category yields only to the categories that list it.
+category-level rule that decides which models the scheduler unloads to make
+room. When a load does not fit the free VRAM, the scheduler first unloads
+occupants of the **other** categories that may evict them. The matrix is a
+one-way hard filter: a category yields only to the categories that list it.
 
 - **Same-slot replacement is always allowed.** Loading a different model
   into a category evicts that category's own occupant, whatever the matrix
   says.
+- A model row that sets `min_turn` stays unevictable for other categories
+  until it has served that many seconds (see `MODELS.md`). The guard never
+  blocks same-slot replacement.
 - WORK is the most protected category, and nothing evicts it. AUX and EMB
   are the most disposable, and both WORK and RP evict them. Only WORK
   evicts RP.
@@ -108,7 +111,7 @@ filter: a category yields only to the categories that list it.
   the planner spares RP, the costliest category to bring back, when a
   cheaper and more disposable AUX or EMB model would do.
 - A refusal that cannot free enough VRAM names the blockers, for example
-  `only WORK can evict RP`.
+  `only WORK can evict RP`, or names a model inside its `min_turn` guard.
 
 The matrix is data, not code. Edit `categories[].evictable_by` in
 `simplehar-se.json` and restart to change who yields to whom.

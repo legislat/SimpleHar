@@ -90,7 +90,9 @@ One harness process, one tokio runtime, plus OS-level children:
 - Eviction follows the `evictable_by` matrix from the config
   (`config::CategoryConfig`): WORK is evicted by nobody, RP only by WORK,
   AUX and EMB by both; same-slot replacement is always allowed. The planner
-  takes the cheapest sufficient victim set (`budget::VictimInfo`).
+  takes the cheapest sufficient victim set (`budget::VictimInfo`). A
+  per-model `min_turn` guard keeps a holder younger than its knob out of
+  that set, and the refusal names it as a blocker (`MODELS.md`).
 
 ## 4. Admission and the witness
 

@@ -3218,6 +3218,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             cost: crate::model::CostClass::Fixed,
             launch_floor_gb: None,
             load_timeout_s: None,
+            min_turn_s: None,
             measured_gb: None,
             measured_min_gb: None,
             measured_offload: None,

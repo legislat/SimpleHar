@@ -422,6 +422,149 @@ async fn admission_refusal_carries_the_numbers_and_keeps_the_slot() {
     );
 }
 
+/// TASK-BERTH-B1 `min_turn` juggle guard: A serves RP under a one-hour knob;
+/// B into WORK needs RP's bytes; the planner must refuse, name A and the knob
+/// in the blockers tail, and keep A serving. Kills A-B-A-B ping-pong (measured
+/// swaps run 14-45 s). Falsifier: delete the young-holder filter in
+/// `plan_victims` and B evicts A — the expect_err below panics.
+#[tokio::test]
+async fn a_young_holder_refuses_to_be_evicted_and_names_the_reason() {
+    let (handle, runtime) = harness5(
+        config(5),
+        &[
+            (
+                "hold-a",
+                "mock",
+                CategoryId::Rp,
+                Some(50.0),
+                "min_turn: 3600",
+            ),
+            ("want-b", "mock", CategoryId::Work, Some(30.0), ""),
+        ],
+    );
+
+    handle
+        .swap("hold-a", CategoryId::Rp)
+        .await
+        .expect("a loads into the empty RP slot");
+    let error = handle
+        .swap("want-b", CategoryId::Work)
+        .await
+        .expect_err("b must refuse while A's turn is inside min_turn");
+    let message = error.to_string();
+    assert!(
+        message.contains("min_turn"),
+        "the refusal must name the knob: {message}"
+    );
+    assert!(
+        message.contains("hold-a"),
+        "the refusal must name the row it refuses to evict: {message}"
+    );
+    assert!(
+        message.contains("3600"),
+        "the refusal must name the seconds: {message}"
+    );
+
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        slot_model(&status, CategoryId::Rp),
+        vec![Some("hold-a".to_string())],
+        "the guarded holder keeps serving"
+    );
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "a refused swap kills nothing and spawns nothing"
+    );
+}
+
+/// Boundary leg of the guard: with `min_turn: 1` the refusal is time-based, not
+/// static — after the turn ages past the knob the same eviction admits.
+/// Falsifier: make the guard age-blind (always block) and this swap refuses;
+/// make it `served <= min_turn` at 1.5 s the eviction still refuses.
+#[tokio::test]
+async fn a_holder_whose_turn_passed_min_turn_is_evicted_again() {
+    let (handle, runtime) = harness5(
+        config(5),
+        &[
+            ("hold-a", "mock", CategoryId::Rp, Some(50.0), "min_turn: 1"),
+            ("want-b", "mock", CategoryId::Work, Some(30.0), ""),
+        ],
+    );
+
+    let Reply::Loaded(a) = handle
+        .swap("hold-a", CategoryId::Rp)
+        .await
+        .expect("a loads")
+    else {
+        panic!("expected Loaded")
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    handle
+        .swap("want-b", CategoryId::Work)
+        .await
+        .expect("the aged holder is evictable again");
+
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![Some("want-b".to_string())],
+        "b must be serving"
+    );
+    assert_eq!(
+        slot_model(&status, CategoryId::Rp),
+        vec![None],
+        "the evicted slot is empty"
+    );
+    assert!(
+        runtime.is_dead(a.port).await,
+        "the evicted engine must be dead (G12)"
+    );
+}
+
+/// Non-goal pinned: the knob guards cross-slot eviction only. An explicit
+/// request for a slot's own model is the user's word and stays open no matter
+/// how young the holder is (the same-slot door in `start_queued_load`).
+/// Falsifier: consult `min_turn` on the same-slot path and this swap refuses.
+#[tokio::test]
+async fn an_explicit_same_slot_request_still_replaces_a_young_holder() {
+    let (handle, runtime) = harness5(
+        config(5),
+        &[
+            (
+                "hold-a",
+                "mock",
+                CategoryId::Work,
+                Some(50.0),
+                "min_turn: 3600",
+            ),
+            ("want-b", "mock", CategoryId::Work, Some(30.0), ""),
+        ],
+    );
+
+    let Reply::Loaded(a) = handle
+        .swap("hold-a", CategoryId::Work)
+        .await
+        .expect("a loads")
+    else {
+        panic!("expected Loaded")
+    };
+    handle
+        .swap("want-b", CategoryId::Work)
+        .await
+        .expect("the same-slot door is never blocked by min_turn");
+
+    let status = handle.status().await.expect("actor alive");
+    assert_eq!(
+        slot_model(&status, CategoryId::Work),
+        vec![Some("want-b".to_string())]
+    );
+    assert!(
+        runtime.is_dead(a.port).await,
+        "the replaced engine must be dead (G12)"
+    );
+}
+
 #[tokio::test]
 async fn under_specified_model_refuses_with_the_real_reason() {
     // F-7 lesson: the refusal must name under-specification, not blame a neighbor.

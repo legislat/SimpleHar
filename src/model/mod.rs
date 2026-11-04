@@ -184,6 +184,12 @@ pub struct ModelEntry {
     /// config default. Strata-class cold starts run for many minutes and would
     /// otherwise be cut off by the global gate (v3.3 parity).
     pub load_timeout_s: Option<u64>,
+    /// Per-model eviction guard in seconds (`min_turn:`): admission refuses to
+    /// evict this model from another model's request until it has served this
+    /// long; `None` means no guard. A same-slot request never consults it. A
+    /// measured swap runs 14-45 s, so a fresh holder must earn its eviction cost
+    /// (A-B-A-B ping-pong guard, operator ruling 2026-11-04).
+    pub min_turn_s: Option<u64>,
     /// High end of the engine footprint measured by the harness while this model
     /// served (`measured_gb:`, written back after Install; see
     /// [`ModelEntry::measured_min_gb`] for the low end). The page shows the range as
@@ -750,6 +756,29 @@ impl ModelEntry {
             }
             None => None,
         };
+        // Same bounds as `load_timeout` (2026-11-04 ruling): `min_turn: 0` means
+        // "no guard" and is written by omitting the key, so an explicit 0 is a
+        // typo the parse must name, and the one-day ceiling guards a mistyped
+        // value that would hold the row unevictable for years.
+        let min_turn_s = match keys.get("min_turn") {
+            Some(raw) => {
+                let v = raw
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| ModelError::BadNumber {
+                        field: "min_turn".to_string(),
+                        value: raw.to_string(),
+                    })?;
+                if v == 0 || v > 86_400 {
+                    return Err(ModelError::BadNumber {
+                        field: "min_turn".to_string(),
+                        value: raw.to_string(),
+                    });
+                }
+                Some(v)
+            }
+            None => None,
+        };
         // Resolved before the measured pair: the `cpu_offload` flip only voids a
         // range on engines whose adapters read the key, and an absent `engine:`
         // means llama (the scan default), so the policy comparison needs this.
@@ -788,6 +817,7 @@ impl ModelEntry {
             cost,
             launch_floor_gb,
             load_timeout_s,
+            min_turn_s,
             measured_gb: measured.max,
             measured_min_gb: measured.min,
             measured_offload: measured.offload,
@@ -1856,6 +1886,33 @@ mod tests {
                 .expect_err("{bad} must be refused");
             assert!(
                 matches!(err, ModelError::BadNumber { ref field, .. } if field == "load_timeout"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// `min_turn` rides the same chain as `load_timeout` (operator ruling
+    /// 2026-11-04): seconds, 1..=86_400, and an explicit 0 is refused because
+    /// "no guard" is written by omitting the key. The raw map must keep the
+    /// verbatim value so write-back never drops the operator's line.
+    /// Falsifier: drop the `v == 0` leg and the "0" case parses to Some(0).
+    #[test]
+    fn min_turn_parses_and_bounds() {
+        let entry = ModelEntry::from_flat(&flat(&[("name", "s"), ("min_turn", "3600")]), "s")
+            .expect("valid entry");
+        assert_eq!(entry.min_turn_s, Some(3600));
+        assert_eq!(entry.raw.get("min_turn").map(String::as_str), Some("3600"));
+        assert_eq!(
+            ModelEntry::from_flat(&flat(&[("name", "s")]), "s")
+                .expect("absent is no guard")
+                .min_turn_s,
+            None
+        );
+        for bad in ["0", "86401", "abc", "-5", "nan", "1e400"] {
+            let err = ModelEntry::from_flat(&flat(&[("name", "s"), ("min_turn", bad)]), "s")
+                .expect_err("{bad} must be refused");
+            assert!(
+                matches!(err, ModelError::BadNumber { ref field, .. } if field == "min_turn"),
                 "{bad}: {err}"
             );
         }

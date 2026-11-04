@@ -503,7 +503,8 @@ impl ActorState {
     /// Step 6 planner: among occupants evictable by this job's category, pick the
     /// cheapest sufficient set (exhaustive over the ≤9 slots; tie-break: fewer
     /// victims). Hard filters first — a non-evictable occupant becomes a named
-    /// blocker, never a candidate. Release order: least-protected first, LRU
+    /// blocker, never a candidate, and so does a holder still inside its
+    /// `min_turn` guard. Release order: least-protected first, LRU
     /// within a category.
     fn plan_victims(
         &self,
@@ -538,6 +539,35 @@ impl ActorState {
             };
             let allowed_list = evictable_by(slot.category);
             if allowed_list.contains(&load_category) {
+                // `min_turn` juggle guard (operator ruling 2026-11-04): a holder
+                // whose current turn is younger than the row's knob is a named
+                // blocker, never a candidate, so an A-B-A-B ping-pong cannot
+                // spend a measured 14-45 s swap on every hop. The knob is read
+                // from the catalog at decision time, never copied onto the job
+                // row: parked and superseded rows outlive their yaml edits, and
+                // only the catalog entry is what the operator last wrote. A
+                // name absent from the catalog has no evidence of a guard, so
+                // it behaves exactly as `None` (absence of evidence is never
+                // evidence of a guard). The turn clock is `Occupant::loaded_at`,
+                // the install instant — read here, inside the actor, the only
+                // place allowed to consult wall-clock state (no new state, no
+                // arithmetic outside the actor).
+                let guard = self
+                    .catalog
+                    .iter()
+                    .find(|entry| entry.name == occupant.model)
+                    .and_then(|entry| entry.min_turn_s);
+                if let Some(min_turn) = guard {
+                    let served = occupant.loaded_at.elapsed().as_secs();
+                    if served < min_turn {
+                        blockers.push(crate::budget::BlockerInfo {
+                            model: occupant.model.clone(),
+                            category: slot.category.to_string(),
+                            reason: format!("served {served}s of its {min_turn}s min_turn guard"),
+                        });
+                        continue;
+                    }
+                }
                 candidates.push((index, occupant.need.0, allowed_list.len()));
                 considered.push(crate::budget::VictimInfo {
                     model: occupant.model.clone(),

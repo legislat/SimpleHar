@@ -131,6 +131,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "cost",
     "launch_only_with_at_least_vram_free",
     "load_timeout",
+    "min_turn",
     "serve_model",
     "cpu_offload",
     "jinja",
@@ -2977,6 +2978,7 @@ mod tests {
              cost: greedy\n\
              launch_only_with_at_least_vram_free: 6\n\
              load_timeout: 600\n\
+             min_turn: 300\n\
              serve_model: golden-id\n\
              cpu_offload: false\n\
              jinja: true\n\
@@ -3145,6 +3147,7 @@ mod tests {
             "cost",
             "launch_only_with_at_least_vram_free",
             "load_timeout",
+            "min_turn",
             "serve_model",
             "cpu_offload",
             "jinja",
