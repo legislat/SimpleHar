@@ -157,8 +157,9 @@ impl ActorState {
     /// the witness loop stands in rather than losing the measurement outright
     /// (review 2026-10-31 M1). The fall-through order is exact: the
     /// process-tree fallback is attempted ONLY when the status path yielded no
-    /// measurement — a body the per-engine stub will not parse yet (phase 1
-    /// stubs answer `None` for every body) or an engine that never answers. A
+    /// measurement — a body the engine's own parse will not take (phases 2
+    /// and 3 parse their status snapshots now and answer `None` for every
+    /// other shape) or an engine that never answers. A
     /// PARSED figure that [`ActorState::measurable_figure`] would refuse is not
     /// retried through the fallback: the one-shot returns `None` here and the
     /// witness loop takes over, standing in with its own fresh readings. The
