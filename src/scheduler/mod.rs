@@ -3603,6 +3603,11 @@ mod tests {
             crate::engine::MeasurementSource::ProcessTreeNvml
         );
         assert_eq!(
+            measurement.confidence,
+            crate::engine::MeasurementConfidence::Low,
+            "the tree sum is a footprint read from outside the engine: Low confidence"
+        );
+        assert_eq!(
             total_gib, 72.0,
             "the message carries the live witness card total"
         );
@@ -3641,6 +3646,7 @@ mod tests {
                 gpu_gib: 67.0,
                 ram_gib: None,
                 source: crate::engine::MeasurementSource::EngineStatus,
+                confidence: crate::engine::MeasurementConfidence::High,
             },
         );
         let entry = &state.catalog[0];
@@ -3714,6 +3720,7 @@ mod tests {
                 gpu_gib: 30.0,
                 ram_gib: None,
                 source: crate::engine::MeasurementSource::ProcessTreeNvml,
+                confidence: crate::engine::MeasurementConfidence::Low,
             },
         );
         let entry = &state.catalog[0];
@@ -3763,6 +3770,7 @@ mod tests {
             gpu_gib,
             ram_gib: None,
             source: crate::engine::MeasurementSource::EngineStatus,
+            confidence: crate::engine::MeasurementConfidence::High,
         };
         state.process_measurement("nm", &ticket, measurement(-5.0));
         state.process_measurement("nm", &ticket, measurement(80.0));
@@ -4737,6 +4745,7 @@ mod tests {
                 gpu_gib: 67.8,
                 ram_gib: None,
                 source: crate::engine::MeasurementSource::EngineStatus,
+                confidence: crate::engine::MeasurementConfidence::High,
             },
         );
         assert_eq!(
@@ -4755,6 +4764,7 @@ mod tests {
                 gpu_gib: 30.0,
                 ram_gib: None,
                 source: crate::engine::MeasurementSource::EngineStatus,
+                confidence: crate::engine::MeasurementConfidence::High,
             },
         );
         assert_eq!(
@@ -4958,14 +4968,19 @@ mod tests {
         }
         let landing = next_report(&mut rx).await;
         assert_eq!(
-            (landing.gpu_gib, landing.source),
-            (30.0, crate::engine::MeasurementSource::ProcessTreeNvml),
-            "the landing is the tree sum"
+            (landing.gpu_gib, landing.source, landing.confidence),
+            (
+                30.0,
+                crate::engine::MeasurementSource::ProcessTreeNvml,
+                crate::engine::MeasurementConfidence::Low,
+            ),
+            "the landing is the tree sum: a footprint read, not the engine's word"
         );
         let upgrade = next_report(&mut rx).await;
         assert!(
             (upgrade.gpu_gib - 34.0).abs() < 1e-6
-                && upgrade.source == crate::engine::MeasurementSource::EngineStatus,
+                && upgrade.source == crate::engine::MeasurementSource::EngineStatus
+                && upgrade.confidence == crate::engine::MeasurementConfidence::High,
             "the first live status answer supersedes the stand-in reading: {upgrade:?}"
         );
         sampler.abort();
@@ -5003,6 +5018,7 @@ mod tests {
                 gpu_gib: 67.8,
                 ram_gib: None,
                 source: crate::engine::MeasurementSource::EngineStatus,
+                confidence: crate::engine::MeasurementConfidence::High,
             },
         );
         let entry = &state.catalog[0];
@@ -5055,6 +5071,7 @@ mod tests {
                 gpu_gib: 67.8,
                 ram_gib: None,
                 source: crate::engine::MeasurementSource::EngineStatus,
+                confidence: crate::engine::MeasurementConfidence::High,
             },
         );
         assert_eq!(
@@ -5347,6 +5364,7 @@ mod tests {
                 gpu_gib: 70.4,
                 ram_gib: None,
                 source: crate::engine::MeasurementSource::EngineStatus,
+                confidence: crate::engine::MeasurementConfidence::High,
             },
         );
         assert_eq!(
@@ -5422,6 +5440,7 @@ mod tests {
                 gpu_gib: 67.4,
                 ram_gib: None,
                 source: crate::engine::MeasurementSource::EngineStatus,
+                confidence: crate::engine::MeasurementConfidence::High,
             },
         );
         assert_eq!(state.snapshot().slots[0].need_gib, Some(67.4));

@@ -370,18 +370,36 @@ pub struct Spawned {
 /// trusted, and provenance is decided at the source, never upgraded post-hoc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MeasurementSource {
-    /// The engine's own status endpoint answered with a footprint figure
-    /// (basalt `/v1/status`, strata `/status`): the engine speaking about
-    /// itself, the process-engine analog of ninfer's `engine_report`. It
-    /// books as `EngineReport`-class trust above the declared floor (the
+    /// The engine's own `/metrics` engine block answered with a footprint
+    /// figure (the 2026-11-04 capture: `/status` is liveness only and
+    /// `/v1/status` reports none): the engine speaking about itself, the
+    /// process-engine analog of ninfer's `engine_report`. It books as
+    /// `EngineReport`-class trust above the declared floor (the
     /// 2026-11-04 ruling extends the amended-15(ii) max truth to it).
     EngineStatus,
-    /// The status endpoint refused, and the witness attributed concrete
-    /// bytes to the engine's pid plus its direct children (one Toolhelp32
-    /// generation: strata.exe and its `strata-vision` child). A footprint of
-    /// this launch, folded without averaging, persisted as the existing
-    /// `per_process` provenance.
+    /// The metrics endpoint refused, and the witness attributed concrete
+    /// bytes to the engine pid plus all its descendants (Toolhelp32 walk:
+    /// python -> python -> `strata.exe` and its `strata-vision` child). A
+    /// footprint of this launch, folded without averaging, persisted as the
+    /// existing `per_process` provenance.
     ProcessTreeNvml,
+}
+
+/// How much trust the harness places in a measured figure
+/// (`TASK-ENGINE-MEASUREMENT` acceptance 1: the report carries source AND
+/// confidence). The class is minted at the source together with
+/// [`MeasurementSource`] and never re-decided downstream — the same doctrine
+/// 12 rule that keeps provenance from being upgraded post-hoc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeasurementConfidence {
+    /// The engine's own status/metrics word (`EngineStatus`): the engine
+    /// speaking about itself, the process-engine analog of ninfer's
+    /// `engine_report`.
+    High,
+    /// The driver's per-process sum over the harness-owned tree
+    /// (`ProcessTreeNvml`): a footprint read from outside the engine, never
+    /// the engine's own word.
+    Low,
 }
 
 /// One measured memory footprint of a process engine
@@ -402,6 +420,12 @@ pub(crate) struct EngineMeasurement {
     /// Which source produced `gpu_gib` — the provenance the fold stamps
     /// (doctrine 12).
     pub source: MeasurementSource,
+    /// How trustworthy the figure is for its source ([`MeasurementConfidence`]):
+    /// `High` for the engine's own status/metrics word, `Low` for the
+    /// driver's per-process sum over the harness-owned tree. Minted at the
+    /// source together with `source`, reported with it, never re-decided
+    /// downstream.
+    pub confidence: MeasurementConfidence,
 }
 
 /// Process-layer operations, driven by the scheduler actor but never executed inline

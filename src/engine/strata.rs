@@ -991,6 +991,7 @@ pub(crate) fn measurement_from_metrics(
         gpu_gib: sum_mib / 1024.0,
         ram_gib: None,
         source: crate::engine::MeasurementSource::EngineStatus,
+        confidence: crate::engine::MeasurementConfidence::High,
     })
 }
 
@@ -1607,6 +1608,11 @@ mod tests {
             measurement.source,
             crate::engine::MeasurementSource::EngineStatus
         );
+        assert_eq!(
+            measurement.confidence,
+            crate::engine::MeasurementConfidence::High,
+            "the engine's own metrics word books with High confidence"
+        );
         assert_eq!(measurement.ram_gib, None);
         let components = (59_832.0 + 1_536.0 + 0.0) / 1024.0;
         assert!(
@@ -1678,6 +1684,10 @@ mod tests {
         assert_eq!(
             measurement.source,
             crate::engine::MeasurementSource::EngineStatus
+        );
+        assert_eq!(
+            measurement.confidence,
+            crate::engine::MeasurementConfidence::High
         );
         assert!(
             (measurement.gpu_gib - (61_368.0 / 1024.0)).abs() < 1e-9,

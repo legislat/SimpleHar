@@ -3,7 +3,7 @@
 //! container report, and the failed-launch log snapshot. The state and its
 //! fields stay owned by `mod.rs`.
 
-use crate::engine::{EngineMeasurement, EngineRuntime, MeasurementSource};
+use crate::engine::{EngineMeasurement, EngineRuntime, MeasurementConfidence, MeasurementSource};
 use crate::ownership::SpawnTicket;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -215,6 +215,7 @@ impl ActorState {
                     gpu_gib: own,
                     ram_gib: None,
                     source: MeasurementSource::ProcessTreeNvml,
+                    confidence: MeasurementConfidence::Low,
                 }
             }
         };
@@ -241,6 +242,7 @@ impl ActorState {
             engine = %ctx.engine,
             gpu_gib = measurement.gpu_gib,
             source = ?measurement.source,
+            confidence = ?measurement.confidence,
             "process engine measurement landed"
         );
         Some(rounded)

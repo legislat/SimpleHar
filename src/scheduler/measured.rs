@@ -646,6 +646,8 @@ impl ActorState {
         if !self.serving_uncontested(model, ticket) {
             tracing::warn!(
                 model,
+                source = ?measurement.source,
+                confidence = ?measurement.confidence,
                 "process measurement dropped: another spawn is in flight and this reading lost its uncontested window"
             );
             return;
@@ -655,6 +657,8 @@ impl ActorState {
                 model,
                 gpu_gib = measurement.gpu_gib,
                 total_gib,
+                source = ?measurement.source,
+                confidence = ?measurement.confidence,
                 "process measurement refused: the figure is nonsense or sub-quantum for this card"
             );
             return;
