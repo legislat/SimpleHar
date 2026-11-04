@@ -41,6 +41,66 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Version-agnostic "decrement if positive" shared by the mock's atomic counters.
+/// `Atomic::fetch_update` is a hard deprecation warning on the newer stable
+/// toolchain (CI), renamed to `try_update`, which does not exist on the local
+/// rustc 1.98.1 (local gate); a `compare_exchange` retry loop compiles and
+/// behaves identically on both. Semantics match the replaced
+/// `fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))` exactly: SeqCst on
+/// every access, a counter already at zero is left alone (no underflow), and
+/// the return value says whether the decrement landed (the old `.is_ok()`).
+fn decrement_if_positive<C: Decrementable>(counter: &C) -> bool {
+    let mut current = counter.load_seq();
+    while current > 0 {
+        match counter.cas_seq(current, current - 1) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
+/// The SeqCst load and compare-and-swap [`decrement_if_positive`] needs,
+/// narrowed from the two atomic widths the mock counters use.
+trait Decrementable {
+    fn load_seq(&self) -> usize;
+    fn cas_seq(&self, current: usize, next: usize) -> Result<usize, usize>;
+}
+
+impl<C: Decrementable + ?Sized> Decrementable for Arc<C> {
+    fn load_seq(&self) -> usize {
+        (**self).load_seq()
+    }
+    fn cas_seq(&self, current: usize, next: usize) -> Result<usize, usize> {
+        (**self).cas_seq(current, next)
+    }
+}
+
+impl Decrementable for AtomicUsize {
+    fn load_seq(&self) -> usize {
+        self.load(Ordering::SeqCst)
+    }
+    fn cas_seq(&self, current: usize, next: usize) -> Result<usize, usize> {
+        self.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+    }
+}
+
+impl Decrementable for AtomicU32 {
+    fn load_seq(&self) -> usize {
+        self.load(Ordering::SeqCst) as usize
+    }
+    fn cas_seq(&self, current: usize, next: usize) -> Result<usize, usize> {
+        self.compare_exchange(
+            current as u32,
+            next as u32,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .map(|observed| observed as usize)
+        .map_err(|observed| observed as usize)
+    }
+}
+
 /// How a mock engine behaves once started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockMode {
@@ -149,11 +209,8 @@ struct MockState {
 }
 
 async fn models(State(state): State<MockState>) -> axum::response::Response {
-    let misses_discovery = state.mode == MockMode::NeverDiscover
-        || state
-            .discover_failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
+    let misses_discovery =
+        state.mode == MockMode::NeverDiscover || decrement_if_positive(&state.discover_failures);
     if misses_discovery {
         // The silent engine: `/v1/models` answers nothing usable, so discovery
         // yields `None` and the proxy must fall back to the harness name.
@@ -655,12 +712,7 @@ impl EngineRuntime for MockRuntime {
                 .lock()
                 .expect("hold ports lock")
                 .contains(&ticket.port);
-        let holds_one = held_by_target
-            || (holdkill
-                && self
-                    .kill_holds
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok());
+        let holds_one = held_by_target || (holdkill && decrement_if_positive(&self.kill_holds));
         if holds_one {
             // RAII: the entry is dropped from `held_kills` when the kill proceeds OR
             // when the product's reap deadline expires and this whole future is
