@@ -10,13 +10,18 @@ review_trigger: release
 
 # Changelog
 
-Up: `docs/DOCS_README.md`. Release history of SimpleHar SE. The format follows Keep
-a Changelog. Versions follow Semantic Versioning.
+Up: `docs/DOCS_README.md`. Release history of SimpleHarn. Older entries keep the product
+names they shipped with. The format follows Keep a Changelog. Versions follow Semantic
+Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## Unreleased
+
+- Renamed the project and binary to SimpleHarn; the config file is now
+  simpleharn.json; the SIMPLEHAR_TOKEN/SIMPLEHAR_CONFIG names still work with a
+  deprecation warning. No behavior change.
 
 ## v1.1.3 - 2026-11-04
 
@@ -30,8 +35,10 @@ built 2026-11-04, SHA256
   harness reads the footprint from the engine's own status snapshot (`/v1/status`
   for Basalt, `/status` for Strata) and stamps it `engine_status`. Above the
   declared `vram_gb` the measured figure books instead of it; the declared
-  value stays the floor. Capture of the status bodies on real hardware is
-  still pending.
+  value stays the floor. The status bodies for Strata and Basalt were later
+  captured on real hardware (evidence layer). Strata's automatic
+  `engine_status` booking is live-verified (59.8 GiB, High). Basalt's
+  automatic booking verification is still owed.
 - A process engine that answers no status endpoint is measured from the
   witness over its own process tree: the engine's pid plus its direct
   children. That figure books as `per_process`. A `total_diff` figure stays

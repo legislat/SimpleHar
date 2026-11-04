@@ -1,6 +1,6 @@
 # examples
 
-Model-row templates for SimpleHar SE. They are not config. Copy one file
+Model-row templates for SimpleHarn. They are not config. Copy one file
 into the `ModelConf` folder beside the exe, then edit it.
 
 Two groups:

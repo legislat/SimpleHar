@@ -1,5 +1,5 @@
 ---
-title: SimpleHar SE user guide
+title: SimpleHarn user guide
 owner: operator
 status: active
 audience: [user, contributor]
@@ -8,15 +8,15 @@ last_reviewed: 2026-11-04
 review_trigger: behavior-change, release
 ---
 
-# SimpleHar SE
+# SimpleHarn
 
 [![CI](https://img.shields.io/github/actions/workflow/status/legislat/SimpleHar/ci.yml?branch=main)](https://github.com/legislat/SimpleHar/actions/workflows/ci.yml)
 
-SimpleHar SE is a Windows tray harness for local LLM inference. It runs several inference
+SimpleHarn is a Windows tray harness for local LLM inference. It runs several inference
 engines on one GPU behind one OpenAI-compatible API. One swap scheduler is the only writer
 of scheduler state. It admits every model load against the memory the card itself reports,
-and it refuses to overcommit. The product name is SimpleHar SE; the repository is named
-SimpleHar.
+and it refuses to overcommit. The product name is SimpleHarn; the repository keeps its
+current name until the repository rename lands as a separate step.
 
 Current release: **v1.1.3**. Windows 10/11, one NVIDIA GPU, single user.
 Prebuilt binaries: see the GitHub Releases page of this repository.
@@ -33,8 +33,8 @@ blockers and the numbers on every refusal.
 
 The `llama` path (llama.cpp) works on any machine that can run `llama-server.exe`. The
 `strata`, `basalt`, and `ninfer` paths are supported for this operator's own setup. They
-may not fit other machines. Compared with llama-swap, which also swaps models, SimpleHar
-SE adds a memory-accounting scheduler that refuses to overcommit. What this is not: it is
+may not fit other machines. Compared with llama-swap, which also swaps models, SimpleHarn
+adds a memory-accounting scheduler that refuses to overcommit. What this is not: it is
 not multi-user, it is not a router for remote or cloud engines, and it is not a replacement
 for llama-swap. It runs and supervises local engines on one machine only.
 
@@ -69,10 +69,12 @@ cargo build --release
    The file stem (`example`) is the model identity. The schema is in
    [MODELS.md](docs/reference/MODELS.md).
 
-2. Run `target\release\simplehar-se.exe` with the `ModelConf` folder beside it. First run
+2. Run `target\release\simpleharn.exe` with the `ModelConf` folder beside it. First run
    probes the GPU total (NVML) and `llama-server.exe` on PATH. It writes the authoritative
-   `simplehar-se.json` beside the exe, and it binds loopback only. It never overwrites a
-   config file that already exists.
+   `simpleharn.json` beside the exe, and it binds loopback only. It never overwrites a
+   config file that already exists. An existing `simplehar-se.json` keeps working: the
+   harness loads it in place and writes back there; an older `simplehar.json` is copied
+   over once.
 
 3. Open `http://127.0.0.1:8708/`. Load one model on the page. The harness starts that
    model's engine. No engine runs before a load.
@@ -116,12 +118,13 @@ and Exit.
 
 ## Configuration
 
-The authoritative `simplehar-se.json` sits beside the exe; page edits persist to it. Core
+The authoritative `simpleharn.json` sits beside the exe; page edits persist to it. Core
 keys:
 
 - `internal_host`: bind address. Default `127.0.0.1`. Read Security before you change it.
 - `control_token`: when set, every route except the page assets requires it. The
-  `SIMPLEHAR_TOKEN` environment variable overrides it and keeps the secret out of the file.
+  `SIMPLEHARN_TOKEN` environment variable overrides it and keeps the secret out of the
+  file. The deprecated `SIMPLEHAR_TOKEN` spelling still works, with one logged warning.
 - `categories`: per-category id, port, slots, default model, and eviction.
 - `vram_total_gb`: admission ceiling. First run normally detects it from the card.
 - `modelconf_dir`: catalog directory. Default: a `ModelConf` folder beside the exe.
@@ -140,7 +143,7 @@ loaded. The control routes, memory provenance, and error codes are in
 
 ## Security
 
-The API is unauthenticated by default, and it binds to loopback. Set `SIMPLEHAR_TOKEN`
+The API is unauthenticated by default, and it binds to loopback. Set `SIMPLEHARN_TOKEN`
 (or `control_token`) before any non-loopback bind, and never expose the harness to a LAN
 without a token.
 

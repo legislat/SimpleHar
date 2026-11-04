@@ -19,8 +19,8 @@ model, and API reference tables live in `docs/reference/`.
 
 ## 1. System context
 
-- SimpleHar SE is a Windows tray harness: one Rust crate
-  (`simplehar-se`, `Cargo.toml`), one process, one NVIDIA GPU, several local
+- SimpleHarn is a Windows tray harness: one Rust crate
+  (`simpleharn`, `Cargo.toml`), one process, one NVIDIA GPU, several local
   LLM inference engines (`llama`, `strata`, `basalt`, `ninfer`, plus a
   test-only `mock`).
 - It owns engine processes as its children, swaps models between four
@@ -174,7 +174,7 @@ One harness process, one tokio runtime, plus OS-level children:
   (`python -m serve.server --engine strata` with forced `--host 127.0.0.1`
   and `--port`). The external `strata_config` mode is superseded: a row that
   declares it is refused at scan (`model/scan.rs`) and at the adapter
-  (`superseded_sentence`) naming `simplehar-se import strata <profile.json>`.
+  (`superseded_sentence`) naming `simpleharn import strata <profile.json>`.
   Readiness needs `/health` 200 and the JSON `loaded` flag (strata answers
   200 while weights stream).
 - `basalt` (`src/engine/basalt.rs`): native Windows engine with a Python
@@ -219,7 +219,7 @@ One harness process, one tokio runtime, plus OS-level children:
 - L1 import: engine-native artifacts (strata profile JSON, operator scripts)
   are copied in by an explicit operator verb, then forgotten. The one
   sanctioned reader is the import bridge (`src/import.rs`, `strata_yaml`;
-  CLI in `src/main.rs`): `simplehar-se import strata <profile.json>` emits a
+  CLI in `src/main.rs`): `simpleharn import strata <profile.json>` emits a
   yaml knob block and touches neither the row nor the profile. Harness-forced
   fields found in L1 are reported as dropped; the serve path never reads an
   L1 file.
@@ -233,13 +233,13 @@ One harness process, one tokio runtime, plus OS-level children:
   the harness launches only from L3 (rendered strata profile, rendered
   ninfer script, rendered llama argv). The invariant is byte-reproducibility
   from L2 + policy + L1 (see `docs/architecture/DOCTRINE.md` item 11).
-- Harness config: `src/config/mod.rs` (`AppConfig`, `simplehar-se.json`,
-  `SIMPLEHAR_CONFIG`-aware, shared `default_config_path`). A present-but-
+- Harness config: `src/config/mod.rs` (`AppConfig`, `simpleharn.json`,
+  `SIMPLEHARN_CONFIG`-aware, shared `default_config_path`). A present-but-
   invalid file fails boot per field; a missing file is materialized at first
   start by real probes (`src/config/firstrun.rs`, never overwriting an
   existing file). `AppConfig::port_claim` is the single port-namespace
   decision (DOCTRINE item 13). `control_token` is optional;
-  `SIMPLEHAR_TOKEN` beats it.
+  `SIMPLEHARN_TOKEN` beats it.
 
 ## 7. Public listeners and control surface
 
@@ -277,7 +277,7 @@ One harness process, one tokio runtime, plus OS-level children:
 | Module | Responsibility |
 |---|---|
 | `src/main.rs` | boot order, wiring, first-start bind supervisor, `import` CLI |
-| `src/config/` | typed `simplehar-se.json` schema, validation, `port_claim`, first-run probes (`firstrun.rs`) |
+| `src/config/` | typed `simpleharn.json` schema, validation, `port_claim`, first-run probes (`firstrun.rs`) |
 | `src/model/` | typed yaml rows (`mod.rs`), Fork-C scan (`scan.rs`), byte-preserving write-back (`writeback.rs`) |
 | `src/catalog.rs` | model identity and alias resolution |
 | `src/scheduler/` | single-writer actor and job state machine (`mod.rs`, `vocab.rs`, method-cluster child modules) |

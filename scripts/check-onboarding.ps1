@@ -30,7 +30,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $source ".git"))) {
   exit 1
 }
 
-$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("simplehar-onboarding-" + [guid]::NewGuid().ToString("N"))
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("simpleharn-onboarding-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 $clone = Join-Path $tempRoot "repo"
 

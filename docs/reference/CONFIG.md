@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [harness configuration keys, category eviction rules]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-04
 review_trigger: behavior-change, release
 ---
 
@@ -14,15 +14,21 @@ Up: `docs/DOCS_README.md`. This file owns the harness configuration keys and
 the category eviction rules. The category and port matrix itself lives in
 `README.md` (Categories and ports).
 
-## The config file: `simplehar-se.json`
+## The config file: `simpleharn.json`
 
 The file lives beside the executable. Override the path with the
-`SIMPLEHAR_CONFIG` environment variable. A file named by that variable is an
+`SIMPLEHARN_CONFIG` environment variable. The deprecated `SIMPLEHAR_CONFIG`
+and `SIMPLEHAR_TOKEN` spellings keep working as fallbacks, with one
+deprecation warning in the log; the `SIMPLEHARN_*` spelling wins when both
+are set. A file named by that variable is an
 instruction, not an absence: boot fails when it does not exist, and
 first-start creation never writes there. Delete the default file to have the
-next boot re-create it at the default path. A file named by `SIMPLEHAR_CONFIG`
-must exist. If a legacy `simplehar.json` sits
-beside the exe and no `simplehar-se.json` exists yet, the harness copies it
+next boot re-create it at the default path. A file named by `SIMPLEHARN_CONFIG`
+must exist. Auto-discovery order: `simpleharn.json`, then `simplehar-se.json`,
+then `simplehar.json`. An existing `simplehar-se.json` is loaded in place and
+write-back stays on that file, so a setup written under the old name keeps
+working after the rename. If a legacy `simplehar.json` sits
+beside the exe and neither newer name exists yet, the harness copies it
 over once and leaves the old file untouched for rollback. **The config file
 is authoritative.** A `default_model` change made on the page persists back
 to the exact file boot read, through an atomic rewrite. The harness completes
@@ -34,7 +40,7 @@ it never applies silent defaults.
 | Field | Default | Meaning |
 |---|---|---|
 | `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN. Set `control_token` first; see the Security note in `README.md`. |
-| `control_token` | *unset* | When set, every route except the page assets requires it, on `X-Har-Token` or `Authorization: Bearer`. `SIMPLEHAR_TOKEN` overrides it and keeps the secret out of the file. |
+| `control_token` | *unset* | When set, every route except the page assets requires it, on `X-Har-Token` or `Authorization: Bearer`. `SIMPLEHARN_TOKEN` overrides it and keeps the secret out of the file. |
 | `categories` | four defaults | Per-category `id`, `public_port`, `max_models` (1-6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), and `engine_ports` (empty = automatic plan; a non-empty list must name exactly `max_models` ports). An omitted `evictable_by` and an empty list mean the same: nobody may evict that category. Boot names every non-WORK category left with no evictor. |
 | `vram_total_gb` | `72.0` | Admission ceiling. First start normally **detects it** (NVML total, floored to 0.1 GiB). This default survives only a failed card probe. Every boot warns when the stored value and the card disagree beyond `witness_tolerance_gb`. It never repairs the value. |
 | `vram_reserve_gb` | `2.0` | A margin that admission never uses. |
@@ -116,4 +122,4 @@ one-way hard filter: a category yields only to the categories that list it.
   `only WORK can evict RP`, or names a model inside its `min_turn` guard.
 
 The matrix is data, not code. Edit `categories[].evictable_by` in
-`simplehar-se.json` and restart to change who yields to whom.
+`simpleharn.json` and restart to change who yields to whom.

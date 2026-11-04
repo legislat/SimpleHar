@@ -3,14 +3,15 @@
 # inside -OutDir and never touches the repository or the source folder.
 #
 # The asset is the minimal public bundle (never the personal deploy
-# directory): simplehar-se.exe, LICENSE, README.md,
-# simplehar-se.example.json, PUBLICATION-SCRUB.md. SHA256SUMS.txt is
+# directory): simpleharn.exe, LICENSE, README.md,
+# simpleharn.example.json, PUBLICATION-SCRUB.md. SHA256SUMS.txt is
 # written beside the zip in -OutDir and covers the exe and the zip (a
 # file cannot carry the hash of the zip that contains it).
 #
 # Refusals (all hard FAIL):
 #   - the source dir (the exe's folder unless -SourceDir says otherwise)
-#     contains ModelConf, logs, simplehar-se.json, or START-NOTES.txt:
+#     contains ModelConf, logs, simpleharn.json, simplehar-se.json, or
+#     START-NOTES.txt:
 #     those are personal runtime files and stay local (PUBLICATION.md);
 #   - the exe hash differs from -ExpectedSha256 (the hash the changelog
 #     records for that tag);
@@ -57,7 +58,7 @@ if (-not $script:allPass) {
 }
 
 # 2. Refuse a personal deploy directory as the source.
-$forbidden = @('ModelConf', 'logs', 'simplehar-se.json', 'START-NOTES.txt')
+$forbidden = @('ModelConf', 'logs', 'simpleharn.json', 'simplehar-se.json', 'START-NOTES.txt')
 $found = @()
 foreach ($name in $forbidden) {
   if (Test-Path -LiteralPath (Join-Path $SourceDir $name)) { $found += $name }
@@ -84,7 +85,7 @@ if (-not $script:allPass) {
 # 4. Stage the bundle (writes only inside -OutDir).
 $staged = Join-Path $OutDir ("staged-" + $Version)
 New-Item -ItemType Directory -Force -Path $staged | Out-Null
-Copy-Item -LiteralPath $exeFull -Destination (Join-Path $staged 'simplehar-se.exe') -Force
+Copy-Item -LiteralPath $exeFull -Destination (Join-Path $staged 'simpleharn.exe') -Force
 Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $staged 'LICENSE') -Force
 Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $staged 'README.md') -Force
 Report $true "staged exe, LICENSE, README.md"
@@ -102,21 +103,22 @@ $exampleJson = @'
   ]
 }
 '@
-[IO.File]::WriteAllText((Join-Path $staged 'simplehar-se.example.json'), $exampleJson)
+[IO.File]::WriteAllText((Join-Path $staged 'simpleharn.example.json'), $exampleJson)
 
 $scrub = @'
 # Publication scrub record - <VERSION> public asset
 
 Date: <DATE>. Built by scripts/make-public-asset.ps1 per docs/process/PUBLICATION.md.
 
-Bundle: simplehar-se.exe (SHA256 <EXESHA>), LICENSE, README.md,
-simplehar-se.example.json, this record. SHA256SUMS.txt ships beside the zip.
+Bundle: simpleharn.exe (SHA256 <EXESHA>), LICENSE, README.md,
+simpleharn.example.json, this record. SHA256SUMS.txt ships beside the zip.
 
 Included from the repository: README.md and LICENSE as tagged; the example
 config is a sanitized template written by the script (loopback 127.0.0.1,
 no control_token, no wsl_user, no model rows).
 
-Excluded by rule: ModelConf, logs, the deployment simplehar-se.json, and
+Excluded by rule: ModelConf, logs, the deployment config file
+(simpleharn.json, or the loaded simplehar-se.json), and
 START-NOTES.txt. These name personal paths and rows and stay local.
 
 Checks: the exe hash was compared against the changelog value for this
@@ -126,7 +128,7 @@ binary and is pinned by the recorded hash instead.
 '@
 $scrub = $scrub.Replace('<VERSION>', $Version).Replace('<DATE>', (Get-Date -Format 'yyyy-MM-dd')).Replace('<EXESHA>', $actualSha)
 [IO.File]::WriteAllText((Join-Path $staged 'PUBLICATION-SCRUB.md'), $scrub)
-Report $true "wrote simplehar-se.example.json and PUBLICATION-SCRUB.md"
+Report $true "wrote simpleharn.example.json and PUBLICATION-SCRUB.md"
 
 # 5. Machine-path scan over the staged text files (same blocklist and
 #    spirit as release-check.ps1 check 9; nothing here carries an
@@ -160,14 +162,14 @@ if (-not $script:allPass) {
 }
 
 # 6. Zip and sums.
-$zip = Join-Path $OutDir ("SimpleHar-SE-" + $Version + "-windows-x64.zip")
+$zip = Join-Path $OutDir ("SimpleHarn-" + $Version + "-windows-x64.zip")
 $zipFiles = Get-ChildItem -LiteralPath $staged -File | ForEach-Object { $_.FullName }
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 Compress-Archive -Path $zipFiles -DestinationPath $zip -CompressionLevel Optimal
 Report $true ("zipped to " + [IO.Path]::GetFileName($zip))
 
 $zipSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
-$sums = ("" + $actualSha + "  simplehar-se.exe`n" + $zipSha + "  " + [IO.Path]::GetFileName($zip) + "`n")
+$sums = ("" + $actualSha + "  simpleharn.exe`n" + $zipSha + "  " + [IO.Path]::GetFileName($zip) + "`n")
 [IO.File]::WriteAllText((Join-Path $OutDir 'SHA256SUMS.txt'), $sums)
 Report $true "wrote SHA256SUMS.txt (exe + zip)"
 

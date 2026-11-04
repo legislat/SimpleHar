@@ -6,7 +6,7 @@
 engine: ninfer
 category: AUX
 ninfer_image: ninfer:local
-ninfer_container: simplehar-example-box
+ninfer_container: simpleharn-example-box
 ninfer_model_name: Example-Artifact-Dir
 ninfer_artifact: example.ninfer
 ninfer_model_roots: /srv/models

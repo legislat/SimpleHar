@@ -17,16 +17,17 @@ rule. Do not invent a ruling here. Full rationale and tombstones live in
 non-ASCII punctuation in quotes is replaced with ASCII equivalents only.
 
 1. **Config file is king.** "Config file is king (read and write-back target
-   `AppConfig.source_path`, `SIMPLEHAR_CONFIG`-aware; SE's own
-   `simplehar-se.json`, legacy read-only (auto-discovery and migration only; an
-   explicitly selected `SIMPLEHAR_CONFIG` path is an operator instruction and the
+   `AppConfig.source_path`, `SIMPLEHARN_CONFIG`-aware; SimpleHarn's own
+   `simpleharn.json`, previous and legacy config names read-only-compatible
+   (auto-discovery and migration only; an
+   explicitly selected `SIMPLEHARN_CONFIG` path is an operator instruction and the
    write target, ruling 2026-11-03), one shared
-   `config::default_config_path()`)." `SIMPLEHAR_TOKEN` beats the file value.
+   `config::default_config_path()`)." `SIMPLEHARN_TOKEN` beats the file value.
    Consequence: page edits persist to the file boot read; an invalid file
    fails boot and is never silently defaulted.
 2. **External engines obey only harness-owned configuration.** "A child's
    whole config set - strata profile, ninfer autostart inputs, engine env -
-   lives under SE control (like `ModelConf/`), validated at scan/spawn; policy
+   lives under harness control (like `ModelConf/`), validated at scan/spawn; policy
    fields (`host`, `port`, key) harness-forced, never obeyed from engine-side
    files." Consequence: no engine-side file can open a bind, move a port, or
    set a key.
@@ -85,7 +86,7 @@ non-ASCII punctuation in quotes is replaced with ASCII equivalents only.
     `engine:` flip voids it). Consequence: admission books only trusted
     attributions, and the physical gate stopper stays the observed `used_gib`.
 13. **Container-internal ports are a third namespace (R10).** The container
-    inside is a third namespace; `ninfer_internal_port` defaults to the SE
+    inside is a third namespace; `ninfer_internal_port` defaults to the harness
     number 8808; "a row naming a `protected_ports`, public-listener or
     engine-plan number is refused at arm time (`AdmissionError::PortClaimed`)
     and named by the rescan"; `AppConfig::port_claim` is the single decision.

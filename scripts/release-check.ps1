@@ -14,11 +14,11 @@
 #   8. The webui status fixture quotes the same version as Cargo.toml (a bump
 #      that forgets the fixture pin ships a red test; v1.1.3 proved the gap).
 #   9. Public docs carry no machine paths (README.md, CHANGELOG.md,
-#      CONTRIBUTING.md, docs/**). The ban targets personal locations on the
-#      operator machine; documented engine defaults stay allowed (the llama.cpp
-#      install default). docs/maintenance/ holds frozen historical audit
-#      records, scanned at their intake, so they are exempt. Rule home:
-#      docs/process/GIT_WORKFLOW.md (release section).
+#      CONTRIBUTING.md, AGENTS.md, docs/**). The ban targets personal
+#      locations on the operator machine; documented engine defaults stay
+#      allowed (the llama.cpp install default). docs/maintenance/ holds frozen
+#      historical audit records, scanned at their intake, so they are exempt.
+#      Rule home: docs/process/GIT_WORKFLOW.md (release section).
 #
 # Exit 0 only when every check passes.
 
@@ -191,7 +191,7 @@ $personalPathPatterns = @(
   'SimpleHar-SE_release',
   'SimpleHar-SE_test'
 )
-$publicDocs = @('README.md', 'CHANGELOG.md', 'CONTRIBUTING.md')
+$publicDocs = @('README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'AGENTS.md')
 if (Test-Path 'docs') {
   # docs/maintenance/** holds frozen historical audit records (scanned at
   # their intake), so the live-doc ban does not rewrite them here.

@@ -104,7 +104,8 @@ own task file.
 The live layer is local-only. Back it up to a separate physical drive or network share. Do
 not use the same physical device as the working tree.
 
-- Back up `HANDOFF.md`, `handoff/`, `ModelConf/`, and the active `simplehar-se.json`.
+- Back up `HANDOFF.md`, `handoff/`, `ModelConf/`, and the active config file
+  (`simpleharn.json`, or the legacy name it loaded).
 - Exclude `target/`, `logs/`, build artifacts, and the frozen `archive/` and
   `base-archive/` trees. The frozen trees are backed up once or preserved in Git history.
 - Cadence: at each handoff checkpoint: before ending a session, before a card window, and

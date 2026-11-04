@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: agent
 source_of_truth_for: [agent behavior, routing]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-04
 review_trigger: behavior-change, release, new-decision
 ---
 
@@ -16,7 +16,7 @@ pointed to, never copied here.
 
 ## 1. Project orientation
 
-- SimpleHar SE is a Windows tray harness (single Rust crate) that supervises local LLM
+- SimpleHarn is a Windows tray harness (single Rust crate) that supervises local LLM
   inference engines (llama, strata, basalt, ninfer, mock) on one GPU.
 - A swap scheduler is the single writer: it admits and evicts engine jobs against live
   memory, so loads and unloads serialize through one decision point.
@@ -122,7 +122,7 @@ Routine code changes never require `DESIGN.md`.
   Never stop, restart, or replace it, never kill its engine children, never start a second
   harness.
 - Protected ports: never bind, stop, or unload a listener on the protected ports named in
-  `HANDOFF.md`. SE test runs use only the SE port set named there.
+  `HANDOFF.md`. Harness test runs use only the dedicated test port set named there.
 - Card window: model loads and card tests happen only in an operator-freed window, never
   in a served session. Cardless work (fmt, clippy, `cargo test`, DOM stub) stays allowed.
 - Single instance: exactly one harness instance per machine.
