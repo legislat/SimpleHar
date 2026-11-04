@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [ModelConf schema, engine-specific model keys]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-04
 review_trigger: behavior-change, release
 ---
 
@@ -40,7 +40,7 @@ edit never leaves a half-written model file in use.
 | `launch_only_with_at_least_vram_free` | GiB. The harness refuses the load **before spawn** unless free VRAM reaches this floor. The reserve is deducted. Free VRAM that meets the floor counts only what the harness itself can make free: its own releasable residents. Foreign occupancy never counts toward the floor. When no release the harness can perform would reach the floor, the refusal says so: "No releases allow for the VRAM floor. Check foreign residents." This is the thrash guard for large and greedy quants. Greedy models without this key inherit `greedy_launch_min_free_gb`. Set `0` on a model to opt out. |
 | `cpu_offload` | `true`/`1`/`yes`/`on` forces `-ngl 0` (**llama only**). Other engines report an `inert_key` hint, and the page offers no CPU control for them. |
 | `serve_model` | The expected engine-reported id. A mismatch records a warning; the harness never trusts it. |
-| `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served: `measured_gb` is the high end and `measured_gb_min` the low end. The harness writes them back after a load. When `vram_gb` is absent, admission books `measured_gb`. The `measured_attribution` stamp decides whose number it is, and only these attributions book: `engine_report` (the container's own startup reservation) and `per_process` (the witness attributed the bytes to this engine's process). A `total_diff` figure (a free-memory delta) displays but never books. An **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure, whatever the provenance, because it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes. The identity is the profile name, plus the resolved `kv` for an override line. An edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, because the reservation follows the KV pool. The write-back also records `measured_offload`, the `cpu_offload` state the pair was taken under; a later flip voids the pair. |
+| `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served: `measured_gb` is the high end and `measured_gb_min` the low end. The harness writes them back after a load. When `vram_gb` is absent, admission books `measured_gb`. The `measured_attribution` stamp decides whose number it is, and only these attributions book: `engine_report` (the container's own startup reservation), `engine_status` (a process engine's own status endpoint stated the footprint), and `per_process` (the witness attributed the bytes to the engine's own process tree). A `total_diff` figure (a free-memory delta) displays but never books. An **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure, whatever the provenance, because it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes. The identity is the profile name, plus the resolved `kv` for an override line. An edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, because the reservation follows the KV pool. The write-back also records `measured_offload`, the `cpu_offload` state the pair was taken under; a later flip voids the pair. |
 | `is_embedding_model` | A truthy value forces category `EMB`. It conflicts with another explicit category. |
 | `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. |
 | `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. For the basalt 482B class, `load_timeout: 1200` is the recommended starting point. |
@@ -96,7 +96,11 @@ silently, with no warning: `bak` is the forensic backup key, and a retired
 
 **Cost sources** decide which number binds admission, and the strongest
 source wins. The sources are an `engine_report` (the ninfer container's own
-startup reservation) and, for llama, a **Fit** projection. When
+startup reservation), an `engine_status` figure (a process engine's own status
+endpoint: see the Strata and Basalt sections), and, for llama, a **Fit**
+projection. A guarded `engine_report` or `engine_status` figure above the
+declared `vram_gb` books instead of it; the declared value stays the floor.
+When
 `engines.llama.fit_probe` is on, the harness runs the engine's own
 `llama-fit-params` calculator before spawn and books that figure when it
 exceeds the declared `vram_gb`. A Fit figure is **never persisted**, so the
@@ -122,6 +126,21 @@ therefore carries no `host`, `port`, or key at all. Readiness needs `/health`
 200 **and** the JSON `loaded` flag not being `false`, because strata answers
 200 while weights stream in. A strata engine starts only when you load it,
 or when a client request names it. Booting the harness starts nothing.
+
+Measurement: after readiness the harness reads `info.vram` from the engine's
+own `GET /status` snapshot. It books `expert_cache_mib + reserve_mib` as the
+footprint: the bytes the engine took, plus the headroom its fill policy
+keeps. The figure carries the `engine_status` stamp. Above the declared
+`vram_gb` it books instead of it; the declared value stays the floor. The
+harness keeps polling that status while the engine serves, and it re-books
+the resident when an expert-cache move crosses the hysteresis band. With no
+status answer, the witness sums the bytes of the `strata.exe` engine plus
+its direct `strata-vision` child and books the `per_process` tree sum. A
+free-memory `total_diff` reading displays and never books. The repo holds no
+captured strata status body: the field names are recorded only for the
+sibling engine's status snapshot. The card run must capture the real body,
+and a differing field set is fixed from that capture, never from a widened
+guess.
 
 The external-profile mode is superseded (operator ruling 2026-11-02, row
 19): a row that declares `strata_config` is refused at scan. The command
@@ -168,12 +187,22 @@ report the `serve_model` alias. For the 482B class, `load_timeout: 1200` is
 the recommended starting point for the load floor. A basalt engine starts
 only when you load it; booting the harness starts nothing.
 
-Cost is the declared `vram_gb` with `cost: fixed`. Both are required: the
-engine reports no projection, so there is no Fit, and a `.basalt` pack's
-bytes never feed the GGUF size estimate. The direct child is the Python
-server, so the witness attributes bytes to that child; the engine grandchild
-appears only as a display-only `total_diff` delta, and that figure never
-books. Set `launch_only_with_at_least_vram_free` to the declared cost:
+Cost starts as the declared `vram_gb` with `cost: fixed`. Both are required:
+a `.basalt` pack's bytes never feed the GGUF size estimate, and the engine
+offers no Fit projection. After readiness the harness reads
+`engine.info.vram` from the engine's own `GET /v1/status` snapshot. It books
+`expert_cache_mib + reserve_mib` as the footprint: the bytes the engine took,
+plus the slab its reserve policy keeps. The figure carries the
+`engine_status` stamp. Above the declared `vram_gb` it books instead of it;
+the declared value stays the floor. The harness keeps polling that status
+while the engine serves, and it re-books the resident when an expert-cache
+move crosses the hysteresis band. With no status answer, the witness sums
+the bytes of the engine's own process tree - the Python server plus its
+direct children - and books the `per_process` tree sum. The Python parent's
+per-process figure alone never books. A free-memory `total_diff` reading
+displays and never books. The evidence holds no raw status body; the card
+run must capture the real one, and a differing field set is fixed from that
+capture. Set `launch_only_with_at_least_vram_free` to the declared cost:
 Basalt needs the card, and a loaded stranger must refuse before spawn.
 
 Kill: the harness job object terminates the Python server. Basalt's server

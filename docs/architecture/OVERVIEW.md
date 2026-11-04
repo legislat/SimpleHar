@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [contributor, agent, architect]
 source_of_truth_for: [current architecture]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-04
 review_trigger: behavior-change, release, new-decision
 ---
 
@@ -116,11 +116,20 @@ One harness process, one tokio runtime, plus OS-level children:
   foreign residents." (in `budget.rs`). Foreign occupancy never counts
   toward meeting a floor.
 - Cost sources (`model::CostSource`, `MeasuredAttribution`): a measured
-  figure books only for trusted provenance (`engine_report`, `per_process`);
-  a `total_diff` figure displays but never books (`MeasuredAttribution::
-  bookable`). The llama Fit class (`src/engine/fit.rs`) asks the engine's own
-  `llama-fit-params` before spawn; a Fit figure is never persisted and is
-  recomputed per proven change; the scheduler owns the cache.
+  figure books only for trusted provenance (`engine_report`, `engine_status`,
+  `per_process`); a `total_diff` figure displays but never books
+  (`MeasuredAttribution::bookable`). The llama Fit class (`src/engine/fit.rs`)
+  asks the engine's own `llama-fit-params` before spawn; a Fit figure is never
+  persisted and is recomputed per proven change; the scheduler owns the cache.
+- Process-engine measurement (`basalt`, `strata`; `TASK-ENGINE-MEASUREMENT`):
+  at readiness the sampler reads the engine's own status snapshot and books
+  that footprint as `engine_status`, the process-engine analog of
+  `engine_report`. With no status answer, the witness sums the bytes of the
+  engine's pid plus its direct children and books the `per_process` tree sum.
+  An elastic resident keeps polling its status and re-books under the
+  down-band hysteresis (`occupant.rs`). A fold or a cost-only rescan re-books
+  the slot occupant without a reload; an amber or greedy-launched resident is
+  never re-booked.
 - Fold gate: `budget::grade_card_occupancy` grades the movement of
   unaccounted memory across a serve; a `ForeignDominated` window mints no
   `total_diff` pair.

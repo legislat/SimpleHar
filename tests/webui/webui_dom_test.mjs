@@ -709,7 +709,8 @@ const driver = `
   // the rendering moves with each flip: Fit amber -> green on the validated
   // verdict, the basis flip moving the cell to the booked measured figure and
   // shedding the calculator sentence, the attribution label riding ONLY the
-  // server's engine_report verdict, and a declared basis owning neither
+  // engine-spoken verdicts (the 2026-11-04 engine_report/engine_status pair,
+  // never the witness per_process sum), and a declared basis owning neither
   // sentence. A render keyed on the row id or a fixture string instead of the
   // verdict fields fails here on the second flip.
   {
@@ -744,6 +745,10 @@ const driver = `
     const measured = trackCost();
     trackState({ cost_basis: "measured", measured_attribution: "engine_report" });
     const reported = trackCost();
+    trackState({ cost_basis: "measured", measured_attribution: "engine_status" });
+    const statusReported = trackCost();
+    trackState({ cost_basis: "measured", measured_attribution: "per_process" });
+    const treeSum = trackCost();
     trackState({ cost_basis: "declared", measured_attribution: null });
     const declared = trackCost();
     check("the cost cell follows the fit verdict flip on one row",
@@ -759,11 +764,14 @@ const driver = `
         measured.title.includes("measured 9.5 GiB") &&
         !measured.title.includes("engine calculator"),
       JSON.stringify(measured));
-    check("the attribution label rides only the server's engine_report verdict",
+    check("the attribution label rides only the engine-spoken verdicts",
       !measured.title.includes("(engine-reported)") &&
         reported.text === "9.5 GiB" &&
-        reported.title.includes("(engine-reported)"),
-      JSON.stringify([measured, reported]));
+        reported.title.includes("(engine-reported)") &&
+        statusReported.text === "9.5 GiB" &&
+        statusReported.title.includes("(engine-reported)") &&
+        !treeSum.title.includes("(engine-reported)"),
+      JSON.stringify([measured, reported, statusReported, treeSum]));
     check("a declared basis owns neither the fit nor the measured sentence",
       declared.text === "12 GiB" && declared.cls.includes("sh-cost-unchecked") &&
         declared.title.includes("declared 12 GiB") &&

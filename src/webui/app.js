@@ -637,8 +637,14 @@ function modelRow(status, model, category) {
         : model.measured_gb.toFixed(1);
     costText = `${range} GiB`;
     costChecked = true;
+    // The tag marks the engine's own word: the container reservation
+    // (`engine_report`) and the process-engine status figure (`engine_status`)
+    // share it; a witness `per_process` sum is not the engine speaking.
     costTitle = `measured ${range} GiB · the gate books it` +
-      (model.measured_attribution === "engine_report" ? " (engine-reported)" : "") +
+      (model.measured_attribution === "engine_report" ||
+      model.measured_attribution === "engine_status"
+        ? " (engine-reported)"
+        : "") +
       (model.cost === "greedy" ? " (greedy)" : "");
   } else if (model.cost === "greedy") {
     costChecked = false;

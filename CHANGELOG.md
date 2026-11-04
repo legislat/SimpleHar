@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, maintainer]
 source_of_truth_for: [release history]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-04
 review_trigger: release
 ---
 
@@ -15,6 +15,33 @@ a Changelog. Versions follow Semantic Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
+
+## Unreleased
+
+### Added
+
+- Strata and Basalt book a measured memory footprint. After readiness the
+  harness reads the footprint from the engine's own status snapshot (`/v1/status`
+  for Basalt, `/status` for Strata) and stamps it `engine_status`. Above the
+  declared `vram_gb` the measured figure books instead of it; the declared
+  value stays the floor. The card-window duty to capture the real status
+  bodies stays open.
+- A process engine that answers no status endpoint is measured from the
+  witness over its own process tree: the engine's pid plus its direct
+  children. That figure books as `per_process`. A `total_diff` figure stays
+  display-only.
+- Elastic Basalt and Strata residents keep polling their status while
+  serving. The harness re-books the resident when the footprint rises, or
+  when it falls past the hysteresis band (1 GiB or 1 percent of the card).
+
+### Changed
+
+- A measured fold re-books the loaded resident's slot booking, so same-slot
+  release credit and the launch-floor guard read the measured figure. An
+  amber or greedy-launched resident is never re-booked.
+- A rescan that moves only cost figures re-books the loaded resident without
+  a reload. A flag change still marks the resident `stale_config` and needs
+  a reload.
 
 ## v1.1.2 - 2026-11-03
 

@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [architect, agent]
 source_of_truth_for: [settled and deferred decisions]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-04
 review_trigger: new-decision, release
 ---
 
@@ -522,3 +522,22 @@ recorded here so dated references to ARCHIVED still resolve:
   Deferred decisions live in this ledger; the register header owns the pointer rule. Aging
   is reviewed at cycle start from task-file dates.
   | 2026-11-03 | `TASK-DOCS-MAINTENANCE`
+
+- **Implemented** RULED 2026-11-04 (TASK-ENGINE-MEASUREMENT phases 1-4, operator approved): a process
+  engine's own status figure books as the new `engine_status` provenance - `EngineReport`-class max
+  truth above the declared floor, valid without a profile stamp (profile identity stays ninfer-only),
+  voided by an `engine:` flip onto ninfer; `engine_report` itself stays ninfer-only. The witness
+  process-tree sum (engine pid plus its direct children) books as the existing `per_process`; a
+  `total_diff` figure stays display-only. A measured fold re-books the slot occupant through the one
+  `booking_need` decision; an amber (`stale_config`) or greedy-launched resident is never re-booked.
+  A rescan that moves ONLY cost figures re-books the loaded resident without a reload; a flag move
+  keeps `stale_config` and the unload + reload apply gesture. Elastic residents keep polling their
+  own status while serving and re-book under the down-band hysteresis. The card leg - capture of the
+  real status bodies - stays owed to an operator-freed window.
+  | 2026-11-04 | `e22695b`..`11f76f4`
+
+- **Accepted** F-EM-402 and F-EM-404 as LOWs by operator-delegated orchestrator ruling
+  2026-11-04: F-EM-402 - a floor-clamped elastic resident's up-churn persists its measured pair while
+  the floor-clamped booking stands; F-EM-404 - a mid-swap rescan re-book is conservative and the
+  plan-time ledger terms of the in-flight swap stay frozen.
+  | 2026-11-04 | `11f76f4`
