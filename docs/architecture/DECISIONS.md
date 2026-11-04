@@ -577,3 +577,10 @@ recorded here so dated references to ARCHIVED still resolve:
   (the form decoder is lossy and the map type accepts every pair); the handler keeps
   the typed-400 arm defensively and the test pins the honest lenient-decode behavior.
   | 2026-11-04 | `ad19144..`
+
+- **Accepted** 2026-11-04 by operator ruling (debt sweep): R2-04-02 - the `snapshot` scan cost
+  per occupied slot inside the 2 s publish stands (microseconds at this catalog size), reopen
+  only on a measured hot spot (12-P precedent); N6 - api-owned byte-level source pins stay as
+  deliberate documented tripwires, a rename forces a pin edit by design; R2-17-02 - the
+  classifier FINDING branch is recorded INFO and lands with the first FINDING-emitting test.
+  | 2026-11-04 | `e5b4a0f..`
