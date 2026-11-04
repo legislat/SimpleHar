@@ -5135,13 +5135,16 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
     /// `cmd.exe` synchronously runs an inner `cmd.exe`, which itself spawns
     /// `ping.exe` — the same python -> python -> engine depth as the
     /// captured Strata and Basalt serves — and every stand-in stays alive
-    /// while the walk runs. The pin proves depth, not just membership: some
-    /// listed pid is itself a parent of another listed pid, which the
-    /// one-generation contract could never show. All stand-ins are spawned
-    /// by this test, so the whole chain is its own to reap: `taskkill` over
-    /// the tree it created, then the handle it owns. Falsifier: restore the
-    /// direct-children-only walk and the nested inclusion fails (the set is
-    /// just the inner cmd.exe, whose own child is missing from it).
+    /// while the walk runs. The second generation needs a moment to exist,
+    /// so the pin POLLS the bounded walk with a deadline until the live tree
+    /// proves some listed pid is itself the parent of another listed pid,
+    /// which the one-generation contract could never show; no single early
+    /// snapshot decides the pin. All stand-ins are spawned by this test, so
+    /// the whole chain is its own to reap: `taskkill` over the tree it
+    /// created, then the handle it owns. Falsifier: restore the
+    /// direct-children-only walk and the pair never appears — the set is
+    /// just the inner cmd.exe, whose own child is missing from it — so the
+    /// deadline expires and the depth assertion fails red.
     #[tokio::test]
     async fn descendant_pids_reaches_the_grandchildren_of_the_asked_pid() {
         use std::os::windows::process::CommandExt;
@@ -5154,19 +5157,24 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             .spawn()
             .expect("outer cmd.exe stands in for the harness child");
         // The inner cmd.exe and its ping take a moment to exist: poll the
-        // bounded walk until the second generation shows up.
+        // bounded walk until the live table proves the depth pair — one
+        // listed pid parenting another listed pid, re-read from the live
+        // tree at that moment, never decided from one snapshot.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let descendants = loop {
+        let (descendants, pair) = loop {
             let found = descendant_pids_of(outer.id());
-            if found.len() >= 2 || std::time::Instant::now() >= deadline {
-                break found;
+            let pair = found.iter().find_map(|&pid| {
+                let below = descendant_pids_of(pid);
+                below
+                    .iter()
+                    .find(|&&child| found.contains(&child))
+                    .map(|&child| (pid, child))
+            });
+            if pair.is_some() || std::time::Instant::now() >= deadline {
+                break (found, pair);
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
-        let nested = descendants.iter().any(|&pid| {
-            let children = descendant_pids_of(pid);
-            !children.is_empty() && children.iter().all(|child| descendants.contains(child))
-        });
         // Reap the whole stand-in tree this test spawned, then its handle.
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &outer.id().to_string()])
@@ -5177,14 +5185,28 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             .status();
         let _ = outer.kill();
         let _ = outer.wait();
+        let Some((deep_parent, grandchild)) = pair else {
+            panic!(
+                "no listed pid parented another listed pid within the deadline — \
+                 depth two never proven: {descendants:?}"
+            );
+        };
         assert!(
-            descendants.len() >= 2,
-            "the inner cmd.exe AND its ping must both hang under the outer: {descendants:?}"
+            descendants.contains(&grandchild),
+            "the grandchild of the asked pid must be in the set: {descendants:?}"
         );
         assert!(
-            nested,
-            "a listed pid must itself parent another listed pid — depth two reached: \
-             {descendants:?}"
+            !descendants.contains(&outer.id()),
+            "the asked pid never enters its own descendant set: {descendants:?}"
+        );
+        assert!(
+            descendants.len() <= DESCENDANT_CAP,
+            "the walk stays bounded: {} listed over cap {DESCENDANT_CAP}",
+            descendants.len()
+        );
+        assert!(
+            descendants.contains(&deep_parent),
+            "the deep parent is itself a listed descendant: {descendants:?}"
         );
     }
 }

@@ -552,3 +552,17 @@ recorded here so dated references to ARCHIVED still resolve:
   still refuses the class: `TASK-BASALT-GREEDY`. Evidence:
   `handoff/evidence/2026-11-04-engine-measurement/CARD-CAPTURE.md`.
   | 2026-11-04 | `bbbf74e`
+
+- **Implemented** RULED 2026-11-04 (TASK-BASALT-GREEDY, operator ruling: "it's greedy and
+  dynamically offloads to RAM"): the Basalt adapter accepts `cost: greedy`. Operator ruling:
+  floor 60; the operator sets `launch_only_with_at_least_vram_free: 60` after this build
+  deploys (a greedy edit ahead of the new binary drops the row from the catalog). The greedy
+  nominal never refuses an admit (`need_deficit = 0`) and books at most the room at admit;
+  the launch floor is the gate. `vram_gb` stays required for `cost: fixed` and may be absent
+  on a greedy row (an unknown nominal is the legal greedy case, DOCTRINE 9/12); a present
+  `vram_gb` on a greedy row is the last measured figure - it never refuses and books only up
+  to the room at admit - while the measured pair never books or re-books a greedy row. A
+  component sum is never a footprint for this engine: the captured components (83.7 GiB)
+  exceed the 72 GiB card under RAM offload. `cost: exact` still refuses with a message
+  naming the two bookable classes.
+  | 2026-11-04 | `1fc2681`

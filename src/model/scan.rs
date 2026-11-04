@@ -754,8 +754,9 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 }
                 // A basalt `.basalt` pack is not a GGUF: its bytes must never
                 // feed the size×1.15+2 estimate. The booking source of a basalt
-                // row is the declared `vram_gb` with `cost: fixed` (TASK-BASALT
-                // design), so a pack stat stays display-blind here.
+                // row is the declared `vram_gb` with `cost: fixed`, or the room
+                // at admit with `cost: greedy` (TASK-BASALT, TASK-BASALT-GREEDY),
+                // so a pack stat stays display-blind here.
                 if entry.engine != "basalt" {
                     entry.gguf_size_gb = stat.map(|meta| meta.len() as f64 / (1024.0_f64).powi(3));
                 }
@@ -850,7 +851,9 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 // a doomed launch can never evict a resident first. The honest
                 // mapping: an absent or blank required key (`model`,
                 // `serve_model`, `basalt_python`, `basalt_cwd`, `basalt_exe`,
-                // `vram_gb`) names its field as a typed reject; a `.basalt`
+                // and `vram_gb` on a `cost: fixed` row - a greedy row may
+                // legally omit the nominal, operator ruling 2026-11-04) names
+                // its field as a typed reject; a `.basalt`
                 // weights file the disk lacks travels the same
                 // `ModelPathMissing` door as llama's `model:`; a server-owned
                 // word in `basalt_engine_args` meets the policy surface — the
@@ -2806,6 +2809,34 @@ mod tests {
                 error.reason
             );
         }
+    }
+
+    /// Operator ruling 2026-11-04 (`TASK-BASALT-GREEDY`): a greedy basalt row
+    /// is the catalog citizen the operator's truth needs - Basalt offloads to
+    /// RAM, so the row may carry no declared `vram_gb` at all (booking takes
+    /// the room at admit, the launch floor gates). The row must publish at
+    /// scan, not vanish behind a catalog error (the live 2026-11-04 failure).
+    /// The `cost: fixed` refusal without `vram_gb` stays pinned by the
+    /// key-missing loop above. Falsifier: an adapter guard refusing Greedy
+    /// drops the row again.
+    #[test]
+    fn a_greedy_basalt_row_publishes_without_a_declared_vram_gb() {
+        let dir = crate::testutil::temp_dir("scan-basalt-greedy");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let weights = basalt_pack(&dir);
+        std::fs::write(
+            dir.join("row.yaml"),
+            basalt_yaml(
+                &dir,
+                &weights,
+                &[("cost", Some("greedy")), ("vram_gb", None)],
+            ),
+        )
+        .expect("write row");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        assert_eq!(catalog.models[0].name, "row");
+        assert_eq!(catalog.models[0].cost, crate::model::CostClass::Greedy);
     }
 
     /// The `.basalt` pack is the weights file the launch spawns against: a

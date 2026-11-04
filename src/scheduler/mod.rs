@@ -5092,6 +5092,11 @@ mod tests {
     #[test]
     fn a_cost_only_edit_rebooks_the_loaded_resident_without_a_reload() {
         let (mut state, yaml, _) = resident_on_a_file();
+        // The fingerprint is (mtime, size): the seed and the edit below have the
+        // same byte length, so a same-tick write could leave the stamp unchanged
+        // and the rebook would (correctly) refuse a "moved stamp, same bytes".
+        // Let the clock tick so the edit is a real byte move on every machine.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
             &yaml,
             "engine: mock\ncost: fixed\nmeasured_gb: 12.0\nmeasured_gb_min: 8.0\n",
@@ -5604,6 +5609,98 @@ mod tests {
             !job.terminal && job.error.is_none(),
             "free 70.0 books the 70.0 need and clears the floor: {:?}",
             job.error
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T5 (the greedy resident, `TASK-BASALT-GREEDY` phase 4): a `cost: greedy`
+    /// Basalt occupant holds the card (70.4) while its booking stays the room
+    /// it grabbed at admit (50) - a measured pair may never re-book a greedy
+    /// row (DOCTRINE 12), so this stale-looking credit is the honest one. A
+    /// fixed Strata replacement with a 65 floor is judged against the booked
+    /// room: red while free+credit misses the floor-after-tolerance (49.6 vs
+    /// 63) with the R3 verdict `no_releases_reach`, exactly as a fixed
+    /// resident would take; a 70.4 fold changes nothing on the greedy slot;
+    /// and once the card reading lets the booked room alone carry the floor
+    /// (free 30 without the victim credit, 80 with it) the replacement admits
+    /// and names the greedy resident as the victim it frees. Falsifier: a
+    /// greedy fold that re-books the slot, or a floor guard that stops
+    /// crediting the same-slot victim, flips the red or the green arm.
+    #[tokio::test]
+    async fn a_greedy_basalt_resident_credits_only_its_room_at_admit() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("readmit-greedy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let resident_yaml = dir.join("basalt-greedy.yaml");
+        std::fs::write(
+            &resident_yaml,
+            "engine: basalt\ncost: greedy\nlaunch_only_with_at_least_vram_free: 60\n",
+        )
+        .expect("seed");
+        let incoming_yaml = dir.join("strata-v2.yaml");
+        std::fs::write(
+            &incoming_yaml,
+            "engine: strata\ncost: fixed\nvram_gb: 60\nlaunch_only_with_at_least_vram_free: 65\n",
+        )
+        .expect("seed");
+        let (mut state, _rx) = readmit_state(70.4);
+        let resident = rescan_entry(&resident_yaml, "basalt-greedy");
+        let ticket = fold_ticket(18_113);
+        state.catalog = vec![resident.clone()];
+        seat_spawn(&mut state, &resident, &ticket, 18_113);
+        // The greedy admit booked the room it grabbed (50), not the 70.4 the
+        // card physically carries - the clamp `min(nominal, planned_room)`.
+        state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(50.0);
+        let incoming = rescan_entry(&incoming_yaml, "strata-v2");
+        // The gate preflights the launch before it evicts: the row rides.
+        state.catalog.push(incoming.clone());
+
+        let red = admit_round(&mut state, &incoming, 70.4);
+        assert!(
+            matches!(
+                state.jobs[&red].error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::BelowLaunchFloor {
+                        no_releases_reach: true,
+                        ..
+                    }
+                ))
+            ),
+            "free 49.6 with the booked room credited misses the 63 floor: {:?}",
+            state.jobs[&red].error
+        );
+
+        state.process_measurement(
+            "basalt-greedy",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 70.4,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::EngineStatus,
+                confidence: crate::engine::MeasurementConfidence::High,
+            },
+        );
+        assert_eq!(
+            state.snapshot().slots[0].need_gib,
+            Some(50.0),
+            "a measured pair never books or re-books a greedy row (DOCTRINE 12)"
+        );
+
+        // The same replacement on a card whose own occupancy released: free 30
+        // never reaches the 65 floor, free 80 does - the greedy victim's booked
+        // room alone is what admits the load.
+        let green = admit_round(&mut state, &incoming, 40.0);
+        let job = &state.jobs[&green];
+        assert!(
+            !job.terminal && job.error.is_none(),
+            "the booked room credits the replacement over the floor: {:?}",
+            job.error
+        );
+        assert_eq!(
+            job.victim.as_ref().expect("victim").model,
+            "basalt-greedy",
+            "the replacement names the greedy resident it is freeing"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7960,6 +8057,16 @@ mod tests {
             ActorState::booking_need(&row),
             Ok(None),
             "a projection no other engine owns floors nothing"
+        );
+        // Operator ruling 2026-11-04 (`TASK-BASALT-GREEDY`): a greedy basalt
+        // row is the legal unknown-nominal case too - `Ok(None)` books the
+        // room at admit, and the gate judges the row's launch floor (60 on
+        // the live row), the same floor-only path the strata spills proved.
+        row.engine = "basalt".to_string();
+        assert_eq!(
+            ActorState::booking_need(&row),
+            Ok(None),
+            "a greedy basalt row without a nominal books the room at admit"
         );
     }
 }

@@ -36,6 +36,18 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ### Changed
 
+- A Basalt row may declare `cost: greedy` (operator ruling 2026-11-04: the
+  engine offloads experts to RAM dynamically). A greedy Basalt row may omit
+  `vram_gb`: a greedy admit never refuses on the nominal size, and the
+  booking takes at most the room at admit; the launch floor is the gate.
+  The operator ruling sets the floor at 60 GiB; the operator writes
+  `launch_only_with_at_least_vram_free: 60` after this build deploys,
+  because a greedy edit ahead of the new binary drops the row from the
+  catalog. A `vram_gb` present on a greedy row is the last measured figure:
+  it never refuses the admit and books only up to the room at admit; the
+  measured pair never books or re-books a greedy row. A `cost: fixed` row
+  still requires `vram_gb`, and `cost: exact` still refuses with a message
+  naming the two bookable classes.
 - A measured fold re-books the loaded resident's slot booking, so same-slot
   release credit and the launch-floor guard read the measured figure. An
   amber or greedy-launched resident is never re-booked.

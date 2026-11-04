@@ -195,9 +195,18 @@ report the `serve_model` alias. For the 482B class, `load_timeout: 1200` is
 the recommended starting point for the load floor. A basalt engine starts
 only when you load it; booting the harness starts nothing.
 
-Cost starts as the declared `vram_gb` with `cost: fixed`. Both are required:
-a `.basalt` pack's bytes never feed the GGUF size estimate, and the engine
-offers no Fit projection. After readiness the harness reads the `engine`
+Cost starts as the declared `vram_gb` with `cost: fixed`. A fixed row
+requires both: a `.basalt` pack's bytes never feed the GGUF size estimate,
+and the engine offers no Fit projection. A row may instead declare
+`cost: greedy` (operator ruling 2026-11-04: Basalt offloads experts to RAM
+dynamically and runs well below its nominal footprint). A greedy row may
+omit `vram_gb`: a greedy admit never refuses on the nominal size
+(`need_deficit = 0`), and the booking takes at most the room at admit; the
+launch floor is the gate. A `vram_gb` present on a greedy row is the last
+measured figure: it never refuses the admit and books only up to the room
+at admit. The measured pair never books or re-books a greedy row, because
+it is offloaded by design. Under `cost: fixed` the measured figure books as
+follows. After readiness the harness reads the `engine`
 block of the engine's own `GET /metrics` snapshot and books
 `expert_cache_mib` alone - 59.9 GiB in the 2026-11-04 capture. The earlier
 status routes carry no footprint: `/status` is liveness only and
@@ -217,7 +226,15 @@ alone never books. A free-memory `total_diff` reading displays and never
 books. The captured bodies are pinned as test fixtures, so a field-set drift
 fails the pin instead of widening a guess. Set
 `launch_only_with_at_least_vram_free` to the declared cost: Basalt needs
-the card, and a loaded stranger must refuse before spawn.
+the card, and a loaded stranger must refuse before spawn. On a greedy row
+the operator ruling sets the floor at 60 GiB; the operator writes
+`launch_only_with_at_least_vram_free: 60` after a build that accepts greedy
+rows deploys, because a greedy edit ahead of the new binary drops the row
+from the catalog. A greedy row without the key gates at the global
+`greedy_launch_min_free_gb` (4.0 GiB default), far below what this engine
+needs, so on Basalt the key is effectively required. The engine launches
+below its nominal size because the experts ride RAM; the floor keeps the
+launch off a thrashed card.
 
 Kill: the harness job object terminates the Python server. Basalt's server
 puts the engine child in its own kill-on-close job, so a Python death also

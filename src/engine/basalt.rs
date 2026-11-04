@@ -210,16 +210,32 @@ pub(crate) fn validate_row(model: &ModelEntry) -> Result<BasaltRow, BasaltRowErr
         let raw = knob(model, "basalt_cwd").ok_or_else(|| missing(model, "basalt_cwd"))?;
         checked_path(model, "basalt_cwd", raw, true)?
     };
-    if model.vram_gb.is_none() {
-        return Err(missing(model, "vram_gb"));
-    }
-    if model.cost != crate::model::CostClass::Fixed {
-        return Err(bad(
-            model,
-            "cost",
-            "basalt rows book a fixed footprint (`cost: fixed`); the engine \
-             reports no projection to book from",
-        ));
+    // Operator ruling 2026-11-04 (`TASK-BASALT-GREEDY`): Basalt is greedy with
+    // dynamic RAM offload - it launches below its nominal footprint because
+    // the experts spill to RAM, so the launch floor is the gate, not the
+    // size. A `cost: greedy` row may omit `vram_gb`: an unknown nominal is
+    // the legal greedy case (DOCTRINE 9/12 lineage — the greedy booking takes
+    // the room at admit and never needs a nominal to book from), and a present
+    // `vram_gb` on a greedy row stays the last measured display value. A
+    // `cost: fixed` row still requires the declared figure: the engine reports
+    // no projection to book from, so a fixed booking without it is a guess.
+    match model.cost {
+        crate::model::CostClass::Fixed => {
+            if model.vram_gb.is_none() {
+                return Err(missing(model, "vram_gb"));
+            }
+        }
+        crate::model::CostClass::Greedy => {}
+        crate::model::CostClass::Exact => {
+            return Err(bad(
+                model,
+                "cost",
+                "basalt rows book a fixed footprint (`cost: fixed`) or run greedy \
+                 (`cost: greedy`: the engine offloads to RAM and the launch floor \
+                 is the gate); this engine reports no computed requirement to \
+                 book as `exact`",
+            ));
+        }
     }
     let parallel = match knob(model, "basalt_parallel") {
         None => PARALLEL_MIN,
@@ -727,7 +743,7 @@ mod tests {
             Err(EngineError::Rejected { .. })
         ));
         let (_dir, mut model) = fixture(&[]);
-        model.cost = CostClass::Greedy;
+        model.cost = CostClass::Exact;
         assert!(matches!(
             BasaltAdapter.spec(&model, 18199),
             Err(EngineError::Rejected { .. })
@@ -738,6 +754,53 @@ mod tests {
             BasaltAdapter.spec(&model, 18199),
             Err(EngineError::MissingField { field, .. }) if field == "vram_gb"
         ));
+    }
+
+    /// Operator ruling 2026-11-04 (`TASK-BASALT-GREEDY`): Basalt is greedy
+    /// with dynamic RAM offload, so a `cost: greedy` row builds a spec even
+    /// when it keeps the last measured `vram_gb` (a present figure is
+    /// display-only under greedy — the booking clamps to the room at admit).
+    /// Falsifier: the pre-ruling guard refused the class outright.
+    #[test]
+    fn a_greedy_row_with_a_declared_vram_gb_builds_a_spec() {
+        let (_dir, mut model) = fixture(&[]);
+        model.cost = CostClass::Greedy;
+        let row = validate_row(&model).expect("a greedy row with `vram_gb` validates");
+        assert_eq!(row.alias, "basalt-test");
+    }
+
+    /// An unknown nominal is the legal greedy case (DOCTRINE 9/12 lineage:
+    /// the greedy booking takes the room at admit and the launch floor is the
+    /// gate), so a greedy row WITHOUT `vram_gb` builds a spec. Falsifier: the
+    /// pre-ruling guard demanded `vram_gb` for every class and the row
+    /// vanished from the catalog (the live 2026-11-04 failure).
+    #[test]
+    fn a_greedy_row_without_vram_gb_builds_a_spec() {
+        let (_dir, mut model) = fixture(&[]);
+        model.cost = CostClass::Greedy;
+        model.vram_gb = None;
+        let row = validate_row(&model).expect("a greedy row without `vram_gb` validates");
+        assert_eq!(row.alias, "basalt-test");
+    }
+
+    /// The remaining refusal leg: `exact` is a precision claim this engine
+    /// cannot answer (no computed requirement, no projection), and the refusal
+    /// names the `cost` key and the two bookable classes.
+    #[test]
+    fn an_exact_row_refuses_naming_the_cost_key() {
+        let (_dir, mut model) = fixture(&[]);
+        model.cost = CostClass::Exact;
+        let error = BasaltAdapter
+            .spec(&model, 18199)
+            .expect_err("`cost: exact` must refuse");
+        let EngineError::Rejected { reason, .. } = error else {
+            panic!("`cost: exact` must refuse as Rejected, got {error:?}");
+        };
+        assert!(reason.contains("`cost`"), "{reason}");
+        assert!(
+            reason.contains("greedy") && reason.contains("fixed"),
+            "the refusal names the bookable classes: {reason}"
+        );
     }
 
     #[test]
