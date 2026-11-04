@@ -113,7 +113,9 @@ pub struct LaunchSpec {
     /// declared var overrides its baseline twin, and nothing else from the
     /// harness environment is inherited.
     pub env: BTreeMap<String, String>,
-    /// Log file base name; the process module appends the epoch (Step 8).
+    /// Log file base name; the runtime sanitizes it into the forensic pool key
+    /// (`sanitize_slug`) and appends the epoch (Step 8, R2-08-03). The raw value
+    /// stays the custody/instance identity — adapters pass the model name as-is.
     pub log_name: String,
     /// Readiness contract.
     pub readiness: ReadinessSpec,

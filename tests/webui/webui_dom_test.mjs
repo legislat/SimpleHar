@@ -80,8 +80,11 @@ const storage = {
   removeItem: (k) => { globalThis.removedKeys.push(k); globalThis.store.delete(k); },
 };
 
+// R2-16-03: the unreachable-header alert names `location.host`, so the page
+// global exists here as it does in a browser.
+globalThis.location = { hostname: "127.0.0.1", host: "127.0.0.1:8708" };
 globalThis.window = {
-  location: { hostname: "127.0.0.1" },
+  location: { hostname: "127.0.0.1", host: "127.0.0.1:8708" },
   matchMedia: () => ({ matches: false }),
   localStorage: storage,
   scrollY: 0,
@@ -108,7 +111,11 @@ globalThis.promptLog = [];
 globalThis.promptAnswers = [];
 globalThis.sentTokens = [];
 
+// R2-16-03 switch: when set, every fetch rejects with this error, so a leg can
+// watch what the page keeps showing while the harness is unreachable.
+globalThis.fetchFails = null;
 globalThis.fetch = async (path, init) => {
+  if (globalThis.fetchFails !== null) throw globalThis.fetchFails;
   if (path === "/har/status") globalThis.statusFetches += 1;
   const sent = (init && init.headers && init.headers["x-har-token"]) || "";
   globalThis.sentTokens.push(sent);
@@ -1077,6 +1084,54 @@ const driver = `
   await refresh();
   check("no catalog errors, no notice block",
     findAll(document.getElementById("sh-main"), "div", "sh-catalog-errors").length === 0);
+
+  // ---- R2-16-03: a dead harness must not leave a live-looking header ----
+  {
+    const headerEl = document.getElementById("sh-header");
+    const headerText = () => textOf(headerEl);
+    quietFlash();
+    check("the leg starts on a real header",
+      headerText().indexOf("loaded") >= 0, headerText().slice(0, 90));
+    // A TypeError is the browser's own "never reached the harness" shape.
+    globalThis.fetchFails = new TypeError("connect ECONNREFUSED 127.0.0.1:8708");
+    await refresh();
+    const deadBadges = findAll(headerEl, "span", "sh-badge")
+      .map((b) => textOf(b) + "@" + b.getAttribute("data-tone"));
+    const deadText = headerText();
+    check("unreachable fetch stamps the header instead of the stale state",
+      deadText.indexOf("harness unreachable") >= 0 &&
+        deadBadges.indexOf("harness unreachable@none") >= 0 &&
+        deadText.indexOf("loaded") < 0 && deadText.indexOf("serving") < 0,
+      "header=" + deadText.slice(0, 110) + " badges=" + deadBadges.join("|"));
+    check("the unreachable stamp keeps the alert",
+      flashBox.hidden === false && String(flashBox.textContent).indexOf("cannot reach") >= 0,
+      JSON.stringify(flashBox.textContent));
+    // Recovery with the SAME payload as before the failure: the render gate was
+    // voided by the stamp, so the unchanged key still forces a full repaint.
+    globalThis.fetchFails = null;
+    quietFlash();
+    await refresh();
+    const backText = headerText();
+    check("the next same-key success restores the real header",
+      backText.indexOf("loaded") >= 0 && backText.indexOf("unreachable") < 0 &&
+        findAll(headerEl, "button", "sh-tab").length === 4,
+      "header=" + backText.slice(0, 110));
+    // A non-network fetch failure admits only "state not confirmed" — the page
+    // cannot claim the harness is down, only that it could not confirm the state.
+    globalThis.fetchFails = new Error("/har/status -> 500");
+    await refresh();
+    const softText = headerText();
+    check("a non-network fetch error stamps state not confirmed",
+      softText.indexOf("state not confirmed") >= 0 &&
+        findAll(headerEl, "span", "sh-badge").some(
+          (b) => b.getAttribute("data-tone") === "none"),
+      "header=" + softText.slice(0, 110));
+    globalThis.fetchFails = null;
+    quietFlash();
+    await refresh();
+    check("the header recovers again after the soft failure",
+      headerText().indexOf("loaded") >= 0, headerText().slice(0, 90));
+  }
 
   for (const [name, ok, extra] of results)
     console.log((ok ? "PASS " : "FAIL ") + name + (ok || !extra ? "" : " :: " + extra));

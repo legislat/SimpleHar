@@ -827,6 +827,29 @@ function renderJobs(status) {
   return wrap;
 }
 
+// The degraded header for an unreachable harness (R2-16-03). A stale "N
+// loaded" badge next to a "cannot reach the harness" alert is the contradiction
+// this stamp removes: the header may not claim a live state the page just
+// failed to read. It reuses the header row classes and admits only what the
+// failure says. The sign-in/token control is a page button, painted by
+// `paintTokenControl`, never a child of this host.
+function renderUnreachableHeader(error) {
+  return el(
+    "div",
+    {},
+    el(
+      "div",
+      { class: "sh-headline" },
+      el("h1", { class: "sh-title" }, text("SimpleHar SE")),
+      el(
+        "span",
+        { class: "sh-badge", "data-tone": "none" },
+        text(error instanceof TypeError ? "harness unreachable" : "state not confirmed"),
+      ),
+    ),
+  );
+}
+
 function flashError(error) {
   const box = document.getElementById("sh-flash");
   box.textContent = String(error.message || error);
@@ -946,6 +969,13 @@ async function refresh() {
     // Nothing rendered on this path, so the header control repaints itself: it is the
     // operator's only way out of a token the harness just refused.
     paintTokenControl();
+    // R2-16-03: the header may not keep claiming "N loaded"/serving state it
+    // just failed to confirm — stamp it degraded. `state` keeps its last read
+    // (a later success must still diff against it), but the render gate is
+    // voided so the next success repaints in full even on an unchanged key.
+    const headerHost = document.getElementById("sh-header");
+    if (headerHost) headerHost.replaceChildren(renderUnreachableHeader(error));
+    lastRenderKey = null;
     return;
   }
   state.status = status;

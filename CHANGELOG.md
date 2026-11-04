@@ -55,6 +55,25 @@ The release steps live in `docs/process/GIT_WORKFLOW.md`.
   a reload. A flag change still marks the resident `stale_config` and needs
   a reload.
 
+### Fixed
+
+- `POST /har/config/default` applies a new category default to memory only
+  after its bytes land in the config file. A write that never lands answers
+  `persisted: false` and names the previous default, so memory can no longer
+  hold a value the file does not.
+- The llama fit probe refuses a memory-key value the serve path refuses (a
+  blank, option-shaped, or control-bearing token). An option-shaped value can
+  no longer reach `llama-fit-params` unvalidated; the refusal names the key,
+  the flag, and the value.
+- The page header stops claiming "N loaded" when the harness is unreachable.
+  A failed status fetch stamps the header `harness unreachable` (or
+  `state not confirmed`), and the next success repaints the real header even
+  when the state did not change.
+- Engine log captures and container snapshots share one forensic pool key: the
+  model name sanitized like the staged profiles. A model with a space in its
+  name no longer keeps two half-pools, and one model's keep-N prune can no
+  longer delete a differently named model's files.
+
 ## v1.1.2 - 2026-11-03
 
 Commit: `2583faf` (release prep). Artifact: `simplehar-se.exe`, SHA256

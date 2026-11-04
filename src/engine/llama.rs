@@ -215,7 +215,8 @@ const NEGATIVE_FORM_KEYS: &[&str] = &[];
 /// present flag takes a real value (a whitespace-only one is not), a value is
 /// not option-shaped unless its flag documents a negative form, and a value
 /// is one clean token with no control characters. The refusal is raised in
-/// [`build_args`], which `preflight_spec` runs before `Quiesce`/`Dispose` —
+/// [`build_args`], which `preflight_spec` runs before `Quiesce`/`Dispose`, and
+/// in the fit probe via [`table_value_rejection`] (R2-09-05) —
 /// a row typo costs the operator an `AdmitFail`, never the resident model.
 /// `None` admits the value; `Some(detail)` names what is wrong, for
 /// [`rejected_table_value`].
@@ -254,6 +255,18 @@ fn safe_display(value: &str) -> String {
         }
     }
     out
+}
+
+/// The probe-side voice for the same floor (R2-09-05): `Some(text)` naming the
+/// yaml key, the flag it feeds and the escaped value, worded exactly like
+/// [`rejected_table_value`], so the fit probe refuses an option-shaped value
+/// before it reaches the calculator instead of rendering it unvalidated.
+pub(crate) fn table_value_rejection(key: &str, flag: &str, value: &str) -> Option<String> {
+    let detail = table_value_problem(key, flag, value)?;
+    Some(format!(
+        "`{key}` value `{}` for `{flag}` {detail}",
+        safe_display(value)
+    ))
 }
 
 /// The refusal voice for a failed value-shape floor: the typed

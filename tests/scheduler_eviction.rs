@@ -1728,15 +1728,44 @@ async fn the_idle_sweep_skips_a_cross_slot_eviction_victim() {
         "no Unload job or ledger row ever named the doomed model: {:?}",
         status.jobs
     );
-    for job in status
+    // R2-04-01 (cause-of-death wording half): first prove the sweep wording
+    // channel is live — the canary's row must carry `idle timeout`, or the
+    // victim asserts below would pass only because no outcome ever lands. Then
+    // demand the victim's death never reads as the sweep's: no row of any kind
+    // naming it may answer `idle timeout`, and no sweep unload row may name it
+    // at all. Its death is the eviction's, already named by the
+    // `victims_released` assert above; an eviction-path unload wording is
+    // "unloaded" (`begin_unload_slot`), never "idle timeout".
+    let idle_rows: Vec<_> = status
         .jobs
         .iter()
         .filter(|job| job.outcome.as_deref() == Some("idle timeout"))
-    {
+        .collect();
+    assert!(
+        idle_rows.iter().any(|job| job.model == "canary"),
+        "the canary's idle-timeout row must be present, or every victim \
+         wording assert below is vacuous: {:?}",
+        status.jobs
+    );
+    for job in idle_rows {
         assert_eq!(
             job.model, "canary",
             "the sweep's only idle-timeout row is the canary's, never the \
              eviction victim's: {job:?}"
+        );
+    }
+    for job in status.jobs.iter().filter(|job| job.model == "rp-doomed") {
+        assert_ne!(
+            job.outcome.as_deref(),
+            Some("idle timeout"),
+            "the eviction victim's cause of death must never read `idle \
+             timeout`: {job:?}"
+        );
+        assert_ne!(
+            job.kind,
+            simplehar_se::scheduler::JobKind::Unload,
+            "no sweep unload row may name the eviction victim beside the \
+             eviction's own release: {job:?}"
         );
     }
     assert!(runtime.is_dead(doomed.port).await, "the doomed engine died");

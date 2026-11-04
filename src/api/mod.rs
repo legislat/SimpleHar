@@ -876,8 +876,11 @@ impl ApiState {
     }
 
     /// Sets (or clears, with `None`) the category default and persists it to
-    /// `simplehar-se.json` atomically (temp file + rename). In-memory wins even when
-    /// persistence fails (logged); the response says which happened.
+    /// `simplehar-se.json` atomically (temp file + rename). Memory applies only
+    /// after the bytes landed: a write that never landed leaves the effective
+    /// default at its previous value, so the config file stays king between the
+    /// failed call and the next boot (R2-07-03). When `persisted: false` names a
+    /// write that never landed, the answer carries the still-effective value.
     ///
     /// A write that lands re-validates the published bytes against the boot schema
     /// (07[11]): the landed tree is exactly what the next boot will read, so its
@@ -901,14 +904,10 @@ impl ApiState {
         category: CategoryId,
         model: Option<&str>,
     ) -> (Option<String>, bool) {
-        self.default_overrides
-            .lock()
-            .expect("default override lock poisoned by a writer panic")
-            .insert(category, model.map(str::to_string));
         let owned_model = model.map(str::to_string);
         let config = self.config.clone();
         let persist_model = owned_model.clone();
-        let persisted = match tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             persist_default_model(&config, category, persist_model.as_deref())
         })
         .await
@@ -916,26 +915,38 @@ impl ApiState {
             Ok(outcome) => match outcome {
                 PersistOutcome::Landed { verdict } => {
                     self.record_config_errors(verdict);
-                    true
+                    self.default_overrides
+                        .lock()
+                        .expect("default override lock poisoned by a writer panic")
+                        .insert(category, owned_model.clone());
+                    (owned_model, true)
                 }
                 // The rename landed: the live boot file now holds bytes the
                 // read-back refused, so the verdict must describe them even
-                // though the answer stays `persisted: false` (R2-07-02).
+                // though the answer stays `persisted: false` (R2-07-02). The
+                // file is king and it holds the NEW bytes, so memory follows
+                // them (R2-07-03).
                 PersistOutcome::LandedUnverified { verdict } => {
                     self.record_config_errors(verdict);
-                    false
+                    self.default_overrides
+                        .lock()
+                        .expect("default override lock poisoned by a writer panic")
+                        .insert(category, owned_model.clone());
+                    (owned_model, false)
                 }
-                PersistOutcome::NotLanded => false,
+                // The bytes never landed: the file still holds the previous
+                // default, so memory must not move (R2-07-03). The answer
+                // carries the still-effective value, not the refused edit.
+                PersistOutcome::NotLanded => (self.default_model(category), false),
             },
             Err(error) => {
                 tracing::error!(
                     error = %error,
                     "config persist task died; answering persisted:false"
                 );
-                false
+                (self.default_model(category), false)
             }
-        };
-        (owned_model, persisted)
+        }
     }
 
     /// Records the per-field validation verdict on the boot config file, replacing

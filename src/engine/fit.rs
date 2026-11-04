@@ -194,9 +194,16 @@ const FIT_MEMORY_KEYS: &[&str] = &[
 /// server-forced pair is irrelevant to a projection, and fit-params rejects
 /// the template/vision pair.
 ///
+/// Every memory key's value faces the serve path's shape floor
+/// ([`super::llama::table_value_rejection`]) before it joins the probe argv
+/// (R2-09-05): the probe must project the launch that can actually run, and
+/// an option-shaped value the serve path refuses may never be rendered to the
+/// calculator unvalidated.
+///
 /// # Errors
 ///
-/// [`FitError::Row`] when the row has no `model:` value.
+/// [`FitError::Row`] when the row has no `model:` value, or when a
+/// memory-relevant key carries a value the serve-path shape floor refuses.
 pub(crate) fn probe_args(raw: &BTreeMap<String, String>) -> Result<Vec<String>, FitError> {
     let value = |key: &str| raw.get(key).map(String::as_str).filter(|v| !v.is_empty());
     let Some(model) = value("model") else {
@@ -213,6 +220,9 @@ pub(crate) fn probe_args(raw: &BTreeMap<String, String>) -> Result<Vec<String>, 
             continue;
         }
         if let Some(v) = value(key) {
+            if let Some(refusal) = super::llama::table_value_rejection(key, flag, v) {
+                return Err(FitError::Row { reason: refusal });
+            }
             args.extend([flag.to_string(), v.to_string()]);
         }
     }
@@ -567,6 +577,29 @@ mod tests {
             probe_args(&raw(&[("context", "4096")])),
             Err(FitError::Row { .. })
         ));
+    }
+
+    /// R2-09-05 falsifier: the serve path refuses an option-shaped table value
+    /// (`build_args` + the shape floor). The probe must refuse the same value,
+    /// naming the key, the flag and the detail — never hand `--api-key` to the
+    /// calculator as the value of `-c`. The clean-row leg stays pinned to the
+    /// same argv `the_probe_takes_only_the_memory_relevant_flags...` expects.
+    #[test]
+    fn the_probe_refuses_a_value_the_serve_path_refuses() {
+        let error = probe_args(&raw(&[("model", "m"), ("context", "--api-key")]))
+            .expect_err("an option-shaped value may not reach the probe");
+        let FitError::Row { reason } = error else {
+            panic!("a refused row value is a Row error, got {error:?}");
+        };
+        assert!(reason.contains("context"), "names the key: {reason}");
+        assert!(reason.contains("-c"), "names the flag: {reason}");
+        assert!(reason.contains("--api-key"), "names the value: {reason}");
+        assert!(
+            reason.contains("option-shaped"),
+            "carries the floor's detail: {reason}"
+        );
+        let clean = probe_args(&raw(&[("model", "m"), ("context", "4096")])).expect("clean row");
+        assert_eq!(clean, vec!["-m", "m", "-c", "4096", "--fit-print", "on"]);
     }
 
     /// The exact-set pin the brief demands: every FIT key answers to a

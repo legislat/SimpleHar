@@ -9,7 +9,9 @@
 //! any stale container of the same name — a harness crash can orphan one until the
 //! model loads again.
 //! Spawns are hidden (`CREATE_NO_WINDOW`) with stdout/stderr captured to
-//! `logs/<name>-<epoch>.log`. Engine children receive exactly an OS baseline plus
+//! `logs/<slug>-<epoch>.log`, the stem sanitized by `sanitize_slug` — the one
+//! forensic pool key shared with the container snapshots (R2-08-03). Engine
+//! children receive exactly an OS baseline plus
 //! `LaunchSpec.env` (§5, E3): harness secrets (`SIMPLEHAR_TOKEN`) and Python
 //! import-hijack vars (`PYTHONPATH`, `VIRTUAL_ENV`) never leak into them. The
 //! harness-internal control commands spawned here (`wsl.exe` docker teardown and
@@ -354,7 +356,9 @@ fn is_container_log(path: &std::path::Path) -> bool {
 /// minted shape `{model}-{epoch}[.container].log` — epoch all digits — NOT a bare
 /// `{model}-` prefix: model names legally contain `-`, so a prefix match let model
 /// `swift`'s keep-N claim (and delete) `swift-7b`'s files. Harness boot logs are
-/// excluded from both classes by [`is_harness_log`].
+/// excluded from both classes by [`is_harness_log`]. The caller passes the ONE
+/// forensic pool key — [`sanitize_slug`] of the model, the same stem both mint
+/// sites use (R2-08-03) — never a raw name or a private spelling.
 fn prune_model_logs(dir: &std::path::Path, prefix: &str, keep: usize) {
     let owned_prefix = format!("{prefix}-");
     let matches_model = |path: &std::path::Path| {
@@ -1939,12 +1943,21 @@ impl EngineRuntime for ProcessRuntime {
                 reason: format!("cannot create {}: {error}", self.logs_dir.display()),
             });
         }
-        prune_model_logs(&self.logs_dir, &spec.log_name, ENGINE_LOG_KEEP);
+        // One forensic naming rule for the whole pool (R2-08-03): the client
+        // capture and the container snapshot share one key — `sanitize_slug`,
+        // the same slug rule the staged profiles use (`prune_staged_profiles`).
+        // `spec.log_name` stays RAW as the custody/instance identity; only the
+        // file name is filesystem-bare, so keep-N bounds one model's pair of
+        // classes and two models cannot prune each other through a raw-vs-clean
+        // split. Names that sanitize identically (`a b` / `a_b`) share one pool
+        // by design — the accepted rule of the staged profiles (review 25 [3]).
+        let pool = sanitize_slug(&spec.log_name);
+        prune_model_logs(&self.logs_dir, &pool, ENGINE_LOG_KEEP);
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or_default();
-        let log_path = self.logs_dir.join(format!("{}-{epoch}.log", spec.log_name));
+        let log_path = self.logs_dir.join(format!("{pool}-{epoch}.log"));
         let log_file = std::fs::File::create(&log_path).map_err(|e| SpawnError::SpawnFailed {
             reason: format!("cannot create {}: {e}", log_path.display()),
         })?;
@@ -2437,18 +2450,13 @@ impl EngineRuntime for ProcessRuntime {
         if text.trim().is_empty() {
             return;
         }
-        // Same sanitization the adapters give `log_name`, so the snapshot shares the
-        // model's prefix and both classes fall under one per-model keep-N.
-        let prefix: String = model
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        // One naming rule, the same `sanitize_slug` the capture mint uses at
+        // `spawn` and the staged profiles use (R2-08-03): adapters hand
+        // `log_name` RAW as the instance identity, so BOTH forensic classes are
+        // keyed under the sanitized stem and one per-model keep-N bounds the
+        // pair. Names that sanitize identically share one pool by design, the
+        // accepted rule of the staged profiles (review 25 [3]).
+        let prefix = sanitize_slug(model);
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -3512,6 +3520,130 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             "another model's forensic log is never evicted: {names:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2-08-03 falsifier: one forensic pool key, `sanitize_slug`, for both
+    /// mint sites. Model `qwen 7b` must land its REAL spawned capture under the
+    /// sanitized stem `qwen_7b-`, and its keep-N prune must bound the captures
+    /// AND the `qwen_7b-*.container.log` snapshots in one pool — while a
+    /// different slug (`qwen-7b`) keeps every file it owns. Falsifier (pre-fix
+    /// shape): the capture mint used the raw `spec.log_name`, so the real
+    /// capture landed as `qwen 7b-<epoch>.log`, the prune of that model matched
+    /// only raw-named files, and the nine seeded `qwen_7b-` captures survived
+    /// the prune untouched — every count assert below goes red.
+    #[tokio::test]
+    async fn captures_and_snapshots_of_one_model_share_one_sanitized_pool() {
+        let dir = harness_logs_dir();
+        std::fs::create_dir_all(&dir).expect("logs dir");
+        // Sweep this test's own pool names first: a previously interrupted or
+        // failing run must not decide this one's outcome from stale litter.
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("qwen 7b-")
+                    || name.starts_with("qwen_7b-")
+                    || name.starts_with("qwen-7b-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let seeds: Vec<String> = ["qwen_7b", "qwen-7b"]
+            .iter()
+            .flat_map(|pool| {
+                (100_000u64..100_007).flat_map(move |epoch| {
+                    [
+                        format!("{pool}-{epoch}.log"),
+                        format!("{pool}-{epoch}.container.log"),
+                    ]
+                })
+            })
+            .collect();
+        for name in &seeds {
+            std::fs::write(dir.join(name), b"x").expect("seed forensic file");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Both real mint paths for the space-bearing model name: the spawn's
+        // capture and the container snapshot.
+        let runtime = ProcessRuntime::new();
+        runtime
+            .spawn(
+                &client_spec("cmd.exe", &["/c", "exit 0"], "qwen 7b"),
+                child_ticket(18_344),
+            )
+            .await
+            .expect("cmd.exe starts as a stand-in client");
+        runtime.save_container_log("qwen 7b", "pool evidence").await;
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read logs dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        let pool_files = |stem: &str, container: bool| -> Vec<String> {
+            names
+                .iter()
+                .filter(|n| {
+                    n.starts_with(&format!("{stem}-"))
+                        && n.ends_with(if container { ".container.log" } else { ".log" })
+                        && n.ends_with(".container.log") == container
+                })
+                .cloned()
+                .collect()
+        };
+        assert!(
+            names.iter().all(|n| !n.starts_with("qwen 7b-")),
+            "the raw name may never mint a forensic file: {names:?}"
+        );
+        // One pool, both classes: keep-N capped by the REAL prune calls.
+        let captured = pool_files("qwen_7b", false);
+        let snapshots = pool_files("qwen_7b", true);
+        assert_eq!(
+            captured.len(),
+            ENGINE_LOG_KEEP,
+            "the shared pool caps the model's captures: {captured:?}"
+        );
+        assert_eq!(
+            snapshots.len(),
+            ENGINE_LOG_KEEP,
+            "the shared pool caps the model's snapshots: {snapshots:?}"
+        );
+        let real_epoch_capture = captured.iter().any(|n| {
+            n.strip_prefix("qwen_7b-")
+                .and_then(|rest| rest.strip_suffix(".log"))
+                .and_then(|epoch| epoch.parse::<u128>().ok())
+                .is_some_and(|epoch| epoch > 1_000_000_000)
+        });
+        assert!(
+            real_epoch_capture,
+            "the spawn's real capture landed under the sanitized stem: {captured:?}"
+        );
+        let real_epoch_snapshot = snapshots.iter().any(|n| {
+            n.strip_prefix("qwen_7b-")
+                .and_then(|rest| rest.strip_suffix(".container.log"))
+                .and_then(|epoch| epoch.parse::<u128>().ok())
+                .is_some_and(|epoch| epoch > 1_000_000_000)
+        });
+        assert!(
+            real_epoch_snapshot,
+            "the snapshot landed in the same pool: {snapshots:?}"
+        );
+        // A different slug keeps every one of its files.
+        assert_eq!(
+            pool_files("qwen-7b", false).len(),
+            7,
+            "another model's captures are never pruned through this pool: {names:?}"
+        );
+        assert_eq!(
+            pool_files("qwen-7b", true).len(),
+            7,
+            "another model's snapshots are never pruned through this pool: {names:?}"
+        );
+        for name in names.iter().filter(|n| {
+            n.starts_with("qwen 7b-") || n.starts_with("qwen_7b-") || n.starts_with("qwen-7b-")
+        }) {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
     }
 
     /// The classification the two budgets depend on. A rolled generation is named

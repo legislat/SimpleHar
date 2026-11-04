@@ -3017,6 +3017,70 @@ async fn defaults_persist_to_the_config_boot_loaded_even_under_a_custom_path() {
 }
 
 #[tokio::test]
+async fn a_default_that_never_landed_never_changes_memory() {
+    // R2-07-03: config file is king. A write that never landed may not leave
+    // memory holding a value the file does not. The boot path is a directory
+    // here: every read fails and the publish rename can never replace it, so
+    // `persist_default_model` can only answer `NotLanded`. Falsifier: the
+    // pre-fix shape inserted the override before the persist leg, so this
+    // call answered `default_model: "new"` and `/har/status` served a default
+    // the next boot will never see.
+    let dir = simplehar_se::testutil::temp_dir("api-config-never-landed");
+    let config_path = dir.join(TEST_CONFIG_NAME);
+    std::fs::create_dir(&config_path).expect("the boot path is an unwritable directory");
+    let mut config = AppConfig::default();
+    config
+        .categories
+        .iter_mut()
+        .find(|cat| cat.id == CategoryId::Work)
+        .expect("WORK")
+        .default_model = Some("old".to_string());
+    config.source_path = Some(config_path.clone());
+    let (control, _, _, _, _, _) = app(
+        config,
+        &[
+            ("old", "mock", CategoryId::Work, Some(4.0)),
+            ("new", "mock", CategoryId::Work, Some(4.0)),
+        ],
+    );
+
+    let (status, body) = post_json(
+        &control,
+        "/har/config/default",
+        r#"{"category":"WORK","model":"new"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["persisted"],
+        serde_json::json!(false),
+        "a write that could never rename cannot claim persistence: {body}"
+    );
+    assert_eq!(
+        body["default_model"],
+        serde_json::json!("old"),
+        "the answer carries the still-effective value, not the refused edit: {body}"
+    );
+
+    let (_, status_body) = get_json(&control, "/har/status").await;
+    let work_cat = status_body["categories"]
+        .as_array()
+        .expect("categories")
+        .iter()
+        .find(|cat| cat["id"] == "WORK")
+        .expect("WORK");
+    assert_eq!(
+        work_cat["default_model"], "old",
+        "memory still answers the previous default the file holds: {status_body}"
+    );
+    assert!(
+        config_path.is_dir(),
+        "the failed write left no file behind where the boot path stands"
+    );
+    let _ = std::fs::remove_dir(&config_path);
+}
+
+#[tokio::test]
 async fn last_error_is_the_newest_failed_load_and_survives_unrelated_success() {
     // A3 (API wiring): a genuine engine failure pins `last_error` (502, names the
     // model + readiness); a newer failure takes the headline; an unrelated
@@ -4137,8 +4201,11 @@ async fn the_retag_reply_surfaces_the_slot_and_default_follow_ups() {
     // Leg 2 — the clear cannot persist: a hand-stamped source_path in a missing
     // directory makes the gated write fail (disk-full/locked-file stand-in). The
     // 200 and `"edited"` stay — the yaml edit is honestly done — but the reply says
-    // the file still names the moved model, and `/har/status` shows the memory
-    // value that did move.
+    // the file still names the moved model, and memory never moves either: a
+    // clear whose bytes never landed leaves the effective default at the value
+    // the file still holds (R2-07-03). The pre-R2-07-03 pin asserted memory
+    // took the clear anyway; the operator ruling retires that memory-beats-file
+    // shape, so this pin now demands the opposite.
     let mut broken = config_defaulting_work("qwen3");
     let unwriteable = simplehar_se::testutil::temp_dir("api-retag-nopersist")
         .join("gone")
@@ -4183,8 +4250,9 @@ async fn the_retag_reply_surfaces_the_slot_and_default_follow_ups() {
         .expect("WORK entry");
     assert_eq!(
         work["default_model"],
-        Value::Null,
-        "memory still took the clear even though the file did not: {doc}"
+        serde_json::json!("qwen3"),
+        "memory keeps answering the default the file still holds — a clear that \
+         never landed never changes memory (R2-07-03): {doc}"
     );
 }
 
