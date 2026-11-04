@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Test port, outside every SE plan and protected range (HANDOFF В§3). Each test in
+/// Test port, outside every SE plan and protected range (HANDOFF §3). Each test in
 /// this binary takes its own offset: `#[tokio::test]` runs them concurrently, so two
 /// children may never be given one port. `18_195` stays reserved for the lib binary's
 /// own engine-child test.
