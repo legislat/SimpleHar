@@ -127,9 +127,18 @@ impl ActorState {
             errors = errors.len(),
             "catalog scanned"
         );
-        self.catalog = models;
+        // Phase 4 (`TASK-ENGINE-MEASUREMENT`, the 2026-11-04 manual-reload
+        // trap): the replace keeps the OLD rows so the re-book round below can
+        // tell a cost move from a flag move before anything judges stale.
+        let previous = std::mem::replace(&mut self.catalog, models);
         self.catalog_errors = errors;
         self.invalidate_queued_loads(drift);
+        // A rescan that moved ONLY cost figures re-books the loaded resident
+        // here, before the marker round judges — the row-cost half of the
+        // reload trap (a rescan used to only mark `stale_config` and leave the
+        // release credit on the paper figure). A flag move falls through
+        // untouched and the marker round ambers it exactly as today.
+        self.rebook_cost_only_moves(&previous, drift);
         self.refresh_stale_markers(drift);
         // R5 report-only reconcile (ruling 9, 2026-11-01): every catalog
         // application — the boot scan and every rescan alike — re-checks which
@@ -141,6 +150,150 @@ impl ActorState {
         // drop on arrival). Deferred and off-thread like everything that
         // touches a volume; a no-op when the probe is off.
         self.spawn_fit_warm();
+    }
+
+    /// Whether one catalog application moved the resident's row ONLY in the
+    /// cost surface a reload was never the cure for: the declared `vram_gb`,
+    /// the cost class, and the measured pair with its provenance stamps — the
+    /// numbers a re-booking can lawfully adopt under the single
+    /// `cost_source` precedence. Anything else is a config change the running
+    /// engine never read and keeps its `stale_config` accusation exactly as
+    /// today: the engine id, the category, the model ref, the launch floor,
+    /// the load timeout, the serve id, the gguf size, and EVERY key outside
+    /// that surface in the raw map (an argv passthrough move like
+    /// `cpu_offload` or a `--vram-elastic` toggle lives there; the ninfer
+    /// profile flag likewise — its pair then voids by comparability and the
+    /// raw move ambers the resident anyway). `fit_gb` never classifies: it is
+    /// an in-process patch, not an operator setting. A byte move in which no
+    /// cost field actually differs (a comment edit, a same-bytes re-save) is
+    /// NOT a cost move: the marker round's conservatism stays in charge.
+    fn cost_only_move(old: &ModelEntry, new: &ModelEntry) -> bool {
+        const COST_KEYS: [&str; 7] = [
+            "vram_gb",
+            "cost",
+            "measured_gb",
+            "measured_gb_min",
+            "measured_offload",
+            "measured_attribution",
+            "measured_profile",
+        ];
+        if old.name != new.name
+            || old.engine != new.engine
+            || old.category != new.category
+            || old.gguf_size_gb != new.gguf_size_gb
+            || old.launch_floor_gb != new.launch_floor_gb
+            || old.load_timeout_s != new.load_timeout_s
+            || old.model_ref != new.model_ref
+            || old.serve_model != new.serve_model
+        {
+            return false;
+        }
+        for (key, value) in &new.raw {
+            if !COST_KEYS.contains(&key.as_str()) && old.raw.get(key) != Some(value) {
+                return false;
+            }
+        }
+        if old
+            .raw
+            .keys()
+            .any(|key| !COST_KEYS.contains(&key.as_str()) && !new.raw.contains_key(key))
+        {
+            return false;
+        }
+        old.vram_gb != new.vram_gb
+            || old.cost != new.cost
+            || old.measured_gb != new.measured_gb
+            || old.measured_min_gb != new.measured_min_gb
+            || old.measured_offload != new.measured_offload
+            || old.measured_attribution != new.measured_attribution
+            || old.measured_profile != new.measured_profile
+    }
+
+    /// The phase-4 half of the reload trap (`TASK-ENGINE-MEASUREMENT`, the
+    /// 2026-11-04 readmission incident): a rescan that moved a loaded row's
+    /// cost figures ONLY re-books the resident's slot `need` from the new
+    /// bytes — the release credit, the R3 no-release guard and the eviction
+    /// planner stop billing a stranger's paper number — instead of leaving
+    /// the operator to unload, edit and reload to move the booking. Runs in
+    /// the same pre-gathered-evidence posture as every other drift round
+    /// (FINDINGS-07 [8]): it judges only the `previous` rows kept by the
+    /// replace and the `drift` stats gathered off-thread — zero filesystem
+    /// calls. The rows it re-books leave the marker round with a capture that
+    /// matches the bytes the booking now follows, so they stay green; every
+    /// row it refuses to re-book (a flag move, an amber already earned, a
+    /// greedy booking, a row that can no longer answer the gate) falls
+    /// through to the unchanged marker verdict — invalidate, never launder.
+    fn rebook_cost_only_moves(&mut self, previous: &[ModelEntry], drift: &DriftStats) {
+        for slot in &mut self.slots {
+            let Some(occupant) = slot.occupant.as_mut() else {
+                continue;
+            };
+            // An amber the operator's flag edit earned is never laundered by
+            // a later cost edit: unload-and-reload stays the apply gesture
+            // for a resident whose launch no longer matches its row.
+            if occupant.stale_config {
+                continue;
+            }
+            let Some((file, then)) = occupant.spawn_config.clone() else {
+                continue;
+            };
+            // Only a re-stat this round actually observed can move a booking:
+            // an unobserved path is absence (the marker round's posture), and
+            // a read that failed this round is absence too, never evidence.
+            let Some(Some(now)) = drift.stats.get(file.as_path()).copied() else {
+                continue;
+            };
+            // The re-book fires only when THIS application is what moved the
+            // bytes. Bytes unchanged with a moved stamp (a pure re-save) is
+            // the marker round's conservatism, not a cost move.
+            if now == then {
+                continue;
+            }
+            // Both sides must exist to classify the move: a row that entered
+            // the catalog only now is not a move of the file this launch came
+            // from (its old bytes were simply not in the last scan).
+            let old = previous
+                .iter()
+                .find(|entry| entry.file.as_deref() == Some(file.as_path()));
+            let new = self
+                .catalog
+                .iter()
+                .find(|entry| entry.file.as_deref() == Some(file.as_path()));
+            let (Some(old), Some(new)) = (old, new) else {
+                continue;
+            };
+            if !Self::cost_only_move(old, new) {
+                continue;
+            }
+            // A greedy booking is card-driven (its admit-time clamp), never
+            // row-driven: a cost edit cannot re-bill it, and the marker round
+            // ambers the change as an ordinary config move.
+            if old.cost == crate::model::CostClass::Greedy
+                || new.cost == crate::model::CostClass::Greedy
+            {
+                continue;
+            }
+            // The booking the new bytes justify, by the ONE decision a fresh
+            // load takes. A row that cannot answer it (a stripped `exact`) is
+            // invalidated, not re-booked: the marker round below ambers it,
+            // which is the acceptance criterion's other half — a cost move
+            // updates the booking OR invalidates it, never silently keeps the
+            // old number while the bytes say otherwise.
+            let Ok(Some(need)) = ActorState::booking_need(new) else {
+                continue;
+            };
+            tracing::info!(
+                model = %occupant.model,
+                booked_gib = need.0,
+                was_gib = occupant.need.0,
+                "cost-only rescan re-booked the loaded resident without a reload"
+            );
+            occupant.need = need;
+            // Axis 2: this round judged these bytes and adopted them, so the
+            // capture rides with the booking — the interlock-5 posture the
+            // fold write-back and the flag-edit re-baseline already carry.
+            occupant.spawn_config = Some((file, now));
+        }
     }
 
     /// The resident half of reload (Axis 2 = B, operator ruling 2026-10-29): on the

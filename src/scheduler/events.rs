@@ -358,22 +358,29 @@ impl ActorState {
                 if Self::report_container(&runtime, &tx, &ctx).await.is_some() {
                     return;
                 }
-                // The same one-shot doctrine for the process engines basalt/strata
-                // (TASK-ENGINE-MEASUREMENT phase 1, ORCHESTRATION §3): one attempt
-                // at the engine's own status endpoint (or the process-tree witness
-                // sum it falls back to) right here at readiness; a figure that
-                // lands ends the witness loop the way ninfer's engine_report ends
-                // it — static footprint, not a point to average. Anything the
-                // sampler refuses (stub parse, silence, an unmeasurable figure)
-                // returns None and falls through to the witness loop below, so
-                // the stand-in readings keep flowing and the one-shot never
-                // consumes them.
-                if matches!(ctx.engine.as_str(), "basalt" | "strata")
-                    && Self::report_measurement(&runtime, &tx, &ctx, &witness)
-                        .await
-                        .is_some()
-                {
-                    return;
+                // The process engines basalt/strata land their own status
+                // figure (or the process-tree witness sum it falls back to)
+                // right here at readiness (TASK-ENGINE-MEASUREMENT phase 1,
+                // ORCHESTRATION §3). Phase 4 amendment: these rows are ELASTIC
+                // engines — the expert caches keep moving after the first
+                // fold — so instead of ending the sampler the way ninfer's
+                // `engine_report` ends its one-shot (ninfer semantics stay
+                // untouched: that path never reaches here), the landed figure
+                // seeds the elastic refresh loop, which re-folds the engine's
+                // own status word under the asymmetric hysteresis band
+                // ([`ActorState::elastic_refresh`]: up freely, down only past
+                // the band). Anything the landing refuses (silence, an
+                // unmeasurable figure) returns None and falls through to the
+                // witness loop below, so the stand-in readings keep flowing
+                // and a refused landing never consumes them (review
+                // 2026-10-31 M1).
+                if matches!(ctx.engine.as_str(), "basalt" | "strata") {
+                    if let Some(booked) =
+                        Self::report_measurement(&runtime, &tx, &ctx, &witness).await
+                    {
+                        Self::elastic_refresh(&runtime, &tx, &ctx, &witness, booked, every).await;
+                        return;
+                    }
                 }
                 // The total-diff stand-in needs the admit reading as its baseline;
                 // with no observation to subtract from, there is no honest

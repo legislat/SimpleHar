@@ -3509,7 +3509,10 @@ async fn a_serving_model_gains_its_launch_stamp_and_ambers_on_the_next_rescan() 
 
     std::fs::write(
         dir.join("stamponly.yaml"),
-        "name: stamponly\nengine: mock\ncategory: WORK\nvram_gb: 44\n",
+        // The `cpu_offload` flag key (phase 4): a pure cost edit is now
+        // re-booked without a reload, so an amber pin must move a flag —
+        // config the running engine never read — to earn the verdict.
+        "name: stamponly\nengine: mock\ncategory: WORK\nvram_gb: 44\ncpu_offload: true\n",
     )
     .expect("operator edit");
     let status = handle.status().await.expect("actor alive");
@@ -3570,7 +3573,10 @@ async fn one_edit_retires_the_queue_and_ambers_the_resident_on_the_same_rescan()
     .await;
     std::fs::write(
         dir.join(format!("{DRIFT_RESIDENT}.yaml")),
-        "name: drift-resident\nengine: mock-hold-kill\ncategory: WORK\nvram_gb: 44\n",
+        // The `cpu_offload` flag key (phase 4): a pure cost edit is now
+        // re-booked without a reload; this pin judges the amber verdict, so
+        // the edit moves a flag the running engine never read.
+        "name: drift-resident\nengine: mock-hold-kill\ncategory: WORK\nvram_gb: 44\ncpu_offload: true\n",
     )
     .expect("edit the resident's yaml");
     handle.reload().await.expect("rescan applied");

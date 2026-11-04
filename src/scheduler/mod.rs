@@ -3573,7 +3573,11 @@ mod tests {
         );
         assert_eq!(
             ActorState::report_measurement(&runtime, &tx, &ctx, &witness).await,
-            Some(())
+            // Phase 4: the landing now reports the booked figure it seeded the
+            // actor with (the same rounded value the fold will land), so the
+            // elastic refresh can judge its hysteresis against the truth — the
+            // tree sum of the engine plus its direct children, 20 + 10.
+            Some(30.0)
         );
         let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -4543,7 +4547,11 @@ mod tests {
         let original = std::fs::read(&yaml).expect("read");
         std::fs::write(
             &yaml,
-            "engine: mock\ncost: fixed\nmeasured_gb: 444.0\nmeasured_gb_min: 8.0\n",
+            // The `cpu_offload` flag key (phase 4): a PURE cost edit is now
+            // re-booked without a reload, so an amber pin must edit a flag —
+            // the launch config the running engine never read — to earn the
+            // verdict this pin then defends against a byte-identical restore.
+            "engine: mock\ncost: fixed\nmeasured_gb: 444.0\nmeasured_gb_min: 8.0\ncpu_offload: true\n",
         )
         .expect("diverge (size moves: no dependence on the clock tick)");
         rescan(&mut state, &yaml, "m");
@@ -4650,14 +4658,17 @@ mod tests {
         // capture been moved under an earned amber).
         std::fs::write(
             &yaml,
-            "engine: mock\ncost: fixed\nmeasured_gb: 120.0\nmeasured_gb_min: 8.0\n",
+            // The `cpu_offload` flag key (phase 4): a pure cost edit is now
+            // re-booked without a reload; this leg needs a real amber, earned
+            // by a config move the running engine never read.
+            "engine: mock\ncost: fixed\nmeasured_gb: 120.0\nmeasured_gb_min: 8.0\ncpu_offload: true\n",
         )
         .expect("operator edit (size moves)");
         rescan(&mut state, &yaml, "m");
         assert_eq!(state.snapshot().slots[0].stale_config, Some(true));
         std::fs::write(
             &yaml,
-            "engine: mock\ncost: fixed\nmeasured_gb: 120.0\nmeasured_gb_min: 8.0\n",
+            "engine: mock\ncost: fixed\nmeasured_gb: 120.0\nmeasured_gb_min: 8.0\ncpu_offload: true\n",
         )
         .expect("fold write over an amber resident");
         let written = crate::model::fingerprint(&yaml).expect("stat");
@@ -4687,6 +4698,895 @@ mod tests {
             Some(false),
             "absence of a capture is absence of evidence, never an accusation"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 4 (`TASK-ENGINE-MEASUREMENT`): the booking policy that removes
+    // the 2026-11-04 manual-reload trap. Two seams: a process measurement
+    // that folds re-books its slot occupant, and a rescan that moved ONLY
+    // cost figures re-books (or invalidates) the resident without a reload.
+    // ---------------------------------------------------------------------
+
+    /// Phase-4 seam (`on_process_measurement`): the fold moves the row's max
+    /// truth, and the slot booking must follow in the same turn — otherwise
+    /// the release credit and the R3 no-release floor guard keep billing the
+    /// paper figure (the Strata 55 / 70.4 incident). Falsifiers: dropping the
+    /// `rebook_after_measurement` call (the first assert stays at the paper
+    /// 55), and booking the raw measurement instead of the ONE decision
+    /// (the second fold to 30.0 must floor back UP to the declared 55, not
+    /// book 30).
+    #[tokio::test]
+    async fn a_folded_measurement_rebooks_the_slots_resident_to_the_max_truth() {
+        let dir = crate::testutil::temp_dir("fold-rebook");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("rb.yaml");
+        std::fs::write(&yaml, "engine: strata\ncost: fixed\nvram_gb: 55\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let resident = rescan_entry(&yaml, "rb");
+        let ticket = fold_ticket(19_040);
+        state.catalog = vec![resident.clone()];
+        seat_spawn(&mut state, &resident, &ticket, 19_040);
+        // The incident's shape: the booking rode the paper row.
+        state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(55.0);
+
+        state.process_measurement(
+            "rb",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 67.8,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::EngineStatus,
+            },
+        );
+        assert_eq!(
+            state.snapshot().slots[0].need_gib,
+            Some(67.8),
+            "the engine's own word above the declared floor re-books the slot"
+        );
+        // The two persist writes race for the disk: land the first before the
+        // second fold, so the final file provably carries the later reading.
+        await_yaml_keys(&yaml, &["measured_gb: 67.8"]).await;
+
+        state.process_measurement(
+            "rb",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 30.0,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::EngineStatus,
+            },
+        );
+        assert_eq!(
+            state.snapshot().slots[0].need_gib,
+            Some(55.0),
+            "the re-book is the ONE decision, not the raw figure: a footprint under \
+             the declared floor floors back at the operator's number"
+        );
+        await_yaml_keys(&yaml, &["measured_gb: 30.0"]).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scripted status answer for the elastic-refresh pin: one body per poll
+    /// (`None` = silence), and silence forever once the sequence is spent.
+    struct SequencedStatusRuntime {
+        answers: std::sync::Mutex<std::collections::VecDeque<Option<serde_json::Value>>>,
+        children: Vec<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::EngineRuntime for SequencedStatusRuntime {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: crate::ownership::SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            panic!("the elastic refresh pin must never load");
+        }
+        async fn kill(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<(), crate::engine::SpawnError> {
+            panic!("the elastic refresh pin must never load");
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            panic!("the elastic refresh pin must never load");
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            panic!("the elastic refresh pin must never load");
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("the elastic refresh pin must never load");
+        }
+        async fn engine_status_json(&self, _port: u16, _path: &str) -> Option<serde_json::Value> {
+            let mut answers = self.answers.lock().expect("lock");
+            answers.pop_front().flatten()
+        }
+        async fn descendant_pids(&self, _pid: u32) -> Vec<u32> {
+            self.children.clone()
+        }
+    }
+
+    /// A Strata-shaped vram snapshot booking `expert_cache_mib + reserve_mib`
+    /// (`measurement_from_status`, the triple the 2026-11-04 evidence line
+    /// records for the sibling engine).
+    fn strata_vram_status(expert_cache_mib: u64) -> serde_json::Value {
+        serde_json::json!({
+            "info": {
+                "vram": {
+                    "expert_cache_mib": expert_cache_mib,
+                    "vram_free_mib": 2048,
+                    "reserve_mib": 0,
+                }
+            }
+        })
+    }
+
+    /// Phase-4 elastic refresh (`ActorState::elastic_refresh`), the asymmetric
+    /// band: starting booked at 62.0 on the scripted 72 GiB card, the polls
+    /// answer equal (62.0 — nothing moves), rise (62.5 — re-books at once,
+    /// under-booking is over-commitment), small fall (62.0 — inside the
+    /// 1 GiB band, the booking stays), big fall (60.0 — 2.5 GiB past the
+    /// band, the credit moves down). After the sequence, silence: absence is
+    /// never a guess, and nothing further ever books. Falsifiers: a symmetric
+    /// band (the rise skipped), no band (the small fall lands), and consuming
+    /// the sampler on the first fold (no message after tick one).
+    #[tokio::test]
+    async fn the_elastic_refresh_rebooks_rises_at_once_and_falls_only_past_the_band() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let runtime = Arc::new(SequencedStatusRuntime {
+            answers: std::sync::Mutex::new(
+                vec![
+                    Some(strata_vram_status(63_488)), // 62.0: equal — silence
+                    Some(strata_vram_status(64_000)), // 62.5: rise — re-books
+                    Some(strata_vram_status(63_488)), // 62.0: 0.5 fall — band
+                    Some(strata_vram_status(61_440)), // 60.0: 2.5 fall — lands
+                ]
+                .into(),
+            ),
+            children: Vec::new(),
+        }) as Arc<dyn crate::engine::EngineRuntime>;
+        let witness = Arc::new(scripted_sample(Vec::new())) as Arc<dyn crate::budget::VramWitness>;
+        let ctx = sampler_ctx("elastic", "strata", fold_ticket(19_041));
+        let sampler = tokio::spawn(async move {
+            ActorState::elastic_refresh(
+                &runtime,
+                &tx,
+                &ctx,
+                &witness,
+                62.0,
+                Duration::from_millis(40),
+            )
+            .await;
+        });
+        async fn next_figure(rx: &mut mpsc::UnboundedReceiver<ActorMsg>) -> f64 {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the expected figure reaches the actor")
+                .expect("actor channel open");
+            let ActorMsg::MeasuredProcessReport { measurement, .. } = msg else {
+                panic!("expected a process-measurement re-book");
+            };
+            measurement.gpu_gib
+        }
+        let rise = next_figure(&mut rx).await;
+        assert!(
+            (rise - 62.5).abs() < 1e-6,
+            "the rise re-books at once, band only ever guards down: {rise}"
+        );
+        let fall = next_figure(&mut rx).await;
+        assert!(
+            (fall - 60.0).abs() < 1e-6,
+            "the small fall stays inside the band; only the 2.5 GiB fall lands: {fall}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "after the sequence, silence re-books nothing (and the loop keeps polling)"
+        );
+        sampler.abort();
+    }
+
+    /// Review F-EM-403: a resident the TREE landed (the status endpoint silent
+    /// at readiness — the 2026-11-04 evidence line records exactly this Strata
+    /// serve lag) stays open to the engine's own word: the refresh loop polls
+    /// the endpoint every tick regardless of what landed first, and when it
+    /// answers, that answer is the truth — above the booked tree figure it
+    /// re-books at once. The landing message stays `ProcessTreeNvml`; the
+    /// upgrade carries `EngineStatus`. Falsifier: ending the sampler after a
+    /// tree landing (the upgrade never arrives).
+    #[tokio::test]
+    async fn a_tree_landed_resident_upgrades_to_the_engines_own_status_word() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let runtime = Arc::new(SequencedStatusRuntime {
+            answers: std::sync::Mutex::new(
+                // pop 1: the landing — silent, so the tree sum books;
+                // pop 2: the first refresh tick — the endpoint came up with
+                // 34.0 GiB above the booked 30.0: the rise re-books at once.
+                vec![None, Some(strata_vram_status(34_816))].into(),
+            ),
+            children: vec![4243],
+        }) as Arc<dyn crate::engine::EngineRuntime>;
+        let witness = Arc::new(scripted_sample(vec![
+            (4242, 20.0),
+            (4243, 10.0),
+            (9999, 5.0),
+        ])) as Arc<dyn crate::budget::VramWitness>;
+        let ticket = SpawnTicket {
+            generation: 7,
+            kind: ResourceKind::ChildProcess,
+            pid: 4242,
+            port: 19_042,
+        };
+        let ctx = sampler_ctx("treeup", "strata", ticket.clone());
+        assert_eq!(
+            ActorState::report_measurement(&runtime, &tx, &ctx, &witness).await,
+            Some(30.0),
+            "the status endpoint is silent at readiness: the engine plus its \
+             direct children land the booking, and the sampler is not consumed"
+        );
+        let sampler = tokio::spawn(async move {
+            ActorState::elastic_refresh(
+                &runtime,
+                &tx,
+                &ctx,
+                &witness,
+                30.0,
+                Duration::from_millis(40),
+            )
+            .await;
+        });
+        async fn next_report(
+            rx: &mut mpsc::UnboundedReceiver<ActorMsg>,
+        ) -> crate::engine::EngineMeasurement {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a measurement reaches the actor")
+                .expect("actor channel open");
+            let ActorMsg::MeasuredProcessReport { measurement, .. } = msg else {
+                panic!("expected a process-measurement report");
+            };
+            measurement
+        }
+        let landing = next_report(&mut rx).await;
+        assert_eq!(
+            (landing.gpu_gib, landing.source),
+            (30.0, crate::engine::MeasurementSource::ProcessTreeNvml),
+            "the landing is the tree sum"
+        );
+        let upgrade = next_report(&mut rx).await;
+        assert!(
+            (upgrade.gpu_gib - 34.0).abs() < 1e-6
+                && upgrade.source == crate::engine::MeasurementSource::EngineStatus,
+            "the first live status answer supersedes the stand-in reading: {upgrade:?}"
+        );
+        sampler.abort();
+    }
+
+    /// Review F-EM-401, amber half: a resident the rescan marked `stale_config`
+    /// keeps its booking through a fold. The fold still records what the
+    /// process actually holds (the measured pair persists — honest data, the
+    /// same ruling as accepted F-EM-402), but a row that no longer describes
+    /// the process may not drive the booking: only unload + reload re-applies,
+    /// exactly the posture `rebook_cost_only_moves` declares. Falsifier: no
+    /// `stale_config` leg in `rebook_after_measurement` (the 67.8 walks onto
+    /// the amber resident's slot).
+    #[tokio::test]
+    async fn an_amber_residents_fold_records_the_pair_but_never_rebooks() {
+        let dir = crate::testutil::temp_dir("fold-rebook-amber");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("amb.yaml");
+        std::fs::write(&yaml, "engine: strata\ncost: fixed\nvram_gb: 55\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let resident = rescan_entry(&yaml, "amb");
+        let ticket = fold_ticket(19_043);
+        state.catalog = vec![resident.clone()];
+        seat_spawn(&mut state, &resident, &ticket, 19_043);
+        if let Some(occupant) = state.slots[0].occupant.as_mut() {
+            occupant.need = Gibibytes(55.0);
+            occupant.stale_config = true;
+        }
+
+        state.process_measurement(
+            "amb",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 67.8,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::EngineStatus,
+            },
+        );
+        let entry = &state.catalog[0];
+        assert_eq!(
+            (entry.measured_gb, entry.measured_attribution),
+            (
+                Some(67.8),
+                Some(crate::model::MeasuredAttribution::EngineStatus)
+            ),
+            "the fold still records what the process holds"
+        );
+        assert_eq!(
+            state.snapshot().slots[0].need_gib,
+            Some(55.0),
+            "but an amber resident's booking stands: the apply gesture is unload + reload"
+        );
+        await_yaml_keys(&yaml, &["measured_gb: 67.8"]).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review F-EM-401, greedy half: the refusal reads the SPAWN-TIME cost
+    /// class the job carries, not the possibly-edited row — an engine launched
+    /// greedy keeps its card-driven clamped booking whatever the yaml says
+    /// now (the rescan seam refuses the same resident from its own side).
+    /// Falsifier: reading only `entry.cost` (the flipped `fixed` row would
+    /// book the 67.8 onto the greedy launch).
+    #[tokio::test]
+    async fn a_greedy_launched_residents_fold_never_rebooks_even_on_a_fixed_row() {
+        let dir = crate::testutil::temp_dir("fold-rebook-greedy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let yaml = dir.join("gdy.yaml");
+        std::fs::write(&yaml, "engine: strata\ncost: greedy\nvram_gb: 40\n").expect("seed");
+        let mut state = fold_state(&dir);
+        let resident = rescan_entry(&yaml, "gdy");
+        let ticket = fold_ticket(19_044);
+        state.catalog = vec![resident.clone()];
+        seat_spawn(&mut state, &resident, &ticket, 19_044);
+        // The card-driven clamp the greedy admit left behind.
+        state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(40.0);
+        // The row reads `fixed` now (an operator flipped the class; the rescan
+        // seam has its own greedy legs) — the JOB still carries the spawn-era
+        // class, and that is what refuses.
+        state.catalog[0].cost = crate::model::CostClass::Fixed;
+
+        state.process_measurement(
+            "gdy",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 67.8,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::EngineStatus,
+            },
+        );
+        assert_eq!(
+            state.snapshot().slots[0].need_gib,
+            Some(40.0),
+            "a greedy launch is never re-booked by a measurement, whatever the row says now"
+        );
+        await_yaml_keys(&yaml, &["measured_gb: 67.8"]).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cost-only rescan (phase 4, `rebook_cost_only_moves`): the loaded
+    /// resident's booking follows the new bytes WITHOUT a reload, the capture
+    /// rides with it so the marker round stays green, and the next unchanged
+    /// rescan confirms the re-baseline. Falsifiers: no re-book (need stays at
+    /// the fixture's 4.0), no re-baseline (the unchanged rescan ambers), and
+    /// laundering a flag move (see the sibling pin below).
+    #[test]
+    fn a_cost_only_edit_rebooks_the_loaded_resident_without_a_reload() {
+        let (mut state, yaml, _) = resident_on_a_file();
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 12.0\nmeasured_gb_min: 8.0\n",
+        )
+        .expect("operator cost edit");
+        rescan(&mut state, &yaml, "m");
+        let after = state.snapshot();
+        assert_eq!(
+            after.slots[0].need_gib,
+            Some(12.0),
+            "the moved cost figure re-books the resident's release credit"
+        );
+        assert_eq!(
+            after.slots[0].stale_config,
+            Some(false),
+            "a booking the new bytes justify is applied, not accused"
+        );
+        rescan(&mut state, &yaml, "m");
+        let again = state.snapshot();
+        assert_eq!(again.slots[0].stale_config, Some(false));
+        assert_eq!(again.slots[0].need_gib, Some(12.0));
+    }
+
+    /// The boundary stays a boundary: an edit that moves a flag (here together
+    /// with a cost figure) is a config change the running engine never read —
+    /// it ambers exactly as before and re-books NOTHING, even though the cost
+    /// figure alone would have been adopted. Falsifier: classifying any
+    /// byte-move as cost-only (this goes green with an unearned 99.0).
+    #[test]
+    fn a_flag_edit_still_ambers_the_resident_and_never_rebooks_it() {
+        let (mut state, yaml, _) = resident_on_a_file();
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 99.0\nmeasured_gb_min: 8.0\ncpu_offload: true\n",
+        )
+        .expect("operator edit moving a flag alongside the cost figure");
+        rescan(&mut state, &yaml, "m");
+        let after = state.snapshot();
+        assert_eq!(
+            after.slots[0].stale_config,
+            Some(true),
+            "the launch no longer matches the row: the amber gesture (unload + reload) stands"
+        );
+        assert_eq!(
+            after.slots[0].need_gib,
+            Some(4.0),
+            "a resident whose engine never read the bytes never re-books on them"
+        );
+    }
+
+    /// Honesty control for the re-book classifier: bytes moved with NO cost
+    /// field actually different (a comment note) is not a cost move — the
+    /// marker round's conservatism keeps the amber and the old booking.
+    #[test]
+    fn a_comment_only_edit_is_not_a_cost_move() {
+        let (mut state, yaml, _) = resident_on_a_file();
+        let original = std::fs::read_to_string(&yaml).expect("read");
+        std::fs::write(&yaml, format!("{original}# operator note\n")).expect("comment edit");
+        rescan(&mut state, &yaml, "m");
+        let after = state.snapshot();
+        assert_eq!(after.slots[0].stale_config, Some(true));
+        assert_eq!(
+            after.slots[0].need_gib,
+            Some(4.0),
+            "nothing moved that a booking could follow"
+        );
+    }
+
+    /// A cost move that leaves the row unable to answer the gate (an `exact`
+    /// stripped of every size) is INVALIDATED, never silently kept: the
+    /// marker round ambers it (the acceptance criterion's other half — update
+    /// the booking or invalidate it, never keep a number the bytes deny).
+    #[test]
+    fn a_cost_move_to_an_unbookable_row_invalidates_instead_of_rebooking() {
+        let (mut state, yaml, _) = resident_on_a_file();
+        std::fs::write(&yaml, "engine: mock\ncost: exact\n").expect("strip every size");
+        rescan(&mut state, &yaml, "m");
+        let after = state.snapshot();
+        assert_eq!(
+            after.slots[0].stale_config,
+            Some(true),
+            "the row no longer justifies any booking: unload + reload is the gesture"
+        );
+        assert_eq!(after.slots[0].need_gib, Some(4.0));
+    }
+
+    /// An amber the operator's flag edit earned is never laundered by a later
+    /// cost edit: the resident whose launch no longer matches its row may not
+    /// re-book against bytes its engine never read. Falsifier: dropping the
+    /// `stale_config` guard in `rebook_cost_only_moves` (the cost edit below
+    /// would turn the resident green and re-booked).
+    #[test]
+    fn an_earned_amber_survives_a_later_cost_only_edit() {
+        let (mut state, yaml, _) = resident_on_a_file();
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 10.0\nmeasured_gb_min: 8.0\ncpu_offload: true\n",
+        )
+        .expect("flag edit earns the amber");
+        rescan(&mut state, &yaml, "m");
+        assert_eq!(state.snapshot().slots[0].stale_config, Some(true));
+        std::fs::write(
+            &yaml,
+            "engine: mock\ncost: fixed\nmeasured_gb: 99.0\nmeasured_gb_min: 8.0\ncpu_offload: true\n",
+        )
+        .expect("later cost-only edit over the amber");
+        rescan(&mut state, &yaml, "m");
+        let after = state.snapshot();
+        assert_eq!(
+            after.slots[0].stale_config,
+            Some(true),
+            "the amber stays until the unload + reload applies it"
+        );
+        assert_eq!(after.slots[0].need_gib, Some(4.0));
+    }
+
+    /// A runtime the readmission pins can safely touch: the kill and the
+    /// release proof answer immediately (the pins judge only the admit
+    /// decision and never drive the swap to the end), while everything the
+    /// pins must never reach keeps the never-called posture.
+    struct ReadmitRuntime;
+
+    #[async_trait::async_trait]
+    impl crate::engine::EngineRuntime for ReadmitRuntime {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: crate::ownership::SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            Ok(crate::engine::Spawned {
+                port: 18_999,
+                pid: 0,
+            })
+        }
+        async fn kill(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<(), crate::engine::SpawnError> {
+            Ok(())
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            Ok(true)
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            panic!("the readmission pin never reaches readiness");
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("the readmission pin never reaches readiness");
+        }
+        async fn engine_status_json(&self, _port: u16, _path: &str) -> Option<serde_json::Value> {
+            None
+        }
+        async fn descendant_pids(&self, _pid: u32) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    /// The 2026-11-04 readmission shape, parameterised: one WORK slot holding
+    /// a resident booked at `paper_gib` while the scripted 72 GiB card
+    /// physically carries `held_gib` (under-booked resident, the incident),
+    /// and no other occupancy — the same-slot replacement is the only release
+    /// the gate can ever count.
+    fn readmit_state(held_gib: f64) -> (ActorState, mpsc::UnboundedReceiver<ActorMsg>) {
+        let (tx, rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+        for engine in ["mock", "basalt", "strata"] {
+            adapters.insert(
+                engine.to_string(),
+                Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+            );
+        }
+        let witness = Arc::new(ScriptedWitness(crate::budget::MemorySample {
+            total_gib: 72.0,
+            used_gib: held_gib,
+            processes: Vec::new(),
+            attribution: crate::budget::attribution_from_processes(&[]),
+        })) as Arc<dyn crate::budget::VramWitness>;
+        let state = ActorState::empty(
+            crate::config::AppConfig::default(),
+            crate::testutil::temp_dir("readmit"),
+            adapters,
+            Arc::new(ReadmitRuntime) as Arc<dyn crate::engine::EngineRuntime>,
+            witness,
+            tx,
+        );
+        (state, rx)
+    }
+
+    fn incident_sample(used_gib: f64) -> crate::budget::MemorySample {
+        crate::budget::MemorySample {
+            total_gib: 72.0,
+            used_gib,
+            processes: Vec::new(),
+            attribution: crate::budget::attribution_from_processes(&[]),
+        }
+    }
+
+    /// Arms `entry` on slot 0 and hands the gate the card reading — the two
+    /// synchronous halves of the load path (`start_queued_load` also samples a
+    /// scripted witness on a task; its message stays unread in the pin's rx).
+    fn admit_round(state: &mut ActorState, entry: &ModelEntry, used_gib: f64) -> super::JobId {
+        let id = state.register_queued_load(0, entry, Vec::new());
+        state.start_queued_load(id, 0, entry.clone());
+        state.finish_admit(id, Ok(incident_sample(used_gib)));
+        id
+    }
+
+    /// T1 (the incident, Strata→Basalt): while the release credit books the
+    /// row's paper 55 and the card physically holds the resident's 70.4, the
+    /// 67.4 replacement with a 65 GiB launch floor must be REFUSED with the
+    /// incident's own verdict — no release the harness may perform reaches the
+    /// floor (54.6 credited free vs a 63 floor after tolerance). Once the
+    /// engine's own status figure has folded (phase-4 seam), the SAME load on
+    /// the SAME card names the resident as its victim and arms. The red leg is
+    /// the falsifier for the whole feature: a booking policy that ignores the
+    /// engine's word keeps this refusal forever.
+    #[tokio::test]
+    async fn a_strata_resident_releases_for_basalt_only_once_its_measured_footprint_is_booked() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("readmit-sb");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let resident_yaml = dir.join("strata-v1.yaml");
+        std::fs::write(&resident_yaml, "engine: strata\ncost: fixed\nvram_gb: 55\n").expect("seed");
+        let incoming_yaml = dir.join("basalt-v2.yaml");
+        std::fs::write(
+            &incoming_yaml,
+            "engine: basalt\ncost: fixed\nvram_gb: 67.4\nlaunch_only_with_at_least_vram_free: 65\n",
+        )
+        .expect("seed");
+        let (mut state, _rx) = readmit_state(70.4);
+        let resident = rescan_entry(&resident_yaml, "strata-v1");
+        let ticket = fold_ticket(18_109);
+        state.catalog = vec![resident.clone()];
+        seat_spawn(&mut state, &resident, &ticket, 18_109);
+        state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(55.0);
+        let incoming = rescan_entry(&incoming_yaml, "basalt-v2");
+        // The gate preflights the launch before it evicts, so the replacement's
+        // row must be in the catalog like it would be on a serving box.
+        state.catalog.push(incoming.clone());
+
+        let red = admit_round(&mut state, &incoming, 70.4);
+        let job = &state.jobs[&red];
+        assert!(job.terminal, "the paper-credit gate must refuse, not arm");
+        assert!(
+            matches!(
+                job.error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::BelowLaunchFloor {
+                        no_releases_reach: true,
+                        ..
+                    }
+                ))
+            ),
+            "the incident's verdict: {:?}",
+            job.error
+        );
+
+        state.process_measurement(
+            "strata-v1",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 70.4,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::EngineStatus,
+            },
+        );
+        assert_eq!(
+            state.snapshot().slots[0].need_gib,
+            Some(70.4),
+            "the fold re-books the slot before any replacement is judged"
+        );
+
+        let green = admit_round(&mut state, &incoming, 70.4);
+        let job = &state.jobs[&green];
+        assert!(
+            !job.terminal && job.error.is_none(),
+            "the footprint credit covers the need and the floor: {:?}",
+            job.error
+        );
+        assert_eq!(
+            job.victim.as_ref().expect("victim").model,
+            "strata-v1",
+            "the release-first swap names the resident it is freeing"
+        );
+        await_yaml_keys(&resident_yaml, &["measured_gb: 70.4"]).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2 (the mirror, Basalt→Strata): paper 60 held 67.4, the incoming Strata
+    /// row needs 70.0 with the same 65 floor — red the need deficit (7.4) is
+    /// even LARGER than the floor deficit (2.4), and the guard still shapes
+    /// the refusal as the floor verdict, exactly as the 2026-11-01 ruling
+    /// demands. After the fold (67.4 credited, free 70.0) it admits.
+    #[tokio::test]
+    async fn a_basalt_resident_releases_for_strata_only_once_its_measured_footprint_is_booked() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("readmit-bs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let resident_yaml = dir.join("basalt-v1.yaml");
+        std::fs::write(&resident_yaml, "engine: basalt\ncost: fixed\nvram_gb: 60\n").expect("seed");
+        let incoming_yaml = dir.join("strata-v2.yaml");
+        std::fs::write(
+            &incoming_yaml,
+            "engine: strata\ncost: fixed\nvram_gb: 70.0\nlaunch_only_with_at_least_vram_free: 65\n",
+        )
+        .expect("seed");
+        let (mut state, _rx) = readmit_state(67.4);
+        let resident = rescan_entry(&resident_yaml, "basalt-v1");
+        let ticket = fold_ticket(18_110);
+        state.catalog = vec![resident.clone()];
+        seat_spawn(&mut state, &resident, &ticket, 18_110);
+        state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(60.0);
+        let incoming = rescan_entry(&incoming_yaml, "strata-v2");
+        // The gate preflights the launch before it evicts: the row rides.
+        state.catalog.push(incoming.clone());
+
+        let red = admit_round(&mut state, &incoming, 67.4);
+        assert!(
+            matches!(
+                state.jobs[&red].error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::BelowLaunchFloor {
+                        no_releases_reach: true,
+                        ..
+                    }
+                ))
+            ),
+            "the incident's verdict: {:?}",
+            state.jobs[&red].error
+        );
+
+        state.process_measurement(
+            "basalt-v1",
+            &ticket,
+            crate::engine::EngineMeasurement {
+                gpu_gib: 67.4,
+                ram_gib: None,
+                source: crate::engine::MeasurementSource::EngineStatus,
+            },
+        );
+        assert_eq!(state.snapshot().slots[0].need_gib, Some(67.4));
+
+        let green = admit_round(&mut state, &incoming, 67.4);
+        let job = &state.jobs[&green];
+        assert!(
+            !job.terminal && job.error.is_none(),
+            "free 70.0 books the 70.0 need and clears the floor: {:?}",
+            job.error
+        );
+        await_yaml_keys(&resident_yaml, &["measured_gb: 67.4"]).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T3 (the row-cost half, Strata side): no measurement at all — the
+    /// operator moves the row's declared cost to the footprint the engine was
+    /// seen holding (55 -> 70.4) and reloads; the rescan re-books the loaded
+    /// resident green, and the replacement admits against the SAME card that
+    /// refused it minutes before. This is the trap's manual gesture made
+    /// automatic: no unload, no reload of the resident.
+    #[tokio::test]
+    async fn a_rebooked_row_lets_the_basalt_replacement_in_without_touching_the_resident() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("readmit-row-sb");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let resident_yaml = dir.join("strata-v1.yaml");
+        std::fs::write(&resident_yaml, "engine: strata\ncost: fixed\nvram_gb: 55\n").expect("seed");
+        let incoming_yaml = dir.join("basalt-v2.yaml");
+        std::fs::write(
+            &incoming_yaml,
+            "engine: basalt\ncost: fixed\nvram_gb: 67.4\nlaunch_only_with_at_least_vram_free: 65\n",
+        )
+        .expect("seed");
+        let (mut state, _rx) = readmit_state(70.4);
+        let resident = rescan_entry(&resident_yaml, "strata-v1");
+        let ticket = fold_ticket(18_111);
+        state.catalog = vec![resident.clone()];
+        seat_spawn(&mut state, &resident, &ticket, 18_111);
+        let capture = crate::model::fingerprint(&resident_yaml).expect("stat");
+        if let Some(occupant) = state.slots[0].occupant.as_mut() {
+            occupant.need = Gibibytes(55.0);
+            // The launch came from this yaml: install captures it, and only a
+            // captured resident can have its bytes re-judged by a rescan.
+            occupant.spawn_config = Some((resident_yaml.clone(), capture));
+        }
+        let incoming = rescan_entry(&incoming_yaml, "basalt-v2");
+        // The gate preflights the launch before it evicts: the row rides.
+        state.catalog.push(incoming.clone());
+
+        let red = admit_round(&mut state, &incoming, 70.4);
+        assert!(
+            matches!(
+                state.jobs[&red].error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::BelowLaunchFloor {
+                        no_releases_reach: true,
+                        ..
+                    }
+                ))
+            ),
+            "the red control before the row moved: {:?}",
+            state.jobs[&red].error
+        );
+
+        std::fs::write(
+            &resident_yaml,
+            "engine: strata\ncost: fixed\nvram_gb: 70.4\n",
+        )
+        .expect("operator moves the declared cost to the footprint");
+        rescan(&mut state, &resident_yaml, "strata-v1");
+        // `rescan` lands a one-row catalog; the replacement's row rides again.
+        state.catalog.push(incoming.clone());
+        let after = state.snapshot();
+        assert_eq!(
+            after.slots[0].need_gib,
+            Some(70.4),
+            "the rescan re-books the loaded resident's credit from the new row"
+        );
+        assert_eq!(
+            after.slots[0].stale_config,
+            Some(false),
+            "a cost-only move is applied, not accused: no reload trap"
+        );
+
+        let green = admit_round(&mut state, &incoming, 70.4);
+        let job = &state.jobs[&green];
+        assert!(
+            !job.terminal && job.error.is_none(),
+            "the same card that refused now releases: {:?}",
+            job.error
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T4 (the row-cost half, Basalt side, mirror of T3): declared 60 -> 67.4
+    /// re-books the resident; the 70.0 Strata replacement that the stale row
+    /// refused (free 62.6 under a 63 floor-after-tolerance) admits against
+    /// free 70.0.
+    #[tokio::test]
+    async fn a_rebooked_row_lets_the_strata_replacement_in_without_touching_the_resident() {
+        use super::{AdmissionError, SchedulerError};
+        let dir = crate::testutil::temp_dir("readmit-row-bs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let resident_yaml = dir.join("basalt-v1.yaml");
+        std::fs::write(&resident_yaml, "engine: basalt\ncost: fixed\nvram_gb: 60\n").expect("seed");
+        let incoming_yaml = dir.join("strata-v2.yaml");
+        std::fs::write(
+            &incoming_yaml,
+            "engine: strata\ncost: fixed\nvram_gb: 70.0\nlaunch_only_with_at_least_vram_free: 65\n",
+        )
+        .expect("seed");
+        let (mut state, _rx) = readmit_state(67.4);
+        let resident = rescan_entry(&resident_yaml, "basalt-v1");
+        let ticket = fold_ticket(18_112);
+        state.catalog = vec![resident.clone()];
+        seat_spawn(&mut state, &resident, &ticket, 18_112);
+        let capture = crate::model::fingerprint(&resident_yaml).expect("stat");
+        if let Some(occupant) = state.slots[0].occupant.as_mut() {
+            occupant.need = Gibibytes(60.0);
+            // The launch came from this yaml: install captures it, and only a
+            // captured resident can have its bytes re-judged by a rescan.
+            occupant.spawn_config = Some((resident_yaml.clone(), capture));
+        }
+        let incoming = rescan_entry(&incoming_yaml, "strata-v2");
+        // The gate preflights the launch before it evicts: the row rides.
+        state.catalog.push(incoming.clone());
+
+        let red = admit_round(&mut state, &incoming, 67.4);
+        assert!(
+            matches!(
+                state.jobs[&red].error,
+                Some(SchedulerError::Admission(
+                    AdmissionError::BelowLaunchFloor {
+                        no_releases_reach: true,
+                        ..
+                    }
+                ))
+            ),
+            "the red control before the row moved: {:?}",
+            state.jobs[&red].error
+        );
+
+        std::fs::write(
+            &resident_yaml,
+            "engine: basalt\ncost: fixed\nvram_gb: 67.4\n",
+        )
+        .expect("operator moves the declared cost to the footprint");
+        rescan(&mut state, &resident_yaml, "basalt-v1");
+        // `rescan` lands a one-row catalog; the replacement's row rides again.
+        state.catalog.push(incoming.clone());
+        let after = state.snapshot();
+        assert_eq!(after.slots[0].need_gib, Some(67.4));
+        assert_eq!(after.slots[0].stale_config, Some(false));
+
+        let green = admit_round(&mut state, &incoming, 67.4);
+        let job = &state.jobs[&green];
+        assert!(
+            !job.terminal && job.error.is_none(),
+            "free 70.0 books the 70.0 need and clears the floor: {:?}",
+            job.error
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The hard invariant's STRUCTURAL tier (established `include_str!` seam, same

@@ -678,6 +678,109 @@ impl ActorState {
             // this spawn's witness history.
             fold_range: false,
         });
+        // Phase 4 (`TASK-ENGINE-MEASUREMENT`, the 2026-11-04 readmission
+        // incident): the fold moved the row's max truth, but the resident's
+        // booking lives on the SLOT — the same-slot release credit, the R3
+        // no-release floor guard and the eviction planner all read that
+        // figure, and an occupant left holding the paper number hands a
+        // same-slot replacement the stale credit (Strata booked 55, held
+        // 70.4; Basalt refused before release-first). Refresh the booking in
+        // this same turn through the SAME single decision a fresh load takes
+        // ([`ActorState::booking_need`] over the row the fold just updated),
+        // so `max(measured, declared floor)` can never drift from what the
+        // gate would book. This stays doctrine 12: the seam receives only
+        // the engine's own word — `engine_status` or the `per_process` tree
+        // sum — never a `total_diff`. A greedy occupant keeps its card-driven
+        // clamped booking (a post-spill footprint is not a nominal size, the
+        // same rule `may_book_measured` applies to the gate).
+        if self.rebook_after_measurement(model, ticket) {
+            self.publish();
+        }
+    }
+
+    /// Refreshes the slot occupant's booked `need` from the row its process
+    /// measurement just folded onto, by the one booking decision
+    /// ([`ActorState::booking_need`]) — the doctrine lives on
+    /// [`ActorState::on_process_measurement`]. `true` only when the booking
+    /// actually moved (the caller publishes). The row is found by the
+    /// spawn-era FILE, the same identity the fold books: a row that went away
+    /// re-books nothing, and a re-minted twin never re-books a stranger's
+    /// occupant because the `(model, ticket)` pair must match the slot.
+    /// The resident-side refusals are the rescan seam's ([`Self::rebook_cost_only_moves`]),
+    /// stated plainly: an engine launched greedy keeps its card-driven clamped
+    /// booking — the SPAWN-TIME class the job carries, not a row an operator
+    /// may have flipped since — and an amber resident's row no longer
+    /// describes the process, so a measurement of the process may not re-book
+    /// against it either.
+    fn rebook_after_measurement(&mut self, model: &str, ticket: &SpawnTicket) -> bool {
+        let Some(slot) = self.slots.iter().position(|slot| {
+            slot.occupant
+                .as_ref()
+                .is_some_and(|o| o.model == model && &o.ticket == ticket)
+        }) else {
+            return false;
+        };
+        let Some((path, spawn_greedy)) = self
+            .jobs
+            .iter()
+            .find(|(_, job)| job.model == model && job.spawned.as_ref() == Some(ticket))
+            .map(|(_, job)| {
+                (
+                    job.measured.as_ref().and_then(|a| a.file.clone()),
+                    job.cost == crate::model::CostClass::Greedy,
+                )
+            })
+        else {
+            return false;
+        };
+        // Greedy launched card-driven (its admit-time clamp), never
+        // measurement-driven — the same rule `may_book_measured` applies to
+        // the gate, on the class the launch actually wore.
+        if spawn_greedy {
+            return false;
+        }
+        // An amber the rescan earned says the row and the process diverged:
+        // the fold still records what the process holds, but the booking
+        // gesture is unload + reload, never a re-read of a stale row.
+        if self.slots[slot]
+            .occupant
+            .as_ref()
+            .is_some_and(|o| o.stale_config)
+        {
+            return false;
+        }
+        let Some(path) = path else {
+            return false;
+        };
+        let Some(entry) = self
+            .catalog
+            .iter()
+            .find(|m| m.file.as_deref() == Some(path.as_path()))
+        else {
+            return false;
+        };
+        if entry.cost == crate::model::CostClass::Greedy {
+            return false;
+        }
+        // A row that cannot answer the gate's question (a stripped `exact`)
+        // books nothing new — the fold's own refusal stands, unchanged.
+        let Ok(Some(need)) = Self::booking_need(entry) else {
+            return false;
+        };
+        let Some(occupant) = self.slots[slot].occupant.as_mut() else {
+            return false;
+        };
+        if occupant.need == need {
+            return false;
+        }
+        tracing::info!(
+            model,
+            booked_gib = need.0,
+            was_gib = occupant.need.0,
+            "measured footprint re-booked the resident's slot need (max of the engine's own word and the declared floor)"
+        );
+        occupant.need = need;
+        true
     }
 
     /// Reconciles a refused measured persist (Fork C): the in-memory measured pair

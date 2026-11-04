@@ -148,14 +148,18 @@ impl ActorState {
         Some(())
     }
 
-    /// The one-shot process-engine measurement (`TASK-ENGINE-MEASUREMENT`,
+    /// The process-engine measurement landing (`TASK-ENGINE-MEASUREMENT`,
     /// ORCHESTRATION §3) for the non-container engines `basalt`/`strata`,
     /// mirroring [`Self::report_container`]: fetch the engine's own status
     /// snapshot once at readiness (basalt `/v1/status`, strata `/status`) and
-    /// hand the parsed figure to the actor; `Some(())` ends the sampler the
-    /// way ninfer's `engine_report` ends it. Every refusal returns `None` so
-    /// the witness loop stands in rather than losing the measurement outright
-    /// (review 2026-10-31 M1). The fall-through order is exact: the
+    /// hand the parsed figure to the actor. `Some(figure)` means the
+    /// measurement landed; for the elastic `basalt`/`strata` rows the caller
+    /// then hands the sampler to [`Self::elastic_refresh`] instead of ending
+    /// it (phase 4: an elastic cache keeps moving after the first fold), while
+    /// ninfer's `engine_report` one-shot semantics stay untouched. Every
+    /// refusal returns `None` so the witness loop stands in rather than
+    /// losing the measurement outright (review 2026-10-31 M1). The
+    /// fall-through order is exact: the
     /// process-tree fallback is attempted ONLY when the status path yielded no
     /// measurement — a body the engine's own parse will not take (phases 2
     /// and 3 parse their status snapshots now and answer `None` for every
@@ -176,7 +180,7 @@ impl ActorState {
         tx: &mpsc::UnboundedSender<ActorMsg>,
         ctx: &SamplerCtx,
         witness: &Arc<dyn crate::budget::VramWitness>,
-    ) -> Option<()> {
+    ) -> Option<f64> {
         let status_path = match ctx.engine.as_str() {
             "basalt" => "/v1/status",
             "strata" => "/status",
@@ -208,12 +212,13 @@ impl ActorState {
                 }
             }
         };
-        // Decide HERE whether the actor could ever book this figure: the
-        // one-shot does not retry after it sends, so consuming the sampler on
-        // a figure the actor would drop would silently skip the witness
-        // stand-in too (review 2026-10-31, M1 — the same gate
-        // `report_container` applies).
-        Self::measurable_figure(measurement.gpu_gib, sample.total_gib)?;
+        // Decide HERE whether the actor could ever book this figure: a
+        // consumed landing without a valid figure would silently skip the
+        // witness stand-in too (review 2026-10-31, M1 — the same gate
+        // `report_container` applies). The rounded figure is what the actor's
+        // fold will book (its own gate rounds identically), so it is what the
+        // caller seeds the elastic hysteresis with.
+        let rounded = Self::measurable_figure(measurement.gpu_gib, sample.total_gib)?;
         if tx
             .send(ActorMsg::MeasuredProcessReport {
                 model: ctx.model.clone(),
@@ -223,7 +228,7 @@ impl ActorState {
             })
             .is_err()
         {
-            return Some(()); // actor gone
+            return Some(rounded); // actor gone
         }
         tracing::info!(
             model = %ctx.model,
@@ -232,7 +237,112 @@ impl ActorState {
             source = ?measurement.source,
             "process engine measurement landed"
         );
-        Some(())
+        Some(rounded)
+    }
+
+    /// The elastic refresh loop (`TASK-ENGINE-MEASUREMENT` phase 4): a
+    /// `basalt`/`strata` row whose status figure landed keeps its sampler
+    /// alive instead of ending it, because an elastic engine's footprint
+    /// MOVES after load — the Strata expert cache (`--vram-elastic`) and the
+    /// Basalt expert cache grow and shrink against the card while serving —
+    /// and a booking frozen at the readiness reading re-creates the
+    /// 2026-11-04 readmission incident with fresh numbers. Every `every`-spaced
+    /// tick re-reads the engine's own status endpoint and re-folds only when
+    /// the move crosses the hysteresis band:
+    ///
+    /// * **Up moves freely.** Any rise above the last booked figure re-folds
+    ///   at once: under-booking is over-commitment, and reserving too much is
+    ///   the one direction the card forgives.
+    /// * **Down moves only past the band.** A fall re-folds when it exceeds
+    ///   `max(1.0 GiB, 1% of the card)`. One GiB is the step scale of the
+    ///   expert caches (sub-GiB churn must not oscillate the booking, nor
+    ///   rewrite the yaml every minute), and 1% scales the band on cards
+    ///   bigger than 100 GiB (1.28 GiB at 128). A fall still lands:
+    ///   hysteresis delays release credit, it never denies it.
+    ///
+    /// Silence on any leg — the witness not answering (the same hard stop the
+    /// witness loop takes: absence is never a guess, §0.3), a status body the
+    /// parse refuses, or a figure the actor would drop — is absence: that
+    /// tick is skipped and the poll continues, because the last honest figure
+    /// stays booked and an engine mid-cache-rebuild answers again next tick.
+    /// The loop ends with its occupant (every residency clear aborts the
+    /// sampler task, `clear_occupant`) or with the 24 h wall-clock bound the
+    /// witness loop has always carried.
+    pub(super) async fn elastic_refresh(
+        runtime: &Arc<dyn EngineRuntime>,
+        tx: &mpsc::UnboundedSender<ActorMsg>,
+        ctx: &SamplerCtx,
+        witness: &Arc<dyn crate::budget::VramWitness>,
+        mut booked: f64,
+        every: std::time::Duration,
+    ) {
+        let status_path = match ctx.engine.as_str() {
+            "basalt" => "/v1/status",
+            "strata" => "/status",
+            _ => return,
+        };
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first interval tick completes at once and is consumed: the fold
+        // that handed this loop `booked` IS the reading that tick would take.
+        tick.tick().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
+        loop {
+            tick.tick().await;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            let Ok(sample) = witness.sample().await else {
+                return; // a witness that cannot answer yields no measurement,
+                        // never a false one — same posture as the witness loop
+            };
+            if !sample.total_gib.is_finite() || sample.total_gib <= 0.0 {
+                continue;
+            }
+            let status = runtime
+                .engine_status_json(ctx.ticket.port, status_path)
+                .await;
+            let parsed = status.as_ref().and_then(|body| {
+                if ctx.engine == "basalt" {
+                    crate::engine::basalt::measurement_from_status(body)
+                } else {
+                    crate::engine::strata::measurement_from_status(body)
+                }
+            });
+            let Some(measurement) = parsed else {
+                continue;
+            };
+            let Some(rounded) = Self::measurable_figure(measurement.gpu_gib, sample.total_gib)
+            else {
+                continue;
+            };
+            let hysteresis = 1.0f64.max(sample.total_gib * 0.01);
+            let rise = rounded > booked;
+            let fall = booked - rounded > hysteresis;
+            if !(rise || fall) {
+                continue;
+            }
+            if tx
+                .send(ActorMsg::MeasuredProcessReport {
+                    model: ctx.model.clone(),
+                    ticket: ctx.ticket.clone(),
+                    measurement,
+                    total_gib: sample.total_gib,
+                })
+                .is_err()
+            {
+                return; // actor gone
+            }
+            tracing::info!(
+                model = %ctx.model,
+                engine = %ctx.engine,
+                gpu_gib = rounded,
+                was_gib = booked,
+                hysteresis_gib = hysteresis,
+                "elastic status refresh re-booked the resident footprint"
+            );
+            booked = rounded;
+        }
     }
 
     /// Snapshots a failed launch's container log (R9, C1): the autostart pre-reap the
