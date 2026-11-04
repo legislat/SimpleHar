@@ -1,0 +1,15 @@
+# llama row template. One GGUF file, one llama-server process.
+# Required keys: model. The paths below are PLACEHOLDERS: replace them
+# with real absolute paths before copying this file into ModelConf.
+# A missing GGUF file drops the row at scan with a named reason.
+engine: llama
+model: C:\models\example-model.gguf
+category: WORK
+vram_gb: 8.0
+cost: fixed
+context: 8192
+batch: 512
+flash_attn: 1
+# Optional keys: cpu_offload: true forces CPU-only serving.
+# mmproj names a vision file. extra_args takes the closed allow-list.
+# min_turn protects a fresh load from other models' evictions.

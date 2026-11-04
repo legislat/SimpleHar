@@ -1,0 +1,9 @@
+# EMB tab row: your embedding model. WORK and RP evict EMB. Paths are
+# PLACEHOLDERS; use a real absolute path when you copy this file into
+# ModelConf. extra_args: --embedding is on the closed llama allow-list.
+engine: llama
+model: C:\models\emb-model.gguf
+category: EMB
+vram_gb: 2.0
+cost: fixed
+extra_args: --embedding

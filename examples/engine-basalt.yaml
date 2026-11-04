@@ -1,0 +1,20 @@
+# basalt row template. Required keys: model (an absolute .basalt pack
+# path), serve_model, basalt_python, basalt_cwd, basalt_exe. All paths
+# below are PLACEHOLDERS: replace them with real absolute paths before
+# copying this file into ModelConf. A missing .basalt pack drops the row
+# at scan with a named reason.
+engine: basalt
+category: RP
+model: C:\models\example-pack.basalt
+serve_model: example-basalt-model
+basalt_python: C:\models\basalt\.venv\Scripts\python.exe
+basalt_cwd: C:\models\basalt
+basalt_exe: C:\models\basalt\basalt-engine.exe
+basalt_parallel: 1
+cost: greedy
+launch_only_with_at_least_vram_free: 60
+load_timeout: 1200
+# Basalt offloads experts to RAM, so cost: greedy fits it (operator
+# ruling 2026-11-04). A greedy row may omit vram_gb; the launch floor
+# gates the load, and on Basalt that key is effectively required: the
+# global default floor is far below what this engine needs.

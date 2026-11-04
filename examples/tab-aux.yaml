@@ -1,0 +1,9 @@
+# AUX tab row: a utility model. WORK and RP evict AUX. AUX holds 1 to 6
+# slots. Paths are PLACEHOLDERS; use a real absolute path when you copy
+# this file into ModelConf.
+engine: llama
+model: C:\models\aux-model.gguf
+category: AUX
+vram_gb: 4.0
+cost: fixed
+context: 4096

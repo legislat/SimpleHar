@@ -1,0 +1,23 @@
+# ninfer row template (template mode, the only mode). Required keys:
+# ninfer_image, ninfer_container, ninfer_model_name, ninfer_artifact,
+# ninfer_model_roots. The values below are PLACEHOLDERS: replace them
+# with your real image, artifact directory, and WSL model roots before
+# copying this file into ModelConf.
+engine: ninfer
+category: AUX
+ninfer_image: ninfer:local
+ninfer_container: simplehar-example-box
+ninfer_model_name: Example-Artifact-Dir
+ninfer_artifact: example.ninfer
+ninfer_model_roots: /srv/models
+ninfer_profile: b
+ninfer_key: true
+vram_gb: 24.0
+cost: fixed
+load_timeout: 900
+# ninfer_model_roots are absolute directories inside the WSL distro,
+# searched in order. ninfer_profile picks a built-in VRAM profile (a-e,
+# default b). ninfer_key: true reads the API key from
+# $HOME/.simplehar/keys/<ninfer_container>.key inside the distro; drop
+# the key to launch without one. Set wsl_distro and wsl_user in the
+# harness config. The harness forces the container to loopback.

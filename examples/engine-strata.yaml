@@ -1,0 +1,20 @@
+# strata row template (template mode). Required keys: strata_exe,
+# serve_model, strata_tokenizer. strata_python and strata_cwd are shown
+# at the documented defaults (CONFIG.md); adjust them to your install.
+# The paths below are PLACEHOLDERS except the two documented defaults:
+# replace them with real absolute paths before copying into ModelConf.
+engine: strata
+category: RP
+serve_model: example-strata-model
+strata_exe: C:\Strata\engine\strata.exe
+strata_tokenizer: C:\Strata\tokenizer.bin
+strata_python: C:\Strata\.venv\Scripts\python.exe
+strata_cwd: C:\Strata
+strata_args: --native, C:\models\example-strata.gguf, --max-context, 8192
+vram_gb: 24.0
+cost: fixed
+load_timeout: 900
+# strata_args entries are comma-separated engine tokens. The harness
+# forces --host and --port and refuses them here. Optional keys:
+# strata_lib_dirs, strata_env, strata_gpu, strata_parallel, strata_vision,
+# strata_sampling, strata_uncensored. See docs/reference/MODELS.md.
