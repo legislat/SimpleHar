@@ -4462,6 +4462,7 @@ fn the_writeback_mutator_set_stays_closed_to_the_rebaseline_table() {
         ("scheduler/catalog.rs", include_str!("catalog.rs"), 0),
         ("scheduler/handle.rs", include_str!("handle.rs"), 0),
         ("scheduler/measured.rs", include_str!("measured.rs"), 1),
+        ("scheduler/messages.rs", include_str!("messages.rs"), 0),
         ("api/mod.rs", include_str!("../api/mod.rs"), 1),
         ("main.rs", include_str!("../main.rs"), 0),
         ("catalog.rs", include_str!("../catalog.rs"), 0),
