@@ -679,6 +679,44 @@ const driver = `
         lightBody.indexOf("--pico-card-border-color: #e6dccb") >= 0 &&
         lightBody.indexOf("--pico-muted-color: #6b6152") >= 0,
       lightBody || "missing");
+    // The warm palette is the DEFAULT: its selector list must match an html
+    // with NO theme attribute (:root:not([data-theme="dark"])). A bare ":root"
+    // branch is the forbidden form: same specificity as the dark defaults but
+    // later order, so it would also land on data-theme="dark" and drag the
+    // deep light ink onto the dark card (2.8:1 there).
+    const warmAt = css.indexOf("--pico-background-color: #f7f1e6");
+    const warmOpen = warmAt < 0 ? -1 : css.lastIndexOf("{", warmAt);
+    const warmSel = warmOpen < 0 ? ""
+      : norm(css.slice(css.lastIndexOf("}", warmOpen) + 1, warmOpen));
+    let bareRoot = false;
+    for (const branch of warmSel.split(",")) {
+      if (norm(branch) === ":root") bareRoot = true;
+    }
+    check("the warm palette is the default: a theme-attribute-less html matches it",
+      warmAt >= 0 && warmSel.indexOf(':root:not([data-theme="dark"])') >= 0 && !bareRoot,
+      "selector=[" + warmSel + "]");
+    // Which element paints the visible background: Pico sets it on the root
+    // (:where(:root) gets background-color:var(--pico-background-color)), so
+    // the no-attribute parchment lives on html, and body stays transparent.
+    // The first literal hit for that string is inside Pico's theme rule as
+    // part of --pico-card-background-color, so scan every occurrence until a
+    // candidate selector names the root.
+    let rootPaint = false;
+    let paintScan = 0;
+    for (;;) {
+      const paintAt = page.pico.indexOf("background-color:var(--pico-background-color)", paintScan);
+      if (paintAt < 0) break;
+      const paintOpen = page.pico.lastIndexOf("{", paintAt);
+      const paintSel = page.pico.slice(page.pico.lastIndexOf("}", paintOpen) + 1, paintOpen);
+      if (paintSel.indexOf(":where(:root)") >= 0) { rootPaint = true; break; }
+      paintScan = paintAt + 1;
+    }
+    check("the visible page background is painted on the root element itself",
+      rootPaint, "no :where(:root) rule carries the page background-color");
+    check("no theme attribute computes the parchment background (head-root hex)",
+      warmAt >= 0 && warmSel.indexOf(':root:not([data-theme="dark"])') >= 0 &&
+        !!lightBody && lightBody.indexOf("--pico-background-color: #f7f1e6") >= 0,
+      "sel=[" + warmSel + "]");
     check("the light amber text ink is the deeper readable amber",
       !!lightBody && lightBody.indexOf("--sh-warn-ink: #805a00") >= 0,
       lightBody || "missing");
