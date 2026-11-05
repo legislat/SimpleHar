@@ -111,8 +111,10 @@ The full port plan is in [docs/reference/CONFIG.md](docs/reference/CONFIG.md).
 
 ## Control page and tray
 
+![The SimpleHarn control page in the light theme](docs/assets/control-page.png)
+
 The page shows slot cards, memory bars (observed VRAM, the reserve, in-flight bookings,
-host RAM), per-model rows with Load and Set default, recent jobs, and the harness log. A
+host RAM), per-model rows with Load and Default, recent jobs, and the harness log. A
 rescan re-reads the catalog; a serving model keeps the launch it was spawned with, so an
 edit to a live model takes effect on its next load. The tray shows green loaded, yellow
 swap in flight, gray idle, or red listener down. The menu offers Open Web UI, Unload All,
