@@ -2065,8 +2065,8 @@ async fn a_distinct_path_flood_costs_a_constant_number_of_lines() {
     );
 }
 
-/// R2-05-01: the window re-armed on ANY unauthenticated success, and the five
-/// `PUBLIC_PATHS` answer 200 without a token in both postures — so an attacker
+/// R2-05-01: the window re-armed on ANY unauthenticated success, and every
+/// `PUBLIC_PATHS` member answers 200 without a token in both postures — so an attacker
 /// alternating refused POSTs with free `GET /` packets got one `guard refused`
 /// line plus one `guard refusals cleared` line per two packets, turning the ring
 /// over at request rate: the exact eviction flood the cardinality cap

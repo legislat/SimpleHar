@@ -58,7 +58,7 @@ fn accepted_request_id(raw: &str) -> bool {
 /// `pub` so the token test iterates this list rather than its own copy of it: when the
 /// two were separate, a stylesheet added to the page but not here shipped an unstyled
 /// control page while the test stayed green, because each asserted a private truth.
-pub const PUBLIC_PATHS: [&str; 5] = [
+pub const PUBLIC_PATHS: [&str; 7] = [
     "/",
     "/index.html",
     "/app.js",
@@ -67,6 +67,11 @@ pub const PUBLIC_PATHS: [&str; 5] = [
     // omitting it left the control page rendering unstyled whenever `control_token` was
     // set (README review, 2026-10-27).
     "/pico.min.css",
+    // The page head links the operator's favicon (asset 2026-11-05), and a browser
+    // probes `/favicon.ico` itself — neither request can carry a token, so both names
+    // must answer before a token exists. Same rule that opened `pico.min.css`.
+    "/favicon.png",
+    "/favicon.ico",
 ];
 
 /// The page's routine polls: GETs whose per-tick `request complete` line would evict
@@ -217,8 +222,8 @@ pub async fn guard(
     // them (operator, 2026-10-26).
     let routine_poll =
         method == axum::http::Method::GET && ROUTINE_POLL_PATHS.contains(&path.as_str());
-    // R2-05-01: a public page or asset is not a command. All five `PUBLIC_PATHS`
-    // answer 200 without a token in every posture, so counting them as a re-arm
+    // R2-05-01: a public page or asset is not a command. Every `PUBLIC_PATHS` member
+    // answers 200 without a token in every posture, so counting them as a re-arm
     // let an attacker alternate refused POSTs with free `GET /` packets and turn
     // the ring over at request rate — the exact eviction flood the cardinality
     // cap was built to end (FINDINGS-BATCH-2026-10-28M [2]). Only a success on a

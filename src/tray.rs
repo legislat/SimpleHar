@@ -2,10 +2,14 @@
 //!
 //! The tray is a *view*: it renders the scheduler's status snapshot and the listener
 //! registry, and sends the same scheduler commands the HTTP handlers send — no
-//! tray-only state. Colors, in precedence order: **red** = a listener is down (the
-//! reason rides in the tooltip), **amber** = no verdict — a category still `Pending`
-//! after the boot grace, or a status fetch that returned nothing, yellow = a
-//! load/unload in flight, green = a model is loaded, gray = nothing loaded. Per-job
+//! tray-only state. The shape is the operator's logo in every state (logo set
+//! integrated 2026-11-05: embedded raw 16x16 RGBA per state, no asset files at
+//! runtime); only the colour carries the state, and the colour meanings stayed what
+//! the solid circles drew. Colors, in precedence order: **red** = a listener is down
+//! (the reason rides in the tooltip), **amber** = no verdict — a category still
+//! `Pending` after the boot grace, or a status fetch that returned nothing; **yellow**
+//! = an in-flight swap (a load or unload), **green** = a model is loaded, **gray** =
+//! nothing loaded. Per-job
 //! errors are *not* red; they ride in the tooltip. This is the LISTENER palette and
 //! stays untouched by config-state marking: the page's `stale_config` amber (Axis-2
 //! ruling 2026-10-29, the row dot) is the CONFIG palette's and never drives the icon. Left click does nothing; the
@@ -33,8 +37,18 @@ use tokio::sync::watch;
 use tray_icon::menu::{MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-/// Icon edge length in pixels (small system tray size).
-const ICON_SIZE: u32 = 32;
+/// Icon edge length in pixels: the operator logo assets are raw 16x16 RGBA.
+const ICON_SIZE: u32 = 16;
+/// The operator logo for a `Green` tray state: raw 16x16 RGBA (asset 2026-11-05).
+const TRAY_ICON_GREEN: &[u8] = include_bytes!("assets/tray_green.rgba");
+/// The operator logo for a `Yellow` tray state (in-flight swap).
+const TRAY_ICON_YELLOW: &[u8] = include_bytes!("assets/tray_yellow.rgba");
+/// The operator logo for an `Amber` tray state (no verdict).
+const TRAY_ICON_AMBER: &[u8] = include_bytes!("assets/tray_amber.rgba");
+/// The operator logo for a `Red` tray state (listener down).
+const TRAY_ICON_RED: &[u8] = include_bytes!("assets/tray_red.rgba");
+/// The operator logo for a `Gray` tray state (nothing loaded).
+const TRAY_ICON_GRAY: &[u8] = include_bytes!("assets/tray_gray.rgba");
 /// Status refresh cadence.
 const REFRESH_MS: u32 = 2_000;
 /// `CREATE_NO_WINDOW`: opening the Web UI must not flash a console (defect E5).
@@ -236,7 +250,7 @@ fn run(ctx: TrayCtx) -> Result<(), String> {
     for item in &items {
         menu.append(item.as_ref()).map_err(|e| e.to_string())?;
     }
-    let icon = solid_icon(TrayState::Gray)?;
+    let icon = state_icon(TrayState::Gray)?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         // The header's "Left click does nothing" is a contract, not an observation
@@ -446,7 +460,7 @@ fn refresh(tray: &TrayIcon, memo: &mut TickMemo) {
     // with the actor gone, and the icon is never frozen on the colour it last earned.
     let tick = tick(&ctx.listeners, status.as_ref(), Instant::now());
     if memo.state != Some(tick.state) {
-        match solid_icon(tick.state) {
+        match state_icon(tick.state) {
             Ok(icon) => {
                 if let Err(error) = tray.set_icon(Some(icon)) {
                     tracing::error!(error = %error, state = ?tick.state, "tray: cannot set the icon");
@@ -699,34 +713,25 @@ fn dead_tooltip(down_reason: Option<&str>) -> String {
     }
 }
 
-/// Renders a filled-circle icon of `state`'s color; no asset files (Step 15).
-fn solid_icon(state: TrayState) -> Result<Icon, String> {
-    let (red, green, blue): (u8, u8, u8) = match state {
-        TrayState::Green => (0x2e, 0xa0, 0x43),
-        TrayState::Yellow => (0xd8, 0x9b, 0x1d),
-        // Amber is orange-shifted against the yellow of an in-flight swap so the two
-        // are told apart at 32 px: "in flight" is the darker gold, "no verdict" the
-        // brighter amber.
-        TrayState::Amber => (0xf5, 0x8b, 0x00),
-        TrayState::Gray => (0x8a, 0x8f, 0x98),
-        TrayState::Red => (0xc0, 0x39, 0x2b),
-    };
-    let size = ICON_SIZE as i32;
-    let center = size as f32 / 2.0;
-    let radius = center - 2.0;
-    let mut rgba = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let distance =
-                ((x as f32 - center + 0.5).powi(2) + (y as f32 - center + 0.5).powi(2)).sqrt();
-            if distance <= radius {
-                rgba.extend_from_slice(&[red, green, blue, 0xff]);
-            } else {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            }
-        }
+/// The embedded logo bytes for one state: the state-to-colour ruling restated as a
+/// state-to-asset mapping. [`state_icon`] builds from here and the pins read the same
+/// mapping, so a swapped arm turns a pin red.
+fn state_asset(state: TrayState) -> &'static [u8] {
+    match state {
+        TrayState::Green => TRAY_ICON_GREEN,
+        TrayState::Yellow => TRAY_ICON_YELLOW,
+        TrayState::Amber => TRAY_ICON_AMBER,
+        TrayState::Red => TRAY_ICON_RED,
+        TrayState::Gray => TRAY_ICON_GRAY,
     }
-    Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE).map_err(|e| e.to_string())
+}
+
+/// Builds `state`'s icon from the embedded operator logo (asset set 2026-11-05);
+/// no asset files at runtime. The vendored `tray-icon` `Icon` keeps its pixels
+/// private, so the byte and size contract is pinned where it is enforced
+/// (`state_asset` + `from_rgba`'s dimension check).
+fn state_icon(state: TrayState) -> Result<Icon, String> {
+    Icon::from_rgba(state_asset(state).to_vec(), ICON_SIZE, ICON_SIZE).map_err(|e| e.to_string())
 }
 
 /// Win32 message pump: waits for messages or the refresh tick, whichever comes first.
@@ -1515,5 +1520,104 @@ mod tests {
             None,
             "and the parked call is what the bound reaps, not the Exit path"
         );
+    }
+
+    /// The operator logo set (assets 2026-11-05): every `TrayState` paints its own
+    /// colour-named asset, and the five assets are pairwise distinct. Nature,
+    /// declared: a byte-level pin over the `include_bytes!` constants through the one
+    /// mapping the icon builder uses (`state_asset`), because the vendored
+    /// `tray-icon` `Icon` exposes no pixel accessor.
+    ///
+    /// Falsifier: swap two arms of `state_asset` (e.g. Green with Yellow) and the
+    /// swapped rows fail; point two constants at the same asset file and the
+    /// distinctness leg fails.
+    #[test]
+    fn every_state_paints_its_own_operator_logo() {
+        let cases = [
+            (TrayState::Green, TRAY_ICON_GREEN),
+            (TrayState::Yellow, TRAY_ICON_YELLOW),
+            (TrayState::Amber, TRAY_ICON_AMBER),
+            (TrayState::Red, TRAY_ICON_RED),
+            (TrayState::Gray, TRAY_ICON_GRAY),
+        ];
+        for (state, asset) in cases {
+            assert_eq!(
+                state_asset(state),
+                asset,
+                "{state:?} must map to its colour-named asset"
+            );
+        }
+        let all = [
+            TRAY_ICON_GREEN,
+            TRAY_ICON_YELLOW,
+            TRAY_ICON_AMBER,
+            TRAY_ICON_RED,
+            TRAY_ICON_GRAY,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "the five logo assets must be pairwise distinct");
+            }
+        }
+    }
+
+    /// The tray still runs after `state_icon` only if the assets keep their alpha:
+    /// the corner pixel is fully transparent (the tray paints nothing there) and the
+    /// centre is fully opaque (the logo body). Nature: a byte-level pin over the
+    /// embedded assets; the icon carries these pixels verbatim — `from_rgba` takes
+    /// the buffer unchanged.
+    ///
+    /// Falsifier: replace an asset with a flattened (opaque-background) render and
+    /// the corner leg fails; resize the build to 32 and the centre index no longer
+    /// addresses the logo body, turning this or the build pin red.
+    #[test]
+    fn the_logo_assets_keep_their_alpha() {
+        let middle = (ICON_SIZE / 2) as usize;
+        for (state, asset) in [
+            (TrayState::Green, TRAY_ICON_GREEN),
+            (TrayState::Yellow, TRAY_ICON_YELLOW),
+            (TrayState::Amber, TRAY_ICON_AMBER),
+            (TrayState::Red, TRAY_ICON_RED),
+            (TrayState::Gray, TRAY_ICON_GRAY),
+        ] {
+            assert_eq!(
+                asset.len(),
+                (ICON_SIZE * ICON_SIZE * 4) as usize,
+                "{state:?}'s asset must be exactly a {ICON_SIZE}x{ICON_SIZE} RGBA buffer"
+            );
+            assert_eq!(
+                asset[3], 0,
+                "{state:?}: a transparent corner must stay transparent"
+            );
+            let centre = (middle * ICON_SIZE as usize + middle) * 4;
+            assert_eq!(
+                asset[centre + 3],
+                0xff,
+                "{state:?}: the logo centre must be opaque"
+            );
+        }
+    }
+
+    /// Every state builds a real icon through the production path. Nature: an
+    /// end-to-end pin of the mapping plus the 16x16 contract — `Icon::from_rgba`
+    /// refuses any pixel count that does not equal `width * height`, so any resize
+    /// of the build (passing 32 for a 16x16 asset) fails here, and a mapping that
+    /// handed over a truncated buffer would too.
+    ///
+    /// Falsifier: change the size passed to `from_rgba` in `state_icon` to 32 and
+    /// every leg fails with `DimensionsVsPixelCount`.
+    #[test]
+    fn every_state_builds_a_16x16_icon() {
+        for state in [
+            TrayState::Green,
+            TrayState::Yellow,
+            TrayState::Amber,
+            TrayState::Red,
+            TrayState::Gray,
+        ] {
+            state_icon(state).unwrap_or_else(|error| {
+                panic!("state {state:?} must build its 16x16 logo icon: {error}")
+            });
+        }
     }
 }

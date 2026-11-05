@@ -15,6 +15,8 @@ const INDEX_HTML: &str = include_str!("index.html");
 const STYLE_CSS: &str = include_str!("style.css");
 const APP_JS: &str = include_str!("app.js");
 const PICO_CSS: &str = include_str!("pico.min.css");
+/// The operator's tri-color Browser_Tab icon (asset 2026-11-05), served as-is.
+const FAVICON_PNG: &[u8] = include_bytes!("favicon.png");
 
 async fn index() -> Response {
     (
@@ -48,6 +50,10 @@ async fn script() -> Response {
         .into_response()
 }
 
+async fn favicon() -> Response {
+    ([(header::CONTENT_TYPE, "image/png")], FAVICON_PNG).into_response()
+}
+
 async fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
@@ -64,12 +70,17 @@ pub fn router(_state: Arc<ApiState>) -> Router {
         .route("/style.css", get(stylesheet))
         .route("/app.js", get(script))
         .route("/pico.min.css", get(pico))
+        .route("/favicon.png", get(favicon))
+        // Browsers probe `/favicon.ico` whether or not the page links an icon; the
+        // same PNG bytes under that name answer the probe instead of a 404 (the
+        // sniffing decoders read a PNG served as `.ico`).
+        .route("/favicon.ico", get(favicon))
         .fallback(not_found)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{APP_JS, STYLE_CSS};
+    use super::{APP_JS, FAVICON_PNG, INDEX_HTML, STYLE_CSS};
     use crate::engine::llama::OFFLOAD_ENGINES;
 
     /// C of the `cpu_offload` scoping ruling: the served page — the exact
@@ -524,5 +535,77 @@ mod tests {
                 "the warm ramp needs {ramp} in the served stylesheet"
             );
         }
+    }
+
+    /// A unit-handler state: the favicon handlers read no state at all, so the
+    /// dummy seam `api`'s unit pins use is the honest here too.
+    fn page_state() -> std::sync::Arc<crate::api::ApiState> {
+        std::sync::Arc::new(crate::api::ApiState::new(
+            crate::config::AppConfig::default(),
+            crate::scheduler::SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            std::sync::Arc::new(crate::budget::LedgerOnlyWitness),
+            crate::api::BootTimings::default(),
+        ))
+    }
+
+    /// The favicon (operator asset 2026-11-05): both names answer 200 `image/png`
+    /// with exactly the embedded PNG bytes — the `.ico` alias exists so the
+    /// browser's default probe lands on the logo instead of the 404 fallback.
+    ///
+    /// Nature, declared: an in-process route test over `router()` itself, the page
+    /// surface without the guard layer (`control_router` composes it in `api`);
+    /// the guard's public-path ledger is doctrine-locked and untouched here.
+    ///
+    /// Falsifier: drop a route and that leg fails with the fallback 404; serve
+    /// anything other than `FAVICON_PNG`, or a content-type other than
+    /// `image/png`, and that leg's assert fails.
+    #[tokio::test]
+    async fn the_favicon_routes_answer_the_embedded_png() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+        for path in ["/favicon.png", "/favicon.ico"] {
+            let response = super::router(page_state())
+                .oneshot(
+                    Request::get(path)
+                        .body(Body::empty())
+                        .expect("favicon request"),
+                )
+                .await
+                .expect("in-process favicon read");
+            assert_eq!(response.status(), StatusCode::OK, "{path} must answer");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .expect("favicon content-type"),
+                "image/png",
+                "{path} must answer as a PNG"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("favicon body");
+            assert_eq!(
+                &bytes[..],
+                FAVICON_PNG,
+                "{path} must answer the embedded PNG bytes"
+            );
+        }
+    }
+
+    /// The page head links the favicon, so a browser uses the link instead of
+    /// probing only `/favicon.ico`. Nature, declared: a source-content assertion
+    /// over the exact `include_str!` bytes `/` answers, the served-asset style of
+    /// every pin in this module.
+    ///
+    /// Falsifier: remove the link from `index.html` and the assert fails.
+    #[test]
+    fn served_index_links_the_favicon() {
+        assert!(
+            INDEX_HTML.contains("<link rel=\"icon\" type=\"image/png\" href=\"/favicon.png\" />"),
+            "the page head must link the favicon: an unlinked page probes only \
+             the .ico path"
+        );
     }
 }

@@ -19,6 +19,10 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
 ### Added
 
+- The tray paints the operator's logo set: five embedded 16x16 RGBA icons, one per
+  tray state, instead of drawn solid circles. The control page carries the operator's
+  favicon: `/favicon.png` serves the embedded PNG, `/favicon.ico` answers the same
+  bytes, and the page head links the icon.
 - A CPU-only llama row (`cpu_offload: true`) books host RAM instead of VRAM. New model
   key `ram_gb` (a GGUF estimate is the floor without it) and config key `ram_reserve_gb`
   (default 8). A RAM shortfall refuses with named blockers and numbers as `unavailable`
