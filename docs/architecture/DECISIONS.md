@@ -551,7 +551,7 @@ recorded here so dated references to ARCHIVED still resolve:
   floor remains the booking. The process-tree NVML fallback is unavailable on this driver
   (`attributed_gb: null`). Basalt is greedy with dynamic offload by operator ruling - the adapter
   still refuses the class: `TASK-BASALT-GREEDY`. Evidence:
-  `handoff/evidence/2026-11-04-engine-measurement/CARD-CAPTURE.md`.
+  `docs/evidence/2026-11-04-engine-measurement.md`.
   | 2026-11-04 | `bbbf74e`
 
 - **Implemented** RULED 2026-11-04 (TASK-BASALT-GREEDY, operator ruling: "it's greedy and
@@ -645,7 +645,7 @@ recorded here so dated references to ARCHIVED still resolve:
   zero on the card, a WORK load drained the RP CPU resident with a confirmed
   release and RAM settle, and measured pairs wrote back (1.4 GiB and 9.4 GiB).
   Card movement is CUDA-context only (~0.35 GiB per llama process), recorded
-  honestly in `handoff/evidence/2026-11-05-cpu-llama/card-run/card-run.md`.
+  honestly in `docs/evidence/v1.3.0-card-run.md`.
   | 2026-11-05 | `9e7ddb7..`
 
 - **Unauthenticated asset list grows to seven** (operator approval 2026-11-05):

@@ -9,6 +9,9 @@
 //   4. No duplicate H1.
 //   5. Every durable doc is listed in docs/DOCS_README.md by filename or path.
 //   6. No literal DRAFT in a doc whose front matter status is active.
+//   7. Repo-relative paths written as inline code resolve to existing files.
+//      Local-only paths (handoff/, ModelConf/, archive/, base-archive/, .kilo/)
+//      are exempt; a path that names a line range keeps its base file.
 // Not scanned: DESIGN.md (historical), handoff/* (local), archive/ and
 // base-archive/ (frozen).
 
@@ -50,6 +53,7 @@ const candidates = [
   "README.md", "AGENTS.md", "CONTRIBUTING.md", "CHANGELOG.md", INDEX,
   ...listFiles("docs/process"),
   ...listFiles("docs/architecture"),
+  ...listFiles("docs/evidence"),
   ...listFiles("docs/reference"),
 ];
 const docs = candidates.filter((p) => existsSync(join(ROOT, p)));
@@ -100,6 +104,51 @@ function checkLinks(rel, entries) {
   }
 }
 
+// Rule 7: repo-relative paths in inline code. The set below is the documented
+// local-only layer: its paths exist only on the operator machine.
+const LOCAL_ONLY_PREFIXES = [
+  "handoff/", "ModelConf/", "archive/", "base-archive/", ".kilo/",
+  "target/", "node_modules/",
+];
+const LOCAL_ONLY_FILES = new Set(["HANDOFF.md"]);
+const TRACKED_PREFIXES = [
+  "docs/", "src/", "tests/", "scripts/", "assets/", "examples/", ".github/",
+];
+const HAS_EXTENSION = /\.[A-Za-z0-9]{1,6}$/;
+
+function isLocalOnly(target) {
+  return LOCAL_ONLY_FILES.has(target) ||
+    LOCAL_ONLY_PREFIXES.some((p) => target.startsWith(p));
+}
+
+function checkInlinePaths(rel, entries) {
+  const baseDir = join(ROOT, rel);
+  for (const e of entries) {
+    if (e.inFence) continue;
+    const re = /`([^`\n]+)`/g;
+    let m;
+    while ((m = re.exec(e.line)) !== null) {
+      let target = m[1].trim();
+      if (target === "" || /\s/.test(target)) continue;
+      if (/^[a-z][a-z0-9+.-]*:/i.test(target)) continue; // URL or scheme
+      if (/^[A-Za-z]:[\\/]/.test(target) || target.includes("\\")) continue; // absolute
+      if (target.startsWith("/") || target.startsWith("-")) continue;
+      if (/[*?<>{}|$]/.test(target)) continue; // glob, placeholder, pipe
+      if (!target.includes("/")) continue; // bare names and identifiers
+      // Strip a trailing line reference: file.rs:120-130
+      target = target.replace(/:\d+(?:-\d+)?$/, "");
+      if (!HAS_EXTENSION.test(target) &&
+          !TRACKED_PREFIXES.some((p) => target.startsWith(p))) continue;
+      if (isLocalOnly(target)) continue;
+      if (target.endsWith("/")) continue; // a directory reference (policy target)
+      const roots = [ROOT, join(ROOT, "src"), join(ROOT, "tests"), join(ROOT, "scripts")];
+      if (!roots.some((root) => existsSync(resolve(root, target)))) {
+        fail(rel, e.n, `unresolved path reference: ${m[1]}`);
+      }
+    }
+  }
+}
+
 const indexText = existsSync(join(ROOT, INDEX))
   ? readFileSync(join(ROOT, INDEX), "utf8")
   : "";
@@ -131,6 +180,9 @@ for (const rel of docs) {
 
   // 2. Relative links.
   checkLinks(rel, entries);
+
+  // 7. Repo-relative paths in inline code.
+  checkInlinePaths(rel, entries);
 
   // 3. Absolute Windows drive paths, code fences included. Exempt exact ruling
   //    copies; allow documented product defaults, reject author-specific paths.

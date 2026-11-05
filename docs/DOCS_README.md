@@ -95,6 +95,13 @@ durable and belongs in this tree.
 | [OPERATIONS.md](reference/OPERATIONS.md) | Autostart, file layout, upgrade, uninstall, backup, log retention | active |
 | [TROUBLESHOOTING.md](reference/TROUBLESHOOTING.md) | Failure diagnosis | active |
 
+### docs/evidence/ (dated card and measurement records)
+
+| Document | Owns | Status |
+|---|---|---|
+| [v1.3.0-card-run.md](evidence/v1.3.0-card-run.md) | v1.3.0 CPU-llama card proof | active |
+| [2026-11-04-engine-measurement.md](evidence/2026-11-04-engine-measurement.md) | Engine VRAM surface measurements | active |
+
 ## 4. Documentation language
 
 Durable documentation must use ASD-STE100 Simplified Technical English: active
@@ -139,5 +146,9 @@ style.
   Documented product defaults in README/reference and exact quoted decisions are
   allowed; paths under a user profile are not.
 - Link only existing files; planned paths stay plain text until created.
+- A repo-relative path written as inline code must resolve (`check-docs` rule
+  7). The local-only layer (`handoff/`, `ModelConf/`, `archive/`,
+  `base-archive/`, `.kilo/`, `HANDOFF.md`) is exempt; a trailing `:line` range
+  keeps its base file. `src/`, `tests/` and `scripts/` are also tried as roots.
 - Durable docs state commands and invariants, not volatile counts or file
   line numbers; dated numbers live in evidence.
