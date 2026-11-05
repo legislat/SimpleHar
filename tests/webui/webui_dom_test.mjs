@@ -462,6 +462,253 @@ const driver = `
     check("Unload all posts the explicit {} scope", hit, JSON.stringify(globalThis.posts));
   }
 
+  // Operator 2026-11-05: the unload family is ONE amber, and the tab-side Unload
+  // is one entity with its tab. No browser here, so the joined edges are
+  // COMPUTED by a mini cascade over the served stylesheet: class-only rules
+  // matched against the element's classes and resolved by specificity then
+  // source order - exactly how a browser breaks those ties (Pico paints its
+  // bases through :where(), specificity 0, so any class rule beats them; the
+  // attribute and pseudo rules are checked directly for the states they name).
+  // The stub never resolves custom properties (UR-05), so the side's
+  // background is pinned twice: as the dedicated token name here, and as the
+  // per-theme hex that token carries in the palette legs - Pico re-scopes
+  // --pico-background-color to its button blue on every button, and the stub
+  // structurally cannot see that (UR-01 landed exactly there).
+  {
+    const page = globalThis.servedPage;
+    const unloadHits = (page.app.match(/sh-unload/g) || []).length;
+    check("the page carries sh-unload at exactly the three unload call sites",
+      unloadHits === 3, "found " + unloadHits);
+    const clsOf = function (b) { return b ? " " + (b.attrs.class || "") + " " : ""; };
+    const hdr = document.getElementById("sh-header");
+    const hdrPills = findAll(hdr, "span", "sh-tab-item");
+    const sideBtn = function (pill) {
+      return findAll(pill, "button").find(function (b) {
+        return (b.attrs.class || "").indexOf("sh-tab-side") >= 0;
+      });
+    };
+    const occupied = hdrPills.filter(function (p) { return !!sideBtn(p); });
+    check("the side Unload renders only on pills that carry a loaded occupant",
+      occupied.length === 1 && hdrPills.filter(function (p) {
+        return findAll(p, "button").some(function (b) { return textOf(b) === "Unload"; });
+      }).length === 1, "side pills: " + occupied.length);
+    const pillKids = occupied[0].children;
+    const side = sideBtn(occupied[0]);
+    check("the side Unload shares the tab container, never a wrapper of its own",
+      pillKids.length === 2 && pillKids[0] === findAll(occupied[0], "button")[0] &&
+        pillKids[1] === side &&
+        (pillKids[0].attrs.class || "").indexOf("sh-tab-part") >= 0 &&
+        pillKids[0].getAttribute("aria-selected") === "true",
+      "kids=" + pillKids.map(function (k) { return k.attrs.class; }).join("|"));
+    const allBtn = findAll(hdr, "button").find(function (b) {
+      return textOf(b) === "Unload all";
+    });
+    const rowBtn = function (label) {
+      return findAll(document.getElementById("sh-main"), "button")
+        .find(function (b) { return textOf(b) === label; });
+    };
+    check("tab-side and Unload all both carry sh-unload",
+      clsOf(side).indexOf(" sh-unload ") >= 0 &&
+        clsOf(allBtn).indexOf(" sh-unload ") >= 0,
+      "side=" + (side && side.attrs.class) + " all=" + (allBtn && allBtn.attrs.class));
+    check("Rescan, Load and Set default never take the amber class",
+      clsOf(findAll(hdr, "button").find(function (b) { return textOf(b) === "Rescan"; }))
+        .indexOf(" sh-unload ") < 0 &&
+        clsOf(rowBtn("Load")).indexOf(" sh-unload ") < 0 &&
+        clsOf(rowBtn("Set default")).indexOf(" sh-unload ") < 0);
+    // The fixture's slot occupant is no catalog row, so the serving row is
+    // synthesised the same way the booking leg does: one loaded row, its
+    // Unload amber, its Set default not; unloaded, the Load stays plain.
+    const amberModel = {
+      id: "amberone", engine: "ninfer", category: "WORK", vram_gb: 30, cost: "fixed",
+      cost_basis: "declared", launch_floor_gb: null, measured_gb: null,
+      measured_min_gb: null, context: null, model_ref: "ninfer://box:8004/served",
+      serve_model: null, cpu_offload: false,
+    };
+    const amberSlot = {
+      category: "WORK", index: 0, model: "amberone", port: 18119, pid: 7,
+      need_gib: 30, idle_s: 0, serve_id: null, loading_job: null,
+      launched_at: "2026-11-05T00:00:00Z", stale_config: false,
+      container_reported_gb: null, state: "serving",
+    };
+    applyState({ ...fixtures["/har/status"], slots: [amberSlot], models: [amberModel] });
+    check("the serving row Unload carries sh-unload and its Set default never does",
+      clsOf(rowBtn("Unload")).indexOf(" sh-unload ") >= 0 &&
+        clsOf(rowBtn("Set default")).indexOf(" sh-unload ") < 0,
+      "unload=" + (rowBtn("Unload") && rowBtn("Unload").attrs.class) +
+        " set=" + (rowBtn("Set default") && rowBtn("Set default").attrs.class));
+    applyState({ ...fixtures["/har/status"],
+      slots: [{ ...amberSlot, model: null, container_reported_gb: null }],
+      models: [amberModel] });
+    check("the unloaded row's Load stays uncoloured and no Unload renders",
+      !rowBtn("Unload") && clsOf(rowBtn("Load")).indexOf(" sh-unload ") < 0,
+      "load=" + (rowBtn("Load") && rowBtn("Load").attrs.class));
+    applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+    const strip = function (src) {
+      let s = src;
+      for (;;) {
+        const a = s.indexOf("/*");
+        if (a < 0) break;
+        const b = s.indexOf("*/", a + 2);
+        if (b < 0) { s = s.slice(0, a); break; }
+        s = s.slice(0, a) + " " + s.slice(b + 2);
+      }
+      return s;
+    };
+    const css = strip(page.css);
+    const wsRe = new RegExp("[" + String.fromCharCode(9, 10, 13, 32) + "]+", "g");
+    const norm = function (s) {
+      return String(s === null || s === undefined ? "" : s).replace(wsRe, " ").trim();
+    };
+    const rules = [];
+    const ruleAt = function (from) {
+      const open = css.indexOf("{", from);
+      if (open < 0) return null;
+      const close = css.indexOf("}", open);
+      if (close < 0) return null;
+      return { sel: norm(css.slice(from, open)), body: css.slice(open + 1, close), next: close + 1 };
+    };
+    let at = 0;
+    let scanned;
+    while ((scanned = ruleAt(at))) {
+      for (const one of scanned.sel.split(",")) {
+        rules.push({ sel: one, body: scanned.body, spec: one.split(".").length - 1 });
+      }
+      at = scanned.next;
+    }
+    const pureSel = function (sel) {
+      if (sel.length === 0 || sel.charAt(0) !== "." || sel.indexOf(" ") >= 0) return false;
+      for (const part of sel.slice(1).split(".")) {
+        if (!/^[A-Za-z][A-Za-z0-9-]*$/.test(part)) return false;
+      }
+      return true;
+    };
+    const applies = function (sel, classes) {
+      if (!pureSel(sel)) return false;
+      return sel.slice(1).split(".").every(function (c) {
+        return classes.indexOf(c) >= 0;
+      });
+    };
+    const computed = function (classes) {
+      const out = {};
+      for (const r of rules) {
+        if (!applies(r.sel, classes)) continue;
+        for (const raw of r.body.split(";")) {
+          const line = norm(raw);
+          if (!line || line.indexOf(":") < 0) continue;
+          const prop = line.slice(0, line.indexOf(":")).trim();
+          const value = norm(line.slice(line.indexOf(":") + 1));
+          const set = function (p, v) {
+            if (out[p] === undefined || r.spec >= out[p + "|spec"]) {
+              out[p] = v;
+              out[p + "|spec"] = r.spec;
+            }
+          };
+          const widthOf = function (v) { return (v.match(/[0-9.]+[a-z%]*/) || ["medium"])[0]; };
+          if (prop === "border") {
+            const w = widthOf(value);
+            set("border-left-width", w); set("border-right-width", w);
+            set("border-top-width", w); set("border-bottom-width", w);
+          } else if (prop === "border-left") {
+            set("border-left-width", widthOf(value));
+          } else if (prop === "border-right") {
+            set("border-right-width", widthOf(value));
+          } else if (prop === "border-radius") {
+            set("border-top-left-radius", value); set("border-top-right-radius", value);
+            set("border-bottom-left-radius", value); set("border-bottom-right-radius", value);
+          } else if (prop === "border-left-width" || prop === "border-right-width" ||
+              prop === "border-top-left-radius" || prop === "border-top-right-radius" ||
+              prop === "border-bottom-left-radius" || prop === "border-bottom-right-radius" ||
+              prop === "background" || prop === "background-color") {
+            set(prop, value);
+          }
+        }
+      }
+      return out;
+    };
+    const sideCss = computed(["sh-mini", "sh-tab-side", "sh-unload"]);
+    check("computed: the joined side has no border on the shared edge",
+      sideCss["border-left-width"] === "0",
+      "border-left-width=" + sideCss["border-left-width"]);
+    check("computed: the joined side paints the dedicated background token, never a Pico button-scope var",
+      sideCss["background"] === "var(--sh-tab-side-bg)",
+      "background=" + sideCss["background"]);
+    check("computed: the side rounds only its right corners (mirrored radius)",
+      sideCss["border-top-left-radius"] === "0" &&
+        sideCss["border-bottom-left-radius"] === "0" &&
+        sideCss["border-top-right-radius"] === "var(--sh-radius)" &&
+        sideCss["border-bottom-right-radius"] === "var(--sh-radius)",
+      "tl=" + sideCss["border-top-left-radius"] + " tr=" + sideCss["border-top-right-radius"] +
+        " bl=" + sideCss["border-bottom-left-radius"] + " br=" + sideCss["border-bottom-right-radius"]);
+    const tabCss = computed(["sh-tab", "sh-tab-part"]);
+    check("computed: the tab gives its right edge to the pair (no border, no radius)",
+      tabCss["border-right-width"] === "0" &&
+        tabCss["border-top-right-radius"] === "0" &&
+        tabCss["border-bottom-right-radius"] === "0",
+      "brw=" + tabCss["border-right-width"] + " tr=" + tabCss["border-top-right-radius"]);
+    const bodyOf = function (needle) {
+      const found = css.indexOf(needle);
+      if (found < 0) return null;
+      const open = css.indexOf("{", found);
+      const close = css.indexOf("}", open);
+      if (open < 0 || close < 0) return null;
+      return norm(css.slice(open + 1, close));
+    };
+    const selBody = bodyOf('.sh-tab[aria-selected="true"] + .sh-tab-side');
+    check("a selected tab shares its accent with the joined side",
+      !!selBody && selBody.indexOf("var(--sh-accent)") >= 0 &&
+        selBody.indexOf("var(--sh-accent-solid)") >= 0,
+      selBody || "no selected-side rule");
+    const amberBody = bodyOf(".sh-unload {");
+    check("sh-unload paints the amber border and ink of the release family",
+      !!amberBody && amberBody.indexOf("var(--sh-warn)") >= 0 &&
+        amberBody.indexOf("var(--sh-warn-ink)") >= 0,
+      amberBody || "missing");
+    check("amber stays amber: the unload class never uses the fault red",
+      !!amberBody && amberBody.indexOf("--sh-bad") < 0 &&
+        amberBody.indexOf("#c0392b") < 0,
+      amberBody || "missing");
+    const hoverBody = bodyOf(".sh-unload:hover");
+    check("sh-unload fills with the amber tint on hover",
+      !!hoverBody && hoverBody.indexOf("var(--sh-warn-tint)") >= 0,
+      hoverBody || "missing");
+    const lightBody = bodyOf('html[data-theme="light"]');
+    check("the light theme is the warm parchment palette",
+      !!lightBody && lightBody.indexOf("--pico-background-color: #f7f1e6") >= 0 &&
+        lightBody.indexOf("--pico-card-background-color: #fffaf3") >= 0 &&
+        lightBody.indexOf("--pico-card-border-color: #e6dccb") >= 0 &&
+        lightBody.indexOf("--pico-muted-color: #6b6152") >= 0,
+      lightBody || "missing");
+    check("the light amber text ink is the deeper readable amber",
+      !!lightBody && lightBody.indexOf("--sh-warn-ink: #805a00") >= 0,
+      lightBody || "missing");
+    const darkBody = bodyOf('html[data-theme="dark"]');
+    check("the dark theme keeps its machine-room palette",
+      !!darkBody && darkBody.indexOf("#10141a") >= 0 &&
+        darkBody.indexOf("#161c24") >= 0 && darkBody.indexOf("#232c38") >= 0 &&
+        darkBody.indexOf("#7d8896") >= 0,
+      darkBody || "missing");
+    // UR-01: the side's computed background equals the dedicated token, and
+    // BOTH themes carry that token as a plain hex - the card surface the pill
+    // sits on - never a custom property Pico re-scopes to its button blue.
+    check("both themes resolve the side's background token to the card hex (UR-01)",
+      !!lightBody && lightBody.indexOf("--sh-tab-side-bg: #fffaf3") >= 0 &&
+        !!darkBody && darkBody.indexOf("--sh-tab-side-bg: #161c24") >= 0 &&
+        css.indexOf("--sh-tab-side-bg: var(--pico-") < 0,
+      "light=" + (lightBody ? lightBody.indexOf("--sh-tab-side-bg") : -1) +
+        " dark=" + (darkBody ? darkBody.indexOf("--sh-tab-side-bg") : -1));
+    // UR-02: the amber label on the hover fill is the intent - dark composites
+    // to 5.2:1 only while the fill's alpha stays at or under 0x2e, so pin it.
+    const tintAt = darkBody ? darkBody.indexOf("--sh-warn-tint: #d89b1d") : -1;
+    const darkTintAlpha = tintAt >= 0
+      ? parseInt(darkBody.slice(tintAt + 23, tintAt + 25), 16) : 255;
+    check("the dark hover fill stays deep enough for the amber label (UR-02)",
+      darkTintAlpha <= 0x2e, "dark hover alpha=" + darkTintAlpha);
+    check("the light hover fill keeps its measured 25 % amber (4.9:1)",
+      !!lightBody && lightBody.indexOf("--sh-warn-tint: #d89b1d40") >= 0,
+      lightBody || "missing");
+  }
+
   const withFault = { ...fixtures["/har/status"], models: fixtures["/har/models"].data, last_error: "broken@WORK: never became ready" };
   applyState(withFault);
   const errJobs = findAll(document.getElementById("sh-main"), "div", "sh-errline");
@@ -755,6 +1002,18 @@ const driver = `
     check("the releasing model row paints its dot releasing",
       !!relRowDot && relRowDot.attrs["data-state"] === "releasing",
       relRowDot ? JSON.stringify(relRowDot.attrs) : "no row dot");
+    const parked = findAll(document.getElementById("sh-main"), "button")
+      .find(function (b) { return textOf(b) === "Releasing…"; });
+    check("the parked releasing button keeps the plain disabled unload behavior",
+      !!parked && parked.attrs.disabled === "" &&
+        (parked.attrs.class || "").indexOf("sh-unload") < 0,
+      parked ? JSON.stringify(parked.attrs) : "missing");
+    const relSide = findAll(relPill, "button").find(function (b) {
+      return (b.attrs.class || "").indexOf("sh-tab-side") >= 0;
+    });
+    check("the releasing pill keeps its joined side Unload", !!relSide &&
+      (relSide.attrs.class || "").indexOf("sh-unload") >= 0,
+      relSide ? relSide.attrs.class : "no side on the releasing pill");
     const legacy = { ...relSlot };
     delete legacy.state;
     applyState({ ...fixtures["/har/status"], slots: [legacy], models: [relModel] });

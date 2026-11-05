@@ -8,6 +8,15 @@
   --sh-accent: #2ea04370;
   --sh-accent-solid: #2ea043;
   --sh-warn: #d89b1d;
+  /* Amber TEXT ink (operator 2026-11-05): --sh-warn is the amber graphic - dots,
+   * borders, the reserve hatch. Normal-size amber text needs a deeper ink to stay
+   * readable; the dark theme keeps this one amber unchanged (7.0:1 on its card,
+   * 7.6:1 on its background), the light theme darkens it on the warm paper. */
+  --sh-warn-ink: var(--sh-warn);
+  /* The unload family's hover fill: the same amber at 25 % (light: label 4.9:1
+   * on the card surfaces the buttons sit on). UR-02 (2026-11-05): the dark
+   * theme overrides this - 25 % there left the label at 4.46:1. */
+  --sh-warn-tint: #d89b1d40;
   --sh-bad: #c0392b;
   --sh-releasing: #a16207;
   --sh-radius: 10px;
@@ -20,12 +29,35 @@ html[data-theme="dark"] {
   --pico-card-background-color: #161c24;
   --pico-card-border-color: #232c38;
   --pico-muted-color: #7d8896;
+  /* UR-01 (2026-11-05): Pico redefines --pico-background-color on EVERY button
+   * (its primary blue), exactly the documented --pico-color trap, so the
+   * joined side reads its background from this own token Pico cannot reach:
+   * the theme's card surface, which is what the pill sits on. */
+  --sh-tab-side-bg: #161c24;
+  /* UR-02 (2026-11-05): an 18 % amber fill keeps the label 5.2:1 on this card
+   * (the 25 % default was 4.46:1). Light stays at 25 % = 4.9:1. */
+  --sh-warn-tint: #d89b1d2e;
 }
 html[data-theme="light"] {
-  --pico-background-color: #f5f4f1;
-  --pico-card-background-color: #ffffff;
-  --pico-card-border-color: #e2e0da;
-  --pico-muted-color: #6b6f76;
+  /* Warm parchment (operator 2026-11-05): the cool paper read clinical against
+   * the green accent; the page is now warm paper, borders and muted ink with
+   * it. Measured on these surfaces (>= 4.5:1 for normal text): body/table ink
+   * #373c44 is 9.9:1 on the parchment and 10.7:1 on the card; muted #6b6152
+   * 5.4:1 / 5.9:1; the deeper amber text ink #805a00 5.5:1 / 6.0:1 idle and
+   * 4.9:1 on its amber hover fill (the dark hover fill is deeper for the same
+   * reason - UR-02); the selected pill's ink on the green wash 6.2:1. The
+   * amber BORDER stays the graphic --sh-warn (the button carries a text
+   * label, so the border marks, never names). */
+  --pico-background-color: #f7f1e6;
+  --pico-card-background-color: #fffaf3;
+  --pico-card-border-color: #e6dccb;
+  --pico-muted-color: #6b6152;
+  --sh-warn-ink: #805a00;
+  --sh-warn-tint: #d89b1d40;
+  /* UR-01 (2026-11-05): the joined side's background token - Pico re-scopes
+   * --pico-background-color to its button blue on every button, so this hex
+   * (the card surface) is what the amber label actually sits on: 6.0:1. */
+  --sh-tab-side-bg: #fffaf3;
   --sh-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
@@ -147,19 +179,42 @@ header.sh-header {
 .sh-tab .sh-dot { margin-right: 0; }
 
 /* The Unload is the tab's second segment (operator 2026-11-01): flat shared edge,
- * matching corners - two buttons that read as one entity. */
+ * matching corners - two buttons that read as one entity. Completed by the
+ * operator 2026-11-05: the side takes the tab's own height, drops its border
+ * on the shared edge (the tab already drops its right edge), mirrors the right
+ * radius, and keeps the tab's full padding as the tap target - one shape, with
+ * the side as the distinct amber action on it. The specificity pairs sh-mini,
+ * whose tighter metrics are the seam. UR-01 (2026-11-05): the background is
+ * the dedicated --sh-tab-side-bg, never --pico-background-color - Pico
+ * re-scopes that custom property to its button blue on every button (the same
+ * trap this file documents for --pico-color), and amber-on-blue measured
+ * 1.19:1 in the browser probe. */
 .sh-tab.sh-tab-part {
   border-top-right-radius: 0;
   border-bottom-right-radius: 0;
   border-right: 0;
 }
 
-.sh-tab-side {
+.sh-mini.sh-tab-side {
+  display: inline-flex;
+  align-items: center;
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
-  margin-left: 0;
-  border-color: var(--pico-card-border-color);
+  border-top-right-radius: var(--sh-radius);
+  border-bottom-right-radius: var(--sh-radius);
+  border-left: 0;
+  padding: 0.35rem 0.8rem;
+  font-size: 0.85rem;
   font-weight: 600;
+  background: var(--sh-tab-side-bg);
+}
+
+/* A selected tab shares its accent with the joined side (operator 2026-11-05):
+ * the pair stays one pill - background, border and ink all follow the tab. */
+.sh-tab[aria-selected="true"] + .sh-tab-side {
+  background: var(--sh-accent);
+  border-color: var(--sh-accent-solid);
+  color: var(--sh-tab-ink);
 }
 
 .sh-tab-port {
@@ -337,6 +392,21 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
   margin: 0;
   width: auto;
 }
+
+/* The unload family (operator 2026-11-05): amber is the release tone - the
+ * same family as the releasing dot, never the red of a fault (red stays for
+ * errors). Amber border + amber ink in both themes, an amber-tinted fill on
+ * hover. One class, three call sites: the tab-side, the row Unload, and
+ * Unload all. Rescan, Load and Set default keep their own colours, and the
+ * parked Releasing…/Loading… buttons carry no class here - they stay plain
+ * and disabled, exactly as before. */
+.sh-unload {
+  background: transparent;
+  border: 1px solid var(--sh-warn);
+  color: var(--sh-warn-ink);
+}
+
+.sh-unload:hover { background: var(--sh-warn-tint); }
 
 /* Above the sticky header (z-index 10) so its own corner is clickable: the header
  * subtree otherwise intercepts the toggle's pointer events (Playwright-found). */

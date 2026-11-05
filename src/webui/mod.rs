@@ -296,4 +296,53 @@ mod tests {
              another state's colour"
         );
     }
+
+    /// The unload entity and its amber (operator ruling 2026-11-05): the three
+    /// unload gestures — tab-side, row Unload, Unload all — carry the one
+    /// `sh-unload` class in the served page bytes, and the served stylesheet
+    /// carries the amber class rule, the shared selected accent of the joined
+    /// pill, and the warm-parchment light palette the ruling names. Rule
+    /// existence is pinned byte-level like the amber tones before it; the
+    /// cascade legs (joined edges computed from the served stylesheet, the
+    /// class on each rendered button) live in
+    /// `tests/webui/webui_dom_test.mjs`.
+    ///
+    /// Nature, declared: a source-content assertion over the exact
+    /// `include_str!` bytes `/app.js` and `/style.css` answer, so an
+    /// `include_str!`-stale exe cannot hide a page bug (GOTCHAS [ui]).
+    ///
+    /// # Falsifier
+    ///
+    /// Drop `sh-unload` from any one call site and that count assert fails;
+    /// delete the amber class rule, the selected-side accent rule, or the
+    /// parchment values from the stylesheet and their asserts fail while the
+    /// releasing and cost asserts stay green.
+    #[test]
+    fn served_assets_join_the_unload_entity_and_colour_it_amber() {
+        assert_eq!(
+            APP_JS.matches("\"sh-mini sh-tab-side sh-unload\"").count(),
+            1,
+            "the tab-side Unload carries the amber class on its joined pill"
+        );
+        assert_eq!(
+            APP_JS.matches("\"sh-mini sh-unload\"").count(),
+            2,
+            "the row Unload and the Unload all carry the amber class"
+        );
+        assert!(
+            STYLE_CSS.contains(".sh-unload {") && STYLE_CSS.contains("var(--sh-warn-ink)"),
+            "the amber unload class needs its rule and its text-ink token in \
+             the served stylesheet"
+        );
+        assert!(
+            STYLE_CSS.contains(".sh-tab[aria-selected=\"true\"] + .sh-tab-side"),
+            "the joined pill must keep sharing the tab's selected accent"
+        );
+        for parchment in ["#f7f1e6", "#fffaf3", "#e6dccb"] {
+            assert!(
+                STYLE_CSS.contains(parchment),
+                "the warm parchment palette needs {parchment} in the served stylesheet"
+            );
+        }
+    }
 }

@@ -247,7 +247,7 @@ function renderTabItem(status, category) {
       el(
         "button",
         {
-          class: "sh-mini sh-tab-side",
+          class: "sh-mini sh-tab-side sh-unload",
           title: `unload every ${category} slot`,
           onclick: () =>
             postJson("/har/unload", { category }).catch((error) => flashError(error)),
@@ -433,7 +433,7 @@ function renderHeader(status) {
     el(
       "button",
       {
-        class: "sh-mini",
+        class: "sh-mini sh-unload",
         // `{}` is the explicit unload-all scope (T12.4) - never an implicit one.
         onclick: () =>
           postJson("/har/unload", {})
@@ -521,7 +521,7 @@ function modelRow(status, model, category) {
       el(
         "button",
         {
-          class: "sh-mini",
+          class: "sh-mini sh-unload",
           onclick: () =>
             postJson("/har/unload", { model: model.id }).catch((error) => flashError(error)),
         },
