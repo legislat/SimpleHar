@@ -327,8 +327,8 @@ pub struct RamSample {
 /// The RAM counterpart of [`crate::budget::VramWitness`]: the host-memory
 /// truth a CPU-resident admission is judged against. A `None` sample refuses
 /// the load fail-closed, exactly as a dead card witness does (DOCTRINE 4) —
-/// there is no ledger-only mode for RAM: the gate releases no RAM, so an
-/// unattributable ledger would be a guess at what the host already holds.
+/// there is no ledger-only mode for RAM: an unattributable ledger would be a
+/// guess at what the host already holds.
 ///
 /// Sync by design: one `GlobalMemoryStatusEx` call per `sample()`, no cache
 /// and no TTL — a syscall cannot spawn the process storm the card witness's

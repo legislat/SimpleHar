@@ -245,10 +245,11 @@ pub enum AdmissionError {
     /// gate may release covers the deficit: the same Step 6 refusal contract
     /// as [`AdmissionError::Insufficient`], judged on the RAM ladder —
     /// `ram_total - ram_reserve - observed ram_used`, credited once for the
-    /// same-slot RAM resident (operator ruling 2026-11-05). In this wave the
-    /// RAM gate releases nothing (no RAM eviction exists), so every host
-    /// holder the harness can name rides `blockers`; unattributable host RAM
-    /// rides the `unreleasable` figure.
+    /// same-slot RAM resident (operator ruling 2026-11-05). The planner
+    /// considers Ram residents only (W2 ruling 2026-11-05): a GPU resident's
+    /// host RAM rides the reading, never enters the releasable set, and rides
+    /// `blockers` as an uncontrolled holder. Unattributable host RAM rides
+    /// the `unreleasable` figure.
     #[error("insufficient RAM: need {need}, free {free}, reserve {reserve}{detail}{tail}",
         detail = .facts.detail_as(*free, "RAM"),
         tail = insufficient_tail(.victims_considered, .blockers)
@@ -263,8 +264,8 @@ pub enum AdmissionError {
         /// The RAM inputs `free` was derived from (`ram_used` beside the RAM
         /// ledger, so "who holds RAM" is diagnosable from the message alone).
         facts: Box<BudgetFacts>,
-        /// Candidates the RAM planner considered; empty while the RAM gate
-        /// plans no eviction.
+        /// Ram candidates the RAM planner considered. GPU residents never
+        /// enter it — their host RAM is not under the harness's control.
         victims_considered: Vec<VictimInfo>,
         /// Host holders the RAM gate may not release, with reasons.
         blockers: Vec<BlockerInfo>,

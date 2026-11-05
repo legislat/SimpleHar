@@ -6970,7 +6970,16 @@ async fn the_vram_planner_never_considers_or_blames_a_ram_occupant() {
 
 /// Falsifier (5): a `whole` GPU request is never blocked by a RAM resident,
 /// and a RAM resident never enters its holder list — the whole-machine gate
-/// is a card posture (operator ruling 2026-11-05).
+/// is a card posture (operator ruling 2026-11-05). The W1-03 closure legs
+/// add the in-flight half: an admitted-not-installed RAM row is likewise
+/// neither a blocker nor a holder — and when a real card holder forces the
+/// refusal, the holder list names the GPU resident only, in-flight RAM row
+/// and seated RAM resident both absent.
+/// Falsifier: delete the `job.ram_need.is_some()` row filter in
+/// `whole_machine_holders` and the in-flight RAM row joins the holders —
+/// leg one refuses an admit that must pass, leg two names `cpu` beside
+/// `gpu-holder`. Delete the occupant-leg filter and the seated `aux-cpu`
+/// does the same in both legs.
 #[tokio::test]
 async fn a_whole_gpu_row_never_sees_a_ram_resident_as_a_holder() {
     use super::{AdmissionError, SchedulerError};
@@ -6983,11 +6992,26 @@ async fn a_whole_gpu_row_never_sees_a_ram_resident_as_a_holder() {
         "engine: mock\ncategory: work\nvram_gb: 12\nlaunch_only_with_at_least_vram_free: whole\n",
     )
     .expect("seed");
+    let cpu_yaml = write_cpu_row_yaml(&dir, "cpu", "10");
     let mut state = fold_state(&dir);
     state.cfg.vram_total_gb = 72.0;
     state.cfg.vram_reserve_gb = 2.0;
     let entry = rescan_entry(&yaml, "whole");
-    state.catalog = vec![entry.clone()];
+    let cpu = rescan_entry(&cpu_yaml, "cpu");
+    state.catalog = vec![entry.clone(), cpu.clone()];
+    let seat = |model: &str, need: f64, ram_need: Option<f64>, port: u16| Occupant {
+        model: model.to_string(),
+        need: Gibibytes(need),
+        ram_need: ram_need.map(Gibibytes),
+        port,
+        ticket: fold_ticket(port),
+        loaded_at: Instant::now(),
+        launched_at_wall: std::time::SystemTime::now(),
+        spawn_config: None,
+        stale_config: false,
+        serve_id: None,
+        measure: None,
+    };
     state.slots = vec![
         Slot {
             category: CategoryId::Work,
@@ -7000,33 +7024,36 @@ async fn a_whole_gpu_row_never_sees_a_ram_resident_as_a_holder() {
             category: CategoryId::Aux,
             index: 1,
             engine_port: 18_131,
-            occupant: Some(Occupant {
-                model: "aux-cpu".to_string(),
-                need: Gibibytes(0.0),
-                ram_need: Some(Gibibytes(10.0)),
-                port: 18_131,
-                ticket: fold_ticket(18_131),
-                loaded_at: Instant::now(),
-                launched_at_wall: std::time::SystemTime::now(),
-                spawn_config: None,
-                stale_config: false,
-                serve_id: None,
-                measure: None,
-            }),
+            occupant: Some(seat("aux-cpu", 0.0, Some(10.0), 18_131)),
+            job: None,
+        },
+        Slot {
+            category: CategoryId::Rp,
+            index: 2,
+            engine_port: 18_132,
+            occupant: None,
             job: None,
         },
     ];
-    let job_id = state.register_queued_load(0, &entry, Vec::new());
-    state.start_queued_load(job_id, 0, entry.clone());
-    state.finish_admit_card(
-        job_id,
+    // The W1-03 leg: an admitted-not-installed RAM row — booked, reserving,
+    // never installed, the row half of the holder scan.
+    let ram_row = state.register_queued_load(2, &cpu, Vec::new());
+    state.jobs.get_mut(&ram_row).expect("row").need = Some(Gibibytes(0.0));
+    state.jobs.get_mut(&ram_row).expect("row").ram_need = Some(Gibibytes(5.0));
+    state.step(ram_row, SwapState::Admit);
+    let sample = || {
         Ok(crate::budget::MemorySample {
             total_gib: 72.0,
             used_gib: 0.0,
             processes: Vec::new(),
             attribution: crate::budget::AttributionQuality::Unavailable,
-        }),
-    );
+        })
+    };
+    // Leg one: no card holder exists — a seated RAM resident and an
+    // in-flight RAM row block nothing and are listed nowhere.
+    let job_id = state.register_queued_load(0, &entry, Vec::new());
+    state.start_queued_load(job_id, 0, entry.clone());
+    state.finish_admit_card(job_id, sample());
     let job = &state.jobs[&job_id];
     assert!(
         !matches!(
@@ -7035,11 +7062,31 @@ async fn a_whole_gpu_row_never_sees_a_ram_resident_as_a_holder() {
                 AdmissionError::WholeMachineBusy { .. }
             ))
         ),
-        "the RAM resident must not block the whole gate: {:?}",
+        "a RAM resident and an in-flight RAM row must not block the whole gate: {:?}",
         job.error
     );
     assert!(job.error.is_none(), "{:?}", job.error);
     assert_eq!(job.path, Some(AdmissionPath::FitsNow));
+    // Leg two: a GPU holder forces the refusal, and the honest holder list
+    // names exactly it — no RAM name may appear at all (the seated
+    // `aux-cpu` and the in-flight `cpu` row included).
+    state.slots[2].occupant = Some(seat("gpu-holder", 6.0, None, 18_132));
+    let job_two = state.register_queued_load(0, &entry, Vec::new());
+    state.start_queued_load(job_two, 0, entry.clone());
+    state.finish_admit_card(job_two, sample());
+    let error = state.jobs[&job_two]
+        .error
+        .as_ref()
+        .expect("a GPU holder keeps the machine from the whole request")
+        .to_string();
+    assert!(
+        error.contains("gpu-holder"),
+        "the GPU holder is named: {error}"
+    );
+    assert!(
+        !error.contains("cpu"),
+        "no RAM holder, resident or in-flight row, is listed: {error}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -7301,6 +7348,460 @@ async fn a_ram_replacement_credits_its_own_slot_once_and_pays_other_ram_loads() 
         msg.contains("free 39.0 GiB"),
         "credit and debit counted once: {msg}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Falsifier (3, W2): RAM short with an evictable Ram resident in a
+/// category the load's own may evict. The RAM planner selects it, the
+/// planned victim rides the row with the resident's own release ticket (the
+/// unchanged evidence-based release path), and the load admits on the Drain
+/// rung (operator ruling 2026-11-05).
+/// Falsifier: on the pre-fix (wave-1) tree the RAM gate never planned, so
+/// this row reads a terminal `InsufficientRam` refusal and no victim exists.
+#[tokio::test]
+async fn a_ram_short_admission_evicts_the_yielding_ram_resident() {
+    let dir = crate::testutil::temp_dir("ram-evict");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cpu_yaml = write_cpu_row_yaml(&dir, "cpu", "20");
+    let mut state = fold_state(&dir);
+    state.adapters.insert(
+        "llama".to_string(),
+        Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+    );
+    let cpu = rescan_entry(&cpu_yaml, "cpu");
+    state.catalog = vec![cpu.clone()];
+    let aux_ticket = fold_ticket(18_131);
+    state.slots = vec![
+        Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_130,
+            occupant: None,
+            job: None,
+        },
+        Slot {
+            category: CategoryId::Aux,
+            index: 1,
+            engine_port: 18_131,
+            occupant: Some(Occupant {
+                model: "aux-cpu".to_string(),
+                need: Gibibytes(0.0),
+                ram_need: Some(Gibibytes(10.0)),
+                port: 18_131,
+                ticket: aux_ticket.clone(),
+                loaded_at: Instant::now(),
+                launched_at_wall: std::time::SystemTime::now(),
+                spawn_config: None,
+                stale_config: false,
+                serve_id: None,
+                measure: None,
+            }),
+            job: None,
+        },
+    ];
+    let job_id = state.register_queued_load(0, &cpu, Vec::new());
+    state.start_queued_load(job_id, 0, cpu.clone());
+    // free = 64 - 8 (reserve) - 44 (used) = 12 < need 20: an 8 GiB deficit,
+    // and the 10 GiB Ram resident in AUX (evictable by WORK in the shipped
+    // matrix) covers it.
+    state.finish_admit(
+        job_id,
+        None,
+        Some(crate::witness::RamSample {
+            total_gib: 64.0,
+            used_gib: 44.0,
+        }),
+    );
+    let job = &state.jobs[&job_id];
+    assert!(job.error.is_none(), "{:?}", job.error);
+    assert!(
+        !job.terminal,
+        "a coverable RAM deficit admits on the drain rung, it does not refuse"
+    );
+    assert_eq!(job.path, Some(AdmissionPath::Drain));
+    let victim = job
+        .victim
+        .as_ref()
+        .expect("the planned victim rides the row");
+    assert_eq!(victim.model, "aux-cpu");
+    assert_eq!(victim.slot, 1);
+    assert!(
+        victim.evicted,
+        "a cross-slot eviction, not a same-slot holder"
+    );
+    assert_eq!(
+        victim.cost, 10.0,
+        "the freed figure is the RAM booking, never the zero VRAM need"
+    );
+    assert_eq!(
+        victim.ticket, aux_ticket,
+        "the release runs on the resident's own (port, generation) ticket"
+    );
+    assert_eq!(job.state, SwapState::Dispose);
+    assert!(
+        state.slots[1].occupant.is_some(),
+        "the victim stays seated until its release is confirmed (DOCTRINE 5)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Falsifier (3, W2, the refusal leg): RAM short with no evictable Ram
+/// resident. The refusal names every Ram holder with its matrix reason and
+/// kills nothing (operator ruling 2026-11-05).
+/// Falsifier: on the pre-fix tree the RAM refusal's only holder reason was
+/// the wave-1 uniform "the RAM gate does not release" line, so this pin's
+/// matrix reason is absent and the pin goes red.
+#[tokio::test]
+async fn a_ram_short_admission_with_no_evictable_ram_resident_refuses_naming_holders() {
+    use super::{AdmissionError, SchedulerError};
+    let dir = crate::testutil::temp_dir("ram-no-victim");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let yaml = dir.join("cpu-aux.yaml");
+    std::fs::write(
+        &yaml,
+        "engine: llama\ncategory: aux\nram_gb: 20\ncpu_offload: true\n",
+    )
+    .expect("seed");
+    let mut state = fold_state(&dir);
+    let cpu = rescan_entry(&yaml, "cpu-aux");
+    state.catalog = vec![cpu.clone()];
+    state.slots = vec![
+        Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_130,
+            occupant: Some(Occupant {
+                model: "work-cpu".to_string(),
+                need: Gibibytes(0.0),
+                ram_need: Some(Gibibytes(10.0)),
+                port: 18_130,
+                ticket: fold_ticket(18_130),
+                loaded_at: Instant::now(),
+                launched_at_wall: std::time::SystemTime::now(),
+                spawn_config: None,
+                stale_config: false,
+                serve_id: None,
+                measure: None,
+            }),
+            job: None,
+        },
+        Slot {
+            category: CategoryId::Aux,
+            index: 1,
+            engine_port: 18_131,
+            occupant: None,
+            job: None,
+        },
+    ];
+    let job_id = state.register_queued_load(1, &cpu, Vec::new());
+    state.start_queued_load(job_id, 1, cpu.clone());
+    // free = 64 - 8 - 44 = 12 < need 20: the only Ram holder sits in WORK,
+    // which the shipped matrix lets nobody evict.
+    state.finish_admit(
+        job_id,
+        None,
+        Some(crate::witness::RamSample {
+            total_gib: 64.0,
+            used_gib: 44.0,
+        }),
+    );
+    let job = &state.jobs[&job_id];
+    assert!(job.terminal, "an unyieldable RAM shortage refuses");
+    assert_eq!(job.state, SwapState::AdmitFail);
+    let error = job.error.as_ref().expect("the refusal rides the row");
+    let SchedulerError::Admission(AdmissionError::InsufficientRam {
+        victims_considered,
+        blockers,
+        ..
+    }) = error
+    else {
+        panic!("the RAM refusal has its own class: {error:?}");
+    };
+    assert!(
+        victims_considered.is_empty(),
+        "WORK yields no victim to any planner: {victims_considered:?}"
+    );
+    assert!(
+        blockers
+            .iter()
+            .any(|b| b.model == "work-cpu" && b.reason.contains("nothing may evict WORK")),
+        "the refusal names the Ram holder with its matrix reason: {blockers:?}"
+    );
+    let msg = error.to_string();
+    assert!(
+        !msg.contains("considered evicting"),
+        "nothing was ever a RAM candidate: {msg}"
+    );
+    assert!(
+        state.slots[0].occupant.is_some(),
+        "nothing killed: the named holder stays seated"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wrong-class pin (W2, falsifier 4's RAM side): the RAM planner over a
+/// machine whose only occupant is a GPU job in an evictable category never
+/// selects or even considers it. The deficit is one the GPU resident's
+/// booked 15 GiB would cover if the resource filter were down, and AUX is
+/// evictable by WORK in the shipped matrix — only the resource filter keeps
+/// it out of the candidate set; it rides the refusal as the uncontrolled
+/// holder its host RAM actually is (operator ruling 2026-11-05).
+/// Falsifier: with the RAM planner seeing all occupants (the W2 filter
+/// reverted in place), the GPU job becomes the covering candidate — the row
+/// drains instead of refusing and the tail names it as considered. Against
+/// the wave-1 tree (planner absent) the refusal shape is the same; the
+/// pin's weight is the mutation red.
+#[tokio::test]
+async fn the_ram_planner_never_considers_a_gpu_occupant_as_a_victim() {
+    use super::{AdmissionError, SchedulerError};
+    let dir = crate::testutil::temp_dir("ram-planner-wrong-class");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cpu_yaml = write_cpu_row_yaml(&dir, "cpu", "18");
+    let mut state = fold_state(&dir);
+    let cpu = rescan_entry(&cpu_yaml, "cpu");
+    state.catalog = vec![cpu.clone()];
+    state.slots = vec![
+        Slot {
+            category: CategoryId::Work,
+            index: 0,
+            engine_port: 18_130,
+            occupant: None,
+            job: None,
+        },
+        Slot {
+            category: CategoryId::Aux,
+            index: 1,
+            engine_port: 18_131,
+            occupant: Some(Occupant {
+                model: "gpu-res".to_string(),
+                need: Gibibytes(15.0),
+                ram_need: None,
+                port: 18_131,
+                ticket: fold_ticket(18_131),
+                loaded_at: Instant::now(),
+                launched_at_wall: std::time::SystemTime::now(),
+                spawn_config: None,
+                stale_config: false,
+                serve_id: None,
+                measure: None,
+            }),
+            job: None,
+        },
+    ];
+    let job_id = state.register_queued_load(0, &cpu, Vec::new());
+    state.start_queued_load(job_id, 0, cpu.clone());
+    // free = 64 - 8 - 52 = 4 < need 18: a 14 GiB deficit a filter-blind
+    // planner would happily cover with the GPU job's bytes.
+    state.finish_admit(
+        job_id,
+        None,
+        Some(crate::witness::RamSample {
+            total_gib: 64.0,
+            used_gib: 52.0,
+        }),
+    );
+    let job = &state.jobs[&job_id];
+    let error = job.error.as_ref().expect("a RAM-only shortage refuses");
+    let SchedulerError::Admission(AdmissionError::InsufficientRam {
+        victims_considered,
+        blockers,
+        ..
+    }) = error
+    else {
+        panic!("a RAM shortage stays the RAM class: {error:?}");
+    };
+    assert!(
+        job.terminal,
+        "the GPU job is no RAM victim: it never drains"
+    );
+    assert!(
+        victims_considered.is_empty(),
+        "the GPU occupant was not even considered: {victims_considered:?}"
+    );
+    assert!(
+        blockers.iter().any(
+            |b| b.model == "gpu-res" && b.reason.contains("never under the RAM gate's control")
+        ),
+        "it rides the refusal only as the uncontrolled holder it is: {blockers:?}"
+    );
+    let msg = error.to_string();
+    assert!(
+        !msg.contains("considered evicting"),
+        "never considered, never victim: {msg}"
+    );
+    assert_eq!(job.state, SwapState::AdmitFail);
+    assert!(
+        state.slots[1].occupant.is_some(),
+        "nothing killed: the GPU resident the RAM gate may not touch stays seated"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// F11 (W2): `min_turn` applies unchanged to both planners. A young Ram
+/// holder is a named blocker of a RAM shortage, in the card leg's own
+/// wording class; and the guard never walls off a same-slot RAM
+/// replacement — releasing the named target of the request is the request
+/// itself, so the deficit that remains is covered from another slot.
+/// Falsifier: on the pre-fix tree the RAM refusal never had the `min_turn`
+/// wording (leg one red) and never admitted a drain at all (leg two red).
+/// A regression that guards the same-slot credit with the young resident's
+/// clock (subtracting the credit instead of filtering candidates) turns leg
+/// two into a refusal — red.
+#[tokio::test]
+async fn a_young_ram_holder_is_a_min_turn_blocker_never_a_same_slot_wall() {
+    use super::{AdmissionError, SchedulerError};
+    let dir = crate::testutil::temp_dir("ram-min-turn");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let seat = |model: &str, ram: f64, port: u16| Occupant {
+        model: model.to_string(),
+        need: Gibibytes(0.0),
+        ram_need: Some(Gibibytes(ram)),
+        port,
+        ticket: fold_ticket(port),
+        loaded_at: Instant::now(),
+        launched_at_wall: std::time::SystemTime::now(),
+        spawn_config: None,
+        stale_config: false,
+        serve_id: None,
+        measure: None,
+    };
+    let write_row = |name: &str, ram_gb: &str, min_turn: Option<&str>| {
+        let yaml = dir.join(format!("{name}.yaml"));
+        let guarded = min_turn.map_or(String::new(), |m| format!("min_turn: {m}\n"));
+        std::fs::write(
+            &yaml,
+            format!(
+                "engine: llama\ncategory: work\nram_gb: {ram_gb}\ncpu_offload: true\n{guarded}"
+            ),
+        )
+        .expect("seed");
+        rescan_entry(&yaml, name)
+    };
+    // Leg one: the young cross-slot Ram holder blocks, named in the
+    // card leg's min_turn wording class; nothing else yields.
+    {
+        let load = write_row("load", "20", None);
+        let young = write_row("aux-cpu", "10", Some("3600"));
+        let mut state = fold_state(&dir);
+        state.catalog = vec![load.clone(), young];
+        state.slots = vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_130,
+                occupant: None,
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_131,
+                occupant: Some(seat("aux-cpu", 10.0, 18_131)),
+                job: None,
+            },
+        ];
+        let job_id = state.register_queued_load(0, &load, Vec::new());
+        state.start_queued_load(job_id, 0, load.clone());
+        state.finish_admit(
+            job_id,
+            None,
+            Some(crate::witness::RamSample {
+                total_gib: 64.0,
+                used_gib: 44.0,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        let error = job
+            .error
+            .as_ref()
+            .expect("the young guard leaves no victim");
+        let SchedulerError::Admission(AdmissionError::InsufficientRam {
+            victims_considered,
+            blockers,
+            ..
+        }) = error
+        else {
+            panic!("a RAM shortage stays the RAM class: {error:?}");
+        };
+        assert!(
+            victims_considered.is_empty(),
+            "a holder inside its guard is a blocker, never a candidate: {victims_considered:?}"
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.model == "aux-cpu" && b.reason.contains("min_turn guard")),
+            "the young Ram holder is a named blocker: {blockers:?}"
+        );
+        assert!(job.terminal);
+        assert!(
+            state.slots[1].occupant.is_some(),
+            "nothing killed: the guarded holder stays seated"
+        );
+    }
+    // Leg two: the young guard never blocks the same-slot replacement. The
+    // same-slot credit still stands (the guard protects a reload cost the
+    // replacement itself IS paying), and the small remaining deficit is
+    // covered by the unguarded Ram resident in AUX — the load drains.
+    {
+        let load = write_row("load30", "30", None);
+        let young = write_row("work-cpu", "10", Some("3600"));
+        let mut state = fold_state(&dir);
+        state.adapters.insert(
+            "llama".to_string(),
+            Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+        );
+        state.catalog = vec![load.clone(), young];
+        state.slots = vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_130,
+                occupant: Some(seat("work-cpu", 10.0, 18_130)),
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_131,
+                occupant: Some(seat("aux-cpu", 10.0, 18_131)),
+                job: None,
+            },
+        ];
+        let job_id = state.register_queued_load(0, &load, Vec::new());
+        state.start_queued_load(job_id, 0, load.clone());
+        // free = 64 - 8 - 40 + 10 (own-slot credit) = 26 < need 30: the
+        // 4 GiB deficit comes from AUX; the young own-slot resident is the
+        // replacement, not a blocker and not a candidate.
+        state.finish_admit(
+            job_id,
+            None,
+            Some(crate::witness::RamSample {
+                total_gib: 64.0,
+                used_gib: 40.0,
+            }),
+        );
+        let job = &state.jobs[&job_id];
+        assert!(job.error.is_none(), "{:?}", job.error);
+        assert!(!job.terminal, "the young guard never walls the same slot");
+        assert_eq!(job.path, Some(AdmissionPath::Drain));
+        let victim = job.victim.as_ref().expect("the replacement rides the row");
+        assert_eq!(victim.model, "work-cpu", "the named target first");
+        assert!(!victim.evicted, "a same-slot release, not an eviction");
+        assert!(
+            job.victims.iter().any(|v| v.model == "aux-cpu"),
+            "the covering victim stays queued: {:?}",
+            job.victims
+                .iter()
+                .map(|v| v.model.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(job.state, SwapState::Dispose);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
