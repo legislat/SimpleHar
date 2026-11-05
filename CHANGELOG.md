@@ -53,6 +53,10 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 - A final chunked review ran over the whole tree; the remaining Medium and
   Low findings are filed for 1.4.
 
+Tag: `v1.3.1`. Commit: `f092b0a` (release prep). Artifact: `simpleharn.exe`,
+built 2026-11-05, SHA256
+`78599990617DF46876301F26DA6E0441502A08D10917A3E0391D0969ACBA5B80`.
+
 
 ## v1.3.0 - 2026-11-05
 
