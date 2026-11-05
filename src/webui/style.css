@@ -73,9 +73,42 @@ html[data-theme="dark"] {
    * The rules take the same warm hex as every other border; the header
    * surface gets the own chrome token below. */
   --pico-table-border-color: #d9c9b2;
+  /* Border audit (operator 2026-11-05: "the border is still lighter than the
+   * background"): Pico's cool muted-border rgb(231, 234, 239.5) is LIGHTER
+   * than the parchment and still feeds the accordion border chain (the log
+   * details) and hr. It takes the same warm hex - one line, every remaining
+   * consumer, measured 1.44:1 below the page. */
+  --pico-muted-border-color: #d9c9b2;
   --sh-chrome-bg: #efe6d6;
   --sh-tab-idle-bg: var(--sh-chrome-bg);
   --sh-panel-head-rule: 1px solid var(--pico-card-border-color);
+  /* The approved tab scheme, extended (operator 2026-11-05: "apply this color
+   * scheme to the remaining blue buttons"). Pico routes EVERY default button,
+   * outline button, link, checkbox accent and focus ring through these
+   * primary variables, so the recolor lives here once and new controls
+   * inherit it: Load, Set default and the default ✕ sit on the chrome plate
+   * with the ink (#373c44 8.96:1 on #efe6d6, 8.02:1 on the hover fill),
+   * Rescan and links take the walnut #6f5b36 (5.79:1 on the page, hover
+   * #5a4a2b 7.63:1), and the focus ring turns warm. The form fields were the
+   * same cool Pico gray (ink #23262c, border #cfd5e2): they take the warm ink
+   * and border here; Pico chains their active border and focus to
+   * --pico-primary-border on its own. Disabled states keep Pico's 0.5
+   * opacity. These variables are declared ONLY here, so dark stays Pico blue
+   * byte-identical (the theme is exactly the blue the operator approved). */
+  --pico-primary: #6f5b36;
+  --pico-primary-hover: #5a4a2b;
+  --pico-primary-underline: rgba(111, 91, 54, 0.5);
+  --pico-primary-background: #efe6d6;
+  --pico-primary-border: #d9c9b2;
+  --pico-primary-hover-background: #e6dac3;
+  --pico-primary-hover-border: #cdba9d;
+  --pico-primary-inverse: #373c44;
+  --pico-primary-focus: rgba(111, 91, 54, 0.45);
+  --pico-form-element-color: #373c44;
+  --pico-form-element-background-color: var(--pico-card-background-color);
+  --pico-form-element-border-color: var(--pico-card-border-color);
+  --pico-form-element-active-background-color: var(--sh-chrome-bg);
+  --pico-form-element-selected-background-color: var(--sh-chrome-bg);
   --sh-warn-ink: #805a00;
   --sh-warn-tint: #d89b1d40;
   /* UR-01 (2026-11-05): the joined side's background token - Pico re-scopes

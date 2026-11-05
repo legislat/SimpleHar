@@ -769,9 +769,10 @@ const driver = `
     // consumer falls back to the pre-fix value, so dark computes identical
     // (the dark/root absence half of this leg is the dark-unchanged guard).
     const rootBody = bodyOf(":root {");
-    check("light depth tokens exist (table rules, chrome surface, idle tab, head rule)",
+    check("light depth tokens exist (table rules, muted rules, chrome surface, idle tab, head rule)",
       !!lightBody && lightBody.indexOf("--pico-card-border-color: #d9c9b2") >= 0 &&
         lightBody.indexOf("--pico-table-border-color: #d9c9b2") >= 0 &&
+        lightBody.indexOf("--pico-muted-border-color: #d9c9b2") >= 0 &&
         lightBody.indexOf("--sh-chrome-bg: #efe6d6") >= 0 &&
         lightBody.indexOf("--sh-tab-idle-bg: var(--sh-chrome-bg)") >= 0 &&
         lightBody.indexOf("--sh-panel-head-rule: 1px solid var(--pico-card-border-color)") >= 0,
@@ -817,9 +818,43 @@ const driver = `
     };
     check("the light chrome and border hexes compute darker than the parchment page",
       lumOf("#efe6d6") < lumOf("#f7f1e6") && lumOf("#d9c9b2") < lumOf("#f7f1e6") &&
-        lumOf("#efe6d6") < lumOf("#fffaf3") && lumOf("#d9c9b2") < lumOf("#fffaf3"),
+        lumOf("#efe6d6") < lumOf("#fffaf3") && lumOf("#d9c9b2") < lumOf("#fffaf3") &&
+        lumOf("#6f5b36") < lumOf("#f7f1e6") && lumOf("#e6dac3") < lumOf("#f7f1e6"),
       "chrome=" + lumOf("#efe6d6").toFixed(4) + " border=" + lumOf("#d9c9b2").toFixed(4) +
         " page=" + lumOf("#f7f1e6").toFixed(4) + " card=" + lumOf("#fffaf3").toFixed(4));
+    // Remaining Pico-primary controls (operator 2026-11-05: "apply this color
+    // scheme to the remaining blue buttons"): the recolor rides Pico's own
+    // primary variables inside the light block, once for every button,
+    // outline, link, checkbox accent and focus ring.
+    check("light Pico-primary variables resolve to the warm chrome scheme",
+      !!lightBody && lightBody.indexOf("--pico-primary-background: #efe6d6") >= 0 &&
+        lightBody.indexOf("--pico-primary-border: #d9c9b2") >= 0 &&
+        lightBody.indexOf("--pico-primary-hover-background: #e6dac3") >= 0 &&
+        lightBody.indexOf("--pico-primary-hover-border: #cdba9d") >= 0 &&
+        lightBody.indexOf("--pico-primary-inverse: #373c44") >= 0 &&
+        lightBody.indexOf("--pico-primary: #6f5b36") >= 0 &&
+        lightBody.indexOf("--pico-primary-hover: #5a4a2b") >= 0 &&
+        lightBody.indexOf("--pico-primary-focus: rgba(111, 91, 54, 0.45)") >= 0,
+      lightBody || "missing");
+    check("light form fields take the warm ink and border, never Pico's cool gray",
+      !!lightBody && lightBody.indexOf("--pico-form-element-color: #373c44") >= 0 &&
+        lightBody.indexOf("--pico-form-element-background-color: var(--pico-card-background-color)") >= 0 &&
+        lightBody.indexOf("--pico-form-element-border-color: var(--pico-card-border-color)") >= 0,
+      lightBody || "missing");
+    check("no primary or form recolor leaks to dark or the :root defaults",
+      !!darkBody && darkBody.indexOf("--pico-primary") < 0 &&
+        darkBody.indexOf("--pico-form-element") < 0 &&
+        darkBody.indexOf("--pico-muted-border-color") < 0 &&
+        !!rootBody && rootBody.indexOf("--pico-primary") < 0 &&
+        rootBody.indexOf("--pico-form-element") < 0 &&
+        rootBody.indexOf("--pico-muted-border-color") < 0,
+      "dark=" + (darkBody || "missing").slice(0, 60));
+    const selectedTabBody = bodyOf('.sh-tab[aria-selected="true"] {');
+    check("the selected tab keeps the green accent, outside the warm primary scheme",
+      !!selectedTabBody && selectedTabBody.indexOf("var(--sh-accent)") >= 0 &&
+        selectedTabBody.indexOf("var(--sh-accent-solid)") >= 0 &&
+        selectedTabBody.indexOf("--pico-primary") < 0,
+      selectedTabBody || "missing");
   }
 
   const withFault = { ...fixtures["/har/status"], models: fixtures["/har/models"].data, last_error: "broken@WORK: never became ready" };

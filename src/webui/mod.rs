@@ -340,6 +340,15 @@ mod tests {
             "a selected tab must not repaint the joined side - the amber \
              action stays amber in every state"
         );
+        assert!(
+            STYLE_CSS.contains("--pico-primary-background: #efe6d6")
+                && STYLE_CSS.matches("--pico-primary-background:").count() == 1
+                && STYLE_CSS.contains("--pico-muted-border-color: #d9c9b2")
+                && STYLE_CSS.matches("--pico-muted-border-color:").count() == 1,
+            "the served stylesheet carries the warm Pico-primary scheme and \
+             the warm muted-border once, in the light block only (dark keeps \
+             Pico blue and Pico's cool muted border)"
+        );
         for parchment in ["#f7f1e6", "#fffaf3", "#d9c9b2", "#efe6d6"] {
             assert!(
                 STYLE_CSS.contains(parchment),
