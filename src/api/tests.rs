@@ -764,7 +764,7 @@ fn model_json_marks_loaded_rows_and_nobody_else() {
 /// can ship — including FINDINGS-BATCH-2026-10-28P [P-1]'s M-E synonym form.
 #[test]
 fn the_status_and_models_render_paths_never_touch_the_filesystem() {
-    let source = include_str!("mod.rs");
+    let source = include_str!("status_render.rs");
     for (head, tail) in [
         ("async fn render_status_document(", "\"config_errors\""),
         ("fn loaded_rows(", "or_insert"),

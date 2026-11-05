@@ -4465,6 +4465,11 @@ fn the_writeback_mutator_set_stays_closed_to_the_rebaseline_table() {
         ("scheduler/messages.rs", include_str!("messages.rs"), 0),
         ("api/mod.rs", include_str!("../api/mod.rs"), 1),
         ("api/guards.rs", include_str!("../api/guards.rs"), 0),
+        (
+            "api/status_render.rs",
+            include_str!("../api/status_render.rs"),
+            0,
+        ),
         ("main.rs", include_str!("../main.rs"), 0),
         ("catalog.rs", include_str!("../catalog.rs"), 0),
         ("tray.rs", include_str!("../tray.rs"), 0),
