@@ -81,7 +81,7 @@ durable and belongs in this tree.
 | [DOCTRINE.md](architecture/DOCTRINE.md) | One-page binding invariants; every agent must carry it | active |
 | [DECISIONS.md](architecture/DECISIONS.md) | Full ruling ledger: LOCKED / DEFERRED / DELIVERED / DATED RULINGS (single home) | active |
 | [OVERVIEW.md](architecture/OVERVIEW.md) | Current architecture, modules, data flow | active |
-| [DEFERRED-IDEAS.md](architecture/DEFERRED-IDEAS.md) | Design notes for deferred items (B9 priority classes, B10 restart reconciliation); no rulings | active |
+| [DEFERRED-IDEAS.md](architecture/DEFERRED-IDEAS.md) | Design notes for Berth items: B8 warm-during-release spike (measurement open), B9 priority classes, B10 restart reconciliation; no rulings | active |
 
 ### docs/reference/
 

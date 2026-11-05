@@ -110,6 +110,12 @@ One harness process, one tokio runtime, plus OS-level children:
 - Refusals name facts, not just numbers: `BudgetFacts`, `VictimInfo`, and
   `BlockerInfo` carry `unreleasable`, `used_gib`, and `booked_total` into the
   refusal text and the job ledger (`GET /har/jobs`).
+- The experimental knob `prefetch_on_release` (`config`, off by default) is
+  the only admission-window side effect of a committed release: the driver's
+  wait opens a detached, non-blocking OS-cache warm of the weight files the
+  incoming model's launch opens (`src/prefetch.rs`; llama and basalt rows),
+  and no warm outcome feeds any decision (design note: `DEFERRED-IDEAS.md`
+  section 3).
 - The accepted decision names its rung. `AdmissionPath` (`scheduler::jobs`,
   derived once in `finish_admit`) answers `FitsNow`, `ReleaseFirst` (the
   same-slot release-first door), or `Drain` (planned cross-category
@@ -293,6 +299,7 @@ One harness process, one tokio runtime, plus OS-level children:
 | `src/catalog.rs` | model identity and alias resolution |
 | `src/scheduler/` | single-writer actor and job state machine (`mod.rs`, `vocab.rs`, method-cluster child modules) |
 | `src/budget.rs` | admission arithmetic, `AdmissionError`, witnesses' types |
+| `src/prefetch.rs` | release-window OS-cache warm of the weight files the incoming row's launch opens (knob-gated, fire-and-forget) |
 | `src/witness.rs` | NVML witness with `nvidia-smi` fallback, TTL caches |
 | `src/engine/` | adapters (`llama.rs`, `strata.rs`, `basalt.rs`, `ninfer.rs`, `mock.rs`), `EnginePolicy` table (`policy.rs`), Fit probe (`fit.rs`) |
 | `src/process.rs` | Job-Object supervision, script staging, single-instance guard, log files |

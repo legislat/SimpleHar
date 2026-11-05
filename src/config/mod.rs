@@ -637,6 +637,16 @@ pub struct AppConfig {
     /// builds its own adapter map. Always serialized, like [`CategoryConfig::control`].
     #[serde(default)]
     pub allow_mock_engine: bool,
+    /// Experimental warm-during-release knob (off by default). When true, a
+    /// load that commits a victim fires a fire-and-forget OS-cache warm of
+    /// the incoming model's weight files on the blocking pool, using the
+    /// driver-confirmed release wait the reload would otherwise idle through.
+    /// The warm is a pure hint: it never blocks the actor, never gates
+    /// admission, and its failure changes no job outcome. Always serialized,
+    /// like [`AppConfig::allow_mock_engine`], so the file states the posture
+    /// explicitly instead of relying on the default.
+    #[serde(default)]
+    pub prefetch_on_release: bool,
     /// Harness-side per-engine defaults (slice 10d: the strata interpreter and
     /// working directory, §20-9 "engines obey only harness-owned configuration").
     /// Unset serializes nothing — existing config files keep their exact shape —
@@ -682,6 +692,7 @@ impl fmt::Debug for AppConfig {
             source_path,
             control_token,
             allow_mock_engine,
+            prefetch_on_release,
             engines,
         } = self;
         let presence = if control_token.is_some() {
@@ -709,6 +720,7 @@ impl fmt::Debug for AppConfig {
             .field("source_path", source_path)
             .field("control_token", &format_args!("REDACTED({presence})"))
             .field("allow_mock_engine", allow_mock_engine)
+            .field("prefetch_on_release", prefetch_on_release)
             .field("engines", engines)
             .finish()
     }
@@ -735,6 +747,7 @@ impl Default for AppConfig {
             wsl_user: None,
             control_token: None,
             allow_mock_engine: false,
+            prefetch_on_release: false,
             engines: None,
             source_path: None,
         }
@@ -1539,6 +1552,7 @@ mod tests {
             source_path: Some(std::path::PathBuf::from("F:/simpleharn.json")),
             control_token: Some("SENTINEL-B".to_string()),
             allow_mock_engine: true,
+            prefetch_on_release: true,
             ..AppConfig::default()
         };
         let text = format!("{cfg:?}");
@@ -1561,6 +1575,7 @@ mod tests {
             ("wsl_user", "operator"),
             ("source_path", "simpleharn.json"),
             ("allow_mock_engine", "true"),
+            ("prefetch_on_release", "true"),
         ] {
             assert!(
                 text.contains(&format!("{name}:")) && text.contains(value),
@@ -1815,6 +1830,67 @@ mod tests {
         );
         let reloaded = AppConfig::parse(&text).expect("persisted denial parses");
         assert!(!reloaded.allow_mock_engine);
+        assert!(reloaded.validate().is_empty());
+    }
+
+    #[test]
+    fn warm_during_release_stays_off_until_the_config_opts_in() {
+        // The experimental warm knob: absent means off, and a file written
+        // before the key existed must still parse rather than fail the boot
+        // (§0.2 step 1, same discipline as the mock-engine grant).
+        let absent = AppConfig::parse("{}").expect("defaults parse");
+        assert!(
+            !absent.prefetch_on_release,
+            "a hint that reads tens of GiB per swap must never be on by default"
+        );
+        assert_eq!(absent, AppConfig::default());
+        assert!(absent.validate().is_empty());
+
+        let older_file = AppConfig::parse("{\"tray_enabled\": false, \"load_timeout_s\": 300}")
+            .expect("a config written before the key existed still parses");
+        assert!(!older_file.prefetch_on_release);
+        assert!(older_file.validate().is_empty());
+
+        let opted_in = AppConfig::parse("{\"prefetch_on_release\": true}").expect("flag parses");
+        assert!(
+            opted_in.prefetch_on_release,
+            "the key is the only thing that turns the warm on"
+        );
+        assert!(opted_in.validate().is_empty());
+    }
+
+    #[test]
+    fn prefetch_on_release_survives_the_config_write_back() {
+        // §6 restart guard: an operator who turned the spike on must find it
+        // still on (and one who never touched it still off) after a
+        // write-back and a restart.
+        let opted_in = AppConfig {
+            prefetch_on_release: true,
+            ..AppConfig::default()
+        };
+        let text = write_back_text(&opted_in);
+        let reloaded = AppConfig::parse(&text).expect("persisted grant parses");
+        let errors = reloaded.validate();
+        assert!(
+            errors.is_empty(),
+            "persisted config must validate: {errors:?}"
+        );
+        assert!(
+            reloaded.prefetch_on_release,
+            "an opt-in must survive a write-back and a restart"
+        );
+
+        // Pinned serde choice: false is serialized (like `allow_mock_engine`),
+        // never omitted, so the file states the denial explicitly.
+        let text = write_back_text(&AppConfig::default());
+        let stamped: serde_json::Value = serde_json::from_str(&text).expect("stamped json parses");
+        assert_eq!(
+            stamped["prefetch_on_release"],
+            serde_json::Value::Bool(false),
+            "the default must be written, not skipped"
+        );
+        let reloaded = AppConfig::parse(&text).expect("persisted denial parses");
+        assert!(!reloaded.prefetch_on_release);
         assert!(reloaded.validate().is_empty());
     }
 

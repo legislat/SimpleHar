@@ -590,6 +590,10 @@ impl ActorState {
             self.dequeue_victim(job_id);
         }
         if self.jobs[&job_id].victim.is_some() {
+            // The release is committed and its wait is about to open: warm
+            // the incoming model's files for the reload that follows
+            // (knob-gated, detached, never able to change this job's path).
+            self.start_release_prefetch(job_id);
             self.spawn_kill_confirm(job_id);
         } else {
             self.begin_spawn(job_id);

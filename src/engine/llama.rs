@@ -344,7 +344,7 @@ pub fn jinja_on(value: &str) -> bool {
 /// exemption the scan's existence trace gives them. With no catalog file to
 /// anchor on (a synthetic entry), the value launches as before — only rows
 /// that went through the scan's stat get the guarantee.
-fn resolve_model_path(raw: &str, dir: Option<&Path>) -> String {
+pub(crate) fn resolve_model_path(raw: &str, dir: Option<&Path>) -> String {
     if raw.contains("://") || Path::new(raw).is_absolute() {
         return raw.to_string();
     }

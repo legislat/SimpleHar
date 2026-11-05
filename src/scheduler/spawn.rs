@@ -331,6 +331,76 @@ impl ActorState {
         matches!(error, SpawnError::StaleTicket { .. })
     }
 
+    /// Warm the incoming model's files into the OS cache while the release
+    /// this job committed drains (config `prefetch_on_release`, off by
+    /// default). Called at the one point where a load has committed its
+    /// release target and the driver-confirmed wait is about to open — the
+    /// reload that follows reads from cache instead of idling through a cold
+    /// disk pass.
+    ///
+    /// Pure hint, by construction: the warm runs detached on the blocking
+    /// pool (never on the actor or the reactor), its handle is never joined,
+    /// and neither its success nor its failure sends anything back — the job
+    /// cannot observe it. A panic inside the warm dies in its own blocking
+    /// thread, which the discarded handle turns into nothing. The whole
+    /// actor-side surface of this function is one config read, a catalog
+    /// lookup, and an in-memory clone of the row keys (review B8R-01): every
+    /// path stat runs on the detached task with the read, so a stalled or
+    /// disconnected volume can park no actor turn. Nothing here touches
+    /// slot, occupant, booking, or ledger state.
+    pub(super) fn start_release_prefetch(&mut self, job_id: JobId) {
+        if !self.cfg.prefetch_on_release {
+            return;
+        }
+        let Some(entry) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|job| self.catalog.iter().find(|m| m.name == job.model))
+        else {
+            return; // the incoming model is not in the catalog: nothing to warm
+        };
+        let Some(spec) = crate::prefetch::RowWarmSpec::from_entry(entry) else {
+            tracing::debug!(model = %entry.name, "prefetch: this engine opens no harness-named weight file");
+            return;
+        };
+        if spec.named.is_empty() {
+            tracing::debug!(model = %spec.model, "prefetch: the row names no weight file");
+            return; // no key to stat: no work for a detached task either
+        }
+        let hook = crate::prefetch::warm_hook();
+        tokio::task::spawn_blocking(move || {
+            // Selection stats live here, on the blocking pool: the commit
+            // turn above only cloned keys (review B8R-01).
+            let targets = spec.targets();
+            if targets.is_empty() {
+                tracing::debug!(model = %spec.model, "prefetch: no warmable file for the incoming model");
+                return;
+            }
+            let started = Instant::now();
+            let outcome = match &hook {
+                Some(hook) => hook(&spec.model, &targets),
+                None => crate::prefetch::warm_files(&targets),
+            };
+            let took_ms = started.elapsed().as_millis() as u64;
+            match outcome {
+                Ok(bytes) => tracing::info!(
+                    path = %spec.model,
+                    files = targets.len(),
+                    bytes,
+                    took_ms,
+                    "prefetch"
+                ),
+                Err(class) => tracing::warn!(
+                    path = %spec.model,
+                    files = targets.len(),
+                    took_ms,
+                    error = %class,
+                    "prefetch failed"
+                ),
+            }
+        });
+    }
+
     /// Kill every process this job owns (its pending victim and its own spawn) and
     /// confirm release with evidence, inside `release_timeout_s` (G12).
     pub(super) fn spawn_kill_confirm(&mut self, job_id: JobId) {

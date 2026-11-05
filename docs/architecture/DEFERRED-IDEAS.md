@@ -3,9 +3,9 @@ title: Ideas for later (not queued)
 owner: operator
 status: active
 audience: [architect, contributor, agent]
-source_of_truth_for: [ideas held for later: priority classes, restart reconciliation]
+source_of_truth_for: [ideas held for later: priority classes, restart reconciliation, B8 warm-during-release spike note]
 last_reviewed: 2026-11-05
-review_trigger: new-decision, an operator decision to promote an idea
+review_trigger: new-decision, B8 card measurement, an operator decision to promote an idea
 ---
 
 # DEFERRED-IDEAS.md
@@ -15,10 +15,14 @@ records design thinking and open risks. It makes no ruling.
 `docs/architecture/DECISIONS.md` owns every ruling, and
 `docs/architecture/OVERVIEW.md` owns current behavior.
 
-Both notes come from the Berth borrow queue (Search#41 investigation). The
-operator demoted both to ideas on 2026-11-05: they hold no queue slot, no tier,
-and no build follows from them. A note here is a thought kept for later, not a
-plan. Promote one only with a new operator decision.
+The notes come from the Berth borrow queue (Search#41 investigation). The
+operator demoted B9 and B10 to ideas on 2026-11-05: they hold no queue slot,
+no tier, and no build follows from them. A note here is a thought kept for
+later, not a plan. Promote one only with a new operator decision. The third
+note (B8) records the spike the ruling of 2026-11-04 folded into the next card
+run: its mechanism is built behind the off-by-default `prefetch_on_release`
+knob, and the note keeps the measurement and the keep-or-remove decision it
+waits for.
 
 ## 1. B9 - Priority classes (hook design only)
 
@@ -165,3 +169,70 @@ Design note only. No implementation exists, and none is approved.
   whatever holds a port.
 - The single-instance guard keeps exactly one harness as writer of slot
   state.
+
+## 3. B8 - Warm the incoming engine during the release wait (spike)
+
+The mechanism is built and cardless-tested. It waits for the measurement
+below. No ruling exists on keeping, removing, or changing its default.
+
+### Why it can help
+
+- A committed release idles in the harness for about five seconds while the
+  driver confirms the release. The reload of the next model then runs about
+  fourteen seconds.
+- A warm reads the files the incoming model's launch opens into the OS
+  cache during that idle window. The reload after the release then reads
+  from cache, not from disk.
+- The borrow comes from the Berth gateway design: warm the next engine's
+  files during a drain. Ours warms during the release wait only.
+
+### Mechanism chosen
+
+- A plain sequential read of each target file, on one detached blocking
+  task, started the instant a load commits its release target. The OS
+  caches every page the read touches.
+- `PrefetchVirtualMemory` was rejected for the spike: it needs the file
+  first mapped as a section view in this process, so it adds unsafe mapping
+  code for a marginal gain over the read. Measure the read first.
+- Targets are the weight files the row's engine really opens. A llama row
+  warms its `model:` and `mmproj:` files; a basalt row warms its `model:`
+  pack file. Every other engine opens nothing its row keys name, so its
+  rows warm nothing: strata weights ride the `strata_args` and
+  `strata_vision` tokens, and a legacy `model:` left in a strata row names
+  a file that launch provably never opens. A ninfer artifact rides
+  `ninfer_model_roots` with `ninfer_artifact`. Targets resolve through the
+  same resolver the scan and the launch use. Scheme sentinels, missing
+  files, directories, and files over 48 GiB are skipped.
+- The commit turn clones only the row keys in memory. Every path stat and
+  every read run on the one detached task, so no volume stall can park an
+  actor turn (review B8R-01, pinned).
+- The warm is a pure hint. It runs detached, never joins the job, never
+  blocks the actor, and cannot change an admission decision or a job
+  outcome. One config key turns it on (`prefetch_on_release`, off by
+  default). One log line names the result:
+  `prefetch path=<model> files=<n> bytes=<n> took_ms=<n>`.
+- Shutdown bound, accepted as spike cost (review B8R-03): process teardown
+  joins an in-flight warm, so a tray Exit during a warm waits out the
+  remaining read. The wait is bounded — at most two files of at most
+  48 GiB, read-rate bound — and the Exit signal path itself stays
+  synchronous. No cancellation plumbing was added.
+
+### What the card run must measure
+
+- Run the same swap sequence with the knob off, then on. Compare the reload
+  time of the incoming model per swap, and read the `prefetch` lines for
+  the warm cost it paid to buy that.
+- Only llama and basalt rows can warm at all. A strata or ninfer row shows
+  no `prefetch` line: never credit the knob with a change on those rows.
+- Expect a per-model split. Files of 25 to 44 GiB approach the box's 95 GiB
+  of RAM, so a warm can evict cache the running engine still wants and make
+  the next swap slower, not faster.
+- A WSL `Z:\` path may defeat the warm entirely: the bytes live behind the
+  WSL filesystem layer, and the harness-side read may not warm the path the
+  container-side open takes. Measure a row that names a `Z:\` file.
+- Time a tray Exit during a knob-on warm. Teardown joins the remaining
+  read; the measured delay decides whether the documented bound is
+  acceptable or needs a ruling (review B8R-03).
+- Judge per model, not per box. The keep-or-remove ruling belongs to the
+  operator after these numbers exist.
+

@@ -19,6 +19,7 @@ pub mod listeners;
 pub mod model;
 pub mod observability;
 pub mod ownership;
+pub mod prefetch;
 pub mod process;
 pub mod scheduler;
 pub mod testutil;

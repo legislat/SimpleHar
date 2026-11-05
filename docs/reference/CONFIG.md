@@ -59,6 +59,7 @@ it never applies silent defaults.
 | `modelconf_dir` | `<exe dir>\ModelConf` | Catalog directory. |
 | `tray_enabled` | `true` | Tray icon at boot. |
 | `allow_mock_engine` | `false` | Test-only. When true, boot registers the mock engine adapter and warns that it is not for production. A row with `engine: mock` is refused when the grant is false. |
+| `prefetch_on_release` | `false` | Experimental. When true, a load that commits a release reads the weight files the incoming model's launch opens into the OS cache during the release wait, so the reload reads from cache. A llama row warms `model:` and `mmproj:`; a basalt row warms its `model:` pack; other engines open nothing these keys name and warm nothing. The warm is a pure hint: it changes no admission decision, never blocks a step, and a failed warm changes no job outcome. `DEFERRED-IDEAS.md` (section 3) owns the measurement it still waits for. |
 
 ## The `categories` key
 
