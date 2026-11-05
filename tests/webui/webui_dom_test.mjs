@@ -607,8 +607,10 @@ const driver = `
           const widthOf = function (v) { return (v.match(/[0-9.]+[a-z%]*/) || ["medium"])[0]; };
           if (prop === "border") {
             const w = widthOf(value);
+            const col = value.split(" ").pop();
             set("border-left-width", w); set("border-right-width", w);
             set("border-top-width", w); set("border-bottom-width", w);
+            if (col.indexOf("var(") === 0 || col.charAt(0) === "#") set("border-color", col);
           } else if (prop === "border-left") {
             set("border-left-width", widthOf(value));
           } else if (prop === "border-right") {
@@ -619,7 +621,8 @@ const driver = `
           } else if (prop === "border-left-width" || prop === "border-right-width" ||
               prop === "border-top-left-radius" || prop === "border-top-right-radius" ||
               prop === "border-bottom-left-radius" || prop === "border-bottom-right-radius" ||
-              prop === "background" || prop === "background-color") {
+              prop === "background" || prop === "background-color" ||
+              prop === "color" || prop === "border-color") {
             set(prop, value);
           }
         }
@@ -640,6 +643,9 @@ const driver = `
         sideCss["border-bottom-right-radius"] === "var(--sh-radius)",
       "tl=" + sideCss["border-top-left-radius"] + " tr=" + sideCss["border-top-right-radius"] +
         " bl=" + sideCss["border-bottom-left-radius"] + " br=" + sideCss["border-bottom-right-radius"]);
+    check("computed: the joined side keeps the amber ink and amber border of the release family",
+      sideCss["color"] === "var(--sh-warn-ink)" && sideCss["border-color"] === "var(--sh-warn)",
+      "color=" + sideCss["color"] + " border-color=" + sideCss["border-color"]);
     const tabCss = computed(["sh-tab", "sh-tab-part"]);
     check("computed: the tab gives its right edge to the pair (no border, no radius)",
       tabCss["border-right-width"] === "0" &&
@@ -655,10 +661,8 @@ const driver = `
       return norm(css.slice(open + 1, close));
     };
     const selBody = bodyOf('.sh-tab[aria-selected="true"] + .sh-tab-side');
-    check("a selected tab shares its accent with the joined side",
-      !!selBody && selBody.indexOf("var(--sh-accent)") >= 0 &&
-        selBody.indexOf("var(--sh-accent-solid)") >= 0,
-      selBody || "no selected-side rule");
+    check("a selected tab never repaints the joined side: no selected-side override ships",
+      selBody === null, selBody === null ? "clean" : selBody);
     const amberBody = bodyOf(".sh-unload {");
     check("sh-unload paints the amber border and ink of the release family",
       !!amberBody && amberBody.indexOf("var(--sh-warn)") >= 0 &&
@@ -735,6 +739,20 @@ const driver = `
         css.indexOf("--sh-tab-side-bg: var(--pico-") < 0,
       "light=" + (lightBody ? lightBody.indexOf("--sh-tab-side-bg") : -1) +
         " dark=" + (darkBody ? darkBody.indexOf("--sh-tab-side-bg") : -1));
+    // Final ruling (2026-11-05): the occupied tab that is also selected is the
+    // common view, and the Unload there must stay amber. The rendered fixture
+    // pill IS a selected occupied tab (see the aria-selected leg above), so
+    // the cascade values are that tab's side; the ink must resolve in both
+    // themes: deep amber #805a00 on the warm paper, plain amber on the card.
+    check("the selected occupied side stays amber-inked on its card token in both themes",
+      selBody === null &&
+        sideCss["background"] === "var(--sh-tab-side-bg)" &&
+        sideCss["color"] === "var(--sh-warn-ink)" &&
+        !!lightBody && lightBody.indexOf("--sh-warn-ink: #805a00") >= 0 &&
+        css.indexOf("--sh-warn-ink: var(--sh-warn)") >= 0 &&
+        css.indexOf("--sh-warn: #d89b1d") >= 0,
+      "selOverride=" + (selBody === null ? "none" : "present") +
+        " bg=" + sideCss["background"] + " ink=" + sideCss["color"]);
     // UR-02: the amber label on the hover fill is the intent - dark composites
     // to 5.2:1 only while the fill's alpha stays at or under 0x2e, so pin it.
     const tintAt = darkBody ? darkBody.indexOf("--sh-warn-tint: #d89b1d") : -1;

@@ -217,13 +217,11 @@ header.sh-header {
   background: var(--sh-tab-side-bg);
 }
 
-/* A selected tab shares its accent with the joined side (operator 2026-11-05):
- * the pair stays one pill - background, border and ink all follow the tab. */
-.sh-tab[aria-selected="true"] + .sh-tab-side {
-  background: var(--sh-accent);
-  border-color: var(--sh-accent-solid);
-  color: var(--sh-tab-ink);
-}
+/* A selected tab keeps its accent to itself (operator ruling 2026-11-05,
+ * final): the joined shape is the entity, the ACTION stays amber - the side
+ * keeps --sh-tab-side-bg, --sh-warn-ink and the amber border in every state
+ * (selected, unselected, both themes). The colour step at the shared edge is
+ * the accepted trade; never repaint the side with the accent again. */
 
 .sh-tab-port {
   color: var(--pico-muted-color);

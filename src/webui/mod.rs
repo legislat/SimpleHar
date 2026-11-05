@@ -299,9 +299,10 @@ mod tests {
 
     /// The unload entity and its amber (operator ruling 2026-11-05): the three
     /// unload gestures — tab-side, row Unload, Unload all — carry the one
-    /// `sh-unload` class in the served page bytes, and the served stylesheet
-    /// carries the amber class rule, the shared selected accent of the joined
-    /// pill, and the warm-parchment light palette the ruling names. Rule
+    /// `sh-unload` class in the served page bytes, the served stylesheet
+    /// carries the amber class rule and the warm-parchment light palette the
+    /// ruling names, and no rule may repaint the joined side when its tab is
+    /// selected: the shape joins, the amber action stays amber. Rule
     /// existence is pinned byte-level like the amber tones before it; the
     /// cascade legs (joined edges computed from the served stylesheet, the
     /// class on each rendered button) live in
@@ -314,9 +315,9 @@ mod tests {
     /// # Falsifier
     ///
     /// Drop `sh-unload` from any one call site and that count assert fails;
-    /// delete the amber class rule, the selected-side accent rule, or the
-    /// parchment values from the stylesheet and their asserts fail while the
-    /// releasing and cost asserts stay green.
+    /// delete the amber class rule or the parchment values from the
+    /// stylesheet, or reintroduce a selected-side accent override, and their
+    /// asserts fail while the releasing and cost asserts stay green.
     #[test]
     fn served_assets_join_the_unload_entity_and_colour_it_amber() {
         assert_eq!(
@@ -335,8 +336,9 @@ mod tests {
              the served stylesheet"
         );
         assert!(
-            STYLE_CSS.contains(".sh-tab[aria-selected=\"true\"] + .sh-tab-side"),
-            "the joined pill must keep sharing the tab's selected accent"
+            !STYLE_CSS.contains(".sh-tab[aria-selected=\"true\"] + .sh-tab-side"),
+            "a selected tab must not repaint the joined side - the amber \
+             action stays amber in every state"
         );
         for parchment in ["#f7f1e6", "#fffaf3", "#e6dccb"] {
             assert!(
