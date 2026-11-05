@@ -836,9 +836,9 @@ const driver = `
         lightBody.indexOf("--pico-primary-hover: #5a4a2b") >= 0 &&
         lightBody.indexOf("--pico-primary-focus: rgba(111, 91, 54, 0.45)") >= 0,
       lightBody || "missing");
-    check("light form fields take the warm ink and border, never Pico's cool gray",
+    check("light form fields take the warm ink, chrome rest plate and border",
       !!lightBody && lightBody.indexOf("--pico-form-element-color: #373c44") >= 0 &&
-        lightBody.indexOf("--pico-form-element-background-color: var(--pico-card-background-color)") >= 0 &&
+        lightBody.indexOf("--pico-form-element-background-color: var(--sh-chrome-bg)") >= 0 &&
         lightBody.indexOf("--pico-form-element-border-color: var(--pico-card-border-color)") >= 0,
       lightBody || "missing");
     check("no primary or form recolor leaks to dark or the :root defaults",
@@ -855,6 +855,56 @@ const driver = `
         selectedTabBody.indexOf("var(--sh-accent-solid)") >= 0 &&
         selectedTabBody.indexOf("--pico-primary") < 0,
       selectedTabBody || "missing");
+    // Matte olive (operator 2026-11-05): the bright #2ea043 is retired. The
+    // shared wash is the matte at 44 %; the solid is matte in light and the
+    // dark block lightens it to stay readable (a graphic/text step of only
+    // 2.95:1 on the dark card would break the >= 4.5:1 rule).
+    check("the accent is the matte olive, dark lightens only the solid",
+      !!rootBody && rootBody.indexOf("--sh-accent: #596B4770") >= 0 &&
+        rootBody.indexOf("--sh-accent-solid: #596B47") >= 0 &&
+        !!darkBody && darkBody.indexOf("--sh-accent-solid: #8fae6f") >= 0 &&
+        darkBody.indexOf("--sh-accent: ") < 0 &&
+        css.indexOf("#2ea043") < 0,
+      "root=" + (rootBody || "missing").slice(0, 40) + " dark=" + (darkBody || "").slice(0, 40));
+    const sideJoinBody = bodyOf(".sh-mini.sh-tab-side");
+    // One plate for every unload (operator 2026-11-05): the row Unload sat on
+    // transparent over the cell, the tab-side on the card token - two looks,
+    // one control. Both take --sh-tab-side-bg now; hover stays the amber tint.
+    check("both unload plates sit on the shared tab-side token",
+      !!amberBody && amberBody.indexOf("background: var(--sh-tab-side-bg)") >= 0 &&
+        !!sideJoinBody && sideJoinBody.indexOf("background: var(--sh-tab-side-bg)") >= 0 &&
+        !!hoverBody && hoverBody.indexOf("var(--sh-warn-tint)") >= 0,
+      "unload=" + (amberBody || "missing") + " side=" + (sideJoinBody || "missing"));
+    // The white seam (operator 2026-11-05): display:flex on the actions td
+    // replaced the table-cell box, so the browser painted a card-white
+    // anonymous cell beside it. The flex is now on an inner span; the td
+    // stays a table-cell and paints the row colour.
+    const actionsTdBody = bodyOf("table.sh-models td.sh-actions");
+    check("the actions flex moved off the td: no display-bearing rule on a cell selector",
+      css.indexOf("td.sh-row-actions") < 0 &&
+        !!actionsTdBody && actionsTdBody.indexOf("width: max-content") >= 0,
+      actionsTdBody || "no td.sh-actions rule");
+    // Row separator continuity (operator 2026-11-05): one collapsed border on
+    // the row spans every column (actions included - it declares no border of
+    // its own); the body cells suppress their bottom border uniformly, never
+    // one cell individually.
+    const trSepBody = bodyOf("table.sh-models tbody tr {");
+    const tdSepBody = bodyOf("table.sh-models tbody td {");
+    check("row separators are one row-level rule and no body cell draws its own",
+      !!trSepBody &&
+        trSepBody.indexOf("border-bottom: 1px solid var(--pico-table-border-color)") >= 0 &&
+        !!tdSepBody && tdSepBody.indexOf("border-bottom: 0") >= 0 &&
+        !!actionsTdBody && actionsTdBody.indexOf("border") < 0 &&
+        css.indexOf("tbody td.sh") < 0,
+      "tr=" + (trSepBody || "missing") + " td=" + (tdSepBody || "missing"));
+    // Panel head and table head are one band of one token (operator 2026-11-05:
+    // "the same color, the darkest one"): both surfaces read --sh-chrome-bg,
+    // declared once as the warm chrome #efe6d6.
+    check("panel head and table head share the single chrome token",
+      !!headBody && headBody.indexOf("background: var(--sh-chrome-bg") >= 0 &&
+        !!thBody && thBody.indexOf("var(--sh-chrome-bg") >= 0 &&
+        !!lightBody && lightBody.indexOf("--sh-chrome-bg: #efe6d6") >= 0,
+      "head=" + (headBody || "missing").slice(0, 40) + " th=" + (thBody || "missing").slice(0, 40));
   }
 
   const withFault = { ...fixtures["/har/status"], models: fixtures["/har/models"].data, last_error: "broken@WORK: never became ready" };
@@ -1154,8 +1204,20 @@ const driver = `
       .find(function (b) { return textOf(b) === "Releasing…"; });
     check("the parked releasing button keeps the plain disabled unload behavior",
       !!parked && parked.attrs.disabled === "" &&
-        (parked.attrs.class || "").indexOf("sh-unload") < 0,
+      (parked.attrs.class || "").indexOf("sh-unload") < 0,
       parked ? JSON.stringify(parked.attrs) : "missing");
+    // Seam fix, rendered truth (operator 2026-11-05): the actions td is a
+    // plain table-cell (class sh-actions, no flex class) and the flexed span
+    // inside it carries the buttons - the cell paints, the span lays out.
+    const parkedRow = findAll(document.getElementById("sh-main"), "tr")
+      .find(function (tr) { return findAll(tr, "button").indexOf(parked) >= 0; });
+    const parkedTds = parkedRow ? findAll(parkedRow, "td") : [];
+    const parkedSpan = parkedTds.length > 0 ? findAll(parkedTds[0], "span", "sh-row-actions")[0] : null;
+    check("the actions cell is a table-cell with the flexed span inside",
+      !!parkedRow && parkedTds.length > 0 &&
+        (parkedTds[0].attrs.class || "") === "sh-actions" && !!parkedSpan &&
+        findAll(parkedSpan, "button").indexOf(parked) >= 0,
+      parkedTds.length ? parkedTds[0].attrs.class : "no actions td");
     const relSide = findAll(relPill, "button").find(function (b) {
       return (b.attrs.class || "").indexOf("sh-tab-side") >= 0;
     });

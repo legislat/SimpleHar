@@ -5,8 +5,14 @@
  * a persistent header so slot state and memory never scroll away. */
 
 :root {
-  --sh-accent: #2ea04370;
-  --sh-accent-solid: #2ea043;
+  /* Matte olive (operator ruling 2026-11-05: the bright WORK green stopped
+   * matching the warm scheme; #596B4770 is the shared wash). Dark overrides
+   * only the solid below: matte #596B47 as a graphic or text sits at 2.95:1
+   * on the dark card (the bright green was 5.08:1), so dark takes the same
+   * matte hue lightened to #8fae6f (6.9:1). The wash is shared - measured
+   * selected-tab ink 5.6:1 light, 6.5:1 dark. */
+  --sh-accent: #596B4770;
+  --sh-accent-solid: #596B47;
   --sh-warn: #d89b1d;
   /* Amber TEXT ink (operator 2026-11-05): --sh-warn is the amber graphic - dots,
    * borders, the reserve hatch. Normal-size amber text needs a deeper ink to stay
@@ -37,6 +43,8 @@ html[data-theme="dark"] {
   /* UR-02 (2026-11-05): an 18 % amber fill keeps the label 5.2:1 on this card
    * (the 25 % default was 4.46:1). Light stays at 25 % = 4.9:1. */
   --sh-warn-tint: #d89b1d2e;
+  /* Matte olive lightened for the dark card (6.9:1) - see :root. */
+  --sh-accent-solid: #8fae6f;
 }
 :root:not([data-theme="dark"]), html[data-theme="light"] {
   /* Warm parchment (operator 2026-11-05): the cool paper read clinical against
@@ -105,7 +113,7 @@ html[data-theme="dark"] {
   --pico-primary-inverse: #373c44;
   --pico-primary-focus: rgba(111, 91, 54, 0.45);
   --pico-form-element-color: #373c44;
-  --pico-form-element-background-color: var(--pico-card-background-color);
+  --pico-form-element-background-color: var(--sh-chrome-bg);
   --pico-form-element-border-color: var(--pico-card-border-color);
   --pico-form-element-active-background-color: var(--sh-chrome-bg);
   --pico-form-element-selected-background-color: var(--sh-chrome-bg);
@@ -350,9 +358,13 @@ header.sh-header {
 .sh-models { min-width: 56rem; }
 .sh-models .sh-name { white-space: nowrap; }
 /* Buttons sit side by side and only slide under each other when the column is
- * genuinely cramped (operator, 2026-10-26). */
-.sh-row-actions { display: flex; flex-wrap: wrap; gap: 0.3rem; }
-table.sh-models td.sh-row-actions { width: max-content; }
+ * genuinely cramped (operator, 2026-10-26). The flex lives on the INNER span
+ * (operator 2026-11-05, white-seam fix): `display: flex` on the td replaced
+ * the table-cell box, so the browser painted an anonymous cell that carries
+ * no background - headless-Edge pixels proved a ~200px column of card white
+ * between the buttons and the Model column. The td stays a table-cell (and
+ * paints its row colour); the span flexes inside it. */
+table.sh-models td.sh-actions { width: max-content; }
 .sh-extlog {
   display: inline-flex;
   align-items: center;
@@ -397,6 +409,19 @@ table.sh-models td, table.sh-models th { padding: 0.45rem 0.6rem; }
 table.sh-models thead th {
   background: var(--sh-chrome-bg, var(--pico-background-color));
 }
+/* Row-level separators (operator 2026-11-05): the line under a row was built
+ * from eight per-cell 1px borders, so any cell that stops painting - the old
+ * flex td at its shrunken box, a column ending at a fractional edge - breaks
+ * or insets the rule. One collapsed border on the TR is a single edge that
+ * spans every column (actions included) and rounds once; the cells suppress
+ * their own bottom border uniformly, none individually. Measured continuous
+ * (segment deltas 0px) at 760/900/1100/1280/1600 and mid-scroll. */
+table.sh-models tbody tr {
+  border-bottom: 1px solid var(--pico-table-border-color);
+}
+table.sh-models tbody td {
+  border-bottom: 0;
+}
 /* Edge cells hug the panel (operator: margins too large, 2026-10-26). */
 table.sh-models th:first-child, table.sh-models td:first-child { padding-left: 0.25rem; }
 table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.25rem; }
@@ -420,7 +445,7 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
    The tray's listener amber is a different palette; this is the config one. */
 .sh-dot[data-stale="amber"] { background: var(--sh-warn); }
 
-.sh-row-actions { display: flex; gap: 0.35rem; justify-content: flex-end; }
+.sh-row-actions { display: inline-flex; flex-wrap: wrap; gap: 0.35rem; justify-content: flex-end; }
 .sh-row-actions button { padding: 0.25rem 0.7rem; font-size: 0.8rem; margin: 0; }
 
 /* Job strip: the last few ledger entries with their reasons. */
@@ -477,9 +502,12 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
  * hover. One class, three call sites: the tab-side, the row Unload, and
  * Unload all. Rescan, Load and Set default keep their own colours, and the
  * parked Releasing…/Loading… buttons carry no class here - they stay plain
- * and disabled, exactly as before. */
+ * and disabled, exactly as before. Match (operator 2026-11-05): every unload
+ * button sits on the same --sh-tab-side-bg plate as the tab-side - a row
+ * Unload on a table cell must not read as a different control (the cell's
+ * page colour used to bleed through the transparent background). */
 .sh-unload {
-  background: transparent;
+  background: var(--sh-tab-side-bg);
   border: 1px solid var(--sh-warn);
   color: var(--sh-warn-ink);
 }

@@ -304,9 +304,11 @@ mod tests {
     /// ruling names, and no rule may repaint the joined side when its tab is
     /// selected: the shape joins, the amber action stays amber. Rule
     /// existence is pinned byte-level like the amber tones before it; the
-    /// cascade legs (joined edges computed from the served stylesheet, the
-    /// class on each rendered button) live in
-    /// `tests/webui/webui_dom_test.mjs`.
+    /// matte-olive accent (bright #2ea043 retired), the table-cell actions
+    /// wrapper (seam fix), the shared unload plate and the warm Pico-primary
+    /// scheme ride the same served bytes; the cascade legs (joined edges
+    /// computed from the served stylesheet, the class on each rendered
+    /// button) live in `tests/webui/webui_dom_test.mjs`.
     ///
     /// Nature, declared: a source-content assertion over the exact
     /// `include_str!` bytes `/app.js` and `/style.css` answer, so an
@@ -315,9 +317,10 @@ mod tests {
     /// # Falsifier
     ///
     /// Drop `sh-unload` from any one call site and that count assert fails;
-    /// delete the amber class rule or the parchment values from the
-    /// stylesheet, or reintroduce a selected-side accent override, and their
-    /// asserts fail while the releasing and cost asserts stay green.
+    /// delete the amber class rule or the parchment values, reintroduce a
+    /// selected-side accent override, the bright #2ea043, a flex on the
+    /// actions td or a transparent unload plate, and their asserts fail while
+    /// the releasing and cost asserts stay green.
     #[test]
     fn served_assets_join_the_unload_entity_and_colour_it_amber() {
         assert_eq!(
@@ -339,6 +342,28 @@ mod tests {
             !STYLE_CSS.contains(".sh-tab[aria-selected=\"true\"] + .sh-tab-side"),
             "a selected tab must not repaint the joined side - the amber \
              action stays amber in every state"
+        );
+        assert!(
+            APP_JS.contains("class: \"sh-row-actions\"")
+                && APP_JS.contains("el(\"td\", { class: \"sh-actions\" }, actions)")
+                && STYLE_CSS.contains("table.sh-models td.sh-actions")
+                && !STYLE_CSS.contains("td.sh-row-actions"),
+            "the actions cell must stay a table-cell wrapping a flexed span \
+             (the display:flex td opened a card-white seam beside it)"
+        );
+        assert!(
+            STYLE_CSS.contains("--sh-accent: #596B4770")
+                && STYLE_CSS.contains("--sh-accent-solid: #596B47")
+                && STYLE_CSS.contains("--sh-accent-solid: #8fae6f")
+                && !STYLE_CSS.contains("#2ea043"),
+            "the accent is the matte olive: shared wash #596B4770, matte \
+             solid in light, the same hue lightened in dark; the bright \
+             green #2ea043 is retired from the served stylesheet"
+        );
+        assert!(
+            STYLE_CSS.contains(".sh-unload {")
+                && STYLE_CSS.contains("background: var(--sh-tab-side-bg)"),
+            "every unload button sits on the shared tab-side plate"
         );
         assert!(
             STYLE_CSS.contains("--pico-primary-background: #efe6d6")

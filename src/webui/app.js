@@ -515,7 +515,10 @@ function modelRow(status, model, category) {
   // Operator layout (2026-10-26): actions first, then the name, then the rest —
   // the buttons stay in view at any width without scrolling. The primary button
   // is state-aware: a serving row offers Unload, a loading row is parked.
-  const actions = el("td", { class: "sh-row-actions" });
+  // The buttons live in a flex SPAN inside the cell (operator 2026-11-05): a
+  // `display: flex` td drops its table-cell box and paints no background,
+  // which opened a card-white seam between the buttons and the name column.
+  const actions = el("span", { class: "sh-row-actions" });
   if (dotState === "serving") {
     actions.append(
       el(
@@ -567,7 +570,7 @@ function modelRow(status, model, category) {
       text("Set default"),
     ),
   );
-  row.append(actions);
+  row.append(el("td", { class: "sh-actions" }, actions));
   row.append(
     el(
       "td",
