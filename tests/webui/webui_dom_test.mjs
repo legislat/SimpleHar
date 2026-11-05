@@ -875,7 +875,22 @@ const driver = `
         darkBody.indexOf("--sh-accent: ") < 0 &&
         css.indexOf("#2ea043") < 0,
       "root=" + (rootBody || "missing").slice(0, 40) + " dark=" + (darkBody || "").slice(0, 40));
-    // Bright working dot (operator 2026-11-05): the serving dot is the bright
+    // Checked boxes on warm paper (operator 2026-11-05): the tick glyph is
+    // hardcoded white and the switch knob is white, both on the checked fill
+    // token - on the warm control fill that was 1.24:1. Light-only, the
+    // checkbox takes the matte olive for its fill and switch track: white on
+    // olive is 5.8:1 (>= 4.5:1). Dark stays Pico blue (5.1:1), the radio dot
+    // keeps its dark ink, and the unchecked border stays the warm token.
+    const checkedBox = css.indexOf(':root:not([data-theme="dark"]) input[type="checkbox"]');
+    const checkedBoxLight = css.indexOf('html[data-theme="light"] input[type="checkbox"]');
+    check("checked boxes and switches take the olive fill in light only, white tick 5.8:1",
+      checkedBox >= 0 && checkedBoxLight >= 0 && checkedBoxLight > checkedBox &&
+        css.indexOf("--pico-primary-background: var(--sh-accent-solid);") > 0 &&
+        css.indexOf("--pico-switch-checked-background-color: var(--sh-accent-solid);") > 0 &&
+        css.indexOf('dark"] input[type="checkbox"]') < 0 &&
+        !!darkBody && darkBody.indexOf('input[type="checkbox"]') < 0 &&
+        css.indexOf("--pico-form-element-border-color: var(--pico-card-border-color)") >= 0,
+      "at=" + checkedBox + "/" + checkedBoxLight);
     // green #22c55e ringed in its deep shade #14532d - a non-text graphic held
     // to >= 3:1 on the ring/fill combination (light: ring 7.6:1 on the surface
     // and fill 4.0:1 on the ring; dark: fill 7.6:1 on the card, the ring a

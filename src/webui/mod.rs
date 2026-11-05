@@ -354,6 +354,41 @@ mod tests {
         );
     }
 
+    /// The checked box on warm paper (operator 2026-11-05): Pico's tick is a
+    /// hardcoded-white SVG glyph and the switch knob is white, both painted on
+    /// `--pico-primary-background` / `--pico-switch-checked-background-color` -
+    /// the warm control fill in light, a 1.24:1 vanishing tick. Light-only,
+    /// both tokens take the matte olive on the checkbox element: white glyph
+    /// and knob read at 5.8:1. Dark must stay exactly as Pico paints it
+    /// (white on its blue is 5.1:1), and the radio shares neither token.
+    ///
+    /// Nature, declared: a source-content assertion over the exact
+    /// `include_str!` bytes `/style.css` answers.
+    ///
+    /// Falsifier: scoping the override to dark or deleting it fails the
+    /// asserts; the dark-uniformity legs keep the dark block honest.
+    #[test]
+    fn served_assets_darken_the_checked_box_in_light() {
+        assert!(
+            STYLE_CSS.contains(":root:not([data-theme=\"dark\"]) input[type=\"checkbox\"]")
+                && STYLE_CSS.contains("html[data-theme=\"light\"] input[type=\"checkbox\"]")
+                && STYLE_CSS.contains("--pico-primary-background: var(--sh-accent-solid);")
+                && STYLE_CSS
+                    .contains("--pico-switch-checked-background-color: var(--sh-accent-solid);")
+                && STYLE_CSS
+                    .matches("--pico-switch-checked-background-color:")
+                    .count()
+                    == 1,
+            "the checked checkbox and switch fill is the olive, declared light-only \
+             and once - the white tick and knob need >= 4.5:1 on it (5.8:1 measured)"
+        );
+        assert!(
+            !STYLE_CSS.contains("html[data-theme=\"dark\"] input[type=\"checkbox\"]")
+                && !STYLE_CSS.contains(":root[data-theme=\"dark\"] input[type=\"checkbox\"]"),
+            "dark's checked box stays Pico's blue, byte-identical"
+        );
+    }
+
     /// The unload entity and its amber (operator ruling 2026-11-05): the three
     /// unload gestures — tab-side, row Unload, Unload all — carry the one
     /// `sh-unload` class in the served page bytes, the served stylesheet
@@ -428,12 +463,13 @@ mod tests {
         );
         assert!(
             STYLE_CSS.contains("--pico-primary-background: #efe6d6")
-                && STYLE_CSS.matches("--pico-primary-background:").count() == 1
+                && STYLE_CSS.matches("--pico-primary-background:").count() == 2
                 && STYLE_CSS.contains("--pico-muted-border-color: #d6c5a8")
                 && STYLE_CSS.matches("--pico-muted-border-color:").count() == 1,
             "the served stylesheet carries the warm Pico-primary scheme and \
               the warm muted-border once, in the light block only (dark keeps \
-              Pico blue and Pico's cool muted border)"
+              Pico blue and Pico's cool muted border); the second \
+              --pico-primary-background is the light checked-box olive override"
         );
         assert!(
             APP_JS.contains("text(\"Default\")") && !APP_JS.contains("text(\"Set default\")"),

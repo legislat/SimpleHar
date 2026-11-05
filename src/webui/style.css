@@ -514,6 +514,20 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
 /* Axis 2 (ruling 2026-10-29): a serving row whose config file moved since launch.
    The tray's listener amber is a different palette; this is the config one. */
 .sh-dot[data-stale="amber"] { background: var(--sh-warn); box-shadow: 0 0 0 1px var(--sh-dot-warn-ring); }
+/* Checked boxes on warm paper (operator 2026-11-05): Pico paints the tick as
+ * a hardcoded-white SVG glyph over --pico-primary-background and the switch
+ * track from --pico-switch-checked-background-color - here the warm control
+ * fill #efe6d6 - so the white tick and the white knob sat at 1.24:1 on their
+ * own fill. Light-only, the checked checkbox and switch take the matte olive
+ * for fill and track: the white glyph and knob read at 5.8:1 and the olive
+ * track against the surface at 4.9:1. Dark keeps Pico's blue (white on
+ * #0172ad is 5.1:1 there); the radio dot already shares neither token and
+ * keeps its dark ink; the unchecked border stays the warm border token. */
+:root:not([data-theme="dark"]) input[type="checkbox"],
+html[data-theme="light"] input[type="checkbox"] {
+  --pico-primary-background: var(--sh-accent-solid);
+  --pico-switch-checked-background-color: var(--sh-accent-solid);
+}
 
 .sh-row-actions {
   display: flex;
