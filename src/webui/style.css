@@ -436,6 +436,17 @@ table.sh-models tbody tr {
 table.sh-models tbody td {
   border-bottom: 0;
 }
+/* The white grid (operator 2026-11-05): in light the body cells painted
+ * Pico's PAGE token while the panel - and therefore the gaps around the
+ * buttons and the strip beside the head - sits on the card surface; headless
+ * pixels proved two surfaces (#F7F1E6 vs #FFFAF3) inside one table block.
+ * Light makes the cells transparent so the single panel token shows through
+ * every gap; dark keeps its approved surfaces byte-identical - the rule is
+ * light-scoped, dark never matches it. */
+:root:not([data-theme="dark"]) table.sh-models tbody td,
+html[data-theme="light"] table.sh-models tbody td {
+  background: transparent;
+}
 /* Edge cells hug the panel (operator: margins too large, 2026-10-26). */
 table.sh-models th:first-child, table.sh-models td:first-child { padding-left: 0.25rem; }
 table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.25rem; }
@@ -466,18 +477,18 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
   align-items: stretch;
   justify-content: flex-start;
 }
-/* Operator (2026-11-05): one tidy block - equal widths in every state. The
- * 6rem flex basis floor covers Load, Unload, Loading, Releasing and the
- * short Default label, so the pair matches side by side; the grow factors
- * are equal and align-items stretches every stacked line to the cell, so
- * the widths stay equal when the pair wraps under a cramped column. The old
+/* Operator (2026-11-05): a compact, tidy block - word plus a small overhead
+ * (padding-inline 0.9rem), no grow, so the table's spare width never
+ * stretches a button. The shared 5.75rem floor keeps every pair equal: each
+ * state label lands on the floor or within a few pixels of it, side by side
+ * and in the stacked line alike, and the block stays flush-left. The old
  * flex-end left a gap on the left of the column as soon as it grew. */
 .sh-row-actions button {
-  padding: 0.25rem 0.7rem;
+  padding: 0.25rem 0.9rem;
   font-size: 0.8rem;
   margin: 0;
-  flex: 1 1 6rem;
-  min-width: 6rem;
+  flex: 0 0 auto;
+  min-width: 5.75rem;
 }
 
 /* Job strip: the last few ledger entries with their reasons. */

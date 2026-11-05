@@ -897,23 +897,37 @@ const driver = `
         !!actionsTdBody && actionsTdBody.indexOf("border") < 0 &&
         css.indexOf("tbody td.sh") < 0,
       "tr=" + (trSepBody || "missing") + " td=" + (tdSepBody || "missing"));
-    // Tidy row actions (operator 2026-11-05): an equal-width, left-aligned
-    // block stuck to the table's left corner - flex-start, an equal basis
-    // floor on both buttons, and a flush first column.
+    // Tidy row actions (operator 2026-11-05): a compact equal-width pair,
+    // flush-left and never stretched by the table's spare width - no grow,
+    // one shared floor, compact padding - on a flush first column.
     const rowActBody = bodyOf(".sh-row-actions {");
     const rowBtnBody = bodyOf(".sh-row-actions button {");
-    check("row actions are a left-aligned equal-width block",
+    check("row actions are a left-aligned compact non-stretching pair",
       !!rowActBody && rowActBody.indexOf("display: flex") >= 0 &&
         rowActBody.indexOf("justify-content: flex-start") >= 0 &&
         rowActBody.indexOf("flex-end") < 0 &&
-        !!rowBtnBody && rowBtnBody.indexOf("flex: 1 1 6rem") >= 0 &&
-        rowBtnBody.indexOf("min-width: 6rem") >= 0 &&
+        !!rowBtnBody && rowBtnBody.indexOf("flex: 0 0 auto") >= 0 &&
+        rowBtnBody.indexOf("min-width: 5.75rem") >= 0 &&
+        rowBtnBody.indexOf("padding: 0.25rem 0.9rem") >= 0 &&
+        css.indexOf("flex: 1 1 6rem") < 0 &&
         css.indexOf("justify-content: flex-end") < 0,
       "span=" + (rowActBody || "missing") + " btn=" + (rowBtnBody || "missing"));
     const flushBody = bodyOf("table.sh-models :is(th, td):first-child:not(.sh-empty)");
     check("the first column drops its start padding so the buttons stick to the table corner",
       !!flushBody && flushBody.indexOf("padding-left: 0") >= 0,
       flushBody || "missing");
+    // One surface through the table block (operator 2026-11-05): light body
+    // cells painted the page token while the panel and every gap around them
+    // sit on the card surface. Light cells go transparent so the panel token
+    // shows through; the rule is light-scoped and dark never matches it.
+    const lightTdBody =
+      bodyOf('html[data-theme="light"] table.sh-models tbody td');
+    check("light body cells paint nothing and dark cells stay untouched",
+      css.indexOf(':root:not([data-theme="dark"]) table.sh-models tbody td') >= 0 &&
+        !!lightTdBody && lightTdBody.indexOf("background: transparent") >= 0 &&
+        css.indexOf('[data-theme="dark"] table.sh-models tbody td') < 0 &&
+        !!darkBody && darkBody.indexOf("table.sh-models tbody td") < 0,
+      lightTdBody || "missing");
     // The white "border" (operator 2026-11-05): no computed border owned it -
     // the wrapper's horizontal scrollbar trough drew white under the table.
     // Light paints the bar warm; dark keeps the platform scrollbar.
