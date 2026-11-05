@@ -630,8 +630,8 @@ recorded here so dated references to ARCHIVED still resolve:
 - **CPU-llama W2 GO; Basalt start/stop granted for card windows** (operator
   ruling 2026-11-05): W2 approved - resource-parameterized RAM victim planner,
   release + RAM settle window, `measured_ram_gb` measured write-back. The
-  operator session is API-driven; subagents are served by
-  `C:\Inference\Basalt\start_basalt.bat`. The orchestrator may start and stop
+  operator session is API-driven; subagents are served by the operator's local Basalt start script. The
+  orchestrator may start and stop
   that process for card-window tests, provided zero subagents are active
   during the tests and nothing is delegated or run in parallel during the
   window; restore and verify afterwards. W3 scope under operator review.

@@ -826,7 +826,7 @@ impl ModelEntry {
 
     /// Whether this row serves CPU-resident: the engine's policy row reads
     /// the `cpu_offload` knob **and** the row's value is in the harness truth
-    /// set — composed from the knob table ([`crate::engine::policy::knob_live`])
+    /// set — composed from the knob table (`crate::engine::policy::knob_live`)
     /// and the canonical read ([`crate::engine::llama::jinja_on`], the words
     /// `true`|`1`|`on` case-sensitively), never re-parsed here. `mock`
     /// impersonates engines in tests but reads no offload knob, so a truthy

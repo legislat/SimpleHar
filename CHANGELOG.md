@@ -15,7 +15,10 @@ names they shipped with. The format follows Keep a Changelog. Versions follow Se
 Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
+
 ## Unreleased
+
+## v1.3.0 - 2026-11-05
 
 ### Added
 
@@ -80,8 +83,6 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 - The scheduler's 7,409-line inline test module moved to `scheduler/tests.rs`
   (move-only; 9,002-line file becomes 1,595).
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
-
-## Unreleased
 
 ## v1.2.0 - 2026-11-04
 

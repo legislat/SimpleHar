@@ -10,7 +10,7 @@ and it refuses to overcommit. The product name is SimpleHarn, and the repository
 and the environment names use the `SIMPLEHARN_` prefix. An existing `simplehar-se.json` or
 `simplehar.json` config and the deprecated `SIMPLEHAR_*` environment names keep working.
 
-Current release: **v1.2.0**. Windows 10/11, one NVIDIA GPU, single user.
+Current release: **v1.3.0**. Windows 10/11, one NVIDIA GPU, single user.
 Prebuilt binaries: see the GitHub Releases page of this repository.
 
 > This is a personal harness, built for my own machine and my own setup. Feel free to try
