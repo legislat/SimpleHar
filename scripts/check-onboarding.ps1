@@ -61,6 +61,7 @@ try {
     "docs/process/TASKS.md",
     "docs/process/HANDOFF.md",
     "docs/process/REVIEW.md",
+    "docs/process/GOTCHAS.md",
     "docs/process/PUBLICATION.md"
   )
   foreach ($rel in $required) {

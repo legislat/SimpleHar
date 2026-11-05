@@ -31,7 +31,7 @@ this file is the table of contents; other documents link to it.
 | Pick up a task | `HANDOFF.md` -> `handoff/PENDING_CHECKLIST.md` -> task file (local-only) |
 | Hand off work | [docs/process/HANDOFF.md](process/HANDOFF.md) |
 | Review code | [docs/process/REVIEW.md](process/REVIEW.md) |
-| Find a trap | `handoff/GOTCHAS.md` (local-only) |
+| Find a trap | [docs/process/GOTCHAS.md](process/GOTCHAS.md) (machine-specific traps stay local-only) |
 | See what changed | [CHANGELOG.md](../CHANGELOG.md) |
 
 Paths in plain text do not exist yet (they are planned) or are local-only.
@@ -74,6 +74,7 @@ durable and belongs in this tree.
 | [HANDOFF.md](process/HANDOFF.md) | Handoff protocol and templates (not live state) | active |
 | [REVIEW.md](process/REVIEW.md) | Review lenses, finding format, closure | active |
 | [PUBLICATION.md](process/PUBLICATION.md) | Scrub checklist before committing local artifacts | active |
+| [GOTCHAS.md](process/GOTCHAS.md) | Contributor traps that cost real time; the local-only layer holds machine-specific ones | active |
 
 ### docs/architecture/
 

@@ -107,9 +107,9 @@ Subagent and ownership rules:
 | Task type | Must read | May skip |
 |---|---|---|
 | Routine code change | this file, `ENGINEERING.md`, `VERIFICATION.md`, task file | `DESIGN.md`, full `DECISIONS.md` |
-| Scheduler / admission / swap | above plus `DOCTRINE.md`, `OVERVIEW.md`, relevant decisions, `GOTCHAS.md` | `DESIGN.md` history |
-| Engine adapter | above plus `docs/reference/MODELS.md`, engine-specific decisions, `GOTCHAS.md` | unrelated architecture |
-| Review | this file, `REVIEW.md`, task file, `GOTCHAS.md`, code under review | full design history |
+| Scheduler / admission / swap | above plus `DOCTRINE.md`, `OVERVIEW.md`, relevant decisions, `docs/process/GOTCHAS.md` | `DESIGN.md` history |
+| Engine adapter | above plus `docs/reference/MODELS.md`, engine-specific decisions, `docs/process/GOTCHAS.md` | unrelated architecture |
+| Review | this file, `REVIEW.md`, task file, `docs/process/GOTCHAS.md`, code under review | full design history |
 | Release | `GIT_WORKFLOW.md`, `VERIFICATION.md`, `CHANGELOG.md`, `README.md` | task-level detail |
 | Handoff | `docs/process/HANDOFF.md`, `HANDOFF.md`, active task file | everything else |
 | New contributor | `README.md`, `CONTRIBUTING.md`, `TASKS.md`, `OVERVIEW.md` | internal ledgers |
