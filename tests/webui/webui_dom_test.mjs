@@ -1892,6 +1892,88 @@ const driver = `
       headerText().indexOf("loaded") >= 0, headerText().slice(0, 90));
   }
 
+  // Category display labels (operator ruling 2026-11-05): tabs, pills and the
+  // retag options render the effective "label" from the status document; an
+  // absent (older harness) or blank label falls back to the id; the id stays
+  // the request and order key - no label may reach a /har/* payload.
+  {
+    const hdr = document.getElementById("sh-header");
+    const mainEl = document.getElementById("sh-main");
+    const tabTexts = () => findAll(hdr, "button", "sh-tab").map(textOf);
+    const pillTexts = () => findAll(hdr, "span", "sh-tab-item").map(textOf);
+    const base = JSON.parse(JSON.stringify(fixtures["/har/status"]));
+    const LABELS = { WORK: "Primary Work", RP: "Theater", AUX: "Utilities", EMB: "Embed" };
+
+    applyState({ ...base, models: fixtures["/har/models"].data });
+    check("default fixture labels render as the ids",
+      tabTexts().map((t) => t.replace(/[^A-Z].*$/, "")).join(",") === "WORK,RP,AUX,EMB",
+      tabTexts().join("|"));
+
+    const labelled = JSON.parse(JSON.stringify(base));
+    for (const c of labelled.categories) c.label = LABELS[c.id];
+    applyState({ ...labelled, models: fixtures["/har/models"].data });
+    const custom = tabTexts();
+    check("custom labels render on the tabs",
+      custom[0].indexOf("Primary Work") === 0 && custom[1].indexOf("Theater") === 0 &&
+        custom[2].indexOf("Utilities") === 0 && custom[3].indexOf("Embed") === 0,
+      custom.join("|"));
+    const pills = pillTexts();
+    check("custom labels render on the pills with their ports",
+      pills[0].indexOf("Primary Work") === 0 && pills[0].indexOf(":8708") >= 0,
+      pills[0]);
+    check("a custom label replaces the id in the pill text",
+      pills[0].indexOf("WORK") < 0, pills[0]);
+    const opt = findAll(mainEl, "option").find((o) => o.getAttribute("value") === "WORK");
+    check("the retag option shows the label and keeps the id as its value",
+      !!opt && textOf(opt) === "Primary Work" && opt.getAttribute("value") === "WORK",
+      opt ? textOf(opt) + "=" + opt.getAttribute("value") : "no option");
+
+    // Fallback legs: an older document without any label key, and a blank one.
+    const legacy = JSON.parse(JSON.stringify(base));
+    for (const c of legacy.categories) delete c.label;
+    legacy.categories[1].label = "   ";
+    applyState({ ...legacy, models: fixtures["/har/models"].data });
+    const fb = tabTexts();
+    check("an absent label falls back to the id",
+      fb[0].indexOf("WORK") === 0 && fb[2].indexOf("AUX") === 0 && fb[3].indexOf("EMB") === 0,
+      fb.join("|"));
+    check("a blank label falls back to the id", fb[1].indexOf("RP") === 0, fb[1]);
+    const fbOpt = findAll(mainEl, "option").find((o) => o.getAttribute("value") === "AUX");
+    check("the option slot falls back too, never to a blank",
+      !!fbOpt && textOf(fbOpt) === "AUX", fbOpt ? JSON.stringify(textOf(fbOpt)) : "no option");
+
+    // The id vocabulary drives every payload even under custom labels: the
+    // tab-side Unload and the row Default post the ids, and no label text ever
+    // reaches a request body. The fixture's WORK pill is occupied, so its side
+    // Unload exists; the WORK panel's first row carries the Default button.
+    applyState({ ...labelled, models: fixtures["/har/models"].data });
+    globalThis.posts = [];
+    const sideUnload = findAll(findAll(hdr, "span", "sh-tab-item")[0], "button")
+      .find((b) => textOf(b) === "Unload");
+    check("the labelled pill still offers its side Unload", !!sideUnload, pillTexts()[0]);
+    if (sideUnload) sideUnload.dispatch("click", {});
+    const setDefault = findAll(mainEl, "button").find((b) => textOf(b) === "Default");
+    check("the labelled panel row still offers Default", !!setDefault);
+    if (setDefault) setDefault.dispatch("click", {});
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    const bodies = (globalThis.posts || []).map((p) => p.path + " " + p.body);
+    check("requests post the id vocabulary under custom labels",
+      bodies.some((b) => b.indexOf("/har/unload") === 0 && b.indexOf('{"category":"WORK"}') > 0) &&
+        bodies.some((b) => b.indexOf("/har/config/default") === 0 && b.indexOf('"category":"WORK"') > 0),
+      JSON.stringify(bodies));
+    check("no label text ever reaches a request body",
+      bodies.every((b) => b.indexOf("Primary Work") < 0 && b.indexOf("Theater") < 0),
+      JSON.stringify(bodies));
+    const app = globalThis.servedPage.app;
+    check("the request and order key on the page stays the id list",
+      app.indexOf('const CATEGORY_ORDER = ["WORK", "RP", "AUX", "EMB"];') >= 0,
+      "CATEGORY_ORDER line drifted");
+
+    // Leave the base document applied for anything that reads state afterwards.
+    applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+  }
+
   for (const [name, ok, extra] of results)
     console.log((ok ? "PASS " : "FAIL ") + name + (ok || !extra ? "" : " :: " + extra));
   process.exit(results.every((r) => r[1]) ? 0 : 1);

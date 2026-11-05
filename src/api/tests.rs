@@ -1214,6 +1214,60 @@ async fn status_document_carries_stranded_containers_only_when_reported() {
     );
 }
 
+/// Operator ruling 2026-11-05: every `/har/status` category row carries an
+/// additive `label` — the trimmed `label`, or the id when it is absent or
+/// blank — always present, beside the unchanged `id` and every pre-existing
+/// key. The label is display-only; the id stays the wire vocabulary.
+/// Falsifier: return an empty string from the `effective_label` fallback and
+/// the absent/blank legs go red; drop the always-set in `render_status_document`
+/// and the set-but-blank row loses its key.
+#[tokio::test]
+async fn status_categories_carry_the_effective_label_beside_the_id() {
+    let mut config = AppConfig::default();
+    config.categories[1].label = Some("Theater".to_string());
+    config.categories[2].label = Some("".to_string());
+    let api = ApiState::new(
+        config,
+        SchedulerHandle::test_dummy(),
+        crate::listeners::ListenerRegistry::new(),
+        Arc::new(crate::budget::LedgerOnlyWitness),
+        BootTimings::default(),
+    );
+    let empty = SchedulerStatus {
+        slots: Vec::new(),
+        jobs: Vec::new(),
+        catalog_errors: Vec::new(),
+        stranded_containers: None,
+        fit_validated: Default::default(),
+    };
+    let doc = render_status_document(&api, &empty).await;
+    let categories = doc["categories"].as_array().expect("categories array");
+    assert_eq!(categories.len(), 4);
+    for row in categories {
+        let id = row["id"].as_str().expect("the id stays the row identity");
+        let label = row["label"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`label` is always present, never absent or null: {row}"));
+        let expected = if id == "RP" { "Theater" } else { id };
+        assert_eq!(
+            label, expected,
+            "the effective label (trimmed `label`, else the id) rides beside the id: {row}"
+        );
+        for key in [
+            "public_port",
+            "max_models",
+            "evictable_by",
+            "engine_ports",
+            "control",
+        ] {
+            assert!(
+                row.get(key).is_some(),
+                "the pre-existing key `{key}` stays: {row}"
+            );
+        }
+    }
+}
+
 /// FINDINGS-14 [7] + the 2026-10-28 "A + amber" ruling: a category whose
 /// supervisor never spoke must be PRESENT in the `listeners` object and LABELED
 /// `Pending`, so the page can never read "no verdict" as "no such category" (the
@@ -3617,6 +3671,75 @@ fn a_landed_write_back_validates_the_published_boot_file_per_field() {
     assert!(
         text.contains(crate::config::CONFIG_FILE) && text.contains("wrok_port"),
         "the error must name the file and the key, as boot's parse does: {text}"
+    );
+}
+
+/// Ruling 2026-11-05: `label` is a KNOWN key of a category entry, so the
+/// read-patch-write that persists a page `Default` edit carries it through as
+/// `Value` passthrough and the landed tree still parses clean — while an
+/// unknown key next to it keeps warning exactly as FINDINGS-07 [11] pinned.
+/// Falsifier: remove the `label` field from the schema and the clean leg lands
+/// a root-naming parse verdict, turning the empty-verdict leg red.
+#[test]
+fn a_persisted_label_survives_the_write_back_and_an_unknown_key_still_warns() {
+    let dir = crate::testutil::temp_dir("api-label-persist");
+    let path = dir.join("simpleharn.json");
+    let config = AppConfig {
+        source_path: Some(path.clone()),
+        ..AppConfig::default()
+    };
+    let mut root = serde_json::to_value(&config).expect("seed serializes");
+    root["categories"][0]["label"] = json!("Primary");
+    std::fs::write(&path, root.to_string()).expect("seed the labeled file");
+
+    match persist_default_model(&config, CategoryId::Work, Some("pinned.gguf")) {
+        PersistOutcome::Landed { verdict } => assert!(
+            verdict.is_empty(),
+            "the known `label` key must not warn: {verdict:?}"
+        ),
+        other => panic!("the labeled file must land clean, never {other:?}"),
+    }
+    let on_disk: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).expect("the file the write-back published"),
+    )
+    .expect("the published file is JSON");
+    assert_eq!(
+        on_disk["categories"][0]["label"],
+        json!("Primary"),
+        "the label must survive the write-back"
+    );
+    assert_eq!(
+        on_disk["categories"][0]["default_model"],
+        json!("pinned.gguf"),
+        "and the write-back still does its own job"
+    );
+
+    // An unknown key next to the label still warns as today (the label is not
+    // the cause; the verdict names the unknown key).
+    let mut root = serde_json::to_value(&config).expect("seed serializes");
+    root["categories"][0]["label"] = json!("Primary");
+    root["categories"][0]["wrok_port"] = json!(9);
+    std::fs::write(&path, root.to_string()).expect("seed the unknown key");
+    let verdict = match persist_default_model(&config, CategoryId::Work, Some("pinned2.gguf")) {
+        PersistOutcome::Landed { verdict } => verdict,
+        other => panic!(
+            "the unknown key rode the passthrough and landed as Landed, \
+                 never {other:?}"
+        ),
+    };
+    assert_eq!(verdict.len(), 1, "one parse-level error: {verdict:?}");
+    let text = verdict[0].to_string();
+    assert!(
+        text.contains(crate::config::CONFIG_FILE) && text.contains("wrok_port"),
+        "the warning must name the file and the unknown key, never the known label: {text}"
+    );
+    let on_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the landed file"))
+            .expect("the published file is JSON");
+    assert_eq!(
+        on_disk["categories"][0]["label"],
+        json!("Primary"),
+        "the label survives beside the warning"
     );
 }
 

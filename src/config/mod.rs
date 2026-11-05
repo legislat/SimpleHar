@@ -189,6 +189,13 @@ fn default_protected_ports() -> BTreeSet<u16> {
     ])
 }
 
+/// Longest accepted category display label, in characters (operator ruling
+/// 2026-11-05). The label is display-only — it never travels where an id is
+/// required — and the cap keeps one hand-written name from breaking the tab
+/// strip. A longer value is refused by [`AppConfig::validate`], naming the
+/// category and the cap.
+pub const CATEGORY_LABEL_MAX_CHARS: usize = 24;
+
 /// One declarative category: slot count, listener, and policy as data (DESIGN Step 5).
 ///
 /// `deny_unknown_fields` (FINDINGS-11 \[1]): the categories carry all the safety policy and
@@ -200,6 +207,20 @@ fn default_protected_ports() -> BTreeSet<u16> {
 pub struct CategoryConfig {
     /// Category identity; also the key referenced by `evictable_by` entries.
     pub id: CategoryId,
+    /// Display name for the page and `/har/status` (operator ruling 2026-11-05:
+    /// the four shipped names are defaults, not fixed). Absent or blank (after
+    /// trim) falls back to the id — [`CategoryConfig::effective_label`]. Trimmed
+    /// at parse like the WSL coordinates. The id stays the wire vocabulary
+    /// everywhere: this value never replaces it in a request, a yaml `category:`
+    /// value, an `evictable_by` list, or the engine-port plan. Unset serializes
+    /// nothing, so existing config files keep their exact shape (the
+    /// GOTCHAS serialization discipline); a blank `""` round-trips as `""`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "trimmed_opt"
+    )]
+    pub label: Option<String>,
     /// Public listener port for this category (Step 11: one listener per category).
     pub public_port: u16,
     /// Model loaded when a no-`model` request finds the category empty (Step 11);
@@ -248,6 +269,7 @@ impl CategoryConfig {
         vec![
             CategoryConfig {
                 id: CategoryId::Work,
+                label: None,
                 public_port: 8708,
                 default_model: None,
                 max_models: 1,
@@ -258,6 +280,7 @@ impl CategoryConfig {
             },
             CategoryConfig {
                 id: CategoryId::Rp,
+                label: None,
                 public_port: 8709,
                 default_model: None,
                 max_models: 1,
@@ -268,6 +291,7 @@ impl CategoryConfig {
             },
             CategoryConfig {
                 id: CategoryId::Aux,
+                label: None,
                 public_port: 8710,
                 default_model: None,
                 max_models: 1,
@@ -278,6 +302,7 @@ impl CategoryConfig {
             },
             CategoryConfig {
                 id: CategoryId::Emb,
+                label: None,
                 public_port: 8711,
                 default_model: None,
                 max_models: 1,
@@ -287,6 +312,24 @@ impl CategoryConfig {
                 engine_ports: vec![],
             },
         ]
+    }
+
+    /// The name the page and `/har/status` show: the trimmed `label` when one is
+    /// configured, else the id (operator ruling 2026-11-05: display-only
+    /// naming, the id stays the wire vocabulary). Re-trims here rather than
+    /// trusting the parse, so a hand-built entry (a test, a future API patch)
+    /// cannot put stray whitespace on the page.
+    #[must_use]
+    pub fn effective_label(&self) -> std::borrow::Cow<'_, str> {
+        match self
+            .label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+        {
+            Some(label) => std::borrow::Cow::Borrowed(label),
+            None => std::borrow::Cow::Owned(self.id.to_string()),
+        }
     }
 }
 
@@ -1089,6 +1132,35 @@ impl AppConfig {
                         cat.engine_ports.len()
                     ),
                 });
+            }
+            // Display label (operator ruling 2026-11-05): absent or blank is the
+            // documented fallback to the id, so only a non-blank label is judged.
+            // The cap bounds the tab strip; the printability rule keeps control
+            // characters (a terminal escape, a stray \0) out of the page and the
+            // status document, where they corrupt rendering invisibly.
+            if let Some(label) = cat
+                .label
+                .as_deref()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+            {
+                if label.chars().count() > CATEGORY_LABEL_MAX_CHARS {
+                    errors.push(ConfigError::Invalid {
+                        field: format!("categories.{}.label", cat.id),
+                        reason: format!(
+                            "display label must be at most {CATEGORY_LABEL_MAX_CHARS} \
+                             characters, got {}",
+                            label.chars().count()
+                        ),
+                    });
+                }
+                if label.chars().any(char::is_control) {
+                    errors.push(ConfigError::Invalid {
+                        field: format!("categories.{}.label", cat.id),
+                        reason: "display label must be printable (no control characters)"
+                            .to_string(),
+                    });
+                }
             }
         }
         for id in CategoryId::all() {
@@ -2221,6 +2293,149 @@ mod tests {
         let warnings = explicit.evictable_by_warnings();
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("AUX"), "{warnings:?}");
+    }
+
+    /// Operator ruling 2026-11-05: the display name is a config option. A set
+    /// label is trimmed at parse (the WSL-coordinate discipline), an absent or
+    /// blank label falls back to the id without a refusal, and an unset label
+    /// serializes nothing — existing config files keep their exact shape (the
+    /// GOTCHAS serialization discipline).
+    /// Falsifier: return an empty fallback from `effective_label` and the id
+    /// legs fail; invert the `skip_serializing_if` and the unset leg fails.
+    #[test]
+    fn a_category_label_trims_at_parse_and_falls_back_to_the_id() {
+        let mut set =
+            parse_mutated(|root| root["categories"][1]["label"] = serde_json::json!("  Theater  "))
+                .expect("a label parses");
+        assert!(set.validate().is_empty(), "{:?}", set.validate());
+        let rp = set.category_mut(CategoryId::Rp).expect("RP present");
+        assert_eq!(
+            rp.label.as_deref(),
+            Some("Theater"),
+            "surrounding space is not part of a display name"
+        );
+        assert_eq!(rp.effective_label(), "Theater");
+
+        let mut blank =
+            parse_mutated(|root| root["categories"][2]["label"] = serde_json::json!("   "))
+                .expect("a blank label parses");
+        assert!(
+            blank.validate().is_empty(),
+            "blank is the documented fallback, not a refusal: {:?}",
+            blank.validate()
+        );
+        assert_eq!(
+            blank
+                .category_mut(CategoryId::Aux)
+                .expect("AUX present")
+                .effective_label(),
+            "AUX"
+        );
+        let stamped: serde_json::Value = serde_json::to_value(&blank).expect("serializes");
+        assert_eq!(
+            stamped["categories"][2]["label"],
+            serde_json::json!(""),
+            "the trimmed blank round-trips as the trimmed blank"
+        );
+
+        let absent = AppConfig::parse("{}").expect("defaults parse");
+        assert_eq!(absent.categories[0].label, None);
+        assert_eq!(absent.categories[0].effective_label(), "WORK");
+        assert!(
+            !serde_json::to_string(&absent)
+                .expect("serializes")
+                .contains("\"label\""),
+            "an unset label must not be stamped into the operator's file"
+        );
+    }
+
+    /// The cap is 24 characters, inclusive (ruling 2026-11-05), and the refusal
+    /// names the category id and the rule. The digits are spelled out here, not
+    /// read from the constant, so the pin is the ruling and not a mirror of the
+    /// code.
+    /// Falsifier: raise the accepted length to 25 and the over-cap leg boots
+    /// clean, turning this pin red.
+    #[test]
+    fn an_over_long_label_is_refused_naming_the_category_and_the_cap() {
+        let exactly = "x".repeat(24);
+        let legal =
+            parse_mutated(|root| root["categories"][1]["label"] = serde_json::json!(exactly))
+                .expect("parses");
+        assert!(
+            legal.validate().is_empty(),
+            "24 is the inclusive cap: {:?}",
+            legal.validate()
+        );
+        let over = parse_mutated(|root| {
+            root["categories"][1]["label"] = serde_json::json!("x".repeat(25))
+        })
+        .expect("parses");
+        let errors = over.validate();
+        assert!(
+            errors.iter().any(|e| {
+                let text = e.to_string();
+                text.contains("categories.RP.label") && text.contains("24")
+            }),
+            "the refusal must name the category id and the 24-character cap: {errors:?}"
+        );
+    }
+
+    /// A display label reaches the browser and the status document; a control
+    /// character there is invisible damage (escapes, split lines), so a
+    /// non-blank label is refused at boot naming the category and the rule.
+    /// Falsifier: drop the printability check and every leg boots clean.
+    #[test]
+    fn a_label_with_control_characters_is_refused_naming_the_category() {
+        for (name, bad) in [
+            ("bell", "Chat\u{7}room"),
+            ("newline", "Work\nBench"),
+            ("tab", "Work\tBench"),
+        ] {
+            let config =
+                parse_mutated(|root| root["categories"][0]["label"] = serde_json::json!(bad))
+                    .expect("parses as json");
+            let errors = config.validate();
+            assert!(
+                errors.iter().any(|e| {
+                    let text = e.to_string();
+                    text.contains("categories.WORK.label") && text.contains("printable")
+                }),
+                "a control character ({name}) must be refused by name: {errors:?}"
+            );
+        }
+    }
+
+    /// The write-back round trip for the label (§6 restart guard, the
+    /// inverted-`skip_serializing_if` GOTCHAS class): a page `Default` edit
+    /// rewrites the whole file, so the persisted bytes must carry the label back
+    /// through parse and validate, while the unset default must not change the
+    /// serialized shape at all.
+    #[test]
+    fn the_label_survives_the_config_write_back() {
+        let mut categories = CategoryConfig::four_defaults();
+        categories[0].label = Some("Primary".to_string());
+        let pinned = AppConfig {
+            categories,
+            ..AppConfig::default()
+        };
+        let text = write_back_text(&pinned);
+        assert!(
+            text.contains("\"label\": \"Primary\""),
+            "a set label must be written back, not skipped: {text}"
+        );
+        let reloaded = AppConfig::parse(&text).expect("the persisted label parses back");
+        assert!(
+            reloaded.validate().is_empty(),
+            "a persisted label must validate: {:?}",
+            reloaded.validate()
+        );
+        assert_eq!(reloaded, pinned, "the label must round-trip unchanged");
+
+        let unset = write_back_text(&AppConfig::default());
+        assert!(
+            !unset.contains("label"),
+            "an unset label keeps the file shape byte-stable for existing configs"
+        );
     }
 
     #[test]

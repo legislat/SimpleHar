@@ -41,7 +41,7 @@ it never applies silent defaults.
 |---|---|---|
 | `internal_host` | `127.0.0.1` | Bind address. `0.0.0.0` publishes to the LAN. Set `control_token` first; see the Security note in `README.md`. |
 | `control_token` | *unset* | When set, every route except the page assets requires it, on `X-Har-Token` or `Authorization: Bearer`. `SIMPLEHARN_TOKEN` overrides it and keeps the secret out of the file. |
-| `categories` | four defaults | Per-category `id`, `public_port`, `max_models` (1-6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), and `engine_ports` (empty = automatic plan; a non-empty list must name exactly `max_models` ports). An omitted `evictable_by` and an empty list mean the same: nobody may evict that category. Boot names every non-WORK category left with no evictor. |
+| `categories` | four defaults | Per-category `id`, optional `label`, `public_port`, `max_models` (1-6 for AUX, exactly 1 otherwise), `default_model`, `evictable_by`, `idle_timeout_s` (0 = never), `control` (exactly one), and `engine_ports` (empty = automatic plan; a non-empty list must name exactly `max_models` ports). An omitted `evictable_by` and an empty list mean the same: nobody may evict that category. Boot names every non-WORK category left with no evictor. |
 | `vram_total_gb` | `72.0` | Admission ceiling. First start normally **detects it** (NVML total, floored to 0.1 GiB). This default survives only a failed card probe. Every boot warns when the stored value and the card disagree beyond `witness_tolerance_gb`. It never repairs the value. |
 | `vram_reserve_gb` | `2.0` | Card GiB kept unreachable: the gate subtracts it before it compares (DOCTRINE item 4). |
 | `ram_reserve_gb` | `8.0` | Host GiB kept unreachable for CPU-resident loads: the RAM gate subtracts it before it compares. The RAM twin of `vram_reserve_gb` on its own resource (operator ruling 2026-11-05). The OS and the desktop need the headroom, and a refused load costs one retry. |
@@ -67,6 +67,17 @@ it never applies silent defaults.
 Each entry in `categories` declares one category. The keys:
 
 - `id`: the category identity, one of `WORK`, `RP`, `AUX`, `EMB`.
+- `label`: an optional display name for the category. The page and
+  `/har/status` show it; the operator ruling of 2026-11-05 keeps the four
+  default names (`WORK`, `RP`, `AUX`, `EMB`) as defaults, not fixed text.
+  The id stays the identity: the yaml `category:` values, the `evictable_by`
+  lists, the `/har/*` request payloads, and the automatic engine-port plan
+  keep using the ids. The page never edits a label. Rules: the harness
+  stores the value trimmed. A non-blank label must be at most 24 characters.
+  It must be printable (no control characters). A refusal names the
+  category id and the broken rule. An absent or blank value falls back to
+  the id. An unset key serializes nothing, so an existing file keeps its
+  exact shape, and the write-back preserves a set label.
 - `public_port`: the public HTTP listener that serves the category. The
   defaults are the matrix in `README.md` (Categories and ports).
 - `max_models`: the slot count. 1-6 for AUX, exactly 1 for every other

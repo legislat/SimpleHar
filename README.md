@@ -98,6 +98,11 @@ The four category listeners on ports 8708-8711 answer the OpenAI-compatible API.
 | AUX | 8710 | 1-6 | utility models | WORK, RP |
 | EMB | 8711 | 1 | embeddings | WORK, RP |
 
+The four category names are display-only defaults. A `categories` entry can
+set an optional `label` to rename what the page and `/har/status` show. The
+ids stay the vocabulary: requests, model yamls, and the eviction matrix keep
+using them. See [docs/reference/CONFIG.md](docs/reference/CONFIG.md).
+
 The full port plan is in [docs/reference/CONFIG.md](docs/reference/CONFIG.md).
 
 ## Control page and tray
@@ -189,3 +194,14 @@ refusal (unload something; the harness never over-admits). The full list, with t
 
 Found a problem or have an idea? Open an issue. Contributions are welcome; start with
 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Special thanks
+
+https://github.com/ggml-org/llama.cpp
+https://github.com/mostlygeek/llama-swap
+https://github.com/T-Crypt/berth
+https://github.com/Niko1221/Strata
+https://github.com/jesdga95/basalt
+https://github.com/Neroued/ninfer
+https://github.com/iamwavecut/ninfer-all
+https://github.com/mw00/project-maya

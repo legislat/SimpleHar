@@ -5,6 +5,19 @@
 const CATEGORY_ORDER = ["WORK", "RP", "AUX", "EMB"];
 const POLL_MS = 2000;
 
+// The display name of a category (ruling 2026-11-05): the effective `label`
+// from the status document, falling back to the id when the document carries
+// none (an older harness) or carries a blank one. The id stays the request and
+// order key everywhere: CATEGORY_ORDER drives tabs and payloads, and no label
+// value may ever reach a `/har/*` body or the route logic.
+function categoryLabel(status, id) {
+  const entry = Array.isArray(status.categories)
+    ? status.categories.find((cat) => cat.id === id)
+    : null;
+  const label = entry ? entry.label : null;
+  return typeof label === "string" && label.trim() !== "" ? label : id;
+}
+
 // Engines whose adapter reads `cpu_offload`: the row's checkbox renders only here.
 // Mirrors the Rust `OFFLOAD_ENGINES` const (engine/llama.rs, §20-9 Fork C knob
 // table row 1); the webui lib test compares these two lists, so they cannot drift.
@@ -228,7 +241,7 @@ function renderTabItem(status, category) {
       },
     },
     el("span", { class: "sh-dot", "data-state": dotState }),
-    text(category),
+    text(categoryLabel(status, category)),
   );
   if (entry) button.append(el("span", { class: "sh-tab-port" }, text(`:${entry.public_port}`)));
   if (releasing && kept.length === 0) {
@@ -595,11 +608,17 @@ function modelRow(status, model, category) {
     ),
   );
 
-  // Category select: page edits write back into the model yaml (Step 9).
+  // Category select: page edits write back into the model yaml (Step 9). The
+  // option shows the display label (ruling 2026-11-05); its `value` — and the
+  // `select.value` the retag posts — stays the id.
   const select = el("select", { class: "sh-mini", "aria-label": "category" });
   for (const option of CATEGORY_ORDER) {
     select.append(
-      el("option", { value: option, ...(option === model.category ? { selected: "" } : {}) }, text(option)),
+      el(
+        "option",
+        { value: option, ...(option === model.category ? { selected: "" } : {}) },
+        text(categoryLabel(status, option)),
+      ),
     );
   }
   select.addEventListener("change", () =>

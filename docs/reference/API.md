@@ -48,6 +48,17 @@ slot on a read fails the pin.
 | `POST /har/config/logging` | `{enabled: bool}`. Toggles the verbose harness log. |
 | `POST /har/config/model` | `{model, category?, cpu?}`. Writes back to the model yaml. |
 
+## Category label field (`categories[].label`)
+
+Every category row of `/har/status` and of the SSE `har_state` document
+carries `label`. The value is the effective display name: the trimmed
+`label` of the config entry, or the `id` when none is set. The field is
+additive and always present; every pre-existing key stays. The `id` beside
+it remains the identity: request payloads, the yaml `category:` values, the
+`evictable_by` lists, and the engine-port plan keep the ids. The page
+renders the label in its tabs and pills. The rules and the 24-character cap
+live in `CONFIG.md` (the `categories` key).
+
 ## Slot state field (`slots[].state`)
 
 Every slot in `/har/status` and in the SSE `har_state` document carries

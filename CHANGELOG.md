@@ -19,6 +19,14 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
 ### Added
 
+- Category display names are a config option: a `categories[]` entry gains an
+  optional `label`. `/har/status` category rows carry the effective `label`
+  (the trimmed name, or the id), and the page shows it on the tabs, the pills,
+  and the category options. The ids stay the wire vocabulary: request
+  payloads, yaml `category:` values, `evictable_by`, and the engine-port plan
+  are unchanged. A non-blank label must be at most 24 printable characters;
+  absent or blank falls back to the id, and the label survives the config
+  write-back.
 - The tray paints the operator's logo set: five embedded 16x16 RGBA icons, one per
   tray state, instead of drawn solid circles. The control page carries the operator's
   favicon: `/favicon.png` serves the embedded PNG, `/favicon.ico` answers the same

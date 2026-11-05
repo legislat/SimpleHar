@@ -15,6 +15,7 @@
    "evictable_by": [],
    "id": "WORK",
    "idle_timeout_s": 0,
+   "label": "WORK",
    "max_models": 1,
    "public_port": 8708
   },
@@ -27,6 +28,7 @@
    ],
    "id": "RP",
    "idle_timeout_s": 0,
+   "label": "RP",
    "max_models": 1,
    "public_port": 8709
   },
@@ -40,6 +42,7 @@
    ],
    "id": "AUX",
    "idle_timeout_s": 0,
+   "label": "AUX",
    "max_models": 1,
    "public_port": 8710
   },
@@ -53,6 +56,7 @@
    ],
    "id": "EMB",
    "idle_timeout_s": 0,
+   "label": "EMB",
    "max_models": 1,
    "public_port": 8711
   }

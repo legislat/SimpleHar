@@ -53,6 +53,11 @@ pub(super) async fn render_status_document(state: &ApiState, scheduler: &Schedul
                 Some(model) => Value::String(model),
                 None => Value::Null,
             };
+            // Additive display field (ruling 2026-11-05): the effective label is
+            // ALWAYS present (the trimmed `label`, else the id), so the page reads
+            // one field and never re-derives the fallback. The id next to it
+            // stays the wire vocabulary; this value never replaces it anywhere.
+            value["label"] = json!(cat.effective_label());
             value
         })
         .collect();
