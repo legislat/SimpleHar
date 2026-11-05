@@ -635,3 +635,14 @@ recorded here so dated references to ARCHIVED still resolve:
   during the tests and nothing is delegated or run in parallel during the
   window; restore and verify afterwards. W3 scope under operator review.
   | 2026-11-05 | `22fdb7f..`
+
+- **W3 approved; CPU card window executed** (operator rulings 2026-11-05): W3
+  (RAM booking surface + docs in 1.3) approved. The card acceptance run was
+  done in an operator-granted window: harness absent, Basalt stopped for the
+  window and restarted/verified after, zero subagents, no delegation. Proof:
+  real CPU llama loads served, RAM bookings carried `need_gib`/`booked_gb`
+  zero on the card, a WORK load drained the RP CPU resident with a confirmed
+  release and RAM settle, and measured pairs wrote back (1.4 GiB and 9.4 GiB).
+  Card movement is CUDA-context only (~0.35 GiB per llama process), recorded
+  honestly in `handoff/evidence/2026-11-05-cpu-llama/card-run/card-run.md`.
+  | 2026-11-05 | `9e7ddb7..`
