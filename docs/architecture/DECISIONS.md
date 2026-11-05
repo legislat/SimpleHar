@@ -618,3 +618,10 @@ recorded here so dated references to ARCHIVED still resolve:
   `docs/DOCS_README.md` section 5 and `scripts/check-docs.mjs` carry the exemption.
   Every other durable doc keeps its front matter. Storefront screenshots come only
   from operator-validated captures. | 2026-11-05 | `011d8a5..`
+
+- **Category names become a config option** (operator ruling 2026-11-05): the
+  four category names are defaults, not fixed labels. A `categories[].label`
+  key will drive the page and `/har/status`; the ids `WORK/RP/AUX/EMB` stay
+  the wire and eviction vocabulary (enum, yaml `category:`, `evictable_by`,
+  engine-port order). Scheduled after `TASK-CPU-LLAMA-EVICTION`; see
+  `handoff/tasks/TASK-CATEGORY-LABELS.md`. | 2026-11-05 | `9c1bfda..`
