@@ -319,6 +319,10 @@ impl ActorState {
     /// row it refuses to re-book (a flag move, an amber already earned, a
     /// greedy booking, a row that can no longer answer the gate) falls
     /// through to the unchanged marker verdict — invalidate, never launder.
+    /// One posture neither re-books nor falls through: a RAM resident adopts
+    /// the bytes without a re-book, because its booking follows only a reload
+    /// and the moved cost keys are inert for its RAM gate (ruling 2026-11-05,
+    /// review W1-01/CLOSURE-01).
     fn rebook_cost_only_moves(&mut self, previous: &[ModelEntry], drift: &DriftStats) {
         for slot in &mut self.slots {
             let Some(occupant) = slot.occupant.as_mut() else {

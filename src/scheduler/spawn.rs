@@ -33,15 +33,14 @@ impl ActorState {
     /// for a same-slot replacement this window is the only physical check the load
     /// ever gets. Only a deliberately silent (`ledger_only`) witness is waved
     /// through (review, 2026-10-26).
+    ///
+    /// A CPU-resident row takes the same shape over its own ladder — the host RAM
+    /// witness and `ram_reserve_gb` — in [`Self::spawn_ram_settle_task`]; comparing
+    /// it against a VRAM target would block a CPU load behind the very card the RAM
+    /// ladder rules out (operator ruling 2026-11-05).
     pub(super) fn spawn_settle_task(&mut self, job_id: JobId) {
-        // A CPU-resident row's release freed host RAM (or, replacing a GPU
-        // resident, VRAM it never needed): comparing the card against a VRAM
-        // gate target it does not have would block a CPU load behind the very
-        // card the RAM ladder rules out (operator ruling 2026-11-05). The
-        // driver-confirmed release above is this row's whole physical proof;
-        // the release is done, so the spawn proceeds.
         if self.jobs[&job_id].resource == crate::model::Resource::Ram {
-            self.begin_spawn(job_id);
+            self.spawn_ram_settle_task(job_id);
             return;
         }
         let tolerance = self.cfg.witness_tolerance_gb;
@@ -125,6 +124,106 @@ impl ActorState {
                                 reserve_gib = reserve, required_gib = required,
                                 "settle timeout: the witness never answered again");
                             format!("witness lost during settle: {reason}")
+                        }
+                    };
+                    let _ = tx.send(ActorMsg::Event {
+                        job: job_id,
+                        event: Event::Settled(Err(numbers)),
+                    });
+                    return;
+                }
+                tokio::time::sleep(PROBE_INTERVAL).await;
+            }
+        });
+        self.jobs
+            .get_mut(&job_id)
+            .expect("invariant: caller holds a live job id")
+            .tasks
+            .push(handle);
+    }
+
+    /// §0.3 memory evidence on the RAM ladder (operator ruling 2026-11-05,
+    /// W2 step 2): after a **confirmed** Ram release, wait until the host witness
+    /// has physically freed the RAM gate target **plus the `ram_reserve_gb` guard
+    /// band** — the same physical half of the RAM admission decision the
+    /// direct-admit leg judges — within the shared `witness_tolerance_gb`
+    /// disagreement band and the existing `settle_timeout_s`, before the spawn
+    /// fires. The release evidence (handle signaled + TCP refused + job-object
+    /// reap, DOCTRINE 5) is this window's entry ticket, never its substitute:
+    /// the drain reaches here only on a proven release, and a release nobody
+    /// proven never spawns a settle at all (pinned by
+    /// `a_ram_eviction_with_an_unconfirmed_release_installs_nothing_and_keeps_the_debit`).
+    /// A silent host reading mid-window holds the spawn until it answers or the
+    /// window expires — fail-closed, exactly as the card window above (there is
+    /// no ledger-only mode for RAM). Windows returns physical pages at process
+    /// exit, so the window is short in practice; the discipline is the point.
+    fn spawn_ram_settle_task(&mut self, job_id: JobId) {
+        let tolerance = self.cfg.witness_tolerance_gb;
+        let reserve = self.cfg.ram_reserve_gb;
+        let gate = self.jobs[&job_id].gate_target.unwrap_or(0.0);
+        // The figure the window actually compares: the planned RAM need plus the
+        // reserve band the admit-time gate subtracted, so the swap path keeps the
+        // same guard band as the no-release RAM path.
+        let required = gate + reserve;
+        let model = self.jobs[&job_id].model.clone();
+        let deadline = Duration::from_secs(self.cfg.settle_timeout_s);
+        let ram_witness = Arc::clone(&self.ram_witness);
+        let tx = self.tx.clone();
+        let handle = tokio::spawn(async move {
+            let started = Instant::now();
+            loop {
+                if let Some(sample) = ram_witness.sample() {
+                    if sample.freed_for(required, tolerance) {
+                        if crate::observability::extended_logging() {
+                            tracing::info!(
+                                used_gib = sample.used_gib,
+                                total_gib = sample.total_gib,
+                                free_gib = sample.free_gib(),
+                                gate_gib = gate,
+                                reserve_gib = reserve,
+                                required_gib = required,
+                                "ram settle evidence (extended)"
+                            );
+                        }
+                        let _ = tx.send(ActorMsg::Event {
+                            job: job_id,
+                            event: Event::Settled(Ok(())),
+                        });
+                        return;
+                    }
+                }
+                if started.elapsed() >= deadline {
+                    let numbers = match ram_witness.sample() {
+                        Some(sample) => {
+                            // G13: the figures the window actually compared, the
+                            // reserve band named inside the required figure.
+                            let msg = format!(
+                                "{:.1} GiB RAM free after release, {:.1} GiB required incl. {:.1} GiB reserve (used {:.1} of {:.1})",
+                                sample.free_gib(),
+                                required,
+                                reserve,
+                                sample.used_gib,
+                                sample.total_gib
+                            );
+                            tracing::warn!(
+                                %job_id,
+                                %model,
+                                used_gib = sample.used_gib,
+                                total_gib = sample.total_gib,
+                                free_gib = sample.free_gib(),
+                                gate_gib = gate,
+                                reserve_gib = reserve,
+                                required_gib = required,
+                                "ram settle timeout: the host never freed the required space"
+                            );
+                            msg
+                        }
+                        None => {
+                            tracing::warn!(%job_id, %model, gate_gib = gate,
+                                reserve_gib = reserve, required_gib = required,
+                                "ram settle timeout: the host witness never answered again");
+                            "ram witness silent during settle: no host reading after release"
+                                .to_string()
                         }
                     };
                     let _ = tx.send(ActorMsg::Event {

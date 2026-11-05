@@ -158,7 +158,9 @@ pub(super) struct Victim {
     pub(super) ticket: SpawnTicket,
     /// The slot the victim occupies, cleared when its release is confirmed.
     pub(super) slot: usize,
-    /// Admission cost freed by this release (ledger arithmetic, Step 6 re-check).
+    /// Admission cost freed by this release, in the resource the drain plans
+    /// (RAM booking on the RAM ladder, W21-01 ruling; ledger arithmetic, Step 6
+    /// re-check).
     pub(super) cost: f64,
     /// True when this victim was a cross-category eviction (vs a same-slot
     /// replacement); recorded in the job ledger (G13).

@@ -41,10 +41,11 @@ pub enum SchedulerError {
     /// The job was cancelled by request or superseded by a newer load.
     #[error("cancelled: {0}")]
     Cancelled(String),
-    /// The card had not physically freed the gate target within `settle_timeout_s`
-    /// after a confirmed release; nothing was double-spawned (§0.3). The reason is
-    /// the witness's own numbers, composed once at the emit site and carried
-    /// structurally — the gate never re-parses a human string.
+    /// The card (or, for a CPU-resident row, the host RAM — W2 ruling
+    /// 2026-11-05) had not physically freed the gate target within
+    /// `settle_timeout_s` after a confirmed release; nothing was double-spawned
+    /// (§0.3). The reason is the witness's own numbers, composed once at the emit
+    /// site and carried structurally — the gate never re-parses a human string.
     #[error("settle timeout: {reason}")]
     SettleTimeout {
         /// What the settle gate saw, e.g. `12.4 GiB free after release, 34.0 GiB

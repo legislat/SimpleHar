@@ -5907,29 +5907,49 @@ async fn a_launch_refused_row_keeps_the_rung_the_gate_decided() {
     );
 }
 
-/// B6 log pin, by source scan: the accepted-decision line inside
-/// `finish_admit` must be an info event named `admission path` carrying
-/// the rung under the field `path`. A `tracing`-capture pin would add a
-/// callsite-interest flake to the suite (`GOTCHAS.md` tracing rows, the
-/// D9 shape: the first touch wins process-wide), so this scans the
-/// source text; the rung VALUES are pinned by the decision pins and the
-/// wire shape by the `/har/jobs` integration pin.
+/// B6 log pin, by source scan: the rung is derived and logged at exactly ONE
+/// site — an `info` event named `admission path` inside the shared admitted
+/// tail, carrying the rung under the field `path`. The scan covers the whole
+/// file and counts the emissions, so a second `admission path` emission
+/// anywhere (a re-gated card leg, a RAM leg deciding its own rung) reddens
+/// this pin (W1-04 closure: the tail re-anchor alone was narrower than the
+/// intent; exactly-one-emission plus the site-inside-the-tail check is the
+/// complete scope, because both ladders funnel their gate through
+/// `finish_admit_tail` and no other line may speak the rung). A
+/// `tracing`-capture pin would add a callsite-interest flake to the suite
+/// (`GOTCHAS.md` tracing rows, the D9 shape: the first touch wins
+/// process-wide), so this scans the source text; the rung VALUES are pinned
+/// by the decision pins and the wire shape by the `/har/jobs` integration pin.
 /// Falsifier: rename the field (`rung = ?path`), demote the event out of
-/// `info!`, or drop the line — each fails the scan.
+/// `info!`, drop the line, or emit the event a second time — each fails the scan.
 #[test]
 fn the_admission_path_log_line_names_the_rung_field() {
     let source = include_str!("admission.rs");
-    let start = source
-        .find("fn finish_admit_tail(")
-        .expect("the admitted tail is still in this file");
-    let body = &source[start..];
-    let at = body
+    let emissions = source.matches("\"admission path\"").count();
+    assert_eq!(
+        emissions, 1,
+        "the rung must ride exactly one log emission — the shared admitted tail's — \
+         so both ladders announce the decision they actually took"
+    );
+    let at = source
         .find("\"admission path\"")
         .expect("the accepted-decision line names the event `admission path`");
-    let macro_start = body[..at]
-        .rfind("tracing::info!(")
-        .expect("the admission path line is an info event");
-    let line = &body[macro_start..at];
+    let tail = source
+        .find("fn finish_admit_tail(")
+        .expect("the admitted tail is still in this file");
+    let after_tail = source[tail..]
+        .find("fn finish_admit_ram(")
+        .expect("the RAM leg still dispatches into this file");
+    assert!(
+        at > tail && at < tail + after_tail,
+        "the one emission must sit inside the shared admitted tail, the single \
+         point where a gate has said yes"
+    );
+    let macro_start = tail
+        + source[tail..at]
+            .rfind("tracing::info!(")
+            .expect("the admission path line is an info event");
+    let line = &source[macro_start..at];
     assert!(
         line.contains("path = ?path"),
         "the rung must ride the log under the field `path`: {line}"
@@ -7149,6 +7169,667 @@ async fn a_cpu_row_refuses_closed_when_the_host_witness_is_silent() {
                 if reason.contains("ram witness")
         ),
         "the refusal names the RAM witness: {error}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- W2 step 2: the RAM settle window (operator ruling 2026-11-05) ----------
+
+/// Host witness for the settle pins: one scripted shape behind a flip.
+/// `held` answers the state during the window (free 20.0 of 64.0), the flip
+/// answers the state after the OS returned the released pages (free 34.0).
+/// Every reading is counted, so a pin can prove the window sampled the host —
+/// and, for an unproven release, that it never started sampling at all.
+#[derive(Default)]
+struct ScriptedRamWitness {
+    held: std::sync::atomic::AtomicBool,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedRamWitness {
+    fn release_pages(&self) {
+        self.held.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl crate::witness::RamWitness for ScriptedRamWitness {
+    fn sample(&self) -> Option<crate::witness::RamSample> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(crate::witness::RamSample {
+            total_gib: 64.0,
+            used_gib: if self.held.load(std::sync::atomic::Ordering::Relaxed) {
+                44.0
+            } else {
+                30.0
+            },
+        })
+    }
+}
+
+/// Kill-confirmation runtime for the settle pins: `kill` is recorded and
+/// issued, `release_confirmed` answers exactly what the pin scripts — `true`
+/// for a proven release (the settle window's entry ticket), `false` forever
+/// for the unproven one (falsifier 6). `spawn` is counted, never faked away,
+/// so "the spawn waited" is an observed fact, not a timing guess; `probe`
+/// stays pending because each pin applies its own readiness event.
+#[derive(Default)]
+struct SettleRuntime {
+    confirm: bool,
+    kills: std::sync::atomic::AtomicUsize,
+    spawns: std::sync::atomic::AtomicUsize,
+}
+
+impl SettleRuntime {
+    fn kills(&self) -> usize {
+        self.kills.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn spawns(&self) -> usize {
+        self.spawns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::engine::EngineRuntime for SettleRuntime {
+    async fn spawn(
+        &self,
+        _spec: &crate::engine::LaunchSpec,
+        ticket: crate::ownership::SpawnTicket,
+    ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+        self.spawns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(crate::engine::Spawned {
+            port: ticket.port,
+            pid: 9_901,
+        })
+    }
+    async fn kill(
+        &self,
+        _ticket: &crate::ownership::SpawnTicket,
+    ) -> Result<(), crate::engine::SpawnError> {
+        self.kills
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+    async fn release_confirmed(
+        &self,
+        _ticket: &crate::ownership::SpawnTicket,
+    ) -> Result<bool, crate::engine::SpawnError> {
+        Ok(self.confirm)
+    }
+    async fn probe(
+        &self,
+        _port: u16,
+        _readiness: &crate::engine::ReadinessSpec,
+    ) -> crate::engine::Probe {
+        std::future::pending::<()>().await;
+        crate::engine::Probe::Ready
+    }
+    async fn discover_model_id(&self, _port: u16) -> Option<String> {
+        None
+    }
+}
+
+/// The resident each settle pin seats: a RAM holder, a GPU holder, or a
+/// caller-built slot list for the legs that need no holder.
+fn ram_settle_seat(model: &str, need: f64, ram_need: Option<f64>, port: u16) -> Occupant {
+    Occupant {
+        model: model.to_string(),
+        need: Gibibytes(need),
+        ram_need: ram_need.map(Gibibytes),
+        port,
+        ticket: fold_ticket(port),
+        loaded_at: Instant::now(),
+        launched_at_wall: std::time::SystemTime::now(),
+        spawn_config: None,
+        stale_config: false,
+        serve_id: None,
+        measure: None,
+    }
+}
+
+/// State wired for the settle legs: a counting host witness, a kill-confirming
+/// runtime, and the card witness never consulted (a RAM row must not read it —
+/// `LedgerOnlyWitness` keeps any accidental card question loud).
+struct RamSwapFixture {
+    state: ActorState,
+    rx: mpsc::UnboundedReceiver<ActorMsg>,
+    witness: Arc<ScriptedRamWitness>,
+    runtime: Arc<SettleRuntime>,
+}
+
+fn ram_swap_fixture(
+    dir: &std::path::Path,
+    cfg: crate::config::AppConfig,
+    slots: Vec<Slot>,
+    confirm: bool,
+) -> RamSwapFixture {
+    let (tx, rx) = mpsc::unbounded_channel::<ActorMsg>();
+    let mut adapters: BTreeMap<String, Arc<dyn EngineAdapter>> = BTreeMap::new();
+    adapters.insert(
+        "llama".to_string(),
+        Arc::new(MockAdapter) as Arc<dyn EngineAdapter>,
+    );
+    let runtime = Arc::new(SettleRuntime {
+        confirm,
+        ..SettleRuntime::default()
+    });
+    let witness = Arc::new(ScriptedRamWitness {
+        held: std::sync::atomic::AtomicBool::new(true),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut state = ActorState::empty(
+        cfg,
+        dir.to_path_buf(),
+        adapters,
+        Arc::clone(&runtime) as Arc<dyn crate::engine::EngineRuntime>,
+        Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+        tx,
+    );
+    state.ram_witness = Arc::clone(&witness) as Arc<dyn crate::witness::RamWitness>;
+    state.slots = slots;
+    RamSwapFixture {
+        state,
+        rx,
+        witness,
+        runtime,
+    }
+}
+
+/// Drives the admit to its applied decision, asserting the RAM row asked the
+/// host and never the card.
+async fn drive_ram_admit(
+    state: &mut ActorState,
+    rx: &mut mpsc::UnboundedReceiver<ActorMsg>,
+    job_id: JobId,
+) {
+    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the admit task dispatches its host reading")
+        .expect("the actor channel is open");
+    match msg {
+        ActorMsg::Event { job, event } => match event {
+            super::Event::Admitted(card, ram) => {
+                assert_eq!(job, job_id, "the reading answers the armed row");
+                assert!(card.is_none(), "a RAM row never samples the card");
+                assert!(ram.is_some(), "the scripted host witness answers");
+                state.apply_event(job, super::Event::Admitted(card, ram));
+            }
+            other => panic!("the admit task sends its sample: {other:?}"),
+        },
+        _ => panic!("expected an event"),
+    }
+}
+
+/// Drives the kill-confirm task to its release event and applies it,
+/// reporting whether the release was confirmed.
+async fn drive_ram_release(
+    state: &mut ActorState,
+    rx: &mut mpsc::UnboundedReceiver<ActorMsg>,
+) -> bool {
+    let msg = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("the reap answers within its window")
+        .expect("the actor channel is open");
+    match msg {
+        ActorMsg::Event { job, event } => match event {
+            super::Event::Released(Ok(elapsed)) => {
+                state.apply_event(job, super::Event::Released(Ok(elapsed)));
+                true
+            }
+            super::Event::Released(Err(error)) => {
+                state.apply_event(job, super::Event::Released(Err(error)));
+                false
+            }
+            other => panic!("the reap sends its release verdict: {other:?}"),
+        },
+        _ => panic!("expected an event"),
+    }
+}
+
+/// Takes the next actor event for this row, whatever it is, asserting its job.
+async fn next_ram_event(
+    rx: &mut mpsc::UnboundedReceiver<ActorMsg>,
+    job_id: JobId,
+    want: &str,
+) -> super::Event {
+    let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("expected {want}"))
+        .expect("the actor channel is open");
+    match msg {
+        ActorMsg::Event { job, event } => {
+            assert_eq!(job, job_id, "the event belongs to the settle row");
+            event
+        }
+        other => panic!("expected {want}, got {other:?}"),
+    }
+}
+
+/// W2 step 2, the window itself (operator ruling 2026-11-05): a confirmed Ram
+/// release does not spawn into a host that has not proven the bytes back —
+/// the spawn waits for a host witness reading past the release inside the
+/// `settle_timeout_s` window, on the RAM ladder's own figures. The release is
+/// the window's entry ticket, never its substitute.
+/// Falsifier: hand the RAM leg back the W1 skip (spawn on release evidence
+/// alone) and the `spawns == 0` waits below go red while the witness is held.
+#[tokio::test]
+async fn the_ram_settle_waits_for_the_witness_before_the_spawn() {
+    let dir = crate::testutil::temp_dir("ram-settle-window");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cpu_yaml = write_cpu_row_yaml(&dir, "cpu", "20");
+    let cpu = rescan_entry(&cpu_yaml, "cpu");
+    let mut fx = ram_swap_fixture(
+        &dir,
+        crate::config::AppConfig::default(),
+        vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_130,
+                occupant: Some(ram_settle_seat("old-cpu", 0.0, Some(10.0), 18_130)),
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_131,
+                occupant: None,
+                job: None,
+            },
+        ],
+        true,
+    );
+    fx.state.catalog = vec![cpu.clone()];
+    let job_id = fx.state.register_queued_load(0, &cpu, Vec::new());
+    fx.state.start_queued_load(job_id, 0, cpu.clone());
+    drive_ram_admit(&mut fx.state, &mut fx.rx, job_id).await;
+    assert_eq!(fx.state.jobs[&job_id].path, Some(AdmissionPath::FitsNow));
+    assert_eq!(fx.state.jobs[&job_id].state, SwapState::Dispose);
+    assert!(
+        drive_ram_release(&mut fx.state, &mut fx.rx).await,
+        "the driver confirms this release"
+    );
+    // The window is open and the host has not freed: the release is proven,
+    // the spawn is not. No actor turn has run since `apply_event`, so the
+    // witness has spent exactly its admit reading so far.
+    assert_eq!(fx.witness.reads(), 1, "the admit reading alone so far");
+    assert_eq!(fx.runtime.spawns(), 0, "the spawn waits on the witness");
+    assert_eq!(fx.state.jobs[&job_id].state, SwapState::Dispose);
+    assert!(!fx.state.jobs[&job_id].terminal);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        fx.witness.reads() >= 2,
+        "the window samples the host after the release — release evidence alone proves nothing"
+    );
+    assert_eq!(
+        fx.runtime.spawns(),
+        0,
+        "the held witness keeps the spawn parked"
+    );
+    fx.witness.release_pages();
+    match next_ram_event(&mut fx.rx, job_id, "the settle verdict").await {
+        super::Event::Settled(Ok(())) => {
+            fx.state.apply_event(job_id, super::Event::Settled(Ok(())))
+        }
+        other => panic!("the window ends when the witness agrees: {other:?}"),
+    }
+    assert_eq!(
+        fx.runtime.spawns(),
+        0,
+        "the spawn fires on the actor's turn"
+    );
+    match next_ram_event(&mut fx.rx, job_id, "the spawn").await {
+        super::Event::Spawned(Ok(spawned)) => {
+            assert_eq!(spawned.port, 18_130);
+            fx.state
+                .apply_event(job_id, super::Event::Spawned(Ok(spawned)));
+        }
+        other => panic!("the spawn answers: {other:?}"),
+    }
+    fx.state.apply_event(
+        job_id,
+        super::Event::Probed(crate::engine::Probe::Ready, None),
+    );
+    assert_eq!(fx.runtime.spawns(), 1, "exactly one engine");
+    assert_eq!(fx.runtime.kills(), 1, "exactly one victim kill");
+    let occupant = fx.state.slots[0]
+        .occupant
+        .as_ref()
+        .expect("the replacement installs");
+    assert_eq!(occupant.model, "cpu");
+    assert_eq!(occupant.ram_need, Some(Gibibytes(20.0)));
+    assert_eq!(
+        fx.state.ram_ledger_sum(),
+        Gibibytes(20.0),
+        "one RAM booking moves through the swap, never two"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// W2 step 2, the window's deadline: a host that never frees the gate target
+/// plus `ram_reserve_gb` within `settle_timeout_s` fails the incoming load
+/// with `SettleTimeout` and its own numbers (G13) — it never spawns, and the
+/// proven release stays proven: the victim slot stays clear and its debit
+/// stays committed. The failure belongs to the incoming row alone.
+/// Falsifier: fail the settle open (wave the timeout through) and the spawn
+/// counter goes non-zero; quote a flattering figure and the numbers asserts
+/// go red.
+#[tokio::test]
+async fn a_ram_settle_timeout_fails_the_incoming_load_never_the_victim() {
+    let dir = crate::testutil::temp_dir("ram-settle-timeout");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cpu_yaml = write_cpu_row_yaml(&dir, "cpu", "20");
+    let cpu = rescan_entry(&cpu_yaml, "cpu");
+    let mut fx = ram_swap_fixture(
+        &dir,
+        crate::config::AppConfig {
+            settle_timeout_s: 1,
+            ..crate::config::AppConfig::default()
+        },
+        vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_130,
+                occupant: Some(ram_settle_seat("old-cpu", 0.0, Some(10.0), 18_130)),
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_131,
+                occupant: None,
+                job: None,
+            },
+        ],
+        true,
+    );
+    fx.state.catalog = vec![cpu.clone()];
+    let job_id = fx.state.register_queued_load(0, &cpu, Vec::new());
+    fx.state.start_queued_load(job_id, 0, cpu.clone());
+    drive_ram_admit(&mut fx.state, &mut fx.rx, job_id).await;
+    assert!(
+        drive_ram_release(&mut fx.state, &mut fx.rx).await,
+        "the release itself is proven"
+    );
+    match next_ram_event(&mut fx.rx, job_id, "the settle verdict").await {
+        super::Event::Settled(Err(reason)) => {
+            fx.state
+                .apply_event(job_id, super::Event::Settled(Err(reason)));
+        }
+        other => panic!("the witness stays held, so the window expires: {other:?}"),
+    }
+    let job = &fx.state.jobs[&job_id];
+    assert!(job.terminal, "the load is done, not parked");
+    assert_eq!(job.state, SwapState::Idle);
+    let error = job.error.as_ref().expect("the row carries its reason");
+    assert!(
+        matches!(error, super::SchedulerError::SettleTimeout { reason }
+            if reason.contains("20.0 GiB RAM free")
+                && reason.contains("28.0 GiB required")
+                && reason.contains("8.0 GiB reserve")),
+        "the failure quotes the compared host figures, reserve named: {error}"
+    );
+    assert_eq!(
+        fx.runtime.spawns(),
+        0,
+        "a host that never freed never spawns"
+    );
+    assert!(
+        fx.state.slots[0].occupant.is_none(),
+        "the proven release stays proven — only the incoming row failed"
+    );
+    assert_eq!(
+        fx.state.ram_ledger_sum(),
+        Gibibytes(0.0),
+        "the released holder's debit stays committed off the ledger"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Falsifier 6 (operator ruling 2026-11-05): a RAM eviction whose release is
+/// never confirmed installs nothing and keeps the debit — the slot stays
+/// occupied, the RAM ledger still books the holder, and the settle window
+/// never opens: the host witness spends only its admit reading. The settle
+/// window exists after proven release and nowhere else (§0.3, DOCTRINE 5).
+/// Falsifier: treat the reap timeout as a release (map the kill-confirm
+/// timeout to `Ok`) and the debit and occupant asserts go red; let the RAM
+/// settle start on an unproven release and the witness-reads assert goes red.
+#[tokio::test]
+async fn a_ram_eviction_with_an_unconfirmed_release_installs_nothing_and_keeps_the_debit() {
+    let dir = crate::testutil::temp_dir("ram-unproven-release");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let cpu_yaml = write_cpu_row_yaml(&dir, "cpu", "20");
+    let cpu = rescan_entry(&cpu_yaml, "cpu");
+    let mut fx = ram_swap_fixture(
+        &dir,
+        crate::config::AppConfig {
+            release_timeout_s: 1,
+            ..crate::config::AppConfig::default()
+        },
+        vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_130,
+                occupant: Some(ram_settle_seat("old-cpu", 0.0, Some(10.0), 18_130)),
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_131,
+                occupant: None,
+                job: None,
+            },
+        ],
+        false,
+    );
+    fx.state.catalog = vec![cpu.clone()];
+    let job_id = fx.state.register_queued_load(0, &cpu, Vec::new());
+    fx.state.start_queued_load(job_id, 0, cpu.clone());
+    drive_ram_admit(&mut fx.state, &mut fx.rx, job_id).await;
+    assert!(
+        !drive_ram_release(&mut fx.state, &mut fx.rx).await,
+        "nobody ever proved this release"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let job = &fx.state.jobs[&job_id];
+    assert!(job.terminal, "an unproven release fails the row");
+    assert_eq!(job.state, SwapState::Idle);
+    let error = job.error.as_ref().expect("the row carries its reason");
+    assert!(
+        matches!(error, super::SchedulerError::ReleaseTimeout { holder } if holder == "old-cpu"),
+        "the holder keeps its name in the failure: {error}"
+    );
+    assert_eq!(
+        fx.runtime.spawns(),
+        0,
+        "nothing installs on a ghost release"
+    );
+    assert_eq!(fx.runtime.kills(), 1, "the harness honestly tried the kill");
+    assert_eq!(
+        fx.witness.reads(),
+        1,
+        "the settle window never opened: an unproven release proves no bytes"
+    );
+    let occupant = fx.state.slots[0]
+        .occupant
+        .as_ref()
+        .expect("the slot still reports its resident — nobody proved it gone");
+    assert_eq!(occupant.model, "old-cpu");
+    assert_eq!(
+        fx.state.ram_ledger_sum(),
+        Gibibytes(10.0),
+        "the debit stays booked as long as the holder might be alive"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// W21-01 closure (review W2 step 1): the same-slot release figure a RAM row
+/// plans with is the holder's RAM booking — credited once, never doubled —
+/// and a GPU holder credits 0.0 on the RAM ladder (its host RAM is real but
+/// unbooked; the settle witness reads the freed bytes instead). A VRAM row's
+/// own-slot figure is unchanged.
+/// Falsifier: revert the own-slot cost to `o.need.0` and the RAM-holder cost
+/// goes 0.0 (the drain plans against nothing); credit it on the ledger leg
+/// too and the double-count asserts go red.
+#[tokio::test]
+async fn the_same_slot_release_under_a_ram_row_credits_the_ram_booking_once() {
+    let dir = crate::testutil::temp_dir("ram-same-slot-cost");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    // Leg A: a RAM holder releases its own booking — 10.0, credited exactly
+    // once (the ledger leg subtracts the holder leg it already carries).
+    let new_yaml = write_cpu_row_yaml(&dir, "new-cpu", "10");
+    let new_cpu = rescan_entry(&new_yaml, "new-cpu");
+    let mut fx = ram_swap_fixture(
+        &dir,
+        crate::config::AppConfig::default(),
+        vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_130,
+                occupant: Some(ram_settle_seat("old-cpu", 0.0, Some(10.0), 18_130)),
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_131,
+                occupant: None,
+                job: None,
+            },
+        ],
+        true,
+    );
+    fx.state.catalog = vec![new_cpu.clone()];
+    let job_id = fx.state.register_queued_load(0, &new_cpu, Vec::new());
+    fx.state.start_queued_load(job_id, 0, new_cpu.clone());
+    drive_ram_admit(&mut fx.state, &mut fx.rx, job_id).await;
+    assert_eq!(
+        fx.state.jobs[&job_id]
+            .victim
+            .as_ref()
+            .expect("the same-slot holder")
+            .cost,
+        10.0,
+        "the figure a RAM holder's release credits is its RAM booking"
+    );
+    assert_eq!(
+        fx.state.jobs[&job_id].free_at_admit,
+        Some(Gibibytes(22.0)),
+        "64 total - 8 reserve - 44 used + 10 holder credit"
+    );
+    assert!(drive_ram_release(&mut fx.state, &mut fx.rx).await);
+    let job = &fx.state.jobs[&job_id];
+    assert_eq!(job.released_cost, 10.0);
+    assert_eq!(job.holder_released_cost, 10.0);
+    assert_eq!(
+        job.free_at_admit.map_or(0.0, |f| f.0) + (job.released_cost - job.holder_released_cost),
+        job.free_at_admit.map_or(0.0, |f| f.0),
+        "the drain re-check adds nothing the admit credit did not already hold"
+    );
+    match next_ram_event(&mut fx.rx, job_id, "the settle verdict").await {
+        super::Event::Settled(Ok(())) => {
+            fx.state.apply_event(job_id, super::Event::Settled(Ok(())))
+        }
+        other => panic!("the released bytes are back in the reading: {other:?}"),
+    }
+    match next_ram_event(&mut fx.rx, job_id, "the spawn").await {
+        super::Event::Spawned(Ok(spawned)) => {
+            fx.state
+                .apply_event(job_id, super::Event::Spawned(Ok(spawned)));
+        }
+        other => panic!("the spawn answers: {other:?}"),
+    }
+    fx.state.apply_event(
+        job_id,
+        super::Event::Probed(crate::engine::Probe::Ready, None),
+    );
+    assert_eq!(
+        fx.state.ram_ledger_sum(),
+        Gibibytes(10.0),
+        "one booking for one resident: the holder's debit left, the new row's arrived"
+    );
+    // Leg B: a GPU holder on the same slot credits 0.0 to a RAM row — its
+    // host RAM is not a booked figure; the settle witness, not the gate,
+    // reads the freed bytes.
+    let gpu_yaml = write_cpu_row_yaml(&dir, "cpu-two", "10");
+    let cpu_two = rescan_entry(&gpu_yaml, "cpu-two");
+    let mut fx = ram_swap_fixture(
+        &dir,
+        crate::config::AppConfig::default(),
+        vec![
+            Slot {
+                category: CategoryId::Work,
+                index: 0,
+                engine_port: 18_130,
+                occupant: Some(ram_settle_seat("gpu-holder", 12.0, None, 18_130)),
+                job: None,
+            },
+            Slot {
+                category: CategoryId::Aux,
+                index: 1,
+                engine_port: 18_131,
+                occupant: None,
+                job: None,
+            },
+        ],
+        true,
+    );
+    fx.state.catalog = vec![cpu_two.clone()];
+    fx.witness.release_pages();
+    let job_id = fx.state.register_queued_load(0, &cpu_two, Vec::new());
+    fx.state.start_queued_load(job_id, 0, cpu_two.clone());
+    drive_ram_admit(&mut fx.state, &mut fx.rx, job_id).await;
+    assert_eq!(
+        fx.state.jobs[&job_id]
+            .victim
+            .as_ref()
+            .expect("the same-slot GPU holder")
+            .cost,
+        0.0,
+        "a GPU holder's host RAM is unbooked: the RAM gate credits no figure it cannot state"
+    );
+    assert!(drive_ram_release(&mut fx.state, &mut fx.rx).await);
+    assert_eq!(fx.state.jobs[&job_id].released_cost, 0.0);
+    match next_ram_event(&mut fx.rx, job_id, "the settle verdict").await {
+        super::Event::Settled(Ok(())) => {
+            fx.state.apply_event(job_id, super::Event::Settled(Ok(())))
+        }
+        other => panic!("the physical reading carries the GPU holder's freed RAM: {other:?}"),
+    }
+    match next_ram_event(&mut fx.rx, job_id, "the spawn").await {
+        super::Event::Spawned(Ok(spawned)) => {
+            fx.state
+                .apply_event(job_id, super::Event::Spawned(Ok(spawned)));
+        }
+        other => panic!("the spawn answers: {other:?}"),
+    }
+    fx.state.apply_event(
+        job_id,
+        super::Event::Probed(crate::engine::Probe::Ready, None),
+    );
+    assert_eq!(
+        fx.state.ram_ledger_sum(),
+        Gibibytes(10.0),
+        "the new RAM row books once; the GPU holder's card figure never entered it"
+    );
+    assert_eq!(
+        fx.state.ledger_sum(),
+        Gibibytes(0.0),
+        "the GPU holder left the VRAM ledger with its release"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

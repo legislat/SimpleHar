@@ -324,6 +324,26 @@ pub struct RamSample {
     pub used_gib: f64,
 }
 
+impl RamSample {
+    /// Physical free host memory, never negative.
+    #[must_use]
+    pub fn free_gib(&self) -> f64 {
+        (self.total_gib - self.used_gib).max(0.0)
+    }
+
+    /// Whether the host has physically freed to `target_gib` of free RAM, within
+    /// `tolerance_gib` — the RAM twin of
+    /// [`crate::budget::MemorySample::freed_for`] (§0.3: the settle window is
+    /// only legal after a proven release). Windows returns physical pages at
+    /// process exit, so the window is short in practice; the discipline (a
+    /// witness reading after the release proves the bytes, never the release
+    /// ticket alone) stays.
+    #[must_use]
+    pub fn freed_for(&self, target_gib: f64, tolerance_gib: f64) -> bool {
+        self.free_gib() + tolerance_gib >= target_gib
+    }
+}
+
 /// The RAM counterpart of [`crate::budget::VramWitness`]: the host-memory
 /// truth a CPU-resident admission is judged against. A `None` sample refuses
 /// the load fail-closed, exactly as a dead card witness does (DOCTRINE 4) —
@@ -424,6 +444,43 @@ mod tests {
                 sample.total_gib
             );
         }
+    }
+
+    /// The RAM settle compare (W2 step 2, the `MemorySample::freed_for` twin):
+    /// free is clamped at zero, the tolerance band is one-sided, and reaching
+    /// the target exactly passes. Falsifier: clamp-free the free side and the
+    /// nonsense reading passes; drop the tolerance and the exact-minus-band
+    /// reading refuses.
+    #[test]
+    fn the_ram_freed_for_compare_is_the_clamped_one_sided_band() {
+        let sample = |total: f64, used: f64| RamSample {
+            total_gib: total,
+            used_gib: used,
+        };
+        assert!(
+            sample(64.0, 36.0).freed_for(28.0, 2.0),
+            "free 28.0 meets the 28.0 target exactly"
+        );
+        assert!(
+            sample(64.0, 38.0).freed_for(28.0, 2.0),
+            "free 26.0 sits inside the one-sided 2.0 tolerance band"
+        );
+        assert!(
+            !sample(64.0, 38.1).freed_for(28.0, 2.0),
+            "below free 26.0 the band is spent and the settle keeps waiting"
+        );
+        assert!(
+            !sample(64.0, 70.0).freed_for(5.0, 2.0),
+            "a nonsense used-over-total reading clamps free to zero, not to a fake -6.0"
+        );
+        assert!(
+            sample(64.0, 70.0).freed_for(1.0, 2.0),
+            "at the clamped floor only the tolerance band can carry the target"
+        );
+        assert!(
+            sample(64.0, 70.0).free_gib() == 0.0,
+            "the clamp is the accessor's own rule"
+        );
     }
 
     #[test]

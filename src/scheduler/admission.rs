@@ -272,12 +272,25 @@ impl ActorState {
                 }
             }
         };
+        // The figure a confirmed holder release credits (W21-01 ruling, W2 step 2):
+        // the bytes this release frees in the resource the drain is planning. A
+        // Ram row drains the RAM ledger, so its own-slot figure is the holder's
+        // RAM booking — credited once (the drain re-check subtracts the holder leg
+        // from the ledger term, R2-03-01, and the physical reading already held
+        // it at sample time), and 0.0 for a GPU holder: its host RAM is real but
+        // unbooked, so the RAM settle witness reads the freed bytes instead of a
+        // credit this gate cannot honestly state. A VRAM row keeps the card
+        // figure, unchanged.
         let victim = self.slots[slot].occupant.as_ref().map(|o| Victim {
             model: o.model.clone(),
             ticket: o.ticket.clone(),
             slot,
             evicted: false,
-            cost: o.need.0,
+            cost: if entry.resource() == crate::model::Resource::Ram {
+                o.ram_need.map_or(0.0, |need| need.0)
+            } else {
+                o.need.0
+            },
         });
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.need = booking;
