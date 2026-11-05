@@ -30,9 +30,9 @@ Write-Output "PROCESS HEALTH REPORT"
 Write-Output ("Generated: " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 Write-Output ""
 
-# 1. Durable docs older than a quarter.
+# 1. Durable docs older than a quarter. README.md is not dated: it carries no front
+# matter per the 2026-11-05 ruling (storefront page) and reviews on release.
 $durable = @(
-  "README.md",
   "AGENTS.md",
   "CONTRIBUTING.md",
   "docs/DOCS_README.md",

@@ -611,3 +611,10 @@ recorded here so dated references to ARCHIVED still resolve:
   `scheduler/mod.rs`) and S2 (catalog/drift helpers into `catalog.rs`) approved.
   Move-only commits, both-shell gates per commit, no behavior change and no test-logic
   edits. | 2026-11-05 | `01f135d..`
+
+- **README drops the front-matter banner** (operator 2026-11-05): GitHub renders the
+  README on the repo landing page, where YAML front matter shows as a metadata table.
+  `README.md` carries no front matter and starts at the H1; the front-matter rule in
+  `docs/DOCS_README.md` section 5 and `scripts/check-docs.mjs` carry the exemption.
+  Every other durable doc keeps its front matter. Storefront screenshots come only
+  from operator-validated captures. | 2026-11-05 | `011d8a5..`

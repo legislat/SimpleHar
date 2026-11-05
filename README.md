@@ -1,13 +1,3 @@
----
-title: SimpleHarn user guide
-owner: operator
-status: active
-audience: [user, contributor]
-source_of_truth_for: [product overview, quick start, safety, navigation]
-last_reviewed: 2026-11-05
-review_trigger: behavior-change, release
----
-
 # SimpleHarn
 
 [![CI](https://img.shields.io/github/actions/workflow/status/legislat/SimpleHarn/ci.yml?branch=main)](https://github.com/legislat/SimpleHarn/actions/workflows/ci.yml)

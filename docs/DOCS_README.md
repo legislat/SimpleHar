@@ -119,8 +119,11 @@ style.
 - Front matter: every durable file starts with `title`, `owner`, `status`,
   `audience`, `source_of_truth_for`, `last_reviewed`, `review_trigger`. A
   document without an owner is a defect. The operator owns every durable
-  document. Audit snapshots under `docs/maintenance/` are exempt; they
-  record a dated audit and keep their own status table.
+  document. `README.md` is the one exempt file: it is the storefront page and
+  GitHub renders front matter there as a metadata table (operator ruling
+  2026-11-05, `docs/architecture/DECISIONS.md`). Audit snapshots under
+  `docs/maintenance/` are exempt; they record a dated audit and keep their own
+  status table.
 - Same-change rule: a change that alters behavior updates every affected
   durable document in the same change, or states why none is affected.
 - Contradiction rule: a contradiction is a stop-the-line event. Record it as

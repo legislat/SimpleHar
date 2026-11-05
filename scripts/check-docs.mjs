@@ -1,6 +1,7 @@
 // Documentation checker for durable docs. Node, no external dependencies.
 // Rules (docs/DOCS_README.md sections 5 and 6):
-//   1. Front matter with the seven required keys.
+//   1. Front matter with the seven required keys. README.md is exempt: it is the
+//      storefront page and GitHub renders front matter there as a table (2026-11-05 ruling).
 //   2. Relative Markdown links resolve to existing files.
 //   3. No author-specific absolute Windows drive paths in durable docs. Documented
 //      product defaults in README/reference and exact quoted decisions are allowed.
@@ -22,6 +23,7 @@ const REQUIRED_KEYS = [
   "title", "owner", "status", "audience",
   "source_of_truth_for", "last_reviewed", "review_trigger",
 ];
+const FRONT_MATTER_EXEMPT = new Set(["README.md"]);
 
 const failures = [];
 const fail = (path, line, message) => failures.push(`${path}:${line}: ${message}`);
@@ -107,11 +109,14 @@ for (const rel of docs) {
   const text = readFileSync(join(ROOT, rel), "utf8");
   const entries = parseLines(text);
 
-  // 1. Front matter.
-  const fm = parseFrontMatter(rel, entries);
-  if (fm) {
-    for (const key of REQUIRED_KEYS) {
-      if (!fm.keys.has(key)) fail(rel, 1, `front matter missing key: ${key}`);
+  // 1. Front matter. README.md is exempt (storefront page); its status is active.
+  const exempt = FRONT_MATTER_EXEMPT.has(rel);
+  const fm = exempt ? { keys: new Map(), status: "active" } : parseFrontMatter(rel, entries);
+  if (exempt || fm) {
+    if (!exempt) {
+      for (const key of REQUIRED_KEYS) {
+        if (!fm.keys.has(key)) fail(rel, 1, `front matter missing key: ${key}`);
+      }
     }
 
     // 6. DRAFT ban on active docs (literal, case-sensitive, outside code fences).
