@@ -18,6 +18,18 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
 ## Unreleased
 
+## v1.3.1 - 2026-11-05
+
+### Added
+
+- Two container log-rotation knobs the harness renders into every ninfer
+  launch script: `ninfer_log_max_size_mib` (default 25, 1..=1024) and
+  `ninfer_log_max_files` (default 5, 1..=50). An absent key renders the
+  previous bytes.
+- `measured_drift_warn_ratio` (default 0.25, 0..=1, 0 silences): the warn-only
+  band that compares the measured engine footprint to the declared row. It
+  never changes admission.
+
 ### Changed
 
 - SimpleHarn is the only name (operator instruction 2026-11-05). The harness
@@ -29,6 +41,18 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
   The harness writes custody under `.simpleharn/` and holds
   `SimpleHarn-SingleInstance`. Backward compatibility and migration do not
   exist.
+
+### Internal
+
+- Ten opaque numbers became named constants; operator-facing messages
+  interpolate them.
+- The fingerprint, log-pruning and guard-capture traps are retired by code
+  and pins, not by prose.
+- The T14 soak log leg now seeds synthetic logs and asserts the per-model
+  prune, so it can fail.
+- A final chunked review ran over the whole tree; the remaining Medium and
+  Low findings are filed for 1.4.
+
 
 ## v1.3.0 - 2026-11-05
 
