@@ -16,8 +16,7 @@
 #   9. Public docs carry no machine paths (README.md, CHANGELOG.md,
 #      CONTRIBUTING.md, AGENTS.md, docs/**). The ban targets personal
 #      locations on the operator machine; documented engine defaults stay
-#      allowed (the llama.cpp install default). docs/maintenance/ holds frozen
-#      historical audit records, scanned at their intake, so they are exempt.
+#      allowed (the llama.cpp install default).
 #      Rule home: docs/process/GIT_WORKFLOW.md (release section).
 #
 # Exit 0 only when every check passes.
@@ -97,7 +96,7 @@ Report $readmeOk ("README.md names tag " + $readmeTag)
 
 # 6. Known stale phrases in current durable docs and source.
 $stalePhrases = @("there is no auth", "arrive with their own turns")
-$scanRoots = @("README.md", "AGENTS.md", "CONTRIBUTING.md", "docs/DOCS_README.md", "docs/process", "docs/architecture", "docs/reference", "docs/maintenance", "src", "tests")
+$scanRoots = @("README.md", "AGENTS.md", "CONTRIBUTING.md", "docs/DOCS_README.md", "docs/process", "docs/architecture", "docs/reference", "src", "tests")
 $scanFiles = @()
 foreach ($root in $scanRoots) {
   if (Test-Path -LiteralPath $root) {
@@ -179,8 +178,7 @@ if (Test-Path -LiteralPath $fixturePath) {
 #    volumes, and the staging and rollback directory names. Legitimate
 #    documented engine defaults are not personal and stay allowed: the
 #    llama.cpp install default lives under C:\Inference, so the ban exempts
-#    exactly that one subtree. docs/maintenance/** is the one exemption:
-#    frozen historical audit records, scanned at their intake.
+#    exactly that one subtree.
 $personalPathPatterns = @(
   'C:\\Inference\\(?!llama\.cpp)',
   'C:\\Users\\',
@@ -193,10 +191,7 @@ $personalPathPatterns = @(
 )
 $publicDocs = @('README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'AGENTS.md')
 if (Test-Path 'docs') {
-  # docs/maintenance/** holds frozen historical audit records (scanned at
-  # their intake), so the live-doc ban does not rewrite them here.
   $publicDocs += (Get-ChildItem -LiteralPath 'docs' -Recurse -Filter '*.md' |
-    Where-Object { $_.FullName -notmatch '\\maintenance\\' } |
     ForEach-Object { $_.FullName })
 }
 $machinePathHits = @()

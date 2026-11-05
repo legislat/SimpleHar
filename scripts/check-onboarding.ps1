@@ -52,7 +52,6 @@ try {
     "CONTRIBUTING.md",
     "CHANGELOG.md",
     "docs/DOCS_README.md",
-    "docs/maintenance/README.md",
     "docs/architecture/DOCTRINE.md",
     "docs/architecture/DECISIONS.md",
     "docs/architecture/OVERVIEW.md",

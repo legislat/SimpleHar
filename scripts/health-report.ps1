@@ -35,8 +35,7 @@ Write-Output ""
 $durable = @(
   "AGENTS.md",
   "CONTRIBUTING.md",
-  "docs/DOCS_README.md",
-  "docs/maintenance/README.md"
+  "docs/DOCS_README.md"
 )
 $durable += (Get-ChildItem -LiteralPath "docs/process" -Filter "*.md" -File | ForEach-Object { $_.FullName })
 $durable += (Get-ChildItem -LiteralPath "docs/architecture" -Filter "*.md" -File | ForEach-Object { $_.FullName })

@@ -95,15 +95,6 @@ durable and belongs in this tree.
 | [OPERATIONS.md](reference/OPERATIONS.md) | Autostart, file layout, upgrade, uninstall, backup, log retention | active |
 | [TROUBLESHOOTING.md](reference/TROUBLESHOOTING.md) | Failure diagnosis | active |
 
-### docs/maintenance/ (maintenance and audit archive)
-
-| Item | Owns |
-|---|---|
-| [maintenance/README.md](maintenance/README.md) | Maintenance and audit archive policy |
-| `maintenance/archive/2026-11-documentation-cleanup/` | Completed 2026-11 documentation cleanup: inventory, reference audit, plan, final report |
-| `maintenance/archive/2026-11-documentation-governance/` | 2026-11-02 documentation and process audit, archived |
-| `maintenance/archive/` | Completed initiatives; historical, non-authoritative |
-
 ## 4. Documentation language
 
 Durable documentation must use ASD-STE100 Simplified Technical English: active
@@ -121,9 +112,7 @@ style.
   document without an owner is a defect. The operator owns every durable
   document. `README.md` is the one exempt file: it is the storefront page and
   GitHub renders front matter there as a metadata table (operator ruling
-  2026-11-05, `docs/architecture/DECISIONS.md`). Audit snapshots under
-  `docs/maintenance/` are exempt; they record a dated audit and keep their own
-  status table.
+  2026-11-05, `docs/architecture/DECISIONS.md`).
 - Same-change rule: a change that alters behavior updates every affected
   durable document in the same change, or states why none is affected.
 - Contradiction rule: a contradiction is a stop-the-line event. Record it as
@@ -136,10 +125,10 @@ style.
   its `last_reviewed`. New decisions and new engines trigger immediate review
   of the affected overview.
 - Archive rule: a superseded durable project document moves to
-  `docs/archive/` with a status banner, never silently deleted. A completed
-  maintenance initiative moves to `docs/maintenance/archive/`. Both are
-  non-authoritative historical records. `archive/` and `base-archive/` are
-  frozen and are never read for current behavior.
+  `docs/archive/` with a status banner, never silently deleted. Maintenance
+  and audit records live in the local-only layer, never in the public tree.
+  `archive/` and `base-archive/` are frozen and are never read for current
+  behavior.
 - No duplication: one fact, one home; every other mention is a pointer. A
   labeled summary that links to the source is allowed; copying a command
   list, a doctrine paragraph, or a schema table is a defect.

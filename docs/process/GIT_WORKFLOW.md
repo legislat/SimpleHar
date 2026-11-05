@@ -127,8 +127,6 @@ Rules:
 - `scripts/release-check.ps1` check 9 enforces the machine-path ban across the public
   docs (`README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `AGENTS.md`, and
   `docs/**`, including the decision ledger). Documented engine defaults stay allowed.
-  `docs/maintenance/` is the
-  one exemption: frozen historical audit records, scanned at their intake.
 
 ## Conflict resolution
 

@@ -9,8 +9,8 @@
 //   4. No duplicate H1.
 //   5. Every durable doc is listed in docs/DOCS_README.md by filename or path.
 //   6. No literal DRAFT in a doc whose front matter status is active.
-// Not scanned: DESIGN.md (historical), docs/maintenance/* (maintenance artifacts),
-// handoff/* (local), archive/ and base-archive/ (frozen).
+// Not scanned: DESIGN.md (historical), handoff/* (local), archive/ and
+// base-archive/ (frozen).
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
