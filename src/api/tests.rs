@@ -1525,13 +1525,13 @@ async fn guard_refusals_leave_one_line_per_class_and_path_not_one_per_packet() {
     // Live actor: the recovery leg needs a poll that actually answers 2xx, and a
     // 5xx would let the window stay shut while looking like it re-armed.
     let api = Arc::new(live_state(BootTimings::default()));
-    // The reporting callsites are warmed and *proven* to deliver before the
-    // measured window opens (see [`warm_capture_lines`]): their process-wide
-    // `Interest` used to be established by an un-asserted warm-up emission that
-    // a co-scheduled, capture-less sibling guard pin could win, which is the
-    // D9 flake — the flood's one line absent while its tower lines were present.
-    warm_guard_reporting_callsites().await;
-    let session = crate::tray::testlog::Session::start();
+    // The install helper warms the reporting callsites — *proven* to deliver —
+    // before this thread subscribes (see [`guard_capture_session`]): their
+    // process-wide `Interest` used to be established by an un-asserted warm-up
+    // emission that a co-scheduled, capture-less sibling guard pin could win,
+    // which is the D9 flake — the flood's one line absent while its tower
+    // lines were present.
+    let session = guard_capture_session().await;
 
     async fn probe(
         api: Arc<ApiState>,
@@ -1640,7 +1640,7 @@ async fn guard_refusals_leave_one_line_per_class_and_path_not_one_per_packet() {
         .await
         .expect("in-process poll");
     assert_eq!(poll.status(), StatusCode::OK);
-    let quiet = crate::tray::testlog::Session::start();
+    let quiet = guard_capture_session().await;
     assert_eq!(
         control_router(Arc::clone(&api))
             .oneshot(
@@ -1674,7 +1674,7 @@ async fn guard_refusals_leave_one_line_per_class_and_path_not_one_per_packet() {
         );
     }
 
-    let rearmed = crate::tray::testlog::Session::start();
+    let rearmed = guard_capture_session().await;
     for _ in 0..3 {
         assert_eq!(
             probe(
@@ -1728,6 +1728,11 @@ const CAPTURE_WARM_UP_ATTEMPTS: usize = 8;
 /// thread-local and every warm-up traffic goes through its own `ApiState`, so a
 /// sibling cannot spend the `(class, path)` budget the caller asserts about; the
 /// interest cache is the only shared state, and this function repairs it.
+///
+/// Guard-reporting pins no longer call this by hand: `guard_capture_session`
+/// performs the warm-up as part of installing the capture, so subscribing
+/// without warming is not a shape a guard pin can write
+/// (TASK-TRAP-RETIREMENT T3, D9 retired structurally).
 async fn warm_capture_lines<F, Fut>(wanted: &[&'static str], mut emit: F)
 where
     F: FnMut() -> Fut,
@@ -1770,8 +1775,11 @@ fn warm_state(token: Option<&str>) -> Arc<ApiState> {
 }
 
 /// The three guard reporting callsites: `note_guard_refusal`'s `Report` and
-/// `Fold` arms and `note_guard_recovery`'s summary. Every pin that asserts on
-/// their lines warms them through this first.
+/// `Fold` arms and `note_guard_recovery`'s summary. No guard pin calls this by
+/// hand anymore: [`guard_capture_session`] warms through this before it
+/// subscribes, so the structural install — pinned by
+/// `the_guard_capture_install_warms_before_it_subscribes` — is the guarantee
+/// (D9, retired structurally by TASK-TRAP-RETIREMENT T3).
 async fn warm_guard_reporting_callsites() {
     warm_capture_lines(
         &[
@@ -1812,6 +1820,23 @@ async fn warm_guard_reporting_callsites() {
         },
     )
     .await;
+}
+
+/// The one capture install for any pin that asserts on guard reporting lines:
+/// it warms the three callsites through [`warm_guard_reporting_callsites`]
+/// *first*, then subscribes this thread to the measured capture. The order is
+/// the one every by-hand pair used (warm on a throwaway state on this thread,
+/// `Session::start` after — a current-thread runtime keeps polling the future
+/// here), and the warm-up is idempotent: each run uses a fresh throwaway
+/// state, so it never spends the budget or fold tallies a pin measures.
+/// Subscribing without warming is thereby not expressible for guard pins
+/// (D9 retired structurally, TASK-TRAP-RETIREMENT T3);
+/// `the_guard_capture_install_warms_before_it_subscribes` pins the order and
+/// `a_guard_capture_installs_warmed_with_no_by_hand_warm_up` shows the line
+/// arriving in a capture that warmed nothing itself.
+async fn guard_capture_session() -> crate::tray::testlog::Session {
+    warm_guard_reporting_callsites().await;
+    crate::tray::testlog::Session::start()
 }
 
 /// FINDINGS2-0507 [3] + the 15[9] token posture: reporting a refusal must never
@@ -1890,6 +1915,91 @@ async fn a_refused_token_is_counted_once_and_never_carries_the_token() {
     );
 }
 
+/// TASK-TRAP-RETIREMENT T3: the observable property of the structural install.
+/// This pin names no warm-up yet still sees the guard line after the D9
+/// hazard is re-created on purpose: one refusal is reported with no capture
+/// installed on this thread (the capture-less first touch of the original
+/// flake), and only then does [`guard_capture_session`] subscribe. What makes
+/// it red: a tracing-core regression that revives the swallow — a first touch
+/// with no subscriber caching an interest no later capture can undo. As
+/// measured on the locked deps (tracing-core 0.1.36, tracing-subscriber
+/// 0.3.23, scratch binary plus this pin under the dropped-warm falsifier) the
+/// current version no longer swallows in any shape a test can reach, so
+/// deleting the warm from `guard_capture_session` passes this pin; the order
+/// itself is falsified by `the_guard_capture_install_warms_before_it_subscribes`,
+/// which is red when the warm is dropped and red when it is reordered.
+#[tokio::test]
+async fn a_guard_capture_installs_warmed_with_no_by_hand_warm_up() {
+    crate::observability::set_extended_logging(false);
+    async fn refuse(api: &Arc<ApiState>) -> StatusCode {
+        control_router(Arc::clone(api))
+            .oneshot(
+                Request::post("/har/rescan")
+                    .header("host", "127.0.0.1:8708")
+                    .header("origin", "http://evil.example")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .expect("probe request"),
+            )
+            .await
+            .expect("in-process probe")
+            .status()
+    }
+    // The hazard first: a refusal reported while this thread has no capture —
+    // exactly the capture-less first touch the D9 flake was. Its own throwaway
+    // state, so it spends nothing from the measured window's budget.
+    let unwatched = warm_state(None);
+    assert_eq!(refuse(&unwatched).await, StatusCode::FORBIDDEN);
+    // No warm-up call between these lines: the install carries it. A fresh
+    // state so the refusal is the window's first Report for this (class, path).
+    let api = Arc::new(unit_state());
+    let session = guard_capture_session().await;
+    assert_eq!(refuse(&api).await, StatusCode::FORBIDDEN);
+    let lines = session.stop();
+    assert!(
+        lines.iter().any(|line| line.contains("guard refused")),
+        "the guard line must reach a capture whose test never warmed by hand: \
+             {lines:?}"
+    );
+}
+
+/// TASK-TRAP-RETIREMENT T3: the behavioral pin above can only watch the order
+/// it is run in, so the order itself is pinned at the source (the repo's
+/// established `include_str!` seam): inside `guard_capture_session`'s body the
+/// warm-up token must appear before the subscribe token. Comments are stripped
+/// before the match, so prose cannot satisfy the order
+/// (FINDINGS-BATCH-2026-10-28C [5] discipline). Falsifier: move
+/// `Session::start()` above the warm-up and the order assert fires; delete the
+/// warm-up call and the expect fires. A guard pin that bypasses the helper is
+/// caught here the same way once it warms inside its own install, or leaves
+/// the structural guarantee vacuous for its lines.
+#[test]
+fn the_guard_capture_install_warms_before_it_subscribes() {
+    let source = include_str!("tests.rs");
+    let start = source
+        .find("async fn guard_capture_session(")
+        .expect("the guard-capture install helper must stay");
+    let rest = &source[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("the install helper closes at column 0");
+    let body = rest[..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let warm = body
+        .find("warm_guard_reporting_callsites()")
+        .expect("the install helper must warm the reporting callsites");
+    let subscribe = body
+        .find("Session::start()")
+        .expect("the install helper must install the capture subscriber");
+    assert!(
+        warm < subscribe,
+        "`guard_capture_session` may not subscribe before it warms (D9): {body}"
+    );
+}
+
 /// FINDINGS-BATCH-2026-10-28M [2]: bounding *repeats* per `(class, path)` did not
 /// bound the flood, because three of the four classes are refused **pre-auth on any
 /// path** — `reject_reason` runs ahead of `auth_reason` and consults neither the
@@ -1939,11 +2049,10 @@ async fn a_distinct_path_flood_costs_a_constant_number_of_lines() {
 
     // Both reporting callsites this pin asserts on (`Report`, `Fold`) and the
     // recovery summary are proven to deliver into a capture before the measured
-    // window opens — on a throwaway state, so none of this spends the budget or
-    // the fold tally the assertions below read (see [`warm_capture_lines`]).
-    warm_guard_reporting_callsites().await;
-
-    let session = crate::tray::testlog::Session::start();
+    // window opens — the install helper warms on a throwaway state, so none of
+    // this spends the budget or the fold tally the assertions below read
+    // (see [`guard_capture_session`]).
+    let session = guard_capture_session().await;
     let flood = 3 * GUARD_TRACKED_PATHS_PER_CLASS;
     for index in 0..flood {
         assert_eq!(
@@ -2059,7 +2168,7 @@ async fn a_distinct_path_flood_costs_a_constant_number_of_lines() {
     );
 
     // Recovery semantics survive the cap: one line, and it says what was hidden.
-    let recovery = crate::tray::testlog::Session::start();
+    let recovery = guard_capture_session().await;
     let health = control_router(Arc::clone(&api))
         .oneshot(
             Request::get("/health")
@@ -2087,7 +2196,7 @@ async fn a_distinct_path_flood_costs_a_constant_number_of_lines() {
     // Re-armed: a fresh distinct path reports again, and an attacker-chosen path of
     // any length costs only the tracked budget (the key and the line agree).
     let long = format!("/long/{}", "x".repeat(4 * GUARD_TRACKED_PATH_CHARS));
-    let rearmed = crate::tray::testlog::Session::start();
+    let rearmed = guard_capture_session().await;
     assert_eq!(
         probe(&api, &long, Some("http://evil.example")).await,
         StatusCode::FORBIDDEN
@@ -2134,8 +2243,7 @@ async fn a_public_page_success_never_rearms_the_refusal_window() {
     crate::observability::set_extended_logging(false);
     // Live actor: the closing leg needs a successful command that really answers.
     let api = Arc::new(live_state(BootTimings::default()));
-    warm_guard_reporting_callsites().await;
-    let session = crate::tray::testlog::Session::start();
+    let session = guard_capture_session().await;
 
     let flood = 3 * GUARD_TRACKED_PATHS_PER_CLASS;
     for index in 0..flood {
@@ -2213,7 +2321,7 @@ async fn a_public_page_success_never_rearms_the_refusal_window() {
     );
 
     // A real command still closes the window exactly once and re-arms it.
-    let recovery = crate::tray::testlog::Session::start();
+    let recovery = guard_capture_session().await;
     let health = control_router(Arc::clone(&api))
         .oneshot(
             Request::get("/health")
@@ -2277,8 +2385,7 @@ async fn a_guard_refusal_line_carries_a_reason_capped_to_the_tracked_width() {
         Arc::new(crate::budget::LedgerOnlyWitness),
         BootTimings::default(),
     ));
-    warm_guard_reporting_callsites().await;
-    let session = crate::tray::testlog::Session::start();
+    let session = guard_capture_session().await;
 
     // Token class: a kilobyte-long path refused 401 before route membership.
     let long_path = format!("/long/{}", "p".repeat(4 * GUARD_TRACKED_PATH_CHARS));
