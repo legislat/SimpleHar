@@ -1134,7 +1134,7 @@ fn the_serve_model_verdict_is_judged_against_the_spawn_era_row() {
 /// when the scan leg said nothing), and the file-wide count leg fails.
 #[test]
 fn the_actor_applies_the_binary_verdict_it_is_handed_and_never_stats_for_one() {
-    let source = include_str!("mod.rs");
+    let source = include_str!("catalog.rs");
     // Counted over the production half only, and with a needle built at compile
     // time so this assertion's own text cannot feed on itself.
     let production = source.split("mod tests").next().unwrap_or(source);

@@ -6,14 +6,110 @@
 
 use crate::model::scan::{Catalog, ScanError, ScanKind};
 use crate::model::ModelEntry;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::{
-    scan_with_binary_check, ActorState, DriftStats, JobId, JobKind, ReconcileRelease, Reply,
-    SchedulerError, SwapState,
-};
+use super::{ActorState, JobId, JobKind, ReconcileRelease, Reply, SchedulerError, SwapState};
+
+/// Runs `scan_dir`'s synchronous filesystem work on a blocking thread (the
+/// reactor-offload rule: `read_dir`, one read per yaml, one stat per model must
+/// never park a task that answers the control plane). `Err` names the failed
+/// blocking task itself (panic/cancel), not a scan report — scan failures travel
+/// inside the [`Catalog`].
+async fn scan_models_dir(dir: PathBuf) -> Result<Catalog, String> {
+    let reported = dir.clone();
+    tokio::task::spawn_blocking(move || crate::model::scan::scan_dir(&dir))
+        .await
+        .map_err(|error| format!("{error} scanning {}", reported.display()))
+}
+
+/// The filesystem half of a catalog refresh: the modelconf walk **and** the configured
+/// `llama-server.exe` stat, on blocking threads, concurrent with each other.
+///
+/// The stat lives here rather than in [`ActorState::apply_catalog`] because that runs
+/// during the single writer's turn: `llama_server_exe` is operator config, so a
+/// `Path::exists()` there parks the actor behind a sleeping USB or a disconnected NAS
+/// volume while the listener is already bound — every command, `/har/status` poll and
+/// tray tick queues behind it, the A1-class stall FINDINGS-14 [1] and FINDINGS-13 [6]
+/// moved the scans off-thread for. This was the last `std::fs` touch on the actor
+/// (FINDINGS2-04 [2]).
+///
+/// # Arguments
+///
+/// * `dir` - the `ModelConf` directory to walk.
+/// * `llama_server_exe` - the configured binary to check.
+///
+/// # Returns
+///
+/// The scan result, plus the page-visible error for a missing binary (`None` when there
+/// is nothing to report: the binary is present, or the blocking task itself died, where
+/// silence beats a false alarm).
+pub(super) async fn scan_with_binary_check(
+    dir: PathBuf,
+    llama_server_exe: PathBuf,
+) -> (Result<Catalog, String>, Option<ScanError>) {
+    let (scan, binary) = tokio::join!(
+        scan_models_dir(dir),
+        tokio::task::spawn_blocking(move || missing_binary_error(&llama_server_exe))
+    );
+    (scan, binary.unwrap_or(None))
+}
+
+/// The `EngineBinaryMissing` report for a binary the config points at but the volume
+/// does not have. Pure apart from the one stat, which is why it runs inside
+/// [`scan_with_binary_check`]'s blocking task and not on the actor.
+#[must_use]
+pub(super) fn missing_binary_error(llama_server_exe: &std::path::Path) -> Option<ScanError> {
+    (!llama_server_exe.exists()).then(|| ScanError {
+        kind: ScanKind::EngineBinaryMissing,
+        file: "config".to_string(),
+        reason: format!(
+            "llama-server.exe not found at {}; llama loads will fail",
+            llama_server_exe.display()
+        ),
+    })
+}
+
+/// The filesystem evidence one catalog application judges: the resident captures
+/// and the queued rows' files, stat'ed **off the actor** by [`gather_drift_stats`]
+/// on the reload's blocking legs (FINDINGS-07 [8] — the scan half moved off-thread
+/// in FINDINGS-13 [6]/FINDINGS2-04 [2]; these stats were the reload turn's last
+/// inline `std::fs`).
+///
+/// Keyed by path, with a three-state answer the drift rounds must respect:
+/// - absent → the path was not gathered for this round (state moved after the
+///   reload was dispatched): absence of evidence, the verdict stays as it is;
+/// - present with `None` → the gather ran and the file could not be stat'ed
+///   (gone/ejected): for the resident marker this IS the accusation the rule
+///   already made ("the file demonstrably is not what it was"), for a queued row
+///   it never retires;
+/// - present with `Some(fp)` → the current bytes' fingerprint.
+#[derive(Debug, Default)]
+pub(super) struct DriftStats {
+    pub(super) stats: HashMap<PathBuf, Option<crate::model::FileFingerprint>>,
+    /// The parked rows the reload dispatch saw. A row absent from this set
+    /// registered after the dispatch: its fingerprint is by construction newer
+    /// than any stat gathered before its birth, so judging it could only invent
+    /// a "changed since queued" — late rows are kept unconditionally.
+    pub(super) queued_at_dispatch: HashSet<JobId>,
+}
+
+/// The blocking-thread half of a reload's drift round: one stat per named path.
+/// Runs inside `spawn_blocking` on the reload task, never on the actor; a path
+/// whose stat fails is inserted with `None` (evidence of absence), and only the
+/// paths the actor named are ever inserted (so an absent key really means
+/// "not observed this round").
+pub(super) fn gather_drift_stats(paths: &[PathBuf]) -> DriftStats {
+    let mut stats = HashMap::with_capacity(paths.len());
+    for path in paths {
+        stats.insert(path.clone(), crate::model::fingerprint(path));
+    }
+    DriftStats {
+        stats,
+        ..Default::default()
+    }
+}
 
 impl ActorState {
     /// Rescans `ModelConf` and cross-checks `default_model`s (§0.2 step 6, Step 9)
