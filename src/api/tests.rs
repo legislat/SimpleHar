@@ -822,7 +822,7 @@ fn the_status_and_models_render_paths_never_touch_the_filesystem() {
 /// after the leg's `.await` trips the same assert.
 #[test]
 fn the_control_write_backs_run_on_a_blocking_thread() {
-    let source = include_str!("mod.rs");
+    let source = include_str!("config_persist.rs");
     for (head, tail, write_calls) in [
         (
             "async fn set_default_model(",
@@ -2647,7 +2647,7 @@ fn config_persistence_is_answered_only_after_the_bytes_read_back() {
 /// (FINDINGS-BATCH-2026-10-28C [5] discipline).
 #[test]
 fn the_boot_config_publish_flushes_through_write_synced() {
-    let source = include_str!("mod.rs");
+    let source = include_str!("config_persist.rs");
     let start = source
         .find("fn persist_default_model(")
         .expect("persist_default_model is still here");
