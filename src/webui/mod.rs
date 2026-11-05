@@ -297,6 +297,63 @@ mod tests {
         );
     }
 
+    /// The working-model dot, made bright (operator 2026-11-05): the matte
+    /// olive served-dot read as nothing at 9px, so serving takes the bright
+    /// green `--sh-dot-live` (#22c55e) with a 1px ring of its deep shade
+    /// `--sh-dot-live-ring` (#14532d) - a non-text graphic held to >= 3:1 on
+    /// its ring/fill combination (measured: light ring 7.6:1 on the surface,
+    /// fill 4.0:1 on the ring; dark fill 7.6:1 on the card, ring a subtle
+    /// 1.9:1 edge). Every other state keeps its hue and the same ring
+    /// treatment; dark drops the other rings to a near-black tint. The
+    /// selected-tab olive accent must stay exactly as it was.
+    ///
+    /// Nature, declared: a source-content assertion over the exact
+    /// `include_str!` bytes `/style.css` answers.
+    ///
+    /// Falsifier: reverting the serving dot to the accent (or dropping a ring)
+    /// fails the rule asserts; recoloring the tab accent fails its pins in
+    /// `served_assets_join_the_unload_entity_and_colour_it_amber`.
+    #[test]
+    fn served_assets_brighten_the_working_dot() {
+        assert!(
+            STYLE_CSS.contains(
+                ".sh-dot[data-state=\"serving\"] { background: var(--sh-dot-live); \
+                 box-shadow: 0 0 0 1px var(--sh-dot-live-ring); }"
+            ),
+            "the serving dot is the bright live green with its deep ring"
+        );
+        assert!(
+            !STYLE_CSS
+                .contains(".sh-dot[data-state=\"serving\"] { background: var(--sh-accent-solid)"),
+            "the matte olive is no longer the working indicator"
+        );
+        assert!(
+            STYLE_CSS.contains("--sh-dot-live: #22c55e")
+                && STYLE_CSS.matches("--sh-dot-live:").count() == 1
+                && STYLE_CSS.contains("--sh-dot-live-ring: #14532d")
+                && STYLE_CSS.matches("--sh-dot-live-ring:").count() == 1,
+            "the live fill and its ring are declared once and shared by both themes"
+        );
+        assert!(
+            STYLE_CSS.contains("background: var(--pico-muted-color);\n  box-shadow: 0 0 0 1px var(--sh-dot-idle-ring);")
+                && STYLE_CSS.contains("--sh-dot-warn-ring: #7c4a03")
+                && STYLE_CSS.contains("--sh-dot-releasing-ring: #5c3804")
+                && STYLE_CSS.contains("--sh-dot-bad-ring: #7f1d12")
+                && STYLE_CSS.contains("--sh-dot-idle-ring: #3d372c"),
+            "idle gets its ring in the base rule and every light state ring is \
+             one dark step of its own hue"
+        );
+        assert!(
+            STYLE_CSS.contains("--sh-dot-warn-ring: #241703")
+                && STYLE_CSS.contains("--sh-dot-releasing-ring: #1d1101")
+                && STYLE_CSS.contains("--sh-dot-bad-ring: #260a06")
+                && STYLE_CSS.contains("--sh-dot-idle-ring: #05070a")
+                && STYLE_CSS.matches("--sh-dot-live-ring:").count() == 1,
+            "dark drops the non-green rings to a near-black tint and keeps the \
+             same green ring as light"
+        );
+    }
+
     /// The unload entity and its amber (operator ruling 2026-11-05): the three
     /// unload gestures — tab-side, row Unload, Unload all — carry the one
     /// `sh-unload` class in the served page bytes, the served stylesheet

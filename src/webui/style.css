@@ -25,6 +25,21 @@
   --sh-warn-tint: #d89b1d40;
   --sh-bad: #c0392b;
   --sh-releasing: #a16207;
+  /* Working-model indicator (operator 2026-11-05): the matte olive dot read
+   * as nearly nothing at 9px on the parchment and the card. The serving dot
+   * becomes the bright saturated green #22c55e with a 1px ring of its deep
+   * shade #14532d: on light the ring sits 7.6:1 on the tab surface and the
+   * fill 4.0:1 on the ring; on dark the fill is 7.6:1 on the card and the
+   * same ring adds a subtle 1.9:1 edge. The selected-tab olive accent is
+   * untouched. Every other state keeps the same treatment - its own hue,
+   * one dark step of a ring; dark keeps the green ring and drops the other
+   * rings to a near-black tint so a bright fill always has a dark edge. */
+  --sh-dot-live: #22c55e;
+  --sh-dot-live-ring: #14532d;
+  --sh-dot-warn-ring: #7c4a03;
+  --sh-dot-releasing-ring: #5c3804;
+  --sh-dot-bad-ring: #7f1d12;
+  --sh-dot-idle-ring: #3d372c;
   --sh-radius: 10px;
   --sh-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
 }
@@ -51,6 +66,14 @@ html[data-theme="dark"] {
    * else in dark moves. */
   --pico-primary-border: #015c8f;
   --pico-primary-hover-border: #01699e;
+  /* Dot rings on the dark card (operator 2026-11-05): the green ring works
+   * as-is (subtle 1.9:1 edge, fill carries the 7.6:1); the other states take
+   * a near-black tint of their own hue so every bright fill keeps a dark
+   * edge between itself and the card. */
+  --sh-dot-warn-ring: #241703;
+  --sh-dot-releasing-ring: #1d1101;
+  --sh-dot-bad-ring: #260a06;
+  --sh-dot-idle-ring: #05070a;
 }
 :root:not([data-theme="dark"]), html[data-theme="light"] {
   /* Warm parchment (operator 2026-11-05): the cool paper read clinical against
@@ -479,17 +502,18 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
   border-radius: 50%;
   margin-right: 0.4rem;
   background: var(--pico-muted-color);
+  box-shadow: 0 0 0 1px var(--sh-dot-idle-ring);
 }
-.sh-dot[data-state="serving"] { background: var(--sh-accent-solid); }
-.sh-dot[data-state="loading"] { background: var(--sh-warn); }
+.sh-dot[data-state="serving"] { background: var(--sh-dot-live); box-shadow: 0 0 0 1px var(--sh-dot-live-ring); }
+.sh-dot[data-state="loading"] { background: var(--sh-warn); box-shadow: 0 0 0 1px var(--sh-dot-warn-ring); }
 /* Releasing (operator ruling 2026-11-04): a committed release whose driver
    confirmation has not landed. Burnt amber — the release family of loading's
    amber, kept a clear shade apart from the loading dot and the failed red. */
-.sh-dot[data-state="releasing"] { background: var(--sh-releasing); }
-.sh-dot[data-state="failed"] { background: var(--sh-bad); }
+.sh-dot[data-state="releasing"] { background: var(--sh-releasing); box-shadow: 0 0 0 1px var(--sh-dot-releasing-ring); }
+.sh-dot[data-state="failed"] { background: var(--sh-bad); box-shadow: 0 0 0 1px var(--sh-dot-bad-ring); }
 /* Axis 2 (ruling 2026-10-29): a serving row whose config file moved since launch.
    The tray's listener amber is a different palette; this is the config one. */
-.sh-dot[data-stale="amber"] { background: var(--sh-warn); }
+.sh-dot[data-stale="amber"] { background: var(--sh-warn); box-shadow: 0 0 0 1px var(--sh-dot-warn-ring); }
 
 .sh-row-actions {
   display: flex;

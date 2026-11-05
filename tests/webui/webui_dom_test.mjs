@@ -875,6 +875,46 @@ const driver = `
         darkBody.indexOf("--sh-accent: ") < 0 &&
         css.indexOf("#2ea043") < 0,
       "root=" + (rootBody || "missing").slice(0, 40) + " dark=" + (darkBody || "").slice(0, 40));
+    // Bright working dot (operator 2026-11-05): the serving dot is the bright
+    // green #22c55e ringed in its deep shade #14532d - a non-text graphic held
+    // to >= 3:1 on the ring/fill combination (light: ring 7.6:1 on the surface
+    // and fill 4.0:1 on the ring; dark: fill 7.6:1 on the card, the ring a
+    // subtle 1.9:1 edge). Other states keep their hue and gain a dark-step
+    // ring; dark drops the non-green rings to a near-black tint. The olive
+    // selected-tab accent stays exactly as the legs above pin it.
+    const servingDotBody = bodyOf('.sh-dot[data-state="serving"] {');
+    check("the serving dot is bright live green with its deep ring, not the olive accent",
+      !!servingDotBody && servingDotBody.indexOf("background: var(--sh-dot-live)") >= 0 &&
+        servingDotBody.indexOf("box-shadow: 0 0 0 1px var(--sh-dot-live-ring)") >= 0 &&
+        servingDotBody.indexOf("--sh-accent-solid") < 0,
+      servingDotBody || "missing");
+    const loadingDotBody = bodyOf('.sh-dot[data-state="loading"] {');
+    const releasingDotBody = bodyOf('.sh-dot[data-state="releasing"] {');
+    const failedDotBody = bodyOf('.sh-dot[data-state="failed"] {');
+    const staleDotBody = bodyOf('.sh-dot[data-stale="amber"] {');
+    check("every dot state keeps its hue and gains one dark-step ring",
+      css.indexOf("box-shadow: 0 0 0 1px var(--sh-dot-idle-ring)") >= 0 &&
+        !!loadingDotBody && loadingDotBody.indexOf("background: var(--sh-warn)") >= 0 &&
+        loadingDotBody.indexOf("var(--sh-dot-warn-ring)") >= 0 &&
+        !!releasingDotBody && releasingDotBody.indexOf("background: var(--sh-releasing)") >= 0 &&
+        releasingDotBody.indexOf("var(--sh-dot-releasing-ring)") >= 0 &&
+        !!failedDotBody && failedDotBody.indexOf("background: var(--sh-bad)") >= 0 &&
+        failedDotBody.indexOf("var(--sh-dot-bad-ring)") >= 0 &&
+        !!staleDotBody && staleDotBody.indexOf("var(--sh-dot-warn-ring)") >= 0,
+      "loading=" + (loadingDotBody || "missing") + " releasing=" + (releasingDotBody || "missing"));
+    check("the live fill and ring ship once and are shared; dark tints only the non-green rings",
+      !!rootBody && rootBody.indexOf("--sh-dot-live: #22c55e") >= 0 &&
+        rootBody.indexOf("--sh-dot-live-ring: #14532d") >= 0 &&
+        rootBody.indexOf("--sh-dot-warn-ring: #7c4a03") >= 0 &&
+        rootBody.indexOf("--sh-dot-releasing-ring: #5c3804") >= 0 &&
+        rootBody.indexOf("--sh-dot-bad-ring: #7f1d12") >= 0 &&
+        rootBody.indexOf("--sh-dot-idle-ring: #3d372c") >= 0 &&
+        !!darkBody && darkBody.indexOf("--sh-dot-live") < 0 &&
+        darkBody.indexOf("--sh-dot-warn-ring: #241703") >= 0 &&
+        darkBody.indexOf("--sh-dot-releasing-ring: #1d1101") >= 0 &&
+        darkBody.indexOf("--sh-dot-bad-ring: #260a06") >= 0 &&
+        darkBody.indexOf("--sh-dot-idle-ring: #05070a") >= 0,
+      "root=" + (rootBody || "missing").slice(0, 40) + " dark=" + (darkBody || "").slice(0, 40));
     const sideJoinBody = bodyOf(".sh-mini.sh-tab-side");
     // One plate for every unload (operator 2026-11-05): the row Unload sat on
     // transparent over the cell, the tab-side on the card token - two looks,
