@@ -907,8 +907,8 @@ const driver = `
         rowActBody.indexOf("justify-content: flex-start") >= 0 &&
         rowActBody.indexOf("flex-end") < 0 &&
         !!rowBtnBody && rowBtnBody.indexOf("flex: 0 0 auto") >= 0 &&
-        rowBtnBody.indexOf("min-width: 5.75rem") >= 0 &&
-        rowBtnBody.indexOf("padding: 0.25rem 0.9rem") >= 0 &&
+        rowBtnBody.indexOf("min-width: 4rem") >= 0 &&
+        rowBtnBody.indexOf("padding: 0.25rem 0.6rem") >= 0 &&
         css.indexOf("flex: 1 1 6rem") < 0 &&
         css.indexOf("justify-content: flex-end") < 0,
       "span=" + (rowActBody || "missing") + " btn=" + (rowBtnBody || "missing"));
@@ -928,6 +928,36 @@ const driver = `
         css.indexOf('[data-theme="dark"] table.sh-models tbody td') < 0 &&
         !!darkBody && darkBody.indexOf("table.sh-models tbody td") < 0,
       lightTdBody || "missing");
+    // Warm block (operator 2026-11-05): no near-white card hex survives inside
+    // the light table block - the panel takes the page parchment (light-only
+    // token with the card fallback for dark) and the unload plate in the
+    // table goes transparent. The header pill keeps its plate.
+    const panelBody = bodyOf(".sh-tabpanel {");
+    const headerCssBody = bodyOf(".sh-header {");
+    check("the light strip sits on the page parchment, dark keeps the card",
+      !!lightBody && lightBody.indexOf("--sh-panel-bg: var(--pico-background-color)") >= 0 &&
+        lightBody.indexOf("--sh-header-bg: var(--pico-background-color)") >= 0 &&
+        !!panelBody &&
+        panelBody.indexOf("background: var(--sh-panel-bg, var(--pico-card-background-color))") >= 0 &&
+        !!headerCssBody &&
+        headerCssBody.indexOf("background: var(--sh-header-bg, var(--pico-card-background-color))") >= 0 &&
+        css.indexOf(':root:not([data-theme="dark"]) .sh-unload:not(:hover)') >= 0 &&
+        css.indexOf('html[data-theme="light"] .sh-unload:not(:hover)') >= 0 &&
+        !!rootBody && rootBody.indexOf("--sh-panel-bg") < 0 &&
+        rootBody.indexOf("--sh-header-bg") < 0 &&
+        !!darkBody && darkBody.indexOf("--sh-panel-bg") < 0 &&
+        darkBody.indexOf("--sh-header-bg") < 0,
+      "panel=" + (panelBody || "missing") + " header=" + (headerCssBody || "missing"));
+    // Equal unload plates (operator #5, made consistency-proof 2026-11-05):
+    // the token plate still carries both unloads in dark; light overrides it
+    // with transparent for every unload, so row, side and Unload-all always
+    // share one background.
+    const lightPlateBody = bodyOf('html[data-theme="light"] .sh-unload:not(:hover)');
+    check("light paints no plate behind any unload and dark keeps the shared token plate",
+      !!lightPlateBody && lightPlateBody.indexOf("background: transparent") >= 0 &&
+        css.indexOf('[data-theme="dark"] .sh-unload') < 0 &&
+        !!sideJoinBody && sideJoinBody.indexOf("background: var(--sh-tab-side-bg)") >= 0,
+      "lightPlate=" + (lightPlateBody || "missing"));
     // The white "border" (operator 2026-11-05): no computed border owned it -
     // the wrapper's horizontal scrollbar trough drew white under the table.
     // Light paints the bar warm; dark keeps the platform scrollbar.

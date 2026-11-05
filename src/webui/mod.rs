@@ -322,8 +322,9 @@ mod tests {
     /// actions td, a transparent unload plate, a renamed-away `Default`
     /// label, a row-action block that is not compact, equal-width and
     /// left-aligned, light body cells painting their own surface instead of
-    /// the panel's, or a wrapper without the warm scrollbar rule, and their
-    /// asserts fail while the releasing and cost asserts stay green.
+    /// the panel's, a light block falling back to the card hex instead of
+    /// the page parchment, or a wrapper without the warm scrollbar rule, and
+    /// their asserts fail while the releasing and cost asserts stay green.
     #[test]
     fn served_assets_join_the_unload_entity_and_colour_it_amber() {
         assert_eq!(
@@ -384,12 +385,25 @@ mod tests {
         );
         assert!(
             STYLE_CSS.contains("flex: 0 0 auto")
-                && STYLE_CSS.contains("min-width: 5.75rem")
-                && STYLE_CSS.contains("padding: 0.25rem 0.9rem")
+                && STYLE_CSS.contains("min-width: 4rem")
+                && STYLE_CSS.contains("padding: 0.25rem 0.6rem")
                 && STYLE_CSS.contains("justify-content: flex-start")
                 && !STYLE_CSS.contains("justify-content: flex-end"),
-            "row action buttons are compact and never stretched (no grow, one \
-             shared floor) and left-aligned in the served stylesheet"
+            "row action buttons are word-width compact (small overhead, small \
+             equalising floor, no grow) and left-aligned in the served stylesheet"
+        );
+        assert!(
+            STYLE_CSS.contains("--sh-panel-bg: var(--pico-background-color)")
+                && STYLE_CSS.contains("--sh-header-bg: var(--pico-background-color)")
+                && STYLE_CSS
+                    .contains("background: var(--sh-panel-bg, var(--pico-card-background-color))")
+                && STYLE_CSS
+                    .contains("background: var(--sh-header-bg, var(--pico-card-background-color))",)
+                && STYLE_CSS.contains("html[data-theme=\"light\"] .sh-unload:not(:hover)")
+                && !STYLE_CSS.contains("[data-theme=\"dark\"] .sh-unload"),
+            "the whole light strip sits on the page parchment (header and panel \
+             tokens with card fallbacks, transparent cells, no plate behind any \
+             unload); dark keeps its card block and its plates byte-identical"
         );
         assert!(
             STYLE_CSS.contains(":root:not([data-theme=\"dark\"]) table.sh-models tbody td")

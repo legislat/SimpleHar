@@ -121,8 +121,18 @@ html[data-theme="dark"] {
   --sh-warn-tint: #d89b1d40;
   /* UR-01 (2026-11-05): the joined side's background token - Pico re-scopes
    * --pico-background-color to its button blue on every button, so this hex
-   * (the card surface) is what the amber label actually sits on: 6.0:1. */
+   * (the card surface) is what the amber label actually sits on: 6.0:1.
+   * Since 2026-11-05 the light overrides this plate with transparent (the
+   * strip's own parchment); the token stays so dark keeps it byte-identical. */
   --sh-tab-side-bg: #fffaf3;
+  /* Warm block (operator 2026-11-05): the table panel sits on the PAGE
+   * parchment, not the card hex - no near-white surface inside the block.
+   * Light-only; dark falls back to the card token, byte-identical. */
+  --sh-panel-bg: var(--pico-background-color);
+  /* The header strip joins the warm block (operator 2026-11-05): with no
+   * plate behind the tab-side, its background must be the parchment too -
+   * light-only, dark falls back to the card token. */
+  --sh-header-bg: var(--pico-background-color);
   --sh-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
@@ -160,7 +170,7 @@ header.sh-header {
   z-index: 10;
   padding: 0.5rem 1rem 0.6rem;
   margin-bottom: 0.8rem;
-  background: var(--pico-card-background-color);
+  background: var(--sh-header-bg, var(--pico-card-background-color));
   border-bottom: 1px solid var(--pico-card-border-color);
   box-shadow: var(--sh-card-shadow);
 }
@@ -395,7 +405,7 @@ table.sh-models :is(th, td):first-child:not(.sh-empty) { padding-left: 0; }
   border: 1px solid var(--pico-card-border-color);
   border-radius: var(--sh-radius);
   padding: 0.5rem 0.75rem;
-  background: var(--pico-card-background-color);
+  background: var(--sh-panel-bg, var(--pico-card-background-color));
 }
 
 /* The default chip's own row, in the panel head's empty space (operator 2026-11-01).
@@ -477,18 +487,19 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
   align-items: stretch;
   justify-content: flex-start;
 }
-/* Operator (2026-11-05): a compact, tidy block - word plus a small overhead
- * (padding-inline 0.9rem), no grow, so the table's spare width never
- * stretches a button. The shared 5.75rem floor keeps every pair equal: each
- * state label lands on the floor or within a few pixels of it, side by side
- * and in the stacked line alike, and the block stays flush-left. The old
- * flex-end left a gap on the left of the column as soon as it grew. */
+/* Operator (2026-11-05): a compact, tidy block - the word plus a small
+ * overhead (padding-inline 0.6rem), no grow, so the table's spare width
+ * never stretches a button (target ~55-75px at the default root). The small
+ * 4rem floor only equalises the short labels (Load/Unload/Default land on it
+ * within a pixel), side by side and in the stacked line alike; the block
+ * stays flush-left. The old flex-end left a gap on the left of the column
+ * as soon as it grew. */
 .sh-row-actions button {
-  padding: 0.25rem 0.9rem;
+  padding: 0.25rem 0.6rem;
   font-size: 0.8rem;
   margin: 0;
   flex: 0 0 auto;
-  min-width: 5.75rem;
+  min-width: 4rem;
 }
 
 /* Job strip: the last few ledger entries with their reasons. */
@@ -556,6 +567,18 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
 }
 
 .sh-unload:hover { background: var(--sh-warn-tint); }
+
+/* One plate for every unload, light (operator 2026-11-05, consistency):
+ * light paints NO plate behind any unload - the row Unload, the joined
+ * tab-side and Unload all sit on the strip's page parchment, so the pair
+ * the operator matched in #5 never splits again and no near-white plate
+ * stands next to the joined tab. Amber ink, amber border and the hover
+ * tint stay; dark keeps the --sh-tab-side-bg plate byte-identical (this
+ * rule is light-scoped, dark never matches it). */
+:root:not([data-theme="dark"]) .sh-unload:not(:hover),
+html[data-theme="light"] .sh-unload:not(:hover) {
+  background: transparent;
+}
 
 /* Above the sticky header (z-index 10) so its own corner is clickable: the header
  * subtree otherwise intercepts the toggle's pointer events (Playwright-found). */
