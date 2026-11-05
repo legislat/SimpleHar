@@ -15,7 +15,8 @@ impl ActorState {
     /// Whether `ticket` names an engine a live job has already committed to
     /// release: its ticket is that job's `victim` or one of its queued `victims`
     /// (R2-02-01). The occupant stays installed until that release is confirmed
-    /// ([`ActorState::clear_released_victim_slot`] is the window's close), so an
+    /// ([`ActorState::commit_victim_release`] is the window's close, and the same
+    /// commit terminalizes the victim's own load row - EVID-01), so an
     /// `Already` receipt for it would promise a slot the harness has already
     /// decided to empty. A terminal job is not a commitment: its unconfirmed
     /// victim stays installed on purpose (G12) and a later swap or restart

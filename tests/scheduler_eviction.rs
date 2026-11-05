@@ -312,6 +312,145 @@ async fn work_load_evicts_aux_victim_when_short() {
 }
 
 #[tokio::test]
+async fn an_eviction_terminalizes_the_victims_own_load_row_as_evicted() {
+    // EVID-01 (live proof 2026-11-05: slot empty, victim's load row still
+    // `Serving`/`loaded`): the slot table cleared on a confirmed eviction
+    // release, but the victim's own ledger row kept claiming it served, so
+    // `/har/jobs` read a gone model as resident. The same commit that empties
+    // the slot must terminalize that row as `evicted` while the incoming row —
+    // the other writer's job — is untouched and goes on to serve.
+    // The victim's kill is held BY TARGET (`hold_kill_of`, FINDINGS-19 [4]) so
+    // the pre-commit window is an observed state, not a race, and the flip is
+    // one commit.
+    // Falsifier (run in place, revert): drop the `terminalize_victim_load_row`
+    // call from `commit_victim_release` in `src/scheduler/occupant.rs` — the
+    // "slot empty" leg stays green (that was the pre-fix half) and the victim-
+    // row legs go red with `Serving`/`loaded`.
+    let witness = FakeWitness::with(vec![sample(72.0, 30.0)]);
+    let (handle, runtime) = harness_rt(
+        1,
+        &[
+            ("aux30", "mock-hold-kill", CategoryId::Aux, 30.0),
+            ("work50", "mock", CategoryId::Work, 50.0),
+        ],
+        Arc::new(witness.clone()),
+        5,
+    );
+    let Reply::Loaded(victim) = handle
+        .swap("aux30", CategoryId::Aux)
+        .await
+        .expect("aux loads")
+    else {
+        panic!("expected Loaded");
+    };
+    runtime.hold_kill_of(victim.port);
+    let evicting = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.swap("work50", CategoryId::Work).await })
+    };
+    wait_until(&handle, 10, |status| {
+        status.jobs.iter().any(|job| {
+            job.model == "work50" && job.state == simpleharn::scheduler::SwapState::Dispose
+        }) && runtime
+            .held_kills()
+            .iter()
+            .any(|(port, _)| *port == victim.port)
+    })
+    .await;
+
+    // The pre-commit window: the row still honestly claims `Serving` while the
+    // release is unproven (G12: gone or kept, never both) and the slot labels
+    // the committed release.
+    let status = handle.status().await.expect("actor alive");
+    let row = job_row(&status, "aux30");
+    assert!(
+        row.terminal
+            && row.state == simpleharn::scheduler::SwapState::Serving
+            && row.outcome.as_deref() == Some("loaded"),
+        "before the commit the victim row still serves: {row:?}"
+    );
+    assert_eq!(
+        status
+            .slots
+            .iter()
+            .find(|slot| slot.category == CategoryId::Aux)
+            .map(|slot| slot.state.as_str()),
+        Some("releasing"),
+        "the committed release is what names the row's pending death"
+    );
+
+    // Land the held release, stage the card, and let the eviction finish.
+    witness.set_used(0.0);
+    runtime.release_held_kills();
+    let Reply::Loaded(incoming) = evicting
+        .await
+        .expect("task alive")
+        .expect("work loads after evicting")
+    else {
+        panic!("expected Loaded");
+    };
+    assert_eq!(incoming.model, "work50");
+
+    let status = handle.status().await.expect("actor alive");
+    let row = job_row(&status, "aux30");
+    assert_eq!(
+        row.state,
+        simpleharn::scheduler::SwapState::Idle,
+        "the confirmed release left the victim's own row non-Serving (terminal-unloaded): {row:?}"
+    );
+    assert!(row.terminal, "the row stays terminal: {row:?}");
+    assert_eq!(
+        row.outcome.as_deref(),
+        Some("evicted"),
+        "the eviction path names itself honestly: {row:?}"
+    );
+    assert!(
+        row.error.is_none() && !row.is_fault,
+        "an eviction is not a fault: {row:?}"
+    );
+
+    // The incoming row is untouched by the fix: its own ticket is not the
+    // victim's, and the commit rewrites no row but the victim's.
+    let swap = job_row(&status, "work50");
+    assert!(
+        swap.terminal
+            && swap.state == simpleharn::scheduler::SwapState::Serving
+            && swap.outcome.as_deref() == Some("loaded"),
+        "the incoming row serves, eviction noted, wording kept: {swap:?}"
+    );
+    assert_eq!(swap.victims_released, vec!["aux30".to_string()]);
+
+    // (b) Slot and ledger agree: the AUX slot is empty exactly when no Serving
+    // row names the victim, and the WORK slot serves exactly the model whose
+    // row serves. Falsifier for the reverse direction alone: terminalize every
+    // `Serving` row of the victim's MODEL name (twin-blind), and a re-minted
+    // twin's live row would go red while this fixture's slot truth stays green.
+    let serving: Vec<&str> = status
+        .jobs
+        .iter()
+        .filter(|job| job.state == simpleharn::scheduler::SwapState::Serving)
+        .map(|job| job.model.as_str())
+        .collect();
+    let aux_empty = model_of(&status, CategoryId::Aux).is_none();
+    assert!(
+        aux_empty && !serving.contains(&"aux30"),
+        "slot empty <=> no Serving row for the victim: slots {:?}, serving {serving:?}",
+        aux_models(&status)
+    );
+    assert_eq!(
+        model_of(&status, CategoryId::Work).as_deref(),
+        Some("work50")
+    );
+    assert!(serving.contains(&"work50"), "serving rows: {serving:?}");
+    assert!(runtime.is_dead(victim.port).await, "the victim engine died");
+    assert_eq!(
+        runtime.server_count(),
+        1,
+        "only the incoming engine is live"
+    );
+}
+
+#[tokio::test]
 async fn a_stale_resident_is_evicted_like_any_other() {
     // Interlock 2 (Axis 2, ruling 2026-10-29): the amber is INFO, not policy. A
     // resident the marker has judged stale must be evicted exactly like a clean one

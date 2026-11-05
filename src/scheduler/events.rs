@@ -42,7 +42,7 @@ impl ActorState {
             (SwapState::Dispose, Event::Released(Ok(elapsed))) => {
                 self.release_samples.push(elapsed);
                 self.set_timing(job_id, |t| &mut t.release_ms);
-                self.clear_released_victim_slot(job_id);
+                self.commit_victim_release(job_id);
                 if let Some(victim) = self.jobs[&job_id].victim.clone() {
                     if let Some(job) = self.jobs.get_mut(&job_id) {
                         job.released_cost += victim.cost;
@@ -178,10 +178,12 @@ impl ActorState {
             (SwapState::CancelRequested, Event::Released(Ok(elapsed))) => {
                 // The release this job's own (aborted) reap task never proved: now the
                 // victim's engine is gone, so its slot must go the way a completed
-                // Dispose release takes it, or the ledger debits a corpse forever.
-                // Confirmed means measured: the duration joins the wait-estimate ring.
+                // Dispose release takes it, or the ledger debits a corpse forever
+                // (and the victim's own row keeps claiming a Serving nobody can
+                // serve - EVID-01). Confirmed means measured: the duration joins the
+                // wait-estimate ring.
                 self.release_samples.push(elapsed);
-                self.clear_released_victim_slot(job_id);
+                self.commit_victim_release(job_id);
                 self.finish_cancelled(job_id);
             }
             (SwapState::CancelRequested, Event::Released(Err(_))) => {

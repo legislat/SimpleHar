@@ -52,7 +52,10 @@ pub struct JobStatus {
     pub state: SwapState,
     /// Whether the job reached a terminal state.
     pub terminal: bool,
-    /// Terminal outcome note ("loaded", "unloaded", ...).
+    /// Terminal outcome note ("loaded", "unloaded", "evicted", ...). A
+    /// confirmed release rewrites a released resident's terminal load row from
+    /// "loaded" to the word that release earned (the scheduler's single commit
+    /// point), so a gone model never reads as serving on `/har/jobs`.
     pub outcome: Option<String>,
     /// Terminal error, human-readable with the numbers (G13).
     pub error: Option<String>,

@@ -3559,6 +3559,171 @@ async fn a_confirmed_release_lands_the_estimate_and_a_place_on_the_next_refusal(
 }
 
 #[tokio::test]
+async fn the_wire_reports_an_evicted_victims_row_not_serving_once_the_release_lands() {
+    // EVID-01 at the wire (the live proof's exact shape: slot empty while the
+    // evicted model's own load row kept `Serving`/`loaded`): after a cross-
+    // category eviction commits, `GET /har/jobs` and the `jobs` array of
+    // `/har/status` must show the victim row terminal and NOT Serving, with the
+    // honest `evicted` word, while the incoming row serves. The victim's kill
+    // is held BY TARGET (`hold_kill_of`, the FINDINGS-19 [4] seam) so the
+    // pre-commit window — row still `Serving`, slot `releasing`, engine alive —
+    // is an observed state, not a race, and the flip is one commit.
+    // Falsifier (run in place, revert): drop the `terminalize_victim_load_row`
+    // call from `commit_victim_release` in `src/scheduler/occupant.rs` — the
+    // slot legs below stay green (the pre-fix half already worked) and the
+    // victim-row legs on both surfaces go red with `Serving`/`loaded`.
+    let adapters: Vec<(&str, Arc<dyn EngineAdapter>)> =
+        vec![("mock-hold-kill", Arc::new(MockAdapter))];
+    let (control, _, _, _, runtime, _) = build_app(
+        aux_slots(1),
+        &[
+            ("aux30", "mock-hold-kill", CategoryId::Aux, Some(30.0)),
+            ("work50", "mock", CategoryId::Work, Some(50.0)),
+        ],
+        &adapters,
+    );
+    let (status, body) = post_json(&control, "/har/load", r#"{"model":"aux30"}"#).await;
+    assert_eq!(status, StatusCode::OK, "load aux30: {body}");
+    let (_, loaded) = get_json(&control, "/har/status").await;
+    let aux_port = u16::try_from(
+        loaded["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .find(|slot| slot["model"] == "aux30")
+            .and_then(|slot| slot["port"].as_u64())
+            .expect("the loaded AUX reports its engine port"),
+    )
+    .expect("port fits u16");
+    runtime.hold_kill_of(aux_port);
+
+    // Card 72, reserve 2, ledger-only: AUX holds 30, WORK wants 50 — the gate
+    // must evict the AUX victim (evictable by WORK) before it spawns.
+    let evicting = {
+        let control = control.clone();
+        tokio::spawn(async move { post_json(&control, "/har/load", r#"{"model":"work50"}"#).await })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (_, status_doc) = get_json(&control, "/har/status").await;
+        let releasing = status_doc["slots"]
+            .as_array()
+            .expect("slots")
+            .iter()
+            .any(|slot| slot["model"] == "aux30" && slot["state"] == "releasing");
+        let jobs = get_json(&control, "/har/jobs").await.1;
+        let still_serving = jobs["jobs"]
+            .as_array()
+            .expect("jobs")
+            .iter()
+            .any(|job| job["model"] == "aux30" && job["state"] == "Serving");
+        if releasing && still_serving {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parked eviction never made the victim row observable as serving-\
+             while-releasing (EVID-01 falsifier inverts this into a permanent red): \
+             status {status_doc}, jobs {jobs}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Land the held release: the commit point for BOTH surfaces at once.
+    runtime.release_held_kills();
+    let (status, body) = evicting.await.expect("evict task joined");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the eviction admits after the release: {body}"
+    );
+
+    let (_, jobs) = get_json(&control, "/har/jobs").await;
+    let victim_row = jobs["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .rev()
+        .find(|job| job["model"] == "aux30")
+        .expect("the victim keeps its ledger row");
+    assert_ne!(
+        victim_row["state"], "Serving",
+        "the evicted victim's row must not claim a gone engine still serves: {victim_row}"
+    );
+    assert_eq!(
+        victim_row["state"], "Idle",
+        "the terminal-unloaded state: {victim_row}"
+    );
+    assert_eq!(
+        victim_row["terminal"],
+        serde_json::json!(true),
+        "{victim_row}"
+    );
+    assert_eq!(
+        victim_row["outcome"], "evicted",
+        "the eviction names itself honestly on the wire: {victim_row}"
+    );
+    assert!(
+        victim_row["error"].is_null() && victim_row["is_fault"] == serde_json::json!(false),
+        "an eviction is not a fault: {victim_row}"
+    );
+    let incoming_row = jobs["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .rev()
+        .find(|job| job["model"] == "work50")
+        .expect("the incoming row is on the ledger");
+    assert_eq!(incoming_row["state"], "Serving", "{incoming_row}");
+    assert_eq!(incoming_row["outcome"], "loaded", "{incoming_row}");
+
+    // `/har/status.jobs` is the second surface EVID-01 caught reading stale —
+    // same actor snapshot, one truth, no second derivation allowed.
+    let (_, status_doc) = get_json(&control, "/har/status").await;
+    let status_victim = status_doc["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .rev()
+        .find(|job| job["model"] == "aux30")
+        .expect("the victim row rides /har/status too");
+    assert_ne!(
+        status_victim["state"], "Serving",
+        "/har/status.jobs must agree with /har/jobs: {status_victim}"
+    );
+    assert_eq!(status_victim["outcome"], "evicted", "{status_victim}");
+
+    // Slot and ledger agree (pin b at the wire): the AUX slot is empty exactly
+    // when no Serving row names the victim, and the engine is really gone.
+    let aux_slot = status_doc["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .find(|slot| slot["category"] == "AUX")
+        .expect("AUX slot");
+    assert!(
+        aux_slot["model"].is_null(),
+        "the victim's slot emptied: {aux_slot}"
+    );
+    assert_eq!(aux_slot["state"], "empty", "{aux_slot}");
+    let serving_rows: Vec<&str> = jobs["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .filter(|job| job["state"] == "Serving")
+        .filter_map(|job| job["model"].as_str())
+        .collect();
+    assert!(
+        !serving_rows.contains(&"aux30") && serving_rows.contains(&"work50"),
+        "no Serving row may name the gone model while the incoming one serves: {serving_rows:?}"
+    );
+    assert!(
+        runtime.is_dead(aux_port).await,
+        "the evicted engine answers nothing on its port"
+    );
+}
+
+#[tokio::test]
 async fn guards_refuse_rebinding_hosts_and_foreign_origins() {
     let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
 

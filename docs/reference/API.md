@@ -38,7 +38,7 @@ slot on a read fails the pin.
 | `GET /health` | Liveness check. Once `control_token` is set, it requires the token like every other route. A probe that omits the token reads 401 and can look like a dead listener. |
 | `GET /har/status` | Full snapshot, including `mem`, `jobs`, `last_error`, and boot timings. |
 | `GET /har/events` | SSE state pushes. |
-| `GET /har/jobs`, `GET /har/jobs/{id}` | Job ledger. Each admitted load row names its admission rung in `path` (see "Job ledger rung field"). |
+| `GET /har/jobs`, `GET /har/jobs/{id}` | Job ledger. Each admitted load row names its admission rung in `path` (see "Job ledger rung field"). A row of a released resident leaves `Serving` at the confirmed release (see "Victim row terminalization"). |
 | `GET /har/log?limit=n` | Ring buffer of harness events. |
 | `GET /har/models` | Full catalog (the page view; includes paths). The `context` field is the **effective served context**, never a stale row key. For llama it is the row `context` knob. For strata it is the context figure in the row's `strata_args` argv (the `--max-context` token or the `--max-context=` spelling, digits only; anything else answers `null`). For ninfer it is the max-context of the profile its launcher resolves (the built-in table or the `ninfer_profile_<name>` line, the identical resolution the spawn uses). Every other engine answers `null`, and so does any row whose effective context does not resolve. |
 | `POST /har/load` | `{model}`. Loads the model into its own category, from its yaml. |
@@ -94,6 +94,30 @@ refusal runs — after the gate said yes.
 The gate implements these three rungs. The rungs `beside-residual`, `lend`,
 and `park` are reserved for a future step. No code path produces a reserved
 rung.
+
+## Victim row terminalization
+
+A confirmed release commits two ledger facts together: the victim's slot
+clears, and the load row that produced that resident leaves `Serving` for
+`Idle`. The row keeps `terminal: true`, reports `state: Idle` on the wire,
+and its `outcome` takes the word that names the release:
+
+- `evicted`: a cross-category eviction released the engine.
+- `unloaded`: an operator unload, an idle-timeout sweep, a same-slot
+  replacement, or a crash restart released the engine. No test pins the
+  crash-restart cause; that one line is a static read.
+
+The row carries no error: a release is not a fault, and the row never turns
+the headline red. An unconfirmed release commits nothing: when a release
+times out, the engine stays installed, the slot reads `serving` again (see
+"Slot state field"), and the row keeps `Serving` and `loaded` — the harness
+claims no death it did not prove.
+
+Read the slot table and the ledger together: a slot is `empty` exactly when
+no `Serving` row names a model for that slot. The scheduler terminalizes
+the victim's own row at the commit point and never rewrites a row that a
+newer spawn owns (the released engine's spawn ticket decides), so a
+re-minted resident keeps its honest `Serving` row.
 
 ## Memory provenance fields
 

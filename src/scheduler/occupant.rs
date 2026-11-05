@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::measured::SamplerCtx;
-use super::{ActorMsg, ActorState, JobId, SnapshotRelease};
+use super::{ActorMsg, ActorState, JobId, JobKind, SnapshotRelease, SwapState, Victim};
 
 impl ActorState {
     /// The free memory the card had when this job's engine started: the admit reading
@@ -37,16 +37,21 @@ impl ActorState {
         }
     }
 
-    /// Clears a victim's own slot once its release is confirmed (same-slot replacement or
-    /// a cross-category evictee — never the job's slot blindly), and only while the
-    /// occupant there is still the one this ticket owns. Shared by the two arms that
-    /// accept a confirmed release, so a cancelled swap cannot leave a reaped engine
-    /// installed (chunk 4 [1]).
+    /// Commits a driver-confirmed release of `job_id`'s current `victim`: the
+    /// victim's own slot goes the way a completed release takes it (same-slot
+    /// replacement or a cross-category evictee — never the job's slot blindly),
+    /// and only while the occupant there is still the one this ticket owns, and
+    /// the victim's own load row is terminalized as unloaded (EVID-01). Shared
+    /// by the two arms that accept a confirmed release, so a cancelled swap
+    /// cannot leave a reaped engine installed (chunk 4 [1]) or a gone model
+    /// still reading `Serving` on the ledger (EVID-01 live proof: slot empty,
+    /// job row `Serving`/`loaded`). Ownership resolves HERE and only here —
+    /// one writer — see [`ActorState::terminalize_victim_load_row`].
     ///
     /// # Arguments
     ///
     /// * `job_id` - the job whose `victim` has just been released.
-    pub(super) fn clear_released_victim_slot(&mut self, job_id: JobId) {
+    pub(super) fn commit_victim_release(&mut self, job_id: JobId) {
         let Some(victim) = self.jobs.get(&job_id).and_then(|job| job.victim.clone()) else {
             return;
         };
@@ -57,6 +62,52 @@ impl ActorState {
         {
             self.clear_occupant(victim.slot);
         }
+        self.terminalize_victim_load_row(&victim);
+    }
+
+    /// EVID-01: a confirmed release means the victim's engine is gone, so the
+    /// ledger may no longer claim its load still serves. The owning row keeps
+    /// `terminal` (its swap ended at install; this is a terminal-ledger
+    /// correction, not a state-machine transition — `Serving -> Idle` is no
+    /// graph edge, which is why the row is rewritten here rather than walked
+    /// through `step`), leaves `Serving`, and takes the honest word its release earned:
+    /// `evicted` for a cross-category eviction, `unloaded` for the operator/
+    /// same-slot path (the `victim.evicted` flag, set once by the eviction
+    /// planner, is the one discriminator at this site). No error is set: a
+    /// release is not a fault, and `fault_of` stays false.
+    ///
+    /// Ownership is resolved by the identity the victim record itself carries
+    /// — `model` + `slot` name it and the spawn ticket makes it exact, the
+    /// same `model` + `ticket` authority
+    /// [`ActorState::container_reported_gb`] reads — never by pattern-matching
+    /// ledger rows for "a row that looks old": a re-minted twin (same model,
+    /// same slot, newer ticket) and the incoming job this very release belongs
+    /// to (its own ticket, or none yet) can never match. `Serving` is the only
+    /// state rewritten, which makes the commit idempotent: a row that already
+    /// went terminal-unloaded here, or never served, stays untouched.
+    fn terminalize_victim_load_row(&mut self, victim: &Victim) {
+        let outcome = if victim.evicted {
+            "evicted"
+        } else {
+            "unloaded"
+        };
+        let Some(row) = self.jobs.values_mut().find(|job| {
+            job.kind == JobKind::Load
+                && job.state == SwapState::Serving
+                && job.model == victim.model
+                && job.slot == Some(victim.slot)
+                && job.spawned.as_ref() == Some(&victim.ticket)
+        }) else {
+            return;
+        };
+        row.state = SwapState::Idle;
+        row.outcome = Some(outcome.to_string());
+        tracing::info!(
+            model = %victim.model,
+            slot = victim.slot,
+            outcome,
+            "confirmed release terminalized the victim's own load row (EVID-01)"
+        );
     }
 
     /// Takes and aborts the sampler of the serving occupant identified by

@@ -2870,6 +2870,24 @@ async fn a_swap_whose_victim_never_proves_its_release_times_out_and_keeps_the_oc
         vec![Some(HOLD_MODEL.to_string())],
         "the victim keeps its occupant"
     );
+    // EVID-01 pin (c), G12 posture at the ledger half: nobody proved the victim
+    // dead, so its own load row keeps the honest Serving/loaded truth — the row
+    // moves only at a confirmed-release commit (`commit_victim_release` in
+    // `src/scheduler/occupant.rs`), and a timeout is not one. Falsifier (run in
+    // place, revert): terminalize the victim row on the `Released(Err)` path
+    // too, and this row reads unloaded while its engine still answers its port
+    // two asserts below.
+    let resident = status
+        .jobs
+        .iter()
+        .find(|j| j.model == HOLD_MODEL && j.kind == JobKind::Load)
+        .expect("the resident's own load row is on the ledger");
+    assert!(
+        resident.terminal
+            && resident.state == SwapState::Serving
+            && resident.outcome.as_deref() == Some("loaded"),
+        "a timed-out release leaves the occupant AND its job serving: {resident:?}"
+    );
     let kept = status
         .slots
         .iter()
@@ -2938,6 +2956,33 @@ async fn a_swap_whose_victim_never_proves_its_release_times_out_and_keeps_the_oc
         unload.timings.release_ms.is_some(),
         "this time the release was proven: {:?}",
         unload.timings
+    );
+    // EVID-01, operator-path wording at the commit: the unload that finally
+    // proved the release also terminalizes the kept LOAD row — the ledger no
+    // longer claims a dead engine serves, and it names the operator release
+    // `unloaded`, never the eviction word `evicted` (`victim.evicted` is the
+    // one discriminator inside `terminalize_victim_load_row`). Falsifier: hard-
+    // code `evicted` at the commit site and this row accuses the operator's own
+    // unload of an eviction.
+    let resident = status
+        .jobs
+        .iter()
+        .find(|j| j.model == HOLD_MODEL && j.kind == JobKind::Load)
+        .expect("the resident's load row stays on the ledger");
+    assert!(resident.terminal, "the row stays terminal: {resident:?}");
+    assert_eq!(
+        resident.state,
+        SwapState::Idle,
+        "the proven release terminalized the victim's load row: {resident:?}"
+    );
+    assert_eq!(
+        resident.outcome.as_deref(),
+        Some("unloaded"),
+        "the operator release names itself honestly: {resident:?}"
+    );
+    assert!(
+        !resident.is_fault,
+        "a proven release is not a fault: {resident:?}"
     );
     assert_eq!(
         runtime.server_count(),
@@ -3235,10 +3280,12 @@ async fn chaos_engine_killed_mid_release_is_confirmed_and_leaves_no_orphan() {
     // the CONFIRMED release (never a timeout), the victim is gone (never kept: G12's
     // "gone or kept, never both"), no engine survives on its port, and the next
     // admission still works.
-    // Falsifier (run in place, revert): remove `clear_released_victim_slot` from the
+    // Falsifier (run in place, revert): remove `commit_victim_release` from the
     // `(Dispose, Released(Ok))` arm in `src/scheduler/events.rs` — the unload-acceptance
     // race B7 exists to catch — and the "slot empty / no orphan / next admission"
-    // asserts below go red while the timeout arm stays green.
+    // asserts below go red while the timeout arm stays green. The unload row's
+    // `unloaded` outcome stays the release wording B7 pins (EVID-01 re-check: the
+    // fix rewrites only the victim's LOAD row, never an unload row's note).
     let (handle, runtime) = hold_kill_harness(config(10));
     let victim = serve_hold_model(&handle).await;
     assert_eq!(runtime.server_count(), 1, "the victim engine is live");
