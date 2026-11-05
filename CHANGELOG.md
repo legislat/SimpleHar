@@ -15,6 +15,45 @@ names they shipped with. The format follows Keep a Changelog. Versions follow Se
 Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
+## Unreleased
+
+### Added
+
+- A per-row `min_turn` guard: admission refuses to evict a model that has served less
+  than the configured seconds.
+- Memory refusals carry `queue_position` and `expected_release_s` (a rolling median of
+  the harness's own measured releases).
+- `/har/status` slots carry `state`; a committed release reads `releasing` until the
+  driver confirms it.
+- `launch_only_with_at_least_vram_free: whole` selects the whole-machine gate, which
+  waits for a fully free card and never evicts.
+- The job ledger names the admission rung (`jobs[].path`).
+- Two cardless chaos legs: engine killed mid-release, harness runtime dropped mid-drain.
+- `prefetch_on_release` (experimental, off by default) warms the incoming llama or
+  basalt model during the release wait.
+- `docs/reference/COMPATIBILITY.md`, copy-ready `examples/` rows, and the control-page
+  screenshot.
+
+### Changed
+
+- The light theme is the dark theme with the lightness direction mirrored: warm page,
+  one table surface (header equals the table), controls with a darker edge, matte olive
+  accent, brighter working dot.
+- The row actions are renamed `Default` and sized to their words.
+- The local gate runs the documentation checks that CI runs.
+
+### Fixed
+
+- A confirmed victim release now terminalizes the victim's own ledger row
+  (`evicted`/`unloaded`) instead of leaving it `Serving`.
+- CI on the Windows runner: LF checkout, host-independent tests, and a toolchain-safe
+  atomic helper.
+- The release check verifies the webui fixture version against `Cargo.toml`.
+
+### Internal
+
+- The scheduler's 7,409-line inline test module moved to `scheduler/tests.rs`
+  (move-only; 9,002-line file becomes 1,595).
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
 ## Unreleased

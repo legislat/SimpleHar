@@ -584,3 +584,30 @@ recorded here so dated references to ARCHIVED still resolve:
   deliberate documented tripwires, a rename forces a pin edit by design; R2-17-02 - the
   classifier FINDING branch is recorded INFO and lands with the first FINDING-emitting test.
   | 2026-11-04 | `e5b4a0f..`
+
+- **Project renamed to SimpleHarn** (operator 2026-11-05; repo renamed 2026-11-04): product,
+  binary and crate are `simpleharn`; the primary config is `simpleharn.json`, with
+  `simplehar-se.json` and `simplehar.json` read in place (write-back stays on the loaded
+  file); `SIMPLEHARN_*` env names win with the `SIMPLEHAR_*` spellings honored as
+  deprecated fallbacks. Legacy-stable on purpose: the wire `simplehar_error` type, the
+  `owned_by: "simplehar"` value, the single-instance mutex and the `.simplehar/` custody
+  dirs. Release `v1.2.0` = `8fcaa82`. | 2026-11-05 | `01f135d..`
+
+- **B9/B10 demoted to IDEAS** (operator 2026-11-05): priority classes and restart
+  reconciliation hold no queue slot and no tier. Notes live in
+  `docs/architecture/DEFERRED-IDEAS.md` with the triggers that would reopen them; no
+  build follows without a new ruling. | 2026-11-05 | `01f135d..`
+
+- **1.3 scope and 1.4 goal** (operator 2026-11-05): release 1.3 is a major release and
+  waits for a proper backlog roundup. Its priorities are CPU-llama eviction and the
+  module split. Project Maya is the 1.4 goal. | 2026-11-05 | `01f135d..`
+
+- **CPU-llama eviction rules** (operator 2026-11-05): RAM is its own resource ladder -
+  a CPU-only row bypasses the VRAM legs, never blocks a `whole` request and is never a
+  VRAM victim; `ram_reserve_gb` defaults to 8 GiB; CPU rows are evicted only by CPU
+  admissions and GPU jobs are never RAM victims. | 2026-11-05 | `01f135d..`
+
+- **Module split waves** (operator 2026-11-05): S1 (scheduler tests out of
+  `scheduler/mod.rs`) and S2 (catalog/drift helpers into `catalog.rs`) approved.
+  Move-only commits, both-shell gates per commit, no behavior change and no test-logic
+  edits. | 2026-11-05 | `01f135d..`
