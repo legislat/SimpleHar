@@ -567,7 +567,7 @@ function modelRow(status, model, category) {
               refresh();
             }),
       },
-      text("Set default"),
+      text("Default"),
     ),
   );
   row.append(el("td", { class: "sh-actions" }, actions));
@@ -775,7 +775,7 @@ function renderTab(status, category) {
           class: "sh-mini sh-x",
           title: "clear the default",
           // Refused (e.g. the row raced a retag from another tab) it must flash and
-          // re-read, exactly like `Set default` (FINDINGS-16 [3]).
+          // re-read, exactly like the row's `Default` (FINDINGS-16 [3]).
           onclick: () =>
             postJson("/har/config/default", { category, model: null })
               .then(refresh)

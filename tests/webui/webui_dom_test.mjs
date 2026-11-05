@@ -511,14 +511,14 @@ const driver = `
       clsOf(side).indexOf(" sh-unload ") >= 0 &&
         clsOf(allBtn).indexOf(" sh-unload ") >= 0,
       "side=" + (side && side.attrs.class) + " all=" + (allBtn && allBtn.attrs.class));
-    check("Rescan, Load and Set default never take the amber class",
+    check("Rescan, Load and Default never take the amber class",
       clsOf(findAll(hdr, "button").find(function (b) { return textOf(b) === "Rescan"; }))
         .indexOf(" sh-unload ") < 0 &&
         clsOf(rowBtn("Load")).indexOf(" sh-unload ") < 0 &&
-        clsOf(rowBtn("Set default")).indexOf(" sh-unload ") < 0);
+        clsOf(rowBtn("Default")).indexOf(" sh-unload ") < 0);
     // The fixture's slot occupant is no catalog row, so the serving row is
     // synthesised the same way the booking leg does: one loaded row, its
-    // Unload amber, its Set default not; unloaded, the Load stays plain.
+    // Unload amber, its Default not; unloaded, the Load stays plain.
     const amberModel = {
       id: "amberone", engine: "ninfer", category: "WORK", vram_gb: 30, cost: "fixed",
       cost_basis: "declared", launch_floor_gb: null, measured_gb: null,
@@ -532,11 +532,11 @@ const driver = `
       container_reported_gb: null, state: "serving",
     };
     applyState({ ...fixtures["/har/status"], slots: [amberSlot], models: [amberModel] });
-    check("the serving row Unload carries sh-unload and its Set default never does",
+    check("the serving row Unload carries sh-unload and its Default never does",
       clsOf(rowBtn("Unload")).indexOf(" sh-unload ") >= 0 &&
-        clsOf(rowBtn("Set default")).indexOf(" sh-unload ") < 0,
+        clsOf(rowBtn("Default")).indexOf(" sh-unload ") < 0,
       "unload=" + (rowBtn("Unload") && rowBtn("Unload").attrs.class) +
-        " set=" + (rowBtn("Set default") && rowBtn("Set default").attrs.class));
+        " set=" + (rowBtn("Default") && rowBtn("Default").attrs.class));
     applyState({ ...fixtures["/har/status"],
       slots: [{ ...amberSlot, model: null, container_reported_gb: null }],
       models: [amberModel] });
@@ -897,6 +897,47 @@ const driver = `
         !!actionsTdBody && actionsTdBody.indexOf("border") < 0 &&
         css.indexOf("tbody td.sh") < 0,
       "tr=" + (trSepBody || "missing") + " td=" + (tdSepBody || "missing"));
+    // Tidy row actions (operator 2026-11-05): an equal-width, left-aligned
+    // block stuck to the table's left corner - flex-start, an equal basis
+    // floor on both buttons, and a flush first column.
+    const rowActBody = bodyOf(".sh-row-actions {");
+    const rowBtnBody = bodyOf(".sh-row-actions button {");
+    check("row actions are a left-aligned equal-width block",
+      !!rowActBody && rowActBody.indexOf("display: flex") >= 0 &&
+        rowActBody.indexOf("justify-content: flex-start") >= 0 &&
+        rowActBody.indexOf("flex-end") < 0 &&
+        !!rowBtnBody && rowBtnBody.indexOf("flex: 1 1 6rem") >= 0 &&
+        rowBtnBody.indexOf("min-width: 6rem") >= 0 &&
+        css.indexOf("justify-content: flex-end") < 0,
+      "span=" + (rowActBody || "missing") + " btn=" + (rowBtnBody || "missing"));
+    const flushBody = bodyOf("table.sh-models :is(th, td):first-child:not(.sh-empty)");
+    check("the first column drops its start padding so the buttons stick to the table corner",
+      !!flushBody && flushBody.indexOf("padding-left: 0") >= 0,
+      flushBody || "missing");
+    // The white "border" (operator 2026-11-05): no computed border owned it -
+    // the wrapper's horizontal scrollbar trough drew white under the table.
+    // Light paints the bar warm; dark keeps the platform scrollbar.
+    check("the table wrapper scrollbar takes the warm light tokens, not the white trough",
+      css.indexOf("scrollbar-color: var(--pico-card-border-color) var(--sh-chrome-bg)") >= 0 &&
+        css.indexOf(':root:not([data-theme="dark"]) .sh-tablewrap') >= 0 &&
+        css.indexOf('html[data-theme="light"] .sh-tablewrap') >= 0,
+      "no warm scrollbar rule");
+    // No border declaration ships a hex lighter than the page (the operator's
+    // "table border is still white" class of defect): every hex named in a
+    // border-bearing declaration sits below the page luminance.
+    const pageLum = lumOf("#f7f1e6");
+    let lightBorder = "";
+    for (const d0 of css.split(";")) {
+      const d = d0.toLowerCase();
+      if (d.indexOf("border") < 0) continue;
+      const h = d.indexOf("#");
+      if (h < 0) continue;
+      const hex = "#" + d.slice(h + 1, h + 7);
+      if (hex.length !== 7) continue;
+      if (lumOf(hex) > pageLum) lightBorder += " [" + d.trim().slice(0, 60) + "]";
+    }
+    check("no border-bearing declaration uses a hex lighter than the page",
+      lightBorder === "", lightBorder.trim() || "clean");
     // Panel head and table head are one band of one token (operator 2026-11-05:
     // "the same color, the darkest one"): both surfaces read --sh-chrome-bg,
     // declared once as the warm chrome #efe6d6.
@@ -1418,15 +1459,15 @@ const driver = `
   const quote = String.fromCharCode(96);
   const refusal = "model " + quote + "qwen3.5-4b" + quote + " belongs to RP, not WORK";
   globalThis.failNextPost = refusal;
-  const setDefault = rowButton("Set default");
-  check("row offers Set default", !!setDefault);
+  const setDefault = rowButton("Default");
+  check("row offers Default", !!setDefault);
   const beforeSet = globalThis.statusFetches;
   setDefault.dispatch("click", {});
   await flush();
-  check("refused Set default flashes the server's reason",
+  check("refused Default flashes the server's reason",
     flashBox.hidden === false && String(flashBox.textContent) === refusal,
     JSON.stringify(flashBox.textContent));
-  check("refused Set default re-reads the server", globalThis.statusFetches > beforeSet,
+  check("refused Default re-reads the server", globalThis.statusFetches > beforeSet,
     beforeSet + " -> " + globalThis.statusFetches);
   const clearDefault = findAll(document.getElementById("sh-main"), "button")
     .find((b) => textOf(b) === "\u2715");
@@ -1444,7 +1485,7 @@ const driver = `
   const beforeAccepted = globalThis.statusFetches;
   setDefault.dispatch("click", {});
   await flush();
-  check("accepted Set default re-reads the server",
+  check("accepted Default re-reads the server",
     globalThis.statusFetches > beforeAccepted && flashBox.hidden !== false,
     beforeAccepted + " -> " + globalThis.statusFetches + " flash=" + JSON.stringify(flashBox.textContent));
 

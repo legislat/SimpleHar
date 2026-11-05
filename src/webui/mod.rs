@@ -319,8 +319,10 @@ mod tests {
     /// Drop `sh-unload` from any one call site and that count assert fails;
     /// delete the amber class rule or the parchment values, reintroduce a
     /// selected-side accent override, the bright #2ea043, a flex on the
-    /// actions td or a transparent unload plate, and their asserts fail while
-    /// the releasing and cost asserts stay green.
+    /// actions td, a transparent unload plate, a renamed-away `Default`
+    /// label, a row-action block that is not equal-width and left-aligned,
+    /// or a wrapper without the warm scrollbar rule, and their asserts fail
+    /// while the releasing and cost asserts stay green.
     #[test]
     fn served_assets_join_the_unload_entity_and_colour_it_amber() {
         assert_eq!(
@@ -371,8 +373,28 @@ mod tests {
                 && STYLE_CSS.contains("--pico-muted-border-color: #d9c9b2")
                 && STYLE_CSS.matches("--pico-muted-border-color:").count() == 1,
             "the served stylesheet carries the warm Pico-primary scheme and \
-             the warm muted-border once, in the light block only (dark keeps \
-             Pico blue and Pico's cool muted border)"
+              the warm muted-border once, in the light block only (dark keeps \
+              Pico blue and Pico's cool muted border)"
+        );
+        assert!(
+            APP_JS.contains("text(\"Default\")") && !APP_JS.contains("text(\"Set default\")"),
+            "the row action is labelled Default - only the label renamed, \
+             the handler still posts the default it always posted"
+        );
+        assert!(
+            STYLE_CSS.contains("flex: 1 1 6rem")
+                && STYLE_CSS.contains("min-width: 6rem")
+                && STYLE_CSS.contains("justify-content: flex-start")
+                && !STYLE_CSS.contains("justify-content: flex-end"),
+            "row action buttons are equal-width (one shared basis floor and \
+             grow) and left-aligned in the served stylesheet"
+        );
+        assert!(
+            STYLE_CSS
+                .contains("scrollbar-color: var(--pico-card-border-color) var(--sh-chrome-bg)")
+                && STYLE_CSS.contains(":root:not([data-theme=\"dark\"]) .sh-tablewrap"),
+            "the table wrapper scrollbar carries the warm light tokens: its \
+             white trough was the white \"border\" under the table"
         );
         for parchment in ["#f7f1e6", "#fffaf3", "#d9c9b2", "#efe6d6"] {
             assert!(

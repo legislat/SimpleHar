@@ -94,7 +94,7 @@ html[data-theme="dark"] {
    * scheme to the remaining blue buttons"). Pico routes EVERY default button,
    * outline button, link, checkbox accent and focus ring through these
    * primary variables, so the recolor lives here once and new controls
-   * inherit it: Load, Set default and the default ✕ sit on the chrome plate
+   * inherit it: Load, Default and the default ✕ sit on the chrome plate
    * with the ink (#373c44 8.96:1 on #efe6d6, 8.02:1 on the hover fill),
    * Rescan and links take the walnut #6f5b36 (5.79:1 on the page, hover
    * #5a4a2b 7.63:1), and the focus ring turns warm. The form fields were the
@@ -350,6 +350,16 @@ header.sh-header {
   white-space: nowrap;
 }
 .sh-tablewrap { overflow-x: auto; }
+/* Operator (2026-11-05, "the table border is still white"): the owner was
+ * never a border - every computed border around the table reads the warm
+ * #d9c9b2 already. With the table wider than the wrapper, the horizontal
+ * scrollbar's default WHITE trough drew a white band under the table. Light
+ * paints it warm (thumb: the border token, track: the chrome plate); dark
+ * keeps the platform scrollbar untouched. */
+:root:not([data-theme="dark"]) .sh-tablewrap,
+html[data-theme="light"] .sh-tablewrap {
+  scrollbar-color: var(--pico-card-border-color) var(--sh-chrome-bg);
+}
 /* Cost cell: the number only, colour carries the provenance (operator 2026-11-01):
  * green = the gate books a launch-validated figure, yellow = unchecked. */
 .sh-cost { font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -365,6 +375,10 @@ header.sh-header {
  * between the buttons and the Model column. The td stays a table-cell (and
  * paints its row colour); the span flexes inside it. */
 table.sh-models td.sh-actions { width: max-content; }
+/* The actions column is the table's first column, so the buttons stick to
+ * its left corner: the column's cells drop the start padding (operator,
+ * 2026-11-05; the empty-state row keeps its reading indent). */
+table.sh-models :is(th, td):first-child:not(.sh-empty) { padding-left: 0; }
 .sh-extlog {
   display: inline-flex;
   align-items: center;
@@ -445,8 +459,26 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
    The tray's listener amber is a different palette; this is the config one. */
 .sh-dot[data-stale="amber"] { background: var(--sh-warn); }
 
-.sh-row-actions { display: inline-flex; flex-wrap: wrap; gap: 0.35rem; justify-content: flex-end; }
-.sh-row-actions button { padding: 0.25rem 0.7rem; font-size: 0.8rem; margin: 0; }
+.sh-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: stretch;
+  justify-content: flex-start;
+}
+/* Operator (2026-11-05): one tidy block - equal widths in every state. The
+ * 6rem flex basis floor covers Load, Unload, Loading, Releasing and the
+ * short Default label, so the pair matches side by side; the grow factors
+ * are equal and align-items stretches every stacked line to the cell, so
+ * the widths stay equal when the pair wraps under a cramped column. The old
+ * flex-end left a gap on the left of the column as soon as it grew. */
+.sh-row-actions button {
+  padding: 0.25rem 0.7rem;
+  font-size: 0.8rem;
+  margin: 0;
+  flex: 1 1 6rem;
+  min-width: 6rem;
+}
 
 /* Job strip: the last few ledger entries with their reasons. */
 .sh-jobs { margin-top: 1rem; }
@@ -500,7 +532,7 @@ table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.
  * same family as the releasing dot, never the red of a fault (red stays for
  * errors). Amber border + amber ink in both themes, an amber-tinted fill on
  * hover. One class, three call sites: the tab-side, the row Unload, and
- * Unload all. Rescan, Load and Set default keep their own colours, and the
+ * Unload all. Rescan, Load and Default keep their own colours, and the
  * parked Releasing…/Loading… buttons carry no class here - they stay plain
  * and disabled, exactly as before. Match (operator 2026-11-05): every unload
  * button sits on the same --sh-tab-side-bg plate as the tab-side - a row
