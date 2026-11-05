@@ -23,6 +23,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 node tests/webui/webui_dom_test.mjs
+node scripts/check-docs.mjs
+node scripts/check-instructions.mjs
 ```
 
 - `cargo test` includes the doc-test.
