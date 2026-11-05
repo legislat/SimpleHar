@@ -457,18 +457,15 @@ table.sh-models thead th {
 table.sh-models tbody tr {
   border-bottom: 1px solid var(--pico-table-border-color);
 }
+/* The one-surface grid (operator 2026-11-05, mirrored the same day): the
+ * body cells painted Pico's PAGE token while their own panel sat one token
+ * lighter - light proved #F7F1E6 over #FFFAF3, dark proved #10141A over
+ * #161C24 - so one table block showed two surfaces. The cells now paint
+ * nothing in BOTH themes, unscoped: the panel token shows through every gap,
+ * and dark mirrors light exactly. The cells also suppress their own bottom
+ * border uniformly - the separator lives on the TR above (2026-11-05). */
 table.sh-models tbody td {
   border-bottom: 0;
-}
-/* The white grid (operator 2026-11-05): in light the body cells painted
- * Pico's PAGE token while the panel - and therefore the gaps around the
- * buttons and the strip beside the head - sits on the card surface; headless
- * pixels proved two surfaces (#F7F1E6 vs #FFFAF3) inside one table block.
- * Light makes the cells transparent so the single panel token shows through
- * every gap; dark keeps its approved surfaces byte-identical - the rule is
- * light-scoped, dark never matches it. */
-:root:not([data-theme="dark"]) table.sh-models tbody td,
-html[data-theme="light"] table.sh-models tbody td {
   background: transparent;
 }
 /* Edge cells hug the panel (operator: margins too large, 2026-10-26). */

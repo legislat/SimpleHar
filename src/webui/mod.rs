@@ -410,11 +410,13 @@ mod tests {
              dark, and the light strip carries no plate behind any unload"
         );
         assert!(
-            STYLE_CSS.contains(":root:not([data-theme=\"dark\"]) table.sh-models tbody td")
-                && STYLE_CSS.contains("html[data-theme=\"light\"] table.sh-models tbody td")
-                && !STYLE_CSS.contains("[data-theme=\"dark\"] table.sh-models tbody td"),
-            "light body cells paint nothing - the panel token shows through \
-             every gap; dark cells keep their approved surfaces byte-identical"
+            STYLE_CSS.contains("table.sh-models tbody td {")
+                && STYLE_CSS.contains("border-bottom: 0;\n  background: transparent;")
+                && !STYLE_CSS.contains("[data-theme=\"light\"] table.sh-models tbody td")
+                && !STYLE_CSS.contains("[data-theme=\"dark\"] table.sh-models tbody td")
+                && !STYLE_CSS.contains(":root:not([data-theme=\"dark\"]) table.sh-models tbody td"),
+            "body cells paint nothing in both themes - one unscoped rule, the \
+             panel token shows through every gap, dark mirrors light exactly"
         );
         assert!(
             STYLE_CSS

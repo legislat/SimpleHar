@@ -925,18 +925,20 @@ const driver = `
     check("the first column drops its start padding so the buttons stick to the table corner",
       !!flushBody && flushBody.indexOf("padding-left: 0") >= 0,
       flushBody || "missing");
-    // One surface through the table block (operator 2026-11-05): light body
-    // cells painted the page token while the panel and every gap around them
-    // sit on the card surface. Light cells go transparent so the panel token
-    // shows through; the rule is light-scoped and dark never matches it.
-    const lightTdBody =
-      bodyOf('html[data-theme="light"] table.sh-models tbody td');
-    check("light body cells paint nothing and dark cells stay untouched",
-      css.indexOf(':root:not([data-theme="dark"]) table.sh-models tbody td') >= 0 &&
-        !!lightTdBody && lightTdBody.indexOf("background: transparent") >= 0 &&
+    // One surface through the table block in BOTH themes (operator
+    // 2026-11-05): body cells painted the page token while their own panel
+    // sat one token lighter - light #F7F1E6 over #FFFAF3, dark #10141A over
+    // #161C24. One unscoped rule now makes every body cell paint nothing, so
+    // the panel token shows through and dark mirrors light exactly.
+    const mirrorTdBody = bodyOf("table.sh-models tbody td {");
+    check("body cells paint nothing in both themes - one unscoped mirror rule",
+      !!mirrorTdBody && mirrorTdBody.indexOf("background: transparent") >= 0 &&
+        mirrorTdBody.indexOf("border-bottom: 0") >= 0 &&
+        css.indexOf('[data-theme="light"] table.sh-models tbody td') < 0 &&
         css.indexOf('[data-theme="dark"] table.sh-models tbody td') < 0 &&
+        css.indexOf(':root:not([data-theme="dark"]) table.sh-models tbody td') < 0 &&
         !!darkBody && darkBody.indexOf("table.sh-models tbody td") < 0,
-      lightTdBody || "missing");
+      mirrorTdBody || "missing");
     // Warm block (operator 2026-11-05): no near-white card hex survives inside
     // the light table block - the panel takes the page parchment (light-only
     // token with the card fallback for dark) and the unload plate in the
