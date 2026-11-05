@@ -2315,7 +2315,7 @@ fn the_token_wall_is_constant_time_and_scheme_case_insensitive() {
         "s3cret",
         "the trim matches `resolve_control_token`"
     );
-    let source = include_str!("mod.rs");
+    let source = include_str!("guards.rs");
     let body_of = |name: &str| {
         let start = source
             .find(name)
@@ -2349,7 +2349,7 @@ fn the_token_wall_is_constant_time_and_scheme_case_insensitive() {
 /// line to `std::env::var("SIMPLEHARN_TOKEN")` and the assert fires.
 #[test]
 fn the_control_token_reads_env_only_through_the_renamed_reader() {
-    let source = include_str!("mod.rs");
+    let source = include_str!("guards.rs");
     let body = source
         .split("fn resolve_control_token(")
         .nth(1)
