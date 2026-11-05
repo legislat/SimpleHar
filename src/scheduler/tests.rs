@@ -3561,6 +3561,24 @@ async fn a_greedy_launched_residents_fold_never_rebooks_even_on_a_fixed_row() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Forces the file's mtime one minute forward. A same-size edit is then a real
+/// byte move even on a coarse volume: the Windows clock can collapse a sub-tick
+/// rewrite, and the fingerprint is (mtime, size) (TRR-01).
+fn bump_mtime(path: &std::path::Path) {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open for the clock bump");
+    file.set_times(
+        std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now()
+                .checked_add(std::time::Duration::from_secs(60))
+                .expect("mtime in range"),
+        ),
+    )
+    .expect("force the mtime forward");
+}
+
 /// A cost-only rescan (phase 4, `rebook_cost_only_moves`): the loaded
 /// resident's booking follows the new bytes WITHOUT a reload, the capture
 /// rides with it so the marker round stays green, and the next unchanged
@@ -3570,16 +3588,14 @@ async fn a_greedy_launched_residents_fold_never_rebooks_even_on_a_fixed_row() {
 #[test]
 fn a_cost_only_edit_rebooks_the_loaded_resident_without_a_reload() {
     let (mut state, yaml, _) = resident_on_a_file();
-    // The fingerprint is (mtime, size): the seed and the edit below have the
-    // same byte length, so a same-tick write could leave the stamp unchanged
-    // and the rebook would (correctly) refuse a "moved stamp, same bytes".
-    // Let the clock tick so the edit is a real byte move on every machine.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // The seed and the edit below have the same byte length: force the stamp
+    // forward so the edit is a real byte move on every machine.
     std::fs::write(
         &yaml,
         "engine: mock\ncost: fixed\nmeasured_gb: 12.0\nmeasured_gb_min: 8.0\n",
     )
     .expect("operator cost edit");
+    bump_mtime(&yaml);
     rescan(&mut state, &yaml, "m");
     let after = state.snapshot();
     assert_eq!(
@@ -3752,14 +3768,14 @@ fn a_cost_only_edit_never_moves_a_ram_resident_into_the_vram_ledger() {
         }),
         job: None,
     }];
-    // The fingerprint is (mtime, size): let the clock tick so the edit is a
-    // real byte move on every machine (the GPU re-book pin's posture).
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Same-size cost edit: force the stamp forward (the GPU re-book pin's
+    // posture).
     std::fs::write(
         &yaml,
         "engine: llama\ncpu_offload: true\nram_gb: 10\nvram_gb: 12\n",
     )
     .expect("operator cost edit");
+    bump_mtime(&yaml);
     rescan(&mut state, &yaml, "cpu");
     let after = state.snapshot();
     assert_eq!(
@@ -3796,12 +3812,14 @@ fn a_cost_only_edit_never_moves_a_ram_resident_into_the_vram_ledger() {
     );
     // The amber half: a later flag edit still earns the amber — adopting
     // cost bytes launders nothing.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Same-size flag edit: force the stamp forward so the amber is a byte
+    // move on every machine.
     std::fs::write(
         &yaml,
         "engine: llama\ncpu_offload: false\nram_gb: 10\nvram_gb: 12\n",
     )
     .expect("operator flag edit");
+    bump_mtime(&yaml);
     rescan(&mut state, &yaml, "cpu");
     let after = state.snapshot();
     assert_eq!(

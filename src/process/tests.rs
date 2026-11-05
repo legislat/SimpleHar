@@ -830,6 +830,71 @@ fn log_pruning_keeps_the_newest_per_model_and_spares_other_models() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Cross-pool and cross-class isolation under a prefix collision: model
+/// `swift` (older files) is pruned while model `swift-7b` (newer files, both
+/// classes) and a non-minted look-alike sit in the same dir. A bare
+/// `{model}-` prefix claim would judge `swift-7b-<epoch>.log` as one of
+/// `swift`'s own files — model names legally contain `-` — and a class-blind
+/// prune would rotate snapshots against captures. The survivor set is exact,
+/// so a reach into either foreign pool, the decoy shape, or across the class
+/// line goes red on the one assert.
+/// Falsifier (wrong prefix): replace the all-digit epoch check in
+/// `prune_model_logs` with `true` — the prune of `swift` then also claims
+/// `swift-7b-*` and the decoy, deleting the older half of both.
+/// Falsifier (across classes): drop the `!is_container_log` guard from the
+/// client-class predicate — snapshots join the client budget and the exact
+/// survivor set no longer holds.
+#[test]
+fn a_prefix_sharing_model_never_prunes_the_longer_names_pool() {
+    let dir = crate::testutil::temp_dir("logprune-collide");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp logs dir");
+    // The pruned model's own pool, six per class, oldest first (lowest index
+    // = oldest mtime), written before every foreign file.
+    for i in 0..6 {
+        std::fs::write(dir.join(format!("swift-{i}.log")), b"x").expect("seed capture");
+        std::fs::write(dir.join(format!("swift-{i}.container.log")), b"x").expect("seed snapshot");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Shares the `swift-` prefix but is nobody's minted shape (`swift-x.log`,
+    // epoch not all digits): outside every pool's scope at any budget.
+    std::fs::write(dir.join("swift-x.log"), b"x").expect("seed look-alike");
+    std::thread::sleep(Duration::from_millis(10));
+    // The longer name's pool: NEWER than every `swift` file, so a prefix-only
+    // mis-scope would keep these newest and delete `swift`'s — and the older
+    // ones of these — instead of leaving them untouched.
+    for i in 0..6 {
+        std::fs::write(dir.join(format!("swift-7b-{i}.log")), b"x").expect("seed 7b capture");
+        std::fs::write(dir.join(format!("swift-7b-{i}.container.log")), b"x")
+            .expect("seed 7b snapshot");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    prune_model_logs(&dir, "swift", 2);
+    let mut survivors: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    survivors.sort();
+    let mut expected: Vec<String> = vec![
+        "swift-4.log".to_string(),
+        "swift-5.log".to_string(),
+        "swift-4.container.log".to_string(),
+        "swift-5.container.log".to_string(),
+        "swift-x.log".to_string(),
+    ];
+    for i in 0..6 {
+        expected.push(format!("swift-7b-{i}.log"));
+        expected.push(format!("swift-7b-{i}.container.log"));
+    }
+    expected.sort();
+    assert_eq!(
+        survivors, expected,
+        "pruning `swift` may reach nothing outside its own minted shape, pool, and class"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// R2-08-03 falsifier: one forensic pool key, `sanitize_slug`, for both
 /// mint sites. Model `qwen 7b` must land its REAL spawned capture under the
 /// sanitized stem `qwen_7b-`, and its keep-N prune must bound the captures
