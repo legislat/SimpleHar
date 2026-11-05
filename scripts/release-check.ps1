@@ -173,38 +173,46 @@ if (Test-Path -LiteralPath $fixturePath) {
 # 9. Public docs carry no personal machine paths (operator ruling 2026-11-04,
 #    review follow-up: DECISIONS.md and DOCTRINE.md are scanned like every
 #    other live doc; the ledger line that leaked a research path was scrubbed
-#    to a name-only reference). The blocklist names personal locations on the
-#    operator machine: the repo roots, user homes, the scratch and backup
-#    volumes, and the staging and rollback directory names. Legitimate
-#    documented engine defaults are not personal and stay allowed: the
-#    llama.cpp install default lives under C:\Inference, so the ban exempts
-#    exactly that one subtree.
-# Legacy machine-path bans: the old-product spellings below are old install,
-# backup and staging directory names on the operator machine - not product names.
-$personalPathPatterns = @(
-  'C:\\Inference\\(?!llama\.cpp)',
-  'C:\\Users\\',
-  'D:\\WORKSPACE-VS',
-  'D:\\SimpleHar-SE-backups',
-  '_release_v',
-  '_test-',
-  'SimpleHar-SE_release',
-  'SimpleHar-SE_test'
-)
-$publicDocs = @('README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'AGENTS.md')
-if (Test-Path 'docs') {
-  $publicDocs += (Get-ChildItem -LiteralPath 'docs' -Recurse -Filter '*.md' |
-    ForEach-Object { $_.FullName })
+#    to a name-only reference). The ban set is the shared constant
+#    scripts/machine-path-bans.json - node scripts/check-docs.mjs enforces the
+#    same patterns at every push, so a durable doc cannot pass the cardless
+#    gate and trip only this release leg on the same path. The blocklist names
+#    personal locations on the operator machine: the repo roots, user homes,
+#    the scratch and backup volumes, and the staging and rollback directory
+#    names. Legitimate documented engine defaults are not personal and stay
+#    allowed: the llama.cpp install default lives under C:\Inference, so the
+#    first ban exempts exactly that one subtree.
+$bansPath = Join-Path $PSScriptRoot 'machine-path-bans.json'
+$bansError = ''
+$personalPathPatterns = @()
+try {
+  $personalPathPatterns = @(
+    (Get-Content -LiteralPath $bansPath -Raw -Encoding UTF8 |
+      ConvertFrom-Json).bans)
+} catch {
+  $bansError = "$_"
 }
-$machinePathHits = @()
-foreach ($pattern in $personalPathPatterns) {
-  $hits = Select-String -Path $publicDocs -Pattern $pattern -ErrorAction SilentlyContinue
-  foreach ($hit in $hits) {
-    $machinePathHits += ($hit.Path + ":" + $hit.LineNumber)
+$personalPathPatterns = @($personalPathPatterns |
+  Where-Object { ($_ -is [string]) -and ($_ -ne '') })
+if ($bansError -or $personalPathPatterns.Count -eq 0) {
+  Report $false ("shared machine-path ban set missing or empty: " + $bansPath +
+    $(if ($bansError) { " (" + $bansError + ")" } else { "" }))
+} else {
+  $publicDocs = @('README.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'AGENTS.md')
+  if (Test-Path 'docs') {
+    $publicDocs += (Get-ChildItem -LiteralPath 'docs' -Recurse -Filter '*.md' |
+      ForEach-Object { $_.FullName })
   }
+  $machinePathHits = @()
+  foreach ($pattern in $personalPathPatterns) {
+    $hits = Select-String -Path $publicDocs -Pattern $pattern -ErrorAction SilentlyContinue
+    foreach ($hit in $hits) {
+      $machinePathHits += ($hit.Path + ":" + $hit.LineNumber)
+    }
+  }
+  Report ($machinePathHits.Count -eq 0) ("public docs carry no machine paths" +
+    $(if ($machinePathHits.Count -gt 0) { ": " + (($machinePathHits | Sort-Object -Unique) -join "; ") } else { "" }))
 }
-Report ($machinePathHits.Count -eq 0) ("public docs carry no machine paths" +
-  $(if ($machinePathHits.Count -gt 0) { ": " + (($machinePathHits | Sort-Object -Unique) -join "; ") } else { "" }))
 
 if ($script:allPass) {
   Write-Output "RELEASE CHECK PASS"

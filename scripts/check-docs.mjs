@@ -5,7 +5,9 @@
 //   2. Relative Markdown links resolve to existing files.
 //   3. No author-specific absolute Windows drive paths in durable docs. Documented
 //      product defaults in README/reference and exact quoted decisions are allowed.
-//      (fail inside code fences too, except for those documented defaults).
+//      (fail inside code fences too, except for those documented defaults). The
+//      shared machine-path ban set in scripts/machine-path-bans.json is enforced
+//      here and by scripts/release-check.ps1 alike.
 //   4. No duplicate H1.
 //   5. Every durable doc is listed in docs/DOCS_README.md by filename or path.
 //   6. No literal DRAFT in a doc whose front matter status is active.
@@ -31,17 +33,26 @@ const FRONT_MATTER_EXEMPT = new Set(["README.md"]);
 const failures = [];
 const fail = (path, line, message) => failures.push(`${path}:${line}: ${message}`);
 
-// Exact quoted rulings may contain the operator's paths. Product defaults are allowed
-// in user-facing docs; author-specific paths (for example C:\Users\...) still fail.
+// Exact quoted rulings may contain the operator's paths: the two ledgers are
+// exempt from the generic drive rule. The shared machine-path bans below apply
+// to every durable doc, exactly as scripts/release-check.ps1 applies them, so
+// one machine path can never pass this gate and fail the release check.
 const PATH_EXEMPT = new Set([
   "docs/architecture/DECISIONS.md",
   "docs/architecture/DOCTRINE.md",
 ]);
-// Legacy machine-path note: the old-product spelling inside this pattern is the
-// name of the operator's current checkout directory on disk (kept until file
-// renames land) - it is a documented-path exemption, not a product name.
+// The canonical machine-path ban set, read from the one shared file so this
+// checker and scripts/release-check.ps1 can never disagree. The llama.cpp
+// engine-default allowance lives inside the first ban pattern itself.
+const MACHINE_PATH_BANS = JSON.parse(
+  readFileSync(join(HERE, "machine-path-bans.json"), "utf8")
+).bans.map((pattern) => new RegExp(pattern, "i"));
+// Documented product defaults: the llama.cpp install default, the strata
+// install home, and the model-root example, all named in README/reference.
+// Author-specific paths (for example C:\Users\... or an F:\ model path) are
+// not product defaults and still fail.
 const PRODUCT_DEFAULT_PATH =
-  /(?:C:\\Inference\\llama\.cpp|C:\\Strata|C:\\Inference\\SimpleHar-SE|D:\\Models)/i;
+  /(?:C:\\Inference\\llama\.cpp|C:\\Strata|D:\\Models)/i;
 
 function listFiles(relDir) {
   const abs = join(ROOT, relDir);
@@ -187,8 +198,19 @@ for (const rel of docs) {
   // 7. Repo-relative paths in inline code.
   checkInlinePaths(rel, entries);
 
-  // 3. Absolute Windows drive paths, code fences included. Exempt exact ruling
-  //    copies; allow documented product defaults, reject author-specific paths.
+  // 3. Machine paths, code fences included. The shared ban set first: every
+  //    durable doc, ruling copies included, exactly like release-check.ps1.
+  //    Then the generic drive rule: it rejects author-specific paths on any
+  //    drive, exempts the exact ruling copies, and allows the documented
+  //    product defaults.
+  entries.forEach((e) => {
+    for (const ban of MACHINE_PATH_BANS) {
+      if (ban.test(e.line)) {
+        fail(rel, e.n, `machine path in durable doc (shared ban ${ban.source})`);
+        break;
+      }
+    }
+  });
   if (!PATH_EXEMPT.has(rel)) {
     entries.forEach((e) => {
       const m = e.line.match(/(^|[^A-Za-z0-9])([A-Za-z]):[\\/]/);

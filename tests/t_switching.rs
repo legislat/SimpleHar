@@ -1640,6 +1640,55 @@ async fn t13_security_guards() {
 
 // ---------------------------------------------------------------- T14
 
+/// The per-model forensic keep, mirrored from the private `ENGINE_LOG_KEEP`
+/// in `src/process.rs`. The T-suite mirrors product constants the way the
+/// tier consts mirror `tier.ps1`: if the product constant moves, the seeded
+/// bounds below go red, so the drift is loud, not silent.
+const ENGINE_LOG_KEEP: usize = 5;
+
+/// The seeded epoch band below: six digits. A real capture epoch is
+/// milliseconds since the epoch (thirteen digits at this date), so a minted
+/// file with an epoch under this bound is one this test seeded and never a
+/// product artifact.
+const SEEDED_EPOCH_CEILING: u128 = 1_000_000_000;
+
+/// The epoch of one file inside the `{prefix}` forensic pool: the minted
+/// shape `{model}-{epoch}.log` / `{model}-{epoch}.container.log` with an
+/// all-digit epoch — the exact scope `prune_model_logs` claims, pool-exact
+/// (`work06-` never claims a `work06b-` file). `None` is outside the pool.
+fn log_epoch(path: &std::path::Path, prefix: &str) -> Option<u128> {
+    let rest = path
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .strip_prefix(prefix)?;
+    let epoch = rest
+        .strip_suffix(".container.log")
+        .or_else(|| rest.strip_suffix(".log"))
+        .unwrap_or(rest);
+    if epoch.is_empty() || !epoch.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    epoch.parse().ok()
+}
+
+/// One model's forensic pool files in `dir`, fail-closed like the leg it
+/// serves: the count and the sweep must share one predicate, and an
+/// unreadable directory is a leg error, never a zero.
+fn minted_model_logs(dir: &std::path::Path, model: &str) -> Vec<PathBuf> {
+    let prefix = format!("{model}-");
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+        panic!(
+            "cannot read {}: engine logs must be listable: {error}",
+            dir.display()
+        )
+    });
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| log_epoch(path, &prefix).is_some())
+        .collect()
+}
+
 #[tokio::test]
 #[ignore = "operator-gated: soak loop; iterations via SE_SOAK_ITERATIONS (default 3)"]
 async fn t14_soak() {
@@ -1649,6 +1698,38 @@ async fn t14_soak() {
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(3);
+
+    // TD-01: the old bound (`<= 50` files named `work06*`) could not fail at
+    // any documented run size (3-20 iterations spawn <= 20 files per model)
+    // and conflated the `work06` and `work06b` pools. The product prunes each
+    // model's forensic pool to the per-model keep at every spawn, so the
+    // bound only becomes falsifiable when the pool already holds more history
+    // than that keep. Seed every model this soak spawns with `keep + 3`
+    // historical files per class, in the exact minted shape and the clearly
+    // synthetic six-digit epoch band. Sweep first: litter from an earlier
+    // failed leg must never decide this one's counts.
+    std::fs::create_dir_all(&harness.logs_dir)
+        .unwrap_or_else(|error| panic!("cannot create {}: {error}", harness.logs_dir.display()));
+    for model in ["work06", "work06b", "aux06"] {
+        for stale in minted_model_logs(&harness.logs_dir, model) {
+            let _ = std::fs::remove_file(&stale);
+        }
+        for epoch in 100_000u64..(100_000 + ENGINE_LOG_KEEP as u64 + 3) {
+            std::fs::write(
+                harness.logs_dir.join(format!("{model}-{epoch}.log")),
+                b"seeded history",
+            )
+            .expect("seed historical capture");
+            std::fs::write(
+                harness
+                    .logs_dir
+                    .join(format!("{model}-{epoch}.container.log")),
+                b"seeded history",
+            )
+            .expect("seed historical snapshot");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     let mut failures = 0;
     // The WORK legs alternate so every iteration forces a real same-category
@@ -1686,22 +1767,74 @@ async fn t14_soak() {
         0,
         "zero orphans after the soak"
     );
-    // Engine logs land beside the exe as `<name>-<epoch>.log`. Count only this run's
-    // engines, and fail closed if the directory cannot be read: the previous version
-    // counted a temp path that never exists, so `unwrap_or(0)` made this unfailable.
-    let log_files = std::fs::read_dir(&harness.logs_dir)
-        .map_err(|error| format!("cannot read {}: {error}", harness.logs_dir.display()))
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().starts_with("work06"))
-                .count()
-        })
-        .expect("engine log directory readable");
-    assert!(
-        log_files <= 50,
-        "this run's engine logs bounded: {log_files} files"
-    );
+    // The "logs bounded" criterion, falsifiable this time (TD-01). Every soak
+    // spawn prunes the model's pool before writing its capture, so the seeded
+    // history must sit capped at the per-model keep, the whole pool bounded at
+    // keep+1 (the final spawn's own capture is the one file past the keep),
+    // and the newest real capture must have survived - over-pruning is not
+    // "bounded". A disabled prune leaves all `keep + 3` seeded files per class
+    // standing and both keep asserts go red; the same seed shape through the
+    // same product prune is pinned cardless by
+    // `captures_and_snapshots_of_one_model_share_one_sanitized_pool`
+    // (`src/process/tests.rs`), red under the identical mutation (2026-11-05).
+    for model in ["work06", "work06b", "aux06"] {
+        let prefix = format!("{model}-");
+        let (mut captures, mut snapshots) = (0usize, 0usize);
+        let (mut seeded_captures, mut seeded_snapshots) = (0usize, 0usize);
+        let mut real_capture_survivor = false;
+        for path in minted_model_logs(&harness.logs_dir, model) {
+            let epoch = log_epoch(&path, &prefix).expect("minted shape");
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".container.log"))
+            {
+                snapshots += 1;
+                if epoch < SEEDED_EPOCH_CEILING {
+                    seeded_snapshots += 1;
+                }
+            } else {
+                captures += 1;
+                if epoch < SEEDED_EPOCH_CEILING {
+                    seeded_captures += 1;
+                } else {
+                    real_capture_survivor = true;
+                }
+            }
+        }
+        let seeded = ENGINE_LOG_KEEP + 3;
+        assert!(
+            captures <= ENGINE_LOG_KEEP + 1,
+            "{model}: client-capture pool bounded at keep+1: {captures} files"
+        );
+        assert!(
+            snapshots <= ENGINE_LOG_KEEP + 1,
+            "{model}: container-snapshot pool bounded at keep+1: {snapshots} files"
+        );
+        assert!(
+            seeded_captures <= ENGINE_LOG_KEEP,
+            "{model}: seeded capture history pruned to the per-model keep: \
+             {seeded_captures} of {seeded} still present"
+        );
+        assert!(
+            seeded_snapshots <= ENGINE_LOG_KEEP,
+            "{model}: seeded snapshot history pruned to the per-model keep: \
+             {seeded_snapshots} of {seeded} still present"
+        );
+        assert!(
+            real_capture_survivor,
+            "{model}: the newest real capture must survive the prune"
+        );
+    }
+    // Leg cleanup: this leg seeds files beside the exe, so it removes them -
+    // seeded history and its own captures alike. A leg that failed above left
+    // its litter for inspection; the sweep at the seed site keeps the next
+    // leg immune to it either way.
+    for model in ["work06", "work06b", "aux06"] {
+        for leftover in minted_model_logs(&harness.logs_dir, model) {
+            let _ = std::fs::remove_file(&leftover);
+        }
+    }
     println!("T14 PASS ({iterations} iterations; full plan: set SE_SOAK_ITERATIONS=20)");
 }
 

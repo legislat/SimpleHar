@@ -5,11 +5,12 @@
 const CATEGORY_ORDER = ["WORK", "RP", "AUX", "EMB"];
 const POLL_MS = 2000;
 
-// The display name of a category (ruling 2026-11-05): the effective `label`
-// from the status document, falling back to the id when the document carries
-// none (an older harness) or carries a blank one. The id stays the request and
-// order key everywhere: CATEGORY_ORDER drives tabs and payloads, and no label
-// value may ever reach a `/har/*` body or the route logic.
+// The display name of a category (ruling 2026-11-05): the `label` the server
+// renders on every category row (the trimmed name, else the id - the server's
+// `effective_label`). The read below only normalizes defensively; no
+// supported harness emits a row without a non-blank label. The id stays the
+// request and order key everywhere: CATEGORY_ORDER drives tabs and payloads,
+// and no label value may ever reach a `/har/*` body or the route logic.
 function categoryLabel(status, id) {
   const entry = Array.isArray(status.categories)
     ? status.categories.find((cat) => cat.id === id)
@@ -206,16 +207,14 @@ function renderTabItem(status, category) {
   const loading = slotJobsFor(status, category).length > 0;
   // Local name kept clear of the module-level UI `state` object (shadowing here
   // would send the onclick handler reading a string).
-  // The server owns `slots[].state` (ruling 2026-11-04): a committed release
-  // shows `releasing` while the occupant is still installed. No `releasing`
-  // slot (and no `state` field on an old payload) leaves today's derivation
-  // untouched.
+  // The server owns `slots[].state` (ruling 2026-11-04) and renders it on
+  // every slot row: a committed release shows `releasing` while the occupant
+  // is still installed. No `releasing` slot leaves the derivation untouched.
   const releasing = slots.some((slot) => slot.state === "releasing");
   // The pill text names the first occupant OUTSIDE the releasing slots
   // (review B3R-02, 2026-11-04): a slot releasing beside a serving one still
   // names the serving model, and the releasing dot carries the in-flight
-  // release. A payload without `state` keeps every occupied slot here, so an
-  // older harness renders exactly as before.
+  // release.
   const kept = slots
     .filter((slot) => slot.state !== "releasing")
     .map((slot) => slot.model)
@@ -504,9 +503,9 @@ function modelRow(status, model, category) {
   // The server owns the fault rule (`fault_of`: failed LOAD, cancels excluded) so the
   // row dot and the headline can never disagree (review, 2026-10-26).
   const failed = !!last && last.is_fault === true;
-  // The server owns `slots[].state` (ruling 2026-11-04): the dot follows a
-  // committed release named on this model's slot. A payload without `state`
-  // (an older harness) keeps today's derivation.
+  // The server owns `slots[].state` (ruling 2026-11-04) and renders it on
+  // every slot row: the dot follows a committed release named on this model's
+  // slot.
   const releasing = status.slots.some(
     (slot) => slot.category === category && slot.model === model.id && slot.state === "releasing",
   );

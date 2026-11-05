@@ -674,10 +674,11 @@ pub(crate) fn fit_capable(engine: &str) -> bool {
 /// (`NINFER-8004-INCIDENT-2026-10-31`): `--restart no` (nothing revives on WSL
 /// boot without the harness deciding), loopback-only publish (the served port
 /// never leaves the machine's loopback interface, §5), and bounded container
-/// logs (`json-file`, 25 MiB × 5 — a week of a serving engine never fills the
-/// distro). The pre-reap of our own name makes `docker run` idempotent, and the
-/// final echo is the machine-readable launch stamp the harness's readiness
-/// forensics read.
+/// logs (`json-file`; the size and count come from the config keys
+/// `ninfer_log_max_size_mib` and `ninfer_log_max_files`, defaults 25 MiB x 5 —
+/// a week of a serving engine never fills the distro). The pre-reap of our own
+/// name makes `docker run` idempotent, and the final echo is the
+/// machine-readable launch stamp the harness's readiness forensics read.
 pub(crate) const CANONICAL_NINFER_SCRIPT: &str = r#"#!/usr/bin/env bash
 # simpleharn canonical ninfer autostart — rendered by the harness from its embedded
 # template; staged content-addressed and launched INSTEAD of any operator script.
