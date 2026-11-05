@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use super::{jobs::JobStatus, JobId};
+use super::{fault_of, jobs::JobStatus, occupant::state_last_used, ActorState, JobId, Slot};
 
 /// Immutable status snapshot (Step 2: reads never probe and never mutate).
 #[derive(Debug, Clone, Serialize)]
@@ -99,4 +99,103 @@ pub struct SlotStatus {
     /// occupants by this (FINDINGS-06 \[1]: never fabricate an instant instead).
     #[serde(skip)]
     pub loaded_at: Instant,
+}
+
+impl ActorState {
+    /// What the occupant's own container reported it reserves (R9), read off the
+    /// spawn anchor of the job that produced this exact occupant (`model` + `ticket`
+    /// — never the model name alone, which a re-minted twin can steal): Some only
+    /// for a ninfer container spawn whose anchor folded an `engine_report` figure.
+    /// The API's memory-bar sum derives from this so `/har/status` and the SSE push
+    /// quote ONE source (review 2026-10-31: threading the sum only through the SSE
+    /// build left the poll path — the only path a token-gated page has — forever
+    /// null, and a fixture carrying the value hid it).
+    fn container_reported_gb(&self, slot: &Slot) -> Option<f64> {
+        let occupant = slot.occupant.as_ref()?;
+        let job = self.jobs.iter().find_map(|(_, job)| {
+            (job.model == occupant.model && job.spawned.as_ref() == Some(&occupant.ticket))
+                .then_some(job)
+        })?;
+        let anchor = job.measured.as_ref()?;
+        (job.engine == crate::ownership::NINFER_ENGINE
+            && anchor.container
+            && anchor.attribution == Some(crate::model::MeasuredAttribution::EngineReport))
+        .then(|| anchor.range.map(|(high, _)| high))
+        .flatten()
+    }
+
+    pub(super) fn snapshot(&self) -> SchedulerStatus {
+        let now = Instant::now();
+        SchedulerStatus {
+            catalog_errors: self.catalog_errors.clone(),
+            // One accessor derives the payload from the dedupe state (empty means
+            // absent, never an empty list that would keep the key alive).
+            stranded_containers: self
+                .last_reported_stranded
+                .as_ref()
+                .filter(|names| !names.is_empty())
+                .cloned(),
+            // R11: only stamps earned under the CURRENT epoch answer — the page
+            // must never show a green carried across a rescan, and reading this
+            // is pure memory (no fs, no clock), like every other snapshot field.
+            fit_validated: self
+                .fit_stamps
+                .iter()
+                .filter(|(_, (epoch, ok))| *ok && *epoch == self.fit_gen())
+                .map(|(model, _)| model.clone())
+                .collect(),
+            slots: self
+                .slots
+                .iter()
+                .map(|s| SlotStatus {
+                    category: s.category,
+                    index: s.index,
+                    model: s.occupant.as_ref().map(|o| o.model.clone()),
+                    port: s.occupant.as_ref().map(|o| o.port),
+                    pid: s.occupant.as_ref().map(|o| o.ticket.pid),
+                    need_gib: s.occupant.as_ref().map(|o| o.need.0),
+                    idle_s: s.occupant.as_ref().map(|o| {
+                        let last = state_last_used(o, &self.last_used);
+                        now.duration_since(last).as_secs()
+                    }),
+                    serve_id: s.occupant.as_ref().and_then(|o| o.serve_id.clone()),
+                    loading_job: s.job,
+                    // The one derivation of the slot label (see
+                    // `ActorState::slot_state`): a committed release reads
+                    // `releasing` until the driver confirms it.
+                    state: self.slot_state(s).to_string(),
+                    launched_at: s
+                        .occupant
+                        .as_ref()
+                        .map(|o| crate::model::iso8601_utc(o.launched_at_wall)),
+                    stale_config: s.occupant.as_ref().map(|o| o.stale_config),
+                    container_reported_gb: self.container_reported_gb(s),
+                    loaded_at: s.occupant.as_ref().map_or(now, |o| o.loaded_at),
+                })
+                .collect(),
+            jobs: self
+                .jobs
+                .iter()
+                .map(|(id, j)| JobStatus {
+                    id: *id,
+                    kind: j.kind,
+                    path: j.path,
+                    model: j.model.clone(),
+                    category: j.category,
+                    state: j.state,
+                    terminal: j.terminal,
+                    outcome: j.outcome.clone(),
+                    error: j.error.as_ref().map(|e| e.to_string()),
+                    need_gib: j.need.map(|n| n.0),
+                    free_at_admit_gib: j.free_at_admit.map(|n| n.0),
+                    observed_at_admit_gib: j.observed_at_admit,
+                    gate_target_gib: j.gate_target,
+                    victims_released: j.victims_released.clone(),
+                    warnings: j.warnings.clone(),
+                    is_fault: fault_of(j.terminal, j.kind, j.outcome.as_deref(), j.error.is_some()),
+                    timings: j.timings,
+                })
+                .collect(),
+        }
+    }
 }

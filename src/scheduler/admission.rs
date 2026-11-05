@@ -6,12 +6,60 @@ use crate::budget::{self, AdmissionError, BudgetFacts, Gibibytes, WaitHint};
 use crate::config::CategoryId;
 use crate::model::ModelEntry;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{
     ActorMsg, ActorState, AdmissionPath, Event, Job, JobId, JobKind, JobTimings, SchedulerError,
     SwapState, Victim, Waiter,
 };
+
+/// How many recent confirmed releases the wait-estimate ring keeps. Bounded by
+/// design (same posture as the log ring): the median answers a refusal, and 32
+/// confirmed releases describe recent release behavior as well as a longer
+/// window without letting one old swap dominate.
+pub(super) const RELEASE_SAMPLE_CAP: usize = 32;
+
+/// Rolling ring of the harness's own measured release durations, in seconds
+/// (accept to driver-confirmed). Memory-only by ruling: nothing is persisted,
+/// so a fresh process has no sample and quotes no estimate — the honest
+/// starting state, not a missing cache (operator ruling 2026-11-04).
+pub(super) struct ReleaseSamples {
+    pub(super) seconds: std::collections::VecDeque<f64>,
+}
+
+impl ReleaseSamples {
+    pub(super) fn new() -> Self {
+        Self {
+            seconds: std::collections::VecDeque::with_capacity(RELEASE_SAMPLE_CAP),
+        }
+    }
+
+    /// Appends one confirmed release, dropping the oldest sample past the cap.
+    pub(super) fn push(&mut self, elapsed: Duration) {
+        if self.seconds.len() == RELEASE_SAMPLE_CAP {
+            self.seconds.pop_front();
+        }
+        self.seconds.push_back(elapsed.as_secs_f64());
+    }
+
+    /// The median release duration in seconds. Odd count: the middle value.
+    /// Even count: the mean of the two middle values (the exact-even rule —
+    /// it never invents a sample that was not measured). `None` on an empty
+    /// ring: with no confirmed release there is no basis to quote an estimate.
+    pub(super) fn median_s(&self) -> Option<f64> {
+        if self.seconds.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.seconds.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let mid = sorted.len() / 2;
+        Some(if sorted.len() % 2 == 1 {
+            sorted[mid]
+        } else {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        })
+    }
+}
 
 impl ActorState {
     /// The ordinary load path: register the row and arm it in one step.

@@ -5,11 +5,13 @@
 
 use crate::engine::{EngineMeasurement, EngineRuntime, MeasurementConfidence, MeasurementSource};
 use crate::ownership::SpawnTicket;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 use super::measured::SamplerCtx;
-use super::{ActorMsg, ActorState, JobId, JobKind, SnapshotRelease, SwapState, Victim};
+use super::{ActorMsg, ActorState, JobId, JobKind, Occupant, SnapshotRelease, SwapState, Victim};
 
 impl ActorState {
     /// The free memory the card had when this job's engine started: the admit reading
@@ -441,4 +443,16 @@ impl ActorState {
             }
         });
     }
+}
+
+/// The occupant's last use: the proxy-side hint when present, else load time.
+pub(super) fn state_last_used(
+    occupant: &Occupant,
+    last_used: &HashMap<String, Instant>,
+) -> Instant {
+    last_used
+        .get(&occupant.model)
+        .copied()
+        .unwrap_or(occupant.loaded_at)
+        .max(occupant.loaded_at)
 }

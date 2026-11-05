@@ -42,11 +42,13 @@ use crate::engine::{EngineAdapter, EngineRuntime};
 use crate::model::scan::{Catalog, ScanError, ScanKind};
 use crate::model::ModelEntry;
 use crate::ownership::SpawnTicket;
+use admission::ReleaseSamples;
 use catalog::{gather_drift_stats, scan_with_binary_check, DriftStats};
 use fit::FitEntry;
 use jobs::{Job, Victim, Waiter};
 use measured::{MeasuredAnchor, MeasuredData, Reading};
 use messages::{ActorMsg, Event, ReconcileRelease, ServeIdProbeRelease, SnapshotRelease};
+use occupant::state_last_used;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -58,6 +60,8 @@ use tokio::sync::mpsc;
 use crate::budget::AdmissionError;
 #[cfg(test)]
 use crate::ownership::ResourceKind;
+#[cfg(test)]
+use admission::RELEASE_SAMPLE_CAP;
 #[cfg(test)]
 use catalog::missing_binary_error;
 #[cfg(test)]
@@ -271,63 +275,6 @@ struct Slot {
     engine_port: u16,
     occupant: Option<Occupant>,
     job: Option<JobId>,
-}
-
-/// How many recent confirmed releases the wait-estimate ring keeps. Bounded by
-/// design (same posture as the log ring): the median answers a refusal, and 32
-/// confirmed releases describe recent release behavior as well as a longer
-/// window without letting one old swap dominate.
-const RELEASE_SAMPLE_CAP: usize = 32;
-
-/// Rolling ring of the harness's own measured release durations, in seconds
-/// (accept to driver-confirmed). Memory-only by ruling: nothing is persisted,
-/// so a fresh process has no sample and quotes no estimate — the honest
-/// starting state, not a missing cache (operator ruling 2026-11-04).
-struct ReleaseSamples {
-    seconds: std::collections::VecDeque<f64>,
-}
-
-impl ReleaseSamples {
-    fn new() -> Self {
-        Self {
-            seconds: std::collections::VecDeque::with_capacity(RELEASE_SAMPLE_CAP),
-        }
-    }
-
-    /// Appends one confirmed release, dropping the oldest sample past the cap.
-    fn push(&mut self, elapsed: Duration) {
-        if self.seconds.len() == RELEASE_SAMPLE_CAP {
-            self.seconds.pop_front();
-        }
-        self.seconds.push_back(elapsed.as_secs_f64());
-    }
-
-    /// The median release duration in seconds. Odd count: the middle value.
-    /// Even count: the mean of the two middle values (the exact-even rule —
-    /// it never invents a sample that was not measured). `None` on an empty
-    /// ring: with no confirmed release there is no basis to quote an estimate.
-    fn median_s(&self) -> Option<f64> {
-        if self.seconds.is_empty() {
-            return None;
-        }
-        let mut sorted: Vec<f64> = self.seconds.iter().copied().collect();
-        sorted.sort_by(f64::total_cmp);
-        let mid = sorted.len() / 2;
-        Some(if sorted.len() % 2 == 1 {
-            sorted[mid]
-        } else {
-            (sorted[mid - 1] + sorted[mid]) / 2.0
-        })
-    }
-}
-
-/// The occupant's last use: the proxy-side hint when present, else load time.
-fn state_last_used(occupant: &Occupant, last_used: &HashMap<String, Instant>) -> Instant {
-    last_used
-        .get(&occupant.model)
-        .copied()
-        .unwrap_or(occupant.loaded_at)
-        .max(occupant.loaded_at)
 }
 
 /// The actor's message loop. The initial catalog scan is the **first thing this task
@@ -947,103 +894,6 @@ impl ActorState {
             .expect("invariant: callers hold live job ids");
         let elapsed = job.t0.elapsed().as_millis() as u64;
         *field(&mut job.timings) = Some(elapsed);
-    }
-
-    /// What the occupant's own container reported it reserves (R9), read off the
-    /// spawn anchor of the job that produced this exact occupant (`model` + `ticket`
-    /// — never the model name alone, which a re-minted twin can steal): Some only
-    /// for a ninfer container spawn whose anchor folded an `engine_report` figure.
-    /// The API's memory-bar sum derives from this so `/har/status` and the SSE push
-    /// quote ONE source (review 2026-10-31: threading the sum only through the SSE
-    /// build left the poll path — the only path a token-gated page has — forever
-    /// null, and a fixture carrying the value hid it).
-    fn container_reported_gb(&self, slot: &Slot) -> Option<f64> {
-        let occupant = slot.occupant.as_ref()?;
-        let job = self.jobs.iter().find_map(|(_, job)| {
-            (job.model == occupant.model && job.spawned.as_ref() == Some(&occupant.ticket))
-                .then_some(job)
-        })?;
-        let anchor = job.measured.as_ref()?;
-        (job.engine == crate::ownership::NINFER_ENGINE
-            && anchor.container
-            && anchor.attribution == Some(crate::model::MeasuredAttribution::EngineReport))
-        .then(|| anchor.range.map(|(high, _)| high))
-        .flatten()
-    }
-
-    fn snapshot(&self) -> SchedulerStatus {
-        let now = Instant::now();
-        SchedulerStatus {
-            catalog_errors: self.catalog_errors.clone(),
-            // One accessor derives the payload from the dedupe state (empty means
-            // absent, never an empty list that would keep the key alive).
-            stranded_containers: self
-                .last_reported_stranded
-                .as_ref()
-                .filter(|names| !names.is_empty())
-                .cloned(),
-            // R11: only stamps earned under the CURRENT epoch answer — the page
-            // must never show a green carried across a rescan, and reading this
-            // is pure memory (no fs, no clock), like every other snapshot field.
-            fit_validated: self
-                .fit_stamps
-                .iter()
-                .filter(|(_, (epoch, ok))| *ok && *epoch == self.fit_gen())
-                .map(|(model, _)| model.clone())
-                .collect(),
-            slots: self
-                .slots
-                .iter()
-                .map(|s| SlotStatus {
-                    category: s.category,
-                    index: s.index,
-                    model: s.occupant.as_ref().map(|o| o.model.clone()),
-                    port: s.occupant.as_ref().map(|o| o.port),
-                    pid: s.occupant.as_ref().map(|o| o.ticket.pid),
-                    need_gib: s.occupant.as_ref().map(|o| o.need.0),
-                    idle_s: s.occupant.as_ref().map(|o| {
-                        let last = state_last_used(o, &self.last_used);
-                        now.duration_since(last).as_secs()
-                    }),
-                    serve_id: s.occupant.as_ref().and_then(|o| o.serve_id.clone()),
-                    loading_job: s.job,
-                    // The one derivation of the slot label (see
-                    // `ActorState::slot_state`): a committed release reads
-                    // `releasing` until the driver confirms it.
-                    state: self.slot_state(s).to_string(),
-                    launched_at: s
-                        .occupant
-                        .as_ref()
-                        .map(|o| crate::model::iso8601_utc(o.launched_at_wall)),
-                    stale_config: s.occupant.as_ref().map(|o| o.stale_config),
-                    container_reported_gb: self.container_reported_gb(s),
-                    loaded_at: s.occupant.as_ref().map_or(now, |o| o.loaded_at),
-                })
-                .collect(),
-            jobs: self
-                .jobs
-                .iter()
-                .map(|(id, j)| JobStatus {
-                    id: *id,
-                    kind: j.kind,
-                    path: j.path,
-                    model: j.model.clone(),
-                    category: j.category,
-                    state: j.state,
-                    terminal: j.terminal,
-                    outcome: j.outcome.clone(),
-                    error: j.error.as_ref().map(|e| e.to_string()),
-                    need_gib: j.need.map(|n| n.0),
-                    free_at_admit_gib: j.free_at_admit.map(|n| n.0),
-                    observed_at_admit_gib: j.observed_at_admit,
-                    gate_target_gib: j.gate_target,
-                    victims_released: j.victims_released.clone(),
-                    warnings: j.warnings.clone(),
-                    is_fault: fault_of(j.terminal, j.kind, j.outcome.as_deref(), j.error.is_some()),
-                    timings: j.timings,
-                })
-                .collect(),
-        }
     }
 }
 

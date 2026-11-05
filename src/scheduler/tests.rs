@@ -4328,9 +4328,9 @@ async fn a_greedy_basalt_resident_credits_only_its_room_at_admit() {
 /// the net fires (FINDINGS-BATCH-2026-10-28P [P-1]'s M-E).
 #[test]
 fn the_snapshot_reads_the_cached_verdict_and_never_stats() {
-    let source = include_str!("mod.rs");
+    let source = include_str!("status.rs");
     let start = source
-        .find("    fn snapshot(&self) -> SchedulerStatus {")
+        .find("    pub(super) fn snapshot(&self) -> SchedulerStatus {")
         .expect("snapshot is still in this file");
     let body = &source[start
         ..start
