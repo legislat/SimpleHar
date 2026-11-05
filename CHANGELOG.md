@@ -84,6 +84,10 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
   (move-only; 9,002-line file becomes 1,595).
 The release steps live in `docs/process/GIT_WORKFLOW.md`.
 
+Tag: `v1.3.0`. Commit: `011257a` (release prep). Artifact: `simpleharn.exe`,
+built 2026-11-05, SHA256
+`E4B57FCFE5B9A0B7A1FF0C31D4450DE4D43519ACE0E6A80E3C90F95C93E806A3`.
+
 ## v1.2.0 - 2026-11-04
 
 Tag: `v1.2.0`. Commit: `8fcaa82` (release prep). Artifact: `simpleharn.exe`,
