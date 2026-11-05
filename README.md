@@ -7,11 +7,19 @@ engines on one GPU behind one OpenAI-compatible API. One swap scheduler is the o
 of scheduler state. It admits every model load against the memory the card itself reports,
 and it refuses to overcommit. The product name is SimpleHarn, and the repository is
 `legislat/SimpleHarn`. The binary is `simpleharn.exe`, the config file is `simpleharn.json`,
-and the environment names use the `SIMPLEHARN_` prefix. An existing `simplehar-se.json` or
-`simplehar.json` config and the deprecated `SIMPLEHAR_*` environment names keep working.
+and the environment names use the `SIMPLEHARN_` prefix.
 
 Current release: **v1.3.0**. Windows 10/11, one NVIDIA GPU, single user.
 Prebuilt binaries: see the GitHub Releases page of this repository.
+
+## Rename from SimpleHar SE
+
+The project shipped under the working name SimpleHar SE. An unrelated utility named
+SimpleHAR, a HAR-file viewer, already used that name. The product, binary, crate, config
+file, env names, wire identifiers, and custody dirs are now SimpleHarn. There is no
+backward compatibility and no migration. The harness ignores an old `simplehar-se.json`
+or `simplehar.json` config file. The old `SIMPLEHAR_*` environment names are inert. The
+harness never reads the old wire values or the old `.simplehar` custody dirs.
 
 > This is a personal harness, built for my own machine and my own setup. Feel free to try
 > it out, give feedback, and contribute.
@@ -65,9 +73,8 @@ cargo build --release
 2. Run `target\release\simpleharn.exe` with the `ModelConf` folder beside it. First run
    probes the GPU total (NVML) and `llama-server.exe` on PATH. It writes the authoritative
    `simpleharn.json` beside the exe, and it binds loopback only. It never overwrites a
-   config file that already exists. An existing `simplehar-se.json` keeps working: the
-   harness loads it in place and writes back there; an older `simplehar.json` is copied
-   over once.
+   config file that already exists. The harness ignores an old `simplehar-se.json` or
+   `simplehar.json` file and creates `simpleharn.json`.
 
 3. Open `http://127.0.0.1:8708/`. Load one model on the page. The harness starts that
    model's engine. No engine runs before a load.
@@ -124,7 +131,7 @@ keys:
 - `internal_host`: bind address. Default `127.0.0.1`. Read Security before you change it.
 - `control_token`: when set, every route except the page assets requires it. The
   `SIMPLEHARN_TOKEN` environment variable overrides it and keeps the secret out of the
-  file. The deprecated `SIMPLEHAR_TOKEN` spelling still works, with one logged warning.
+  file. The old `SIMPLEHAR_TOKEN` spelling is inert.
 - `categories`: per-category id, port, slots, default model, and eviction.
 - `vram_total_gb`: admission ceiling. First run normally detects it from the card.
 - `modelconf_dir`: catalog directory. Default: a `ModelConf` folder beside the exe.

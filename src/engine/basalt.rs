@@ -3,7 +3,7 @@
 //! Same doctrine as strata template mode (operator ruling 2026-11-02 row 19),
 //! generalized: the row yaml names the interpreters, the weights and a few
 //! scalars; the harness renders the whole profile itself, stages it
-//! content-addressed into its own custody root (`.simplehar/basalt-profiles`),
+//! content-addressed into its own custody root (`.simpleharn/basalt-profiles`),
 //! and rewrites the `--config` slot to exactly the staged file. `host`, `port`
 //! and the key are absent from the profile **by construction** and harness-
 //! forced in argv; the served id is verified at readiness by an exact

@@ -55,10 +55,11 @@ The reply is `{"object": "list", "data": [...]}`. Each row carries `id`,
 `object: "model"`, `owned_by`, and `engine`. Evidence: `v1_models` and
 `models_are_filtered_per_listener`.
 
-`owned_by` is the string `simplehar`. It is a deliberate, legacy-stable public
-wire identifier. It keeps its pre-rename spelling so clients that branch on it
-keep parsing. The earliest rename is v2.0. Evidence: the keep-pin inside
-`models_are_filtered_per_listener`.
+`owned_by` is the string `simpleharn`. The harness never sends the pre-rename
+string `simplehar`. There is no backward compatibility for the old value, so a
+client that branches on `owned_by` must match the new one. Evidence: the pins
+inside `models_are_filtered_per_listener` and the naming pins in
+`tests/naming_cleanup.rs`.
 
 This answer carries no loaded stamp. The loaded facts `launched_at` and
 `stale_config` ride only the control-side `/har/models` and the SSE `har_state`
@@ -175,8 +176,9 @@ page claims no full OpenAI parameter coverage.
   `unknown_routes_answer_the_envelope_on_every_listener`, and
   `wrong_methods_answer_the_envelope_and_keep_the_allow_header`. The full code
   list lives in `docs/reference/API.md`.
-- The `error.type` value is `simplehar_error`. It is legacy-stable on purpose.
-  The tests above pin it.
+- The `error.type` value is `simpleharn_error`. The tests above pin it. The
+  harness never sends the pre-rename `simplehar_error` value; there is no
+  backward compatibility for it.
 - An admission refusal adds two wait fields at the flat top level.
   `queue_position` is a one-based integer or an explicit null.
   `expected_release_s` is the rolling median of the harness's own measured

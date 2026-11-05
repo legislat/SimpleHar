@@ -607,7 +607,7 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
     // operator-steerable: the canonical script `cat`s this file into `--api-key`, so
     // an arbitrary path would let a yaml export any distro secret (`.ssh/id_rsa`)
     // into `docker run` argv — the key lives in exactly one custody root,
-    // `$HOME/.simplehar/keys/<file>.key`, with `<file>` a single bare word
+    // `$HOME/.simpleharn/keys/<file>.key`, with `<file>` a single bare word
     // (chunk-10 custody doctrine: engines obey only harness-owned locations).
     let key_file = optional_param(model, "ninfer_key_file")
         .unwrap_or_else(|| format!("{keys_root}/{container}.key"));
@@ -1502,17 +1502,17 @@ mod tests {
             (
                 "ninfer_key_file",
                 "/home/u/.ssh/id_rsa",
-                "$HOME/.simplehar/keys/",
+                "$HOME/.simpleharn/keys/",
             ),
             (
                 "ninfer_key_file",
-                "$HOME/.simplehar/keys/../../.ssh/id_rsa.key",
-                "$HOME/.simplehar/keys/",
+                "$HOME/.simpleharn/keys/../../.ssh/id_rsa.key",
+                "$HOME/.simpleharn/keys/",
             ),
             (
                 "ninfer_key_file",
-                "$HOME/.simplehar/keys/sub/x.key",
-                "$HOME/.simplehar/keys/",
+                "$HOME/.simpleharn/keys/sub/x.key",
+                "$HOME/.simpleharn/keys/",
             ),
             ("ninfer_serve_cmd", "bash -c id", "ninfer_serve_cmd"),
         ] {
@@ -1641,7 +1641,7 @@ mod tests {
                 .expect("key mode renders");
             let script = spec.script.expect("rendered");
             assert!(
-                script.contains("API_KEY_FILE=\"$HOME/.simplehar/keys/ninfer-x.key\""),
+                script.contains("API_KEY_FILE=\"$HOME/.simpleharn/keys/ninfer-x.key\""),
                 "{script}"
             );
             assert!(script.contains("missing or empty"), "{script}");

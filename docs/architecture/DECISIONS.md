@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [architect, agent]
 source_of_truth_for: [settled and deferred decisions]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: new-decision, release
 ---
 
@@ -41,10 +41,13 @@ change and no ruling may be deleted.
   kill/release (handle signaled + TCP-refused proof); witness 2 s TTL, no stale guesses.
   A job reaps **every** process it owns (victim + own spawn); engine kill/release require
   `(port, generation)` - a stale ticket is refused, never honoured.
-- Config file is king (read *and* write-back target `AppConfig.source_path`,
-  `SIMPLEHAR_CONFIG`-aware; SE's own `simplehar-se.json`, legacy read-only, one shared
-  `config::default_config_path()`). Optional `control_token`, `SIMPLEHAR_TOKEN` beats the
-  file. Tray red = listener down, not per-job errors.
+- Config file is king (read *and* write-back target `AppConfig.source_path`).
+  Discovery reads only `simpleharn.json`; only the `SIMPLEHARN_*` env names
+  are read (`SIMPLEHARN_CONFIG`, `SIMPLEHARN_TOKEN`, `SIMPLEHARN_LOG`), and
+  `SIMPLEHARN_TOKEN` beats the file value. No other config name is read and
+  there is no migration (2026-11-05 ruling: the SimpleHar name and its
+  compatibility are retired). Optional `control_token`. Tray red = listener
+  down, not per-job errors.
 - Guard order: structural refusals (Host, cross-site `Origin` -> **403**, content-type -> 415)
   precede the token (401); only `/`, `/index.html`, `/app.js`, `/style.css`,
   `/pico.min.css`, `/favicon.png`, `/favicon.ico` are unauthenticated, and
@@ -592,7 +595,17 @@ recorded here so dated references to ARCHIVED still resolve:
   file); `SIMPLEHARN_*` env names win with the `SIMPLEHAR_*` spellings honored as
   deprecated fallbacks. Legacy-stable on purpose: the wire `simplehar_error` type, the
   `owned_by: "simplehar"` value, the single-instance mutex and the `.simplehar/` custody
-  dirs. Release `v1.2.0` = `8fcaa82`. | 2026-11-05 | `01f135d..`
+  dirs. Release `v1.2.0` = `8fcaa82`. SUPERSEDED 2026-11-05 by the entry below. | 2026-11-05 | `01f135d..`
+
+- **No SimpleHar compatibility; the name retires fully** (operator instruction
+  2026-11-05, TASK-NAMING-CLEANUP): supersedes the "legacy-stable on purpose"
+  sentence in the entry above. The name clash with the SimpleHAR HAR-file viewer
+  retires every legacy spelling. Config discovery reads only `simpleharn.json`; an old
+  `simplehar-se.json` or `simplehar.json` is ignored. Only `SIMPLEHARN_CONFIG`,
+  `SIMPLEHARN_TOKEN` and `SIMPLEHARN_LOG` are read; the `SIMPLEHAR_*` spellings are
+  inert. The wire values are `simpleharn_error` and `owned_by: "simpleharn"`. The
+  single-instance mutex is `SimpleHarn-SingleInstance` and the custody roots are
+  `.simpleharn/`. There is no fallback read and no migration. | 2026-11-05 | `01f135d..`
 
 - **B9/B10 demoted to IDEAS** (operator 2026-11-05): priority classes and restart
   reconciliation hold no queue slot and no tier. Notes live in

@@ -189,7 +189,7 @@ pub(super) fn model_json(
     let mut body = json!({
         "id": entry.name,
         "object": "model",
-        "owned_by": "simplehar",
+        "owned_by": "simpleharn",
         "engine": entry.engine,
         "category": entry.category,
         "vram_gb": entry.vram_gb,
@@ -447,7 +447,7 @@ pub(super) async fn v1_models(
             json!({
                 "id": entry.name,
                 "object": "model",
-                "owned_by": "simplehar",
+                "owned_by": "simpleharn",
                 "engine": entry.engine,
             })
         })

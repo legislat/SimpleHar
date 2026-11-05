@@ -26,7 +26,7 @@ use super::llama::LLAMA_ENGINE_HOST;
 /// tree: a staged file can never shadow or be confused with a hand-written one
 /// (template adoption, operator ruling 2026-10-31). This is the ninfer row's
 /// executed-path custody root: the location the harness itself writes and runs.
-pub(crate) const NINFER_STAGED_SCRIPTS_ROOT: &str = ".simplehar/autostart";
+pub(crate) const NINFER_STAGED_SCRIPTS_ROOT: &str = ".simpleharn/autostart";
 
 /// The one directory a ninfer key file may live in, as the distro shell sees it
 /// (`$HOME` expands in the assignment; `~` never does). The canonical script
@@ -35,7 +35,7 @@ pub(crate) const NINFER_STAGED_SCRIPTS_ROOT: &str = ".simplehar/autostart";
 /// lives in exactly one custody root, `<root>/<file>.key`, with `<file>` a
 /// single bare word (chunk-10 custody doctrine: engines obey only
 /// harness-owned locations).
-pub(crate) const NINFER_KEYS_ROOT: &str = "$HOME/.simplehar/keys";
+pub(crate) const NINFER_KEYS_ROOT: &str = "$HOME/.simpleharn/keys";
 
 /// The Windows directory harness-rendered strata profiles stage into, as the
 /// tail below the executable's own directory — beside the strata custody
@@ -45,14 +45,14 @@ pub(crate) const NINFER_KEYS_ROOT: &str = "$HOME/.simplehar/keys";
 /// `--config` to exactly the staged file, so the child reads only what the
 /// harness wrote. `process::strata_profiles_dir` resolves it to an absolute
 /// path from the single source that this cell spells.
-pub(crate) const STRATA_RENDERED_PROFILES_ROOT: &str = ".simplehar/strata-profiles";
+pub(crate) const STRATA_RENDERED_PROFILES_ROOT: &str = ".simpleharn/strata-profiles";
 
 /// The Windows directory harness-rendered basalt profiles stage into, as the
 /// tail below the executable's own directory — the same exe-adjacent custody
 /// posture as [`STRATA_RENDERED_PROFILES_ROOT`], one directory per engine so a
 /// basalt launch can never stage into strata's pool or the reverse
 /// (`TASK-BASALT` stage 1; `process::rendered_profiles_dir` resolves it).
-pub(crate) const BASALT_RENDERED_PROFILES_ROOT: &str = ".simplehar/basalt-profiles";
+pub(crate) const BASALT_RENDERED_PROFILES_ROOT: &str = ".simpleharn/basalt-profiles";
 
 /// The CLOSED allow-list of `extra_args` option words an operator may pass
 /// through to llama-server (FINDINGS2-0910 [1]): the inversion of the old
@@ -1631,13 +1631,13 @@ mod tests {
         assert!(admits_under_root(
             &row,
             CustodyClass::Data,
-            "$HOME/.simplehar/keys/x.key"
+            "$HOME/.simpleharn/keys/x.key"
         ));
         assert!(
             !admits_under_root(
                 &row,
                 CustodyClass::Data,
-                "$HOME/.simplehar/keys/../../x.key"
+                "$HOME/.simpleharn/keys/../../x.key"
             ),
             "a traversal component matches no root"
         );
@@ -1650,7 +1650,7 @@ mod tests {
         assert!(!admits_under_root(
             &row,
             CustodyClass::Executed,
-            "$HOME/.simplehar/keys/x.key"
+            "$HOME/.simpleharn/keys/x.key"
         ));
     }
 

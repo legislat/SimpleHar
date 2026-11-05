@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: agent
 source_of_truth_for: [binding product invariants]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: new-decision, release
 ---
 
@@ -18,8 +18,8 @@ non-ASCII punctuation in quotes is replaced with ASCII equivalents only.
 
 1. **Config file is king.** "Config file is king (read and write-back target
    `AppConfig.source_path`, `SIMPLEHARN_CONFIG`-aware; SimpleHarn's own
-   `simpleharn.json`, previous and legacy config names read-only-compatible
-   (auto-discovery and migration only; an
+   `simpleharn.json`, and no other config name is ever read (ruling
+   2026-11-05; an
    explicitly selected `SIMPLEHARN_CONFIG` path is an operator instruction and the
    write target, ruling 2026-11-03), one shared
    `config::default_config_path()`)." `SIMPLEHARN_TOKEN` beats the file value.

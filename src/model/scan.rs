@@ -3107,7 +3107,7 @@ mod tests {
              ninfer_serve_args: --spec=dflash2 --draft-tokens=7\n\
              ninfer_gpu_device: \"0\"\n\
              ninfer_model_id: golden-id\n\
-             ninfer_key_file: $HOME/.simplehar/keys/golden-box.key\n\
+             ninfer_key_file: $HOME/.simpleharn/keys/golden-box.key\n\
              ninfer_serve_cmd: ninfer-serve\n\
              ninfer_env: CUDA_MODULE_LOADING=LAZY\n\
              external: false\n",

@@ -179,6 +179,8 @@ if (Test-Path -LiteralPath $fixturePath) {
 #    documented engine defaults are not personal and stay allowed: the
 #    llama.cpp install default lives under C:\Inference, so the ban exempts
 #    exactly that one subtree.
+# Legacy machine-path bans: the old-product spellings below are old install,
+# backup and staging directory names on the operator machine - not product names.
 $personalPathPatterns = @(
   'C:\\Inference\\(?!llama\.cpp)',
   'C:\\Users\\',

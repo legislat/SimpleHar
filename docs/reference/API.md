@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [HTTP control API contract, error codes, memory provenance]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: behavior-change, release
 ---
 
@@ -192,9 +192,9 @@ declaration (max truth). A declaration at or above the report stands.
 
 Every error carries both a flat `{code, message}` and the OpenAI-style
 `{error:{message,type,code}}` envelope, with the same values in both. The
-`type` value is the wire identifier `simplehar_error`; it is legacy-stable:
-it keeps its pre-rename spelling on purpose so existing clients keep
-parsing, and it is not renamed with the product. The
+`type` value is the wire identifier `simpleharn_error`. It follows the product
+name. The harness never sends the pre-rename `simplehar_error` value; there is
+no backward compatibility for it. The
 `code` is one of: `not_found` (404), `bad_request` (400), `unauthorized`
 (401, control token), `forbidden` (403, cross-site `Origin` on a POST),
 `conflict` (409, cancelled / superseded / port still held / an edit the

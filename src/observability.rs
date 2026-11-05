@@ -523,10 +523,8 @@ pub(crate) fn file_sink_path_for_test() -> Option<PathBuf> {
 
 /// Initializes the global tracing subscriber.
 ///
-/// Filter level comes from the `SIMPLEHARN_LOG` environment variable — or, as a
-/// deprecated fallback (TASK-RENAME-SIMPLEHARN, review R1R-01), `SIMPLEHAR_LOG`,
-/// honored only when the primary name is unset and reported once through the
-/// subscriber installed below; when neither name is set it defaults to
+/// Filter level comes from the `SIMPLEHARN_LOG` environment variable — the one
+/// name read (TASK-NAMING-CLEANUP); when it is unset the level defaults to
 /// `DEFAULT_LOG_LEVEL`. A value that does not parse is **not** silently
 /// accepted: `EnvFilter::new` is `parse_lossy`, which drops unparseable directives and
 /// defaults to `ERROR` (tracing-subscriber-0.3.23 src/filter/env/mod.rs:350-354) — so
@@ -538,12 +536,11 @@ pub(crate) fn file_sink_path_for_test() -> Option<PathBuf> {
 /// Called once from `main`; tests never call it (the default subscriber would
 /// reject a second registration).
 pub fn init() {
-    // The knob reads through the centralized rename-aware reader (R1R-01):
-    // SIMPLEHARN_LOG wins, the deprecated SIMPLEHAR_LOG fills only absence, and
-    // the fallback is reported after the subscriber exists — warning here would
-    // reach the no-op dispatcher, the exact FINDINGS-15 [8] silence.
-    let (env_value, used_deprecated_log) = crate::config::log_level_from_env();
-    let env = env_value.unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
+    // The knob reads through the centralized single-name reader (R1R-01
+    // lineage): `SIMPLEHARN_LOG` is the only name, and an invalid value is
+    // reported below — warning before the subscriber exists would reach the
+    // no-op dispatcher, the exact FINDINGS-15 [8] silence.
+    let env = crate::config::log_level_from_env().unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
     let (filter, invalid) = log_filter(&env);
     let console_filter = filter.clone();
     // Taken before `filter` moves into the ring layer: the file keeps its own floor.
@@ -555,10 +552,6 @@ pub fn init() {
         .with(ring_layer)
         .with(file_layer)
         .init();
-    // After `init` for the same reason as the invalid-level report below: the
-    // deprecated-name warning must ride the real subscriber, not the no-op
-    // dispatcher (R1R-01; the FINDINGS-15 [8] silence this function refuses).
-    crate::config::warn_log_fallback(used_deprecated_log);
     // After `init`, so a failure can be reported through the subscriber that now exists.
     if let Err(error) = attach_file_sink(&crate::process::harness_logs_dir()) {
         tracing::warn!(
@@ -636,17 +629,14 @@ mod tests {
         assert_eq!(tail.last().expect("non-empty").message, "event 509");
     }
 
-    /// TASK-RENAME-SIMPLEHARN pin (review R1R-01, wiring half): `init` reads the
-    /// knob only through `config::log_level_from_env` — the name pair and the
-    /// precedence legs are pinned in `config`, so a raw `std::env::var` here
-    /// would silently drop the deprecated `SIMPLEHAR_LOG` fallback — and the
-    /// fallback report rides after the subscriber exists: a `tracing::warn!`
-    /// before `init` reaches the no-op dispatcher, the exact silence FINDINGS-15
-    /// [8] documents. Falsifier: restore the raw env read (fallback gone) or
-    /// hoist the report above the subscriber install, and this pin goes red
-    /// without an operator-visible symptom for any other test to catch.
+    /// TASK-NAMING-CLEANUP pin (rewiring of the R1R-01 wiring half): `init` reads the
+    /// knob only through `config::log_level_from_env` — the name itself and its
+    /// single-name status are pinned in `config`, and a raw `std::env::var` here
+    /// would bypass the centralized reader while staying invisible to every other
+    /// test. Falsifier: replace the call with a raw env read and this pin goes
+    /// red without an operator-visible symptom for any other test to catch.
     #[test]
-    fn the_log_knob_reads_only_through_the_renamed_reader_and_warns_after_the_subscriber() {
+    fn the_log_knob_reads_only_through_the_centralized_reader() {
         let source = include_str!("observability.rs");
         let body = source
             .split("pub fn init()")
@@ -657,20 +647,11 @@ mod tests {
             .expect("init must close");
         assert!(
             body.contains("config::log_level_from_env()"),
-            "the knob must read through the primary/fallback pair, not one raw name: {body}"
+            "the knob must read through the single centralized reader, not a raw name: {body}"
         );
         assert!(
-            !body.contains(r#"env::var("SIMPLEHAR"#),
-            "a raw SIMPLEHAR* env read in init bypasses the rename reader: {body}"
-        );
-        let subscriber_at = body.find(".init();").expect("the subscriber must install");
-        let warn_at = body
-            .find("config::warn_log_fallback(")
-            .expect("the deprecated-name report must stay");
-        assert!(
-            warn_at > subscriber_at,
-            "the fallback warning must fire after the subscriber exists — before it, \
-             tracing::warn! reaches the no-op dispatcher (FINDINGS-15 [8])"
+            !body.contains(r#"env::var("SIMPLEHAR"#), // NAMING-CLEANUP-EXEMPT: shared prefix guards both spellings
+            "a raw env read in init bypasses the centralized reader: {body}"
         );
     }
 

@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [autostart, file layout, upgrade, uninstall, backup, log retention]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: behavior-change, release
 ---
 
@@ -49,8 +49,8 @@ The harness keeps its state beside the exe:
 | `simpleharn.json` | The config file, beside the exe. `SIMPLEHARN_CONFIG` overrides the path. |
 | `ModelConf\` | The catalog directory. Default `<exe dir>\ModelConf`. |
 | `logs\` | The harness log and the engine child logs. |
-| `.simplehar\strata-profiles\` | The rendered strata profile JSONs, written at each load. |
-| `.simplehar\basalt-profiles\` | The rendered basalt profile JSONs, written at each load. |
+| `.simpleharn\strata-profiles\` | The rendered strata profile JSONs, written at each load. |
+| `.simpleharn\basalt-profiles\` | The rendered basalt profile JSONs, written at each load. |
 | `ninfer-claims.json` | The ninfer claim ledger beside the harness exe. |
 | `ninfer-autostart-template.sh` | The readable copy of the ninfer launch template, beside the exe in the release package. |
 | `autostart.vbs` | Present only when you registered autostart, at the path the `Run` key names. |
@@ -62,6 +62,11 @@ Stop the running harness (the tray menu offers Exit). Back up
 with the new exe and start the harness again. Keep the existing
 `simpleharn.json` and `ModelConf`: the config file beside the exe is
 authoritative, and the catalog carries over unchanged.
+
+From a SimpleHar SE build: rename the config file to `simpleharn.json`
+before the first start, and replace the old `SIMPLEHAR_*` environment names
+with the `SIMPLEHARN_*` names. The harness ignores the old file names and
+the old environment names. It does not migrate them.
 
 ## Uninstall
 

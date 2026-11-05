@@ -205,7 +205,6 @@ fn spawn_raw(entries: &[Entry], sentinel: &str, aux_slots: usize) -> (Child, Pat
     let child = Command::new(harness_exe())
         .env("SIMPLEHARN_CONFIG", &config_path)
         .env_remove("SIMPLEHARN_TOKEN")
-        .env_remove("SIMPLEHAR_TOKEN")
         .spawn()
         .expect("spawn simpleharn.exe");
     (child, work_dir)
@@ -1183,7 +1182,6 @@ async fn g10_second_harness_is_refused_while_first_serves() {
     let mut second = Command::new(harness_exe())
         .env("SIMPLEHARN_CONFIG", harness.config_path())
         .env_remove("SIMPLEHARN_TOKEN")
-        .env_remove("SIMPLEHAR_TOKEN")
         .spawn()
         .expect("spawn the second instance of the same exe on the same config");
     let started = Instant::now();

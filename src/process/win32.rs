@@ -157,13 +157,12 @@ impl SingleInstanceGuard {
         // Safety: CreateMutexW with no security attributes and automatic ownership
         // reclaim; we only inspect the last error, never wait on the handle.
         unsafe {
-            // The mutex name keeps the PRE-rename spelling on purpose
-            // (TASK-RENAME-SIMPLEHARN, 2026-11-04): during the live-deployment
-            // switch window the pre-rename binary and `simpleharn.exe` must still
-            // see each other's lock, or two harnesses share one card and the
-            // single-instance rule (AGENTS.md §6) is silently broken.
-            // This is a compatibility shim: do not "clean up" the old name.
-            let name = windows::core::w!("SimpleHarSE-SingleInstance");
+            // The mutex name carries the product name (TASK-NAMING-CLEANUP,
+            // operator ruling 2026-11-05): the pre-rename compatibility shim
+            // is retired, exactly as the rename decision is complete — a
+            // pre-rename binary no longer shares this lock, and none is
+            // expected to run beside the current harness.
+            let name = windows::core::w!("SimpleHarn-SingleInstance");
             let handle = windows::Win32::System::Threading::CreateMutexW(None, false, name)
                 .map_err(|e| format!("cannot create mutex: {e}"))?;
             if windows::Win32::Foundation::GetLastError()
@@ -293,4 +292,36 @@ pub(super) unsafe fn terminate_job(job: windows::Win32::Foundation::HANDLE) {
     use windows::Win32::System::JobObjects::TerminateJobObject;
 
     let _ = TerminateJobObject(job, 1);
+}
+
+#[cfg(test)]
+mod tests {
+    /// TASK-NAMING-CLEANUP pin (c, mutex half): the single-instance mutex name
+    /// carries the current product spelling. The pre-rename compatibility shim
+    /// is retired by the operator ruling of 2026-11-05; a drift back to the
+    /// pre-rename name would silently split the lock into two namespaces and
+    /// break the single-instance rule for one of them. Falsifier: restore the
+    /// pre-rename shim name — the first assert drops the new literal, the
+    /// second catches the pre-rename spelling.
+    #[test]
+    fn the_single_instance_mutex_carries_the_current_product_name() {
+        let source = include_str!("win32.rs");
+        let body = source
+            .split("fn acquire(")
+            .nth(1)
+            .expect("acquire must stay")
+            .split("\n    }")
+            .next()
+            .expect("acquire must close");
+        assert!(
+            body.contains(r#"w!("SimpleHarn-SingleInstance")"#),
+            "the mutex must carry the current product name: {body}"
+        );
+        let stripped = body.replace("SimpleHarn", "");
+        let pre_rename = ["Simple", "Har"].concat();
+        assert!(
+            !stripped.contains(&pre_rename),
+            "the pre-rename mutex spelling must not return: {stripped}"
+        );
+    }
 }

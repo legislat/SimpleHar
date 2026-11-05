@@ -113,7 +113,7 @@ fn writeback_errors_map_to_their_http_class_without_rewording() {
 }
 
 #[test]
-fn config_write_path_follows_boot_and_never_the_legacy_file_on_fallback() {
+fn config_write_path_follows_boot_and_the_default_file() {
     // Write-back must land where boot reads. Comparing the WHOLE path is what makes
     // this bite: every fallback branch ends in CONFIG_FILE, so a filename-only
     // assertion would pass even if the default directory moved under it.
@@ -127,11 +127,11 @@ fn config_write_path_follows_boot_and_never_the_legacy_file_on_fallback() {
         expected,
         "with no stamped path, write to boot's own default location"
     );
-    assert_ne!(
+    assert_eq!(
         config_write_path(&no_source).file_name(),
-        Some(std::ffi::OsStr::new(crate::config::LEGACY_CONFIG_FILE)),
-        "on the fallback, SE never writes the older app's config file (an explicit \
-             SIMPLEHARN_CONFIG selection at that name is the operator-instruction exception)"
+        Some(std::ffi::OsStr::new(crate::config::CONFIG_FILE)),
+        "on the fallback, the harness writes only its one config file — never any \
+             older spelling (TASK-NAMING-CLEANUP)"
     );
 
     let loaded = std::path::PathBuf::from(r"C:\Configs\lan.json");
@@ -142,23 +142,8 @@ fn config_write_path_follows_boot_and_never_the_legacy_file_on_fallback() {
     assert_eq!(
         config_write_path(&stamped),
         loaded,
-        "the file boot actually loaded always wins"
-    );
-
-    // The ruling's exception leg (2026-11-03, `TASK-DEBT-LEFTOVERS`): when the
-    // operator explicitly stamps a legacy-named path, it IS the write target —
-    // config file is king. Boot warns about the strand; the API writes where boot
-    // read. `main.rs::boot_config` pins the warn; this pins the follow-the-stamp.
-    let legacy = std::path::PathBuf::from(r"C:\Configs\simplehar.json");
-    let explicit_legacy = AppConfig {
-        source_path: Some(legacy.clone()),
-        ..AppConfig::default()
-    };
-    assert_eq!(
-        config_write_path(&explicit_legacy),
-        legacy,
-        "an explicit SIMPLEHARN_CONFIG selection is honored as the write target, \
-             even at the legacy name"
+        "the file boot actually loaded always wins — config file is king, an explicit \
+             SIMPLEHARN_CONFIG selection IS the write target (ruling 2026-11-03)"
     );
 }
 
@@ -572,7 +557,7 @@ fn error_body_carries_flat_and_openai_envelope() {
     let body = error_body(&err);
     assert_eq!(body["code"], "not_found");
     assert_eq!(body["message"], "not found: model `x`");
-    assert_eq!(body["error"]["type"], "simplehar_error");
+    assert_eq!(body["error"]["type"], "simpleharn_error");
     assert_eq!(body["error"]["code"], "not_found");
     assert_eq!(body["error"]["message"], body["message"]);
     // An error without a wait hint grows neither field (falsifier: render
@@ -596,7 +581,7 @@ fn error_body_renders_the_wait_hint_as_flat_fields_only() {
     assert_eq!(body["queue_position"], json!(2));
     assert_eq!(body["expected_release_s"], json!(4.2));
     assert_eq!(body["error"]["message"], body["message"]);
-    assert_eq!(body["error"]["type"], "simplehar_error");
+    assert_eq!(body["error"]["type"], "simpleharn_error");
     assert!(body["error"].get("queue_position").is_none());
     assert!(body["error"].get("expected_release_s").is_none());
 
@@ -2706,14 +2691,13 @@ fn the_token_wall_is_constant_time_and_scheme_case_insensitive() {
     );
 }
 
-/// TASK-RENAME-SIMPLEHARN pin (c, wiring half): the guard's only env read is
-/// `crate::config::token_from_env` — the name pair (`SIMPLEHARN_TOKEN` first,
-/// deprecated `SIMPLEHAR_TOKEN` second) and the once-per-process warning are
-/// pinned in `config`; a direct `std::env::var` here would silently drop the
-/// fallback or the warning while the guard stays green. Falsifier: revert this
-/// line to `std::env::var("SIMPLEHARN_TOKEN")` and the assert fires.
+/// TASK-NAMING-CLEANUP pin (c, wiring half): the guard's only env read is
+/// `crate::config::token_from_env` — the single `SIMPLEHARN_TOKEN` name is
+/// pinned in `config`; a direct `std::env::var` here would drift from the
+/// centralized reader while the guard stays green. Falsifier: revert this line
+/// to a raw `std::env::var` and the second assert fires.
 #[test]
-fn the_control_token_reads_env_only_through_the_renamed_reader() {
+fn the_control_token_reads_env_only_through_the_centralized_reader() {
     let source = include_str!("guards.rs");
     let body = source
         .split("fn resolve_control_token(")
@@ -2724,12 +2708,69 @@ fn the_control_token_reads_env_only_through_the_renamed_reader() {
         .expect("the resolver must close");
     assert!(
         body.contains("crate::config::token_from_env()"),
-        "the env read must go through the primary/fallback pair, not one raw name: {body}"
+        "the env read must go through the single centralized reader, not one raw name: {body}"
     );
     assert!(
         !body.contains("std::env::var"),
-        "a second raw env read here bypasses the deprecated-name fallback and its \
-             warning: {body}"
+        "a second raw env read here bypasses the centralized reader: {body}"
+    );
+}
+
+/// TASK-NAMING-CLEANUP pin (b, gated-route half): the old token name grants
+/// nothing. The harness is configured with a file token while the legacy
+/// variable carries a sentinel; the sentinel must NOT be the credential the
+/// gate honours (401), and the file token must keep working beside it (200).
+/// Falsifier: restore the old-name fallback in `token_from_env` — the sentinel
+/// then resolves as the boot token, overriding the file value, and the first
+/// assert goes red with a 200.
+/// NAMING-CLEANUP-EXEMPT: the old spelling is set here only to prove the gate ignores it.
+/// Safe to inject: no reader in this binary names the old spelling, so no other
+/// test can observe the injection.
+#[tokio::test]
+async fn the_old_token_name_grants_nothing_to_a_gated_route() {
+    const LEGACY: &str = "legacy-token-never-honored";
+    const FILE_TOKEN: &str = "file-token-that-gates";
+    // NAMING-CLEANUP-EXEMPT: the old token env spelling under test.
+    std::env::set_var("SIMPLEHAR_TOKEN", LEGACY); // NAMING-CLEANUP-EXEMPT
+    let guarded = Arc::new(ApiState::new(
+        AppConfig {
+            control_token: Some(FILE_TOKEN.to_string()),
+            ..AppConfig::default()
+        },
+        SchedulerHandle::test_dummy(),
+        crate::listeners::ListenerRegistry::new(),
+        Arc::new(crate::budget::LedgerOnlyWitness),
+        BootTimings::default(),
+    ));
+    let presented = |token: &str| {
+        let guarded = Arc::clone(&guarded);
+        let token = token.to_string();
+        async move {
+            control_router(guarded)
+                .oneshot(
+                    Request::get("/health")
+                        .header("host", "127.0.0.1:8708")
+                        .header("x-har-token", token)
+                        .body(Body::empty())
+                        .expect("probe request"),
+                )
+                .await
+                .expect("in-process probe")
+                .status()
+        }
+    };
+    let legacy_answer = presented(LEGACY).await;
+    let file_answer = presented(FILE_TOKEN).await;
+    std::env::remove_var("SIMPLEHAR_TOKEN"); // NAMING-CLEANUP-EXEMPT
+    assert_eq!(
+        legacy_answer,
+        StatusCode::UNAUTHORIZED,
+        "a request carrying the old name's value must be refused: it is not a credential"
+    );
+    assert_eq!(
+        file_answer,
+        StatusCode::OK,
+        "the gate still stands on the file token beside the inert old name"
     );
 }
 

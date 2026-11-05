@@ -21,69 +21,22 @@ use std::time::Duration;
 /// A missing file yields defaults ("no config file" is usable, §0.1); an invalid file
 /// or any validation failure is fatal and every problem is logged (never silently
 /// defaulted — defect D1). `env_config_path` is the effective value of
-/// `SIMPLEHARN_CONFIG` — or its deprecated `SIMPLEHAR_CONFIG` fallback, resolved by
-/// `config::config_path_from_env` at boot (passed in, not read here, so tests never
-/// mutate process env): naming a path that is not an existing file is fatal
-/// (FINDINGS-14 [3]), and a legacy-migration copy that fails is fatal too — the
-/// operator has a config the boot cannot honour (FINDINGS-14 [2]). With no env name
-/// the load order is `simpleharn.json`, then the previous primary name
-/// `simplehar-se.json` loaded in place (TASK-RENAME-SIMPLEHARN), then the v3.3
-/// migration copy of `simplehar.json`.
+/// `SIMPLEHARN_CONFIG` (passed in, not read here, so tests never mutate process
+/// env): naming a path that is not an existing file is fatal (FINDINGS-14 [3]).
+/// With no env name the harness reads exactly one file — the beside-the-exe
+/// `simpleharn.json`. There is no discovery of any earlier config name and no
+/// migration copy (TASK-NAMING-CLEANUP, operator ruling 2026-11-05): a file
+/// carrying an older spelling is ignored, and only an explicit env path — an
+/// operator instruction — selects a file by location alone.
 fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigError>> {
     // The test harness (and operators) can point at a config anywhere; otherwise
-    // the config lives beside the executable.
+    // the config lives beside the executable. An explicit path is an instruction:
+    // it never falls back, a missing one stays fatal (14 [3]).
     let explicit = env_config_path.map(PathBuf::from);
-    let mut path = match &explicit {
+    let path = match &explicit {
         Some(path) => Some(path.clone()),
         None => config::default_config_path(),
     };
-    // Rename compatibility (TASK-RENAME-SIMPLEHARN, 2026-11-04): when the env names
-    // nothing and no file carries the primary name beside the exe, the previous
-    // primary name loads **in place** — `source_path` (stamped below from `path`)
-    // keeps every write-back on the file that was loaded, so switching binaries
-    // never forks a live deployment into two configs. An explicit path is an
-    // instruction: it never falls back, a missing one stays fatal (14 [3]).
-    if explicit.is_none() {
-        if let Some(default) = path.as_deref() {
-            path =
-                config::rename_compatible_default(default).or_else(|| Some(default.to_path_buf()));
-        }
-    }
-    // One-time migration from the shared v3.3 name. The legacy file is copied, never
-    // moved or rewritten: the rollback exe must still find what it expects there
-    // (deploy review, 2026-10-26 — our full-struct persist writes `protected_ports`,
-    // which makes v3.3 exit on its own port-namespace check).
-    if let Some(path) = path.as_ref() {
-        if !path.exists()
-            && path
-                .file_name()
-                .is_some_and(|name| name == config::CONFIG_FILE)
-        {
-            let legacy = path.with_file_name(config::LEGACY_CONFIG_FILE);
-            if legacy.exists() {
-                if let Err(error) = std::fs::copy(&legacy, path) {
-                    // FINDINGS-14 [2]: a failed copy must not warn-and-continue — the
-                    // operator has a config and this boot cannot honour it, so serving
-                    // built-in defaults would be a security/admission posture nobody
-                    // authored. `exists()` (not `is_file()`) so a legacy path that is
-                    // present but uncopiable reaches this same fatal arm.
-                    return Err(vec![ConfigError::Invalid {
-                        field: config::LEGACY_CONFIG_FILE.to_string(),
-                        reason: format!(
-                            "could not migrate {} to {}: {error}",
-                            legacy.display(),
-                            path.display()
-                        ),
-                    }]);
-                }
-                tracing::warn!(
-                    "migrated {} -> {} (the legacy file is left untouched for rollback)",
-                    legacy.display(),
-                    path.display()
-                );
-            }
-        }
-    }
     if let Some(path) = &explicit {
         // FINDINGS-14 [3]: an explicit env path is an instruction, not an absence.
         if !path.is_file() {
@@ -91,22 +44,6 @@ fn boot_config(env_config_path: Option<String>) -> Result<AppConfig, Vec<ConfigE
                 field: "SIMPLEHARN_CONFIG".to_string(),
                 reason: format!("no configuration file at {}", path.display()),
             }]);
-        }
-        // REV6-01 (ruling 2026-11-03, `TASK-DEBT-LEFTOVERS`): a legacy-named selection
-        // is honoured — config file is king — but the hazard must reach the log before
-        // the first page edit makes it real: every write-back rewrites this v3.3 file,
-        // and that can strand the rollback exe it was meant to protect.
-        if path
-            .file_name()
-            .is_some_and(|name| name == config::LEGACY_CONFIG_FILE)
-        {
-            tracing::warn!(
-                file = %path.display(),
-                "SIMPLEHARN_CONFIG selects the legacy config name: every config \
-                 write-back rewrites this file, and v3.3 reads `protected_ports` and \
-                 may exit on its own port-namespace check — the rollback exe can be \
-                 stranded; keep an untouched copy if a rollback is planned"
-            );
         }
     }
     let mut config = match &path {
@@ -474,9 +411,10 @@ const LISTENER_RETRY: Duration = Duration::from_secs(5);
 const FIRST_RUN_PROBE_BUDGET: Duration = Duration::from_secs(3);
 
 /// First-start gate: materialization fires only for the beside-the-exe
-/// `simpleharn.json` that is absent — never for a legacy name, and never for a
-/// `SIMPLEHARN_CONFIG` path (an explicit env file is an instruction: boot already
-/// failed when it was missing, FINDINGS-14 [3]; if it exists it is not a target).
+/// `simpleharn.json` that is absent — never for a differently named file, and
+/// never for a `SIMPLEHARN_CONFIG` path (an explicit env file is an instruction:
+/// boot already failed when it was missing, FINDINGS-14 [3]; if it exists it is
+/// not a target).
 fn first_run_target(config: &AppConfig) -> Option<PathBuf> {
     config.source_path.clone().filter(|path| {
         path.file_name()
@@ -1303,28 +1241,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_legacy_migration_copy_is_fatal() {
-        // FINDINGS-14 [2]: a present-but-uncopiable legacy config must fail the boot,
-        // never warn and fall through to built-in defaults. The legacy path is a
-        // directory: `exists()` passes but `std::fs::copy` fails deterministically.
-        let dir = simpleharn::testutil::temp_dir("legacy-copy-fail");
-        let target = dir.join(config::CONFIG_FILE);
-        let legacy = dir.join(config::LEGACY_CONFIG_FILE);
-        std::fs::create_dir(&legacy).expect("legacy dir");
-        let errors = boot_config(Some(target.display().to_string()))
-            .expect_err("an unmigratable legacy config must be fatal, not defaults");
-        let text = error_text(&errors);
-        assert!(
-            text.contains(&legacy.display().to_string()),
-            "the error must name the legacy path: {text}"
-        );
-        assert!(
-            text.contains(&target.display().to_string()),
-            "the error must name the migration target: {text}"
-        );
-    }
-
-    #[test]
     fn missing_file_named_by_simpleharn_config_is_fatal() {
         // FINDINGS-14 [3]: the env var is an instruction, not an absence.
         let dir = simpleharn::testutil::temp_dir("env-missing");
@@ -1342,22 +1258,24 @@ mod tests {
         );
     }
 
+    /// Serializes the two tests that observe the beside-the-exe default config:
+    /// one materializes probe files in the exe directory, and the other must
+    /// not boot while they exist — its `default.exists()` guard only sees what
+    /// a same-binary sibling leaves on disk, so the lock keeps the skip honest.
+    static EXE_DIR_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn missing_default_config_still_defaults() {
-        // Regression pin for [2]/[3]: unset env + no file beside the exe keeps the
+        // Regression pin for [3]: unset env + no file beside the exe keeps the
         // §0.1 defaults path untouched. Guarded: a stray config beside the test
-        // exe is not the case under test. Since the 2026-11-04 rename the stray
-        // that can exist beside a test exe includes the previous primary name
-        // (`rename_compatible_default` would load it) and the v3.3 name.
+        // exe is not the case under test.
+        let _serial = EXE_DIR_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(default) = config::default_config_path() else {
             return;
         };
-        if default.exists()
-            || default
-                .with_file_name(config::PREVIOUS_CONFIG_FILE)
-                .exists()
-            || default.with_file_name(config::LEGACY_CONFIG_FILE).exists()
-        {
+        if default.exists() {
             return;
         }
         let loaded = boot_config(None).expect("unset env with no file must boot defaults");
@@ -1366,6 +1284,72 @@ mod tests {
             ..AppConfig::default()
         };
         assert_eq!(loaded, expected);
+    }
+
+    /// Probe files that remove themselves on scope exit, including through an
+    /// assertion panic.
+    struct ProbeFiles(Vec<std::path::PathBuf>);
+
+    impl Drop for ProbeFiles {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// TASK-NAMING-CLEANUP pin (a): a config directory that holds both the
+    /// primary name and files under older spellings boots on `simpleharn.json`
+    /// — bytes and stamp alike. The older files sit in the same directory with
+    /// distinct sentinel values; boot must never look at them.
+    /// NAMING-CLEANUP-EXEMPT: the older spellings are materialized here only
+    /// to prove the boot ignores them.
+    /// Falsifier: restore the old in-place fallback discovery in `boot_config`
+    /// — with the primary deleted first, the boot stamps the sentinel file and
+    /// the asserts below go red.
+    #[test]
+    fn a_dir_holding_older_config_names_boots_on_the_primary_file() {
+        let _serial = EXE_DIR_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(default) = config::default_config_path() else {
+            return;
+        };
+        let dir = default.parent().expect("exe directory").to_path_buf();
+        if default.exists() {
+            return; // a real deployment config beside the test exe: not the case under test
+        }
+        // NAMING-CLEANUP-EXEMPT: the two older spellings boot must ignore.
+        let previous = dir.join("simplehar-se.json"); // NAMING-CLEANUP-EXEMPT
+        let older = dir.join("simplehar.json"); // NAMING-CLEANUP-EXEMPT
+        let _probes = ProbeFiles(vec![default.clone(), previous.clone(), older.clone()]);
+        std::fs::write(&default, r#"{"vram_total_gb": 41.0}"#).expect("primary config");
+        std::fs::write(&previous, r#"{"vram_total_gb": 42.0}"#).expect("previous-name sibling");
+        std::fs::write(&older, r#"{"vram_total_gb": 43.0}"#).expect("older sibling");
+        let loaded = boot_config(None).expect("boot must read the primary file");
+        assert_eq!(
+            loaded.vram_total_gb, 41.0,
+            "boot must read the `simpleharn.json` bytes, not a sibling's"
+        );
+        assert_eq!(
+            loaded.source_path.as_deref(),
+            Some(default.as_path()),
+            "the write-back stamp must name the primary file"
+        );
+
+        // The other half of the pin: with only older-named files present, boot
+        // does NOT load one — it boots on built-in defaults stamped at the
+        // primary path (FINDINGS-14 [2]'s copy-forward is retired with the name).
+        std::fs::remove_file(&default).expect("remove primary");
+        let loaded = boot_config(None).expect("older-named files alone boot on defaults");
+        assert_eq!(
+            loaded,
+            AppConfig {
+                source_path: Some(default),
+                ..AppConfig::default()
+            },
+            "an older-spelling file is ignored: no bytes load, defaults stand"
+        );
     }
 
     #[test]
@@ -1398,154 +1382,6 @@ mod tests {
         assert!(
             !text.contains(config::CONFIG_FILE),
             "the report must not name the default file this boot never read: {text}"
-        );
-    }
-
-    #[test]
-    fn legacy_named_file_is_a_write_target_only_when_explicitly_selected() {
-        // R2-14-04: the claim is "SE never writes the legacy file unless the operator
-        // explicitly selects it". Both legs pinned at the boot decision: `source_path`
-        // is exactly what `api::config_write_path` writes back to (pinned by the
-        // api-side test), so what boot stamps IS the write target (doctrine 1).
-        let dir = simpleharn::testutil::temp_dir("env-legacy-name");
-        let explicit = dir.join(config::LEGACY_CONFIG_FILE);
-        std::fs::write(&explicit, r#"{"vram_total_gb": 24.0}"#).expect("legacy-named config");
-        let loaded = boot_config(Some(explicit.display().to_string()))
-            .expect("an explicit env path is an instruction, even at the legacy name");
-        assert_eq!(loaded.vram_total_gb, 24.0, "the selected file must load");
-        assert_eq!(
-            loaded.source_path,
-            Some(explicit),
-            "an explicitly selected legacy-named file is `source_path`, hence the \
-             write-back target — config file is king"
-        );
-
-        // Fallback leg: with no env and no file beside the exe, boot stamps the
-        // default name — never a legacy or previous-rename name. Guarded like
-        // `missing_default_config_still_defaults`: a stray config beside the test
-        // exe (either compatibility name) is not the case under test.
-        let Some(default) = config::default_config_path() else {
-            return;
-        };
-        if default.exists()
-            || default
-                .with_file_name(config::PREVIOUS_CONFIG_FILE)
-                .exists()
-            || default.with_file_name(config::LEGACY_CONFIG_FILE).exists()
-        {
-            return;
-        }
-        let fallback = boot_config(None).expect("unset env with no file must boot defaults");
-        assert_eq!(
-            fallback.source_path.as_deref(),
-            Some(default.as_path()),
-            "fallback boot stamps the beside-the-exe default"
-        );
-        assert_ne!(
-            fallback
-                .source_path
-                .as_ref()
-                .and_then(|path| path.file_name()),
-            Some(std::ffi::OsStr::new(config::LEGACY_CONFIG_FILE)),
-            "fallback boot never stamps the legacy name, so write-back never writes it"
-        );
-    }
-
-    /// TASK-RENAME-SIMPLEHARN pin (b, boot half): a config that still carries the
-    /// previous primary name is loaded **in place** and stamped as `source_path` —
-    /// and `source_path` IS the write-back target (`api::config_write_path`, pinned
-    /// on the api side), so the write lands in exactly the file this boot loaded.
-    /// Auto-discovery itself is pinned in `config` (`rename_compatible_default`);
-    /// this pin covers the stamping `boot_config` does with whatever discovery
-    /// returns. Falsifier: copy-forward to the primary name instead of loading in
-    /// place, and the stamp names a file this boot never read while a second
-    /// config silently forks beside the operator's one.
-    #[test]
-    fn previous_name_config_stamps_source_path_as_the_write_target() {
-        let dir = simpleharn::testutil::temp_dir("env-previous-name");
-        let path = dir.join(config::PREVIOUS_CONFIG_FILE);
-        std::fs::write(&path, r#"{"vram_total_gb": 41.0}"#).expect("previous-name config");
-        let loaded = boot_config(Some(path.display().to_string()))
-            .expect("the previous primary name is a valid file to load");
-        assert_eq!(
-            loaded.vram_total_gb, 41.0,
-            "the loaded file's value must survive"
-        );
-        assert_eq!(
-            loaded.source_path.as_deref(),
-            Some(path.as_path()),
-            "write-back must follow the previous-name file, never fork to a new name"
-        );
-        assert_eq!(
-            first_run_target(&loaded),
-            None,
-            "an existing previous-name file is a legacy name: materialization must \
-             not create a competing primary-name file beside it"
-        );
-    }
-
-    /// REV6-01 pin: an explicitly selected legacy-named config must warn on the log
-    /// before the first write-back can strand the v3.3 rollback exe. The capture
-    /// subscriber is scoped to this test thread (`with_default`; `boot_config` is
-    /// synchronous and same-thread) and writes to an in-memory buffer — no console,
-    /// no global subscriber, no file sink. Falsifier: delete the warn arm in
-    /// `boot_config` and the first assertion fails on an empty capture.
-    #[test]
-    fn explicit_legacy_named_config_warns_about_the_rollback_strand() {
-        #[derive(Clone, Default)]
-        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
-        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Writer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("capture lock").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Buffer {
-            type Writer = Writer;
-            fn make_writer(&'w self) -> Self::Writer {
-                Writer(Arc::clone(&self.0))
-            }
-        }
-        fn capture(config_path: &std::path::Path) -> String {
-            let buffer = Buffer::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(buffer.clone())
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                boot_config(Some(config_path.display().to_string()))
-                    .expect("an explicit env selection boots")
-            });
-            let captured =
-                String::from_utf8_lossy(&buffer.0.lock().expect("capture lock")).into_owned();
-            captured
-        }
-
-        let dir = simpleharn::testutil::temp_dir("env-legacy-warn");
-        let legacy = dir.join(config::LEGACY_CONFIG_FILE);
-        std::fs::write(&legacy, "{}").expect("legacy-named config");
-        let text = capture(&legacy);
-        assert!(
-            text.contains("WARN")
-                && text.contains("legacy")
-                && text.contains(&legacy.display().to_string())
-                && text.contains("rollback")
-                && text.contains("protected_ports"),
-            "the legacy-named selection must warn about the rollback-strand hazard, \
-             naming the selected file; captured: {text}"
-        );
-
-        // The other side of the pin: a differently-named selection warns nothing.
-        let other = dir.join("custom-name.json");
-        std::fs::write(&other, "{}").expect("custom-named config");
-        let text = capture(&other);
-        assert!(
-            !text.contains("WARN"),
-            "a non-legacy selection has no hazard to warn about; captured: {text}"
         );
     }
 

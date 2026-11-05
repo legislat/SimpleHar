@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [contributor, agent, architect]
 source_of_truth_for: [current architecture]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: behavior-change, release, new-decision
 ---
 
@@ -202,7 +202,7 @@ One harness process, one tokio runtime, plus OS-level children:
   booking source (section 4).
 - `strata` (`src/engine/strata.rs`): template mode is the current and only
   mode. The row yaml owns the profile fields (`strata_*` keys); the harness
-  renders the full profile JSON at every load under `.simplehar\
+  renders the full profile JSON at every load under `.simpleharn\
   strata-profiles` (`process::strata_profiles_dir`, content-addressed,
   atomic, keep-N prune) and launches only its own staged copy
   (`python -m serve.server --engine strata` with forced `--host 127.0.0.1`
@@ -216,7 +216,7 @@ One harness process, one tokio runtime, plus OS-level children:
   directly in `basalt_cwd` (not the source-tree launcher), forces
   `--host 127.0.0.1` and the assigned `--port`, and supplies `--engine-bin`,
   `--alias`, `--gpu 0`, and `--parallel`. It renders the `{"server": ...}`
-  profile at every load under `.simplehar\basalt-profiles`
+  profile at every load under `.simpleharn\basalt-profiles`
   (`process::rendered_profiles_dir`, content-addressed, atomic, keep-N
   prune) and rewrites `--config` to exactly that staged file. Readiness
   needs `/health` 200 with the JSON `loaded` flag not `false`, then

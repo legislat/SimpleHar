@@ -279,7 +279,7 @@ fn router_error_body(code: &'static str, message: String) -> Value {
     json!({
         "code": code,
         "message": message,
-        "error": { "message": message, "type": "simplehar_error", "code": code },
+        "error": { "message": message, "type": "simpleharn_error", "code": code },
     })
 }
 

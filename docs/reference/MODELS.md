@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [ModelConf schema, engine-specific model keys]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: behavior-change, release
 ---
 
@@ -72,7 +72,7 @@ edit never leaves a half-written model file in use.
 | `ninfer_serve_args` | Extra flags appended to the serve line, as shell-bare tokens. Both shipped engine parsers reject the `--flag=value` form, so write each option with a space and put the value in its own token, for example `--spec dflash2`. Option tokens must be long options that start with `--`. The canonical script reserves these options: `--host`, `--port`, `--api-key`, `--data-dir`, `--data-dir-permissions`, `--model`, `--model-id`, `--log-level`, `--log-dir`, `--uds`, `--ssl-keyfile`, `--ssl-certfile`, `--max-context`, `--kv-capacity`, `--max-concurrency`, `--kv-dtype`. The harness refuses each of them by name and by any abbreviation or extension of it, so `--max-cont` and `--host-context-mib` are refused too. Your args can therefore never resize what the cost estimate measured. |
 | `ninfer_model_id` | Optional OpenAI-style served id, passed as `--model-id`. |
 | `ninfer_env` | Extra container environment as `NAME=VALUE` tokens. This is an **allow-list**, not a parse rule. The only admissible pair today is `CUDA_MODULE_LOADING=EAGER\|LAZY`, the cold-start flag of the NInfer-all cards. The harness refuses an arbitrary name, such as `LD_PRELOAD` or `PATH`, by name. Growing the list needs a code review, never a yaml edit. |
-| `ninfer_key_file` | The place where `ninfer_key: true` reads the API key. The path is exactly `$HOME/.simplehar/keys/<file>.key` in the distro, a bare word with no traversal and no subdirectories. The script `cat`s it into `--api-key`, so an arbitrary path would let the yaml export any distro secret. Default: `$HOME/.simplehar/keys/<ninfer_container>.key`. |
+| `ninfer_key_file` | The place where `ninfer_key: true` reads the API key. The path is exactly `$HOME/.simpleharn/keys/<file>.key` in the distro, a bare word with no traversal and no subdirectories. The script `cat`s it into `--api-key`, so an arbitrary path would let the yaml export any distro secret. Default: `$HOME/.simpleharn/keys/<ninfer_container>.key`. |
 | `ninfer_autostart` | **Removed** (ruling 18b, after a green Wave C). The launch path for operator-written autostart scripts no longer exists. A row that declares it is refused at scan and at launch with the migration message, and is never published: declare `ninfer_image`, `ninfer_model_name`, `ninfer_artifact`, and `ninfer_model_roots` (template mode) and delete the `ninfer_autostart` line. |
 | `ninfer_container` | **Required for ninfer.** The container name. The harness reaps it with `docker rm -f` on unload, scoped strictly to the name this harness started (claim ledger: `ninfer-claims.json` beside the harness exe). The name must be docker-legal and must not look like a container ID (4+ hex chars). |
 | `ninfer_profile` | Template mode: one of the built-in VRAM profiles `a` to `e` (default `b`). The table is the operator's own: `a` 262k ctx/524k kv/2 conc, `b` 262k/262k/1, `c` 131k/131k/1, `d` 16k/32k/2 nvfp4, `e` 64k/64k/1. Or use a custom lowercase name, resolved by a `ninfer_profile_<name> = ctx=... kv=... conc=... kv_dtype=...` line. `kv_dtype` is one of `fp8`/`nvfp4`/`fp16`/`bf16`/`int8`/`rk8v4`, and `kv` must cover `ctx`. The override line applies to custom names only. The built-in table wins for `a` to `e`, so the harness refuses a `ninfer_profile_b`-style line at launch rather than silently ignoring it. |
@@ -80,12 +80,12 @@ edit never leaves a half-written model file in use.
 
 The harness renders strata rows; it never hands the row to the engine. At
 every load the harness writes the full profile JSON into
-`.simplehar\strata-profiles` beside the exe (content-addressed
+`.simpleharn\strata-profiles` beside the exe (content-addressed
 `<model>-<hash>.json`, atomic write, keep-N prune) and launches only its own
 staged copy. See "Strata engines" below.
 
 The harness renders basalt rows the same way. At every load it writes its
-`{"server": ...}` profile into `.simplehar\basalt-profiles` beside the exe
+`{"server": ...}` profile into `.simpleharn\basalt-profiles` beside the exe
 and launches only its own staged copy. See "Basalt engines" below.
 
 The harness keeps unknown keys for reference and reports them as
@@ -128,7 +128,7 @@ Strata models (`engine: strata`) run in **template mode, the supported
 path**. The row yaml carries the profile fields (the `strata_*` keys above),
 and the harness renders the full profile JSON at every load. It launches
 `python -m serve.server --engine strata --host 127.0.0.1 --config <rendered> --port <assigned>`
-in `strata_cwd`. The render is staged under `.simplehar\strata-profiles`
+in `strata_cwd`. The render is staged under `.simpleharn\strata-profiles`
 beside the exe (content-addressed `<model>-<hash>.json`, atomic write,
 keep-N prune). The spawn rewrites `--config` to exactly that file, so the
 child can never point at another profile. The bind is the forced
@@ -191,7 +191,7 @@ other parent environment passes.
 
 The harness renders the profile itself. The JSON carries one `server`
 object with three figures only: the `alias`, the absolute `.basalt` model
-path, and `parallel`. The render is staged under `.simplehar\basalt-profiles`
+path, and `parallel`. The render is staged under `.simpleharn\basalt-profiles`
 beside the exe (content-addressed `<model>-<hash>.json`, atomic write,
 keep-N prune). The spawn rewrites `--config` to exactly that file, so the
 child can never point at another profile. The profile carries no `host`,
@@ -286,7 +286,7 @@ name (`docker rm -f <ninfer_container>`), and the release evidence is the port
 closing, not the client exit. The client runs the harness's own canonical
 script. The harness renders it from your yaml, stages it base64
 through a stdin driver to
-`~/.simplehar/autostart/<container-slug>-<content-hash>.sh`, verifies it by
+`~/.simpleharn/autostart/<container-slug>-<content-hash>.sh`, verifies it by
 checksum on the distro before and after the atomic publish, and prunes to
 the newest renders of that container. The rendered launch carries the
 incident-review guarantees: `--restart no` (nothing revives on WSL boot
@@ -337,7 +337,7 @@ Notes:
 - `--publish 127.0.0.1:...` keeps the container loopback-only. The rendered
   launch never writes anything else; a wider publish would expose an
   unauthenticated engine to your LAN, and only the `key` mode (with a real
-  key file under `$HOME/.simplehar/keys/`) would make that safe.
+  key file under `$HOME/.simpleharn/keys/`) would make that safe.
 - `--restart no` is not a preference. A `--restart` policy revives
   containers on WSL boot outside any harness decision, with no ledger entry
   and no reap path (the NINFER-8004 incident). The rendered script hard-codes

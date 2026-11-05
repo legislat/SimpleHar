@@ -647,18 +647,16 @@ async fn models_are_filtered_per_listener() {
         .map(|m| m["id"].as_str().expect("id"))
         .collect();
     assert_eq!(ids, vec!["work-model"]);
-    // TASK-RENAME-SIMPLEHARN keep-pin (review R1R-02): `owned_by: "simplehar"`
-    // is a deliberate public wire contract — the operator ruling kept the
-    // legacy-stable identifier through the rename so OpenAI-compatible clients
-    // that branch on it do not break at v1.2.0; the earliest rename is v2.0 as
-    // a documented contract change. Falsifier: rename the wire literal and this
-    // pin goes red before any client can discover the drift.
+    // TASK-NAMING-CLEANUP pin (c, wire half): `owned_by: "simpleharn"` is the
+    // public wire contract. The old legacy-stable ruling is superseded by the
+    // operator ruling of 2026-11-05: the wire value carries the one product
+    // name. Falsifier: rename the wire literal and this pin goes red before
+    // any client can discover the drift.
     for row in body["data"].as_array().expect("list") {
         assert_eq!(
             row["owned_by"].as_str(),
-            Some("simplehar"),
-            "owned_by is a public wire contract (TASK-RENAME-SIMPLEHARN ruling, \
-             renamed at v2.0 at the earliest): {row}"
+            Some("simpleharn"),
+            "owned_by is the public wire contract of the current product name: {row}"
         );
     }
 
@@ -4977,7 +4975,7 @@ async fn refusal_envelope(
     let body: Value = serde_json::from_slice(&bytes).expect("envelope JSON");
     assert_eq!(body["code"], want_code, "flat envelope: {body}");
     assert_eq!(body["error"]["code"], want_code, "OpenAI envelope: {body}");
-    assert_eq!(body["error"]["type"], "simplehar_error", "{body}");
+    assert_eq!(body["error"]["type"], "simpleharn_error", "{body}");
     assert_eq!(body["error"]["message"], body["message"], "{body}");
     body
 }

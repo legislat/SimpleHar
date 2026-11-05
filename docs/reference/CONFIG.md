@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [harness configuration keys, category eviction rules]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: behavior-change, release
 ---
 
@@ -17,19 +17,15 @@ the category eviction rules. The category and port matrix itself lives in
 ## The config file: `simpleharn.json`
 
 The file lives beside the executable. Override the path with the
-`SIMPLEHARN_CONFIG` environment variable. The deprecated `SIMPLEHAR_CONFIG`
-and `SIMPLEHAR_TOKEN` spellings keep working as fallbacks, with one
-deprecation warning in the log; the `SIMPLEHARN_*` spelling wins when both
-are set. A file named by that variable is an
+`SIMPLEHARN_CONFIG` environment variable. The harness reads only the
+`SIMPLEHARN_*` environment names; the old `SIMPLEHAR_*` spellings are inert.
+A file named by that variable is an
 instruction, not an absence: boot fails when it does not exist, and
 first-start creation never writes there. Delete the default file to have the
 next boot re-create it at the default path. A file named by `SIMPLEHARN_CONFIG`
-must exist. Auto-discovery order: `simpleharn.json`, then `simplehar-se.json`,
-then `simplehar.json`. An existing `simplehar-se.json` is loaded in place and
-write-back stays on that file, so a setup written under the old name keeps
-working after the rename. If a legacy `simplehar.json` sits
-beside the exe and neither newer name exists yet, the harness copies it
-over once and leaves the old file untouched for rollback. **The config file
+must exist. Auto-discovery finds only `simpleharn.json`. The harness ignores
+the pre-rename `simplehar-se.json` and `simplehar.json` files: it never reads
+them, never writes them, and never migrates them. **The config file
 is authoritative.** A `default_model` change made on the page persists back
 to the exact file boot read, through an atomic rewrite. The harness completes
 partial files. An invalid file stops boot and the harness logs every problem;

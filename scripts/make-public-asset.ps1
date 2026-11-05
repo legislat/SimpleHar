@@ -10,8 +10,7 @@
 #
 # Refusals (all hard FAIL):
 #   - the source dir (the exe's folder unless -SourceDir says otherwise)
-#     contains ModelConf, logs, simpleharn.json, simplehar-se.json, or
-#     START-NOTES.txt:
+#     contains ModelConf, logs, simpleharn.json, or START-NOTES.txt:
 #     those are personal runtime files and stay local (PUBLICATION.md);
 #   - the exe hash differs from -ExpectedSha256 (the hash the changelog
 #     records for that tag);
@@ -58,7 +57,7 @@ if (-not $script:allPass) {
 }
 
 # 2. Refuse a personal deploy directory as the source.
-$forbidden = @('ModelConf', 'logs', 'simpleharn.json', 'simplehar-se.json', 'START-NOTES.txt')
+$forbidden = @('ModelConf', 'logs', 'simpleharn.json', 'START-NOTES.txt')
 $found = @()
 foreach ($name in $forbidden) {
   if (Test-Path -LiteralPath (Join-Path $SourceDir $name)) { $found += $name }
@@ -118,7 +117,7 @@ config is a sanitized template written by the script (loopback 127.0.0.1,
 no control_token, no wsl_user, no model rows).
 
 Excluded by rule: ModelConf, logs, the deployment config file
-(simpleharn.json, or the loaded simplehar-se.json), and
+(simpleharn.json), and
 START-NOTES.txt. These name personal paths and rows and stay local.
 
 Checks: the exe hash was compared against the changelog value for this
@@ -138,6 +137,8 @@ Report $true "wrote simpleharn.example.json and PUBLICATION-SCRUB.md"
 #    exactly what release-check.ps1 treats as durable text.
 $scanFiles = Get-ChildItem -LiteralPath $staged -File |
   Where-Object { $_.Extension -ne '.exe' } | ForEach-Object { $_.FullName }
+# Legacy machine-path bans: the old-product spellings below are old install,
+# backup and staging directory names on the operator machine - not product names.
 $personalPathPatterns = @(
   'C:\\Inference\\(?!llama\.cpp)',
   'C:\\Users\\',

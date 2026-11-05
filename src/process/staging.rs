@@ -129,7 +129,7 @@ pub(crate) fn rendered_profiles_dir(engine: &str) -> PathBuf {
 }
 
 /// The strata spelling of [`rendered_profiles_dir`], kept for the strata call
-/// sites and their pins (byte-identical tail: `.simplehar/strata-profiles`).
+/// sites and their pins (byte-identical tail: `.simpleharn/strata-profiles`).
 #[must_use]
 pub(crate) fn strata_profiles_dir() -> PathBuf {
     rendered_profiles_dir("strata")
@@ -405,7 +405,7 @@ pub(super) fn staging_driver(script: &str, file_name: &str, blob: &str) -> Strin
     )
 }
 
-/// Stage `script`'s bytes at `path` (a `~/.simplehar/autostart/` path the wsl_user
+/// Stage `script`'s bytes at `path` (a `~/.simpleharn/autostart/` path the wsl_user
 /// owns) and prove the *content* landed. The distro rules (GOTCHAS `[ps]`) are "never
 /// `wsl bash -c <string>` — the login shell re-tokenizes and expands the payload
 /// before the inner shell sees it" and (same reason) never hand the inner shell a

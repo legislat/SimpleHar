@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, operator]
 source_of_truth_for: [handoff protocol]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-05
 review_trigger: behavior-change, release, quarterly
 ---
 
@@ -105,7 +105,7 @@ The live layer is local-only. Back it up to a separate physical drive or network
 not use the same physical device as the working tree.
 
 - Back up `HANDOFF.md`, `handoff/`, `ModelConf/`, and the active config file
-  (`simpleharn.json`, or the legacy name it loaded).
+  (`simpleharn.json`).
 - Exclude `target/`, `logs/`, build artifacts, and the frozen `archive/` and
   `base-archive/` trees. The frozen trees are backed up once or preserved in Git history.
 - Cadence: at each handoff checkpoint: before ending a session, before a card window, and

@@ -95,18 +95,17 @@ impl ApiState {
 
 /// Where a config write-back belongs: the file boot actually loaded (`SIMPLEHARN_CONFIG`
 /// included), else the default beside the executable — taken from
-/// [`crate::config::default_config_path`] so the file SE reads and the file SE writes can
-/// never drift apart.
+/// [`crate::config::default_config_path`] so the file the harness reads and the file
+/// it writes can never drift apart.
 ///
 /// The final `PathBuf::from(CONFIG_FILE)` is a last resort for a process that cannot
-/// resolve its own executable path: `boot_config` always stamps `source_path`, so this is
-/// reached in practice only by a hand-built `AppConfig`. It used to name `simplehar.json`,
-/// the older app's file. SE never writes the legacy file unless the operator explicitly
-/// selects it as `SIMPLEHARN_CONFIG` (ruling 2026-11-03, `TASK-DEBT-LEFTOVERS`):
-/// auto-discovery and migration only read it, and boot warns once about the
-/// rollback-strand hazard when the operator selects it (`main.rs::boot_config`). The
-/// fallback itself must therefore name [`crate::config::CONFIG_FILE`] — naming the
-/// legacy file here would write a file boot never loads (README review, 2026-10-27).
+/// resolve its own executable path: `boot_config` always stamps `source_path`, so this
+/// is reached in practice only by a hand-built `AppConfig`. The harness never writes a
+/// config file other than the one it loaded or [`crate::config::CONFIG_FILE`], unless
+/// the operator explicitly selected another path as `SIMPLEHARN_CONFIG` — an explicit
+/// path is an operator instruction and config file is king (ruling 2026-11-03,
+/// `TASK-DEBT-LEFTOVERS`). The fallback must therefore name [`crate::config::CONFIG_FILE`]:
+/// naming any other file would write a file boot never loads (README review, 2026-10-27).
 pub(super) fn config_write_path(config: &AppConfig) -> std::path::PathBuf {
     config
         .source_path

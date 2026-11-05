@@ -112,7 +112,7 @@ async fn a_container_the_harness_never_claimed_is_never_queried_for_evidence() {
 }
 
 /// Template adoption (2026-10-31): the staged path is content-addressed, lives
-/// only under `~/.simplehar/autostart/`, and is a single unquoted word to the
+/// only under `~/.simpleharn/autostart/`, and is a single unquoted word to the
 /// distro shell — so a hostile slug or a re-render can neither escape the
 /// directory nor collide with another model's staged file.
 #[test]
@@ -120,7 +120,7 @@ fn a_staged_script_path_is_content_addressed_and_shell_bare() {
     let first = staged_script_path("ninfer-x", "echo a");
     let second = staged_script_path("ninfer-x", "echo b");
     assert!(
-        first.starts_with("~/.simplehar/autostart/ninfer-x-"),
+        first.starts_with("~/.simpleharn/autostart/ninfer-x-"),
         "{first}"
     );
     assert!(first.ends_with(".sh"), "{first}");
@@ -324,8 +324,14 @@ fn rendered_profile_roots_are_per_engine_and_distinct() {
         "the strata spelling is unchanged"
     );
     let basalt = rendered_profiles_dir("basalt");
-    assert!(strata.ends_with(".simplehar/strata-profiles"), "{strata:?}");
-    assert!(basalt.ends_with(".simplehar/basalt-profiles"), "{basalt:?}");
+    assert!(
+        strata.ends_with(".simpleharn/strata-profiles"),
+        "{strata:?}"
+    );
+    assert!(
+        basalt.ends_with(".simpleharn/basalt-profiles"),
+        "{basalt:?}"
+    );
     assert_ne!(strata, basalt);
 }
 
@@ -2198,8 +2204,8 @@ fn upper_keys(env: &[(String, String)]) -> Vec<String> {
 
 /// A synthetic harness env carrying every baseline var (mixed spellings where
 /// Windows plausibly carries them) plus the vars that must never reach an
-/// engine child: the plaintext control secret, the harness log knob in both
-/// spellings, and the Python hijack vars.
+/// engine child: the plaintext control secret, the harness log knob, and the
+/// Python hijack vars.
 fn secret_bearing_source() -> Vec<(String, String)> {
     pairs(&[
         ("SystemRoot", "C:\\Windows"),
@@ -2210,9 +2216,7 @@ fn secret_bearing_source() -> Vec<(String, String)> {
         ("TEMP", "C:\\Temp"),
         ("TMP", "C:\\Temp"),
         ("SIMPLEHARN_TOKEN", "plaintext-secret"),
-        ("SIMPLEHAR_TOKEN", "plaintext-secret"),
         ("SIMPLEHARN_LOG", "debug"),
-        ("SIMPLEHAR_LOG", "debug"),
         ("PYTHONPATH", "C:\\evil\\hijack"),
         ("VIRTUAL_ENV", "C:\\evil\\venv"),
         ("CARGO_MANIFEST_DIR", "C:\\src"),
@@ -2247,7 +2251,6 @@ fn baseline_keeps_only_the_os_names_and_drops_every_secret() {
     assert_eq!(actual, expected, "baseline carries exactly the OS names");
     for secret in [
         "SIMPLEHARN_TOKEN",
-        "SIMPLEHAR_TOKEN",
         "PYTHONPATH",
         "VIRTUAL_ENV",
         "CARGO_MANIFEST_DIR",
@@ -2341,9 +2344,7 @@ fn engine_child_env_keeps_baseline_and_spec_and_drops_everything_else() {
     }
     for forbidden in [
         "SIMPLEHARN_TOKEN",
-        "SIMPLEHAR_TOKEN",
         "SIMPLEHARN_LOG",
-        "SIMPLEHAR_LOG",
         "PYTHONPATH",
         "VIRTUAL_ENV",
         "CARGO_MANIFEST_DIR",
@@ -2366,9 +2367,7 @@ fn assembled_env_reaches_a_real_child_without_inherited_secrets() {
     let mut source: Vec<(String, String)> = std::env::vars().collect();
     source.extend(pairs(&[
         ("SIMPLEHARN_TOKEN", "plaintext-secret"),
-        ("SIMPLEHAR_TOKEN", "plaintext-secret"),
         ("SIMPLEHARN_LOG", "debug"),
-        ("SIMPLEHAR_LOG", "debug"),
         ("PYTHONPATH", "C:\\evil\\hijack"),
     ]));
     let assembled = engine_child_env(source, &spec_map(&[("PROBE_MARKER", "seen")]));
@@ -2395,16 +2394,8 @@ fn assembled_env_reaches_a_real_child_without_inherited_secrets() {
         "secret reached the child: {text}"
     );
     assert!(
-        !has_child_var(&text, "SIMPLEHAR_TOKEN"),
-        "the deprecated token name is a secret too: it may not reach the child: {text}"
-    );
-    assert!(
         !has_child_var(&text, "SIMPLEHARN_LOG"),
         "harness log knob reached the child: {text}"
-    );
-    assert!(
-        !has_child_var(&text, "SIMPLEHAR_LOG"),
-        "the deprecated log name is harness-only too: it may not reach the child: {text}"
     );
     assert!(
         !has_child_var(&text, "PYTHONPATH"),
@@ -2427,11 +2418,10 @@ fn assembled_env_reaches_a_real_child_without_inherited_secrets() {
 /// Injects harness-process vars for one test and removes them on scope exit,
 /// including through an assertion panic. Only names no other test in this
 /// binary reads may be injected: the crate reads just `SIMPLEHARN_LOG`,
-/// `SIMPLEHARN_TOKEN` and `SIMPLEHARN_CONFIG` — plus the deprecated
-/// `SIMPLEHAR_LOG`/`SIMPLEHAR_TOKEN`/`SIMPLEHAR_CONFIG` fallbacks (the log
-/// knob is read only inside `observability::init`, which tests never call) —
-/// never `PYTHONPATH`/`VIRTUAL_ENV`, and integration suites are separate
-/// processes.
+/// `SIMPLEHARN_TOKEN` and `SIMPLEHARN_CONFIG` — and nothing else
+/// (TASK-NAMING-CLEANUP: no older spelling is read; the log knob is read only
+/// inside `observability::init`, which tests never call) — never
+/// `PYTHONPATH`/`VIRTUAL_ENV`, and integration suites are separate processes.
 /// `std::env::set_var` is a safe call in edition 2021 — an `unsafe` block here
 /// would deny the build with `unused_unsafe` under `-D warnings`.
 struct HarnessEnvGuard(Vec<String>);
@@ -2480,13 +2470,12 @@ async fn engine_spawn_serves_only_the_declared_environment() {
     // The production path end to end: `ProcessRuntime::spawn` (the single
     // LaunchSpec-driven spawn site) must hand the child baseline + spec only.
     // Neutralising its `env_clear()` fails the PYTHONPATH/VIRTUAL_ENV/
-    // SIMPLEHAR_LOG/CARGO_ assertions below, because these markers genuinely
+    // SIMPLEHARN_LOG/CARGO_ assertions below, because these markers genuinely
     // live in the harness process while the child spawns.
     let _markers = HarnessEnvGuard::set(&[
         ("PYTHONPATH", "C:\\evil\\hijack"),
         ("VIRTUAL_ENV", "C:\\evil\\venv"),
         ("SIMPLEHARN_LOG", "debug"),
-        ("SIMPLEHAR_LOG", "debug"),
     ]);
     let dir = crate::testutil::temp_dir("enginespawn");
     let dump = dir.join("child-set.txt");
@@ -2531,9 +2520,7 @@ async fn engine_spawn_serves_only_the_declared_environment() {
     );
     for forbidden in [
         "SIMPLEHARN_TOKEN",
-        "SIMPLEHAR_TOKEN",
         "SIMPLEHARN_LOG",
-        "SIMPLEHAR_LOG",
         "PYTHONPATH",
         "VIRTUAL_ENV",
     ] {
@@ -2580,7 +2567,7 @@ fn control_child_env_is_the_baseline_and_nothing_else() {
     assert_eq!(keys.len(), env.len(), "no case-duplicates: {keys:?}");
     for name in &keys {
         assert!(
-            !name.starts_with("SIMPLEHAR") && !name.starts_with("CARGO_"),
+            !name.starts_with("SIMPLEHARN") && !name.starts_with("CARGO_"),
             "secret/toolchain name {name} reached the control assembly"
         );
     }
@@ -2608,9 +2595,7 @@ async fn a_control_command_child_carries_no_harness_environment() {
     let text = wait_for_child_env_dump(&dump).await;
     for forbidden in [
         "SIMPLEHARN_TOKEN",
-        "SIMPLEHAR_TOKEN",
         "SIMPLEHARN_LOG",
-        "SIMPLEHAR_LOG",
         "PYTHONPATH",
         "VIRTUAL_ENV",
     ] {

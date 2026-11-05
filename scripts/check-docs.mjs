@@ -37,6 +37,9 @@ const PATH_EXEMPT = new Set([
   "docs/architecture/DECISIONS.md",
   "docs/architecture/DOCTRINE.md",
 ]);
+// Legacy machine-path note: the old-product spelling inside this pattern is the
+// name of the operator's current checkout directory on disk (kept until file
+// renames land) - it is a documented-path exemption, not a product name.
 const PRODUCT_DEFAULT_PATH =
   /(?:C:\\Inference\\llama\.cpp|C:\\Strata|C:\\Inference\\SimpleHar-SE|D:\\Models)/i;
 

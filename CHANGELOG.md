@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, maintainer]
 source_of_truth_for: [release history]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: release
 ---
 
@@ -17,6 +17,18 @@ Versioning.
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
 ## Unreleased
+
+### Changed
+
+- SimpleHarn is the only name (operator instruction 2026-11-05). The harness
+  retires the working-name spellings. Config discovery reads only
+  `simpleharn.json` and ignores an old `simplehar-se.json` or
+  `simplehar.json`. The harness reads only `SIMPLEHARN_CONFIG`,
+  `SIMPLEHARN_TOKEN` and `SIMPLEHARN_LOG` and treats the old names as
+  inert. The wire carries `simpleharn_error` and `owned_by: "simpleharn"`.
+  The harness writes custody under `.simpleharn/` and holds
+  `SimpleHarn-SingleInstance`. Backward compatibility and migration do not
+  exist.
 
 ## v1.3.0 - 2026-11-05
 

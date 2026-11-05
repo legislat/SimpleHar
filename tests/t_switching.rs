@@ -367,7 +367,6 @@ impl Harness {
             // An ambient token would authenticate every harness we spawn and then 401
             // the whole suite, because our client never sends one (review, 2026-10-27).
             .env_remove("SIMPLEHARN_TOKEN")
-            .env_remove("SIMPLEHAR_TOKEN")
             .spawn()
             .expect("spawn simpleharn.exe");
 

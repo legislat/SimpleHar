@@ -88,9 +88,8 @@ pub const ROUTINE_POLL_PATHS: [&str; 3] = ["/har/status", "/har/log", "/har/mode
 
 /// The control token, if any: the environment wins so the secret can stay out of the
 /// config file entirely (AGENTS.md — secrets live in the environment, not in
-/// code/config). The env name is `SIMPLEHARN_TOKEN`, with the deprecated
-/// `SIMPLEHAR_TOKEN` as a fallback that warns once (`config::token_from_env`,
-/// TASK-RENAME-SIMPLEHARN). Whitespace-only values mean "no token" at read time;
+/// code/config). The env name is `SIMPLEHARN_TOKEN`, and it is the only name read
+/// (TASK-NAMING-CLEANUP). Whitespace-only values mean "no token" at read time;
 /// `validate` rejects them in the file, so a typo can never silently disable auth.
 pub(super) fn resolve_control_token(config: &AppConfig) -> Option<String> {
     crate::config::token_from_env()
