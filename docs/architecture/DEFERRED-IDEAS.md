@@ -1,11 +1,11 @@
 ---
-title: Deferred design notes
+title: Ideas for later (not queued)
 owner: operator
 status: active
 audience: [architect, contributor, agent]
-source_of_truth_for: [design notes for deferred Berth items B9 and B10]
+source_of_truth_for: [ideas held for later: priority classes, restart reconciliation]
 last_reviewed: 2026-11-05
-review_trigger: new-decision, operator approval of either item
+review_trigger: new-decision, an operator decision to promote an idea
 ---
 
 # DEFERRED-IDEAS.md
@@ -16,8 +16,9 @@ records design thinking and open risks. It makes no ruling.
 `docs/architecture/OVERVIEW.md` owns current behavior.
 
 Both notes come from the Berth borrow queue (Search#41 investigation). The
-operator ruling of 2026-11-04 placed both items in the last tier: design notes
-only, and no build without a new operator approval.
+operator demoted both to ideas on 2026-11-05: they hold no queue slot, no tier,
+and no build follows from them. A note here is a thought kept for later, not a
+plan. Promote one only with a new operator decision.
 
 ## 1. B9 - Priority classes (hook design only)
 
