@@ -4447,10 +4447,12 @@ fn the_drift_rounds_judge_only_pre_gathered_evidence() {
 /// handler's reload). "True today" was grep-only; this pin makes the claim
 /// structural, the repo's established `include_str!` style: every scanned source
 /// keeps exactly its allowed count of writeback call sites in its production
-/// half, and each mutator file must also carry its note. A third caller must
-/// register the write in the re-baseline table (send `ModelFileWritten` /
-/// `note_model_file_written` with the write) or the amber blames the harness for
-/// its own write — the exact lie interlock 5 forbids.
+/// half, and each mutator file must also carry its note. The scan list names
+/// every scheduler production file, so a new writer anywhere in the scheduler
+/// tree trips this pin, not only the files that already carry mutators. A
+/// third caller must register the write in the re-baseline table (send
+/// `ModelFileWritten` / `note_model_file_written` with the write) or the amber
+/// blames the harness for its own write — the exact lie interlock 5 forbids.
 /// Falsifier: inject `let _ = crate::model::writeback::set_flags_on_file(
 /// std::path::Path::new("x"), &[]);` into any scanned production body and this
 /// is the sole failing test; add the call to api WITHOUT the note and the note
@@ -4459,10 +4461,19 @@ fn the_drift_rounds_judge_only_pre_gathered_evidence() {
 fn the_writeback_mutator_set_stays_closed_to_the_rebaseline_table() {
     for (file, source, allowed) in [
         ("scheduler/mod.rs", include_str!("mod.rs"), 0usize),
+        ("scheduler/admission.rs", include_str!("admission.rs"), 0),
         ("scheduler/catalog.rs", include_str!("catalog.rs"), 0),
+        ("scheduler/commands.rs", include_str!("commands.rs"), 0),
+        ("scheduler/events.rs", include_str!("events.rs"), 0),
+        ("scheduler/fit.rs", include_str!("fit.rs"), 0),
         ("scheduler/handle.rs", include_str!("handle.rs"), 0),
+        ("scheduler/jobs.rs", include_str!("jobs.rs"), 0),
         ("scheduler/measured.rs", include_str!("measured.rs"), 1),
         ("scheduler/messages.rs", include_str!("messages.rs"), 0),
+        ("scheduler/occupant.rs", include_str!("occupant.rs"), 0),
+        ("scheduler/spawn.rs", include_str!("spawn.rs"), 0),
+        ("scheduler/status.rs", include_str!("status.rs"), 0),
+        ("scheduler/vocab.rs", include_str!("vocab.rs"), 0),
         ("api/mod.rs", include_str!("../api/mod.rs"), 0),
         ("api/guards.rs", include_str!("../api/guards.rs"), 0),
         (
