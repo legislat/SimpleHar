@@ -26,8 +26,11 @@
 //! G12 release evidence: the child handle is signaled *and* the port refuses TCP
 //! (for containers, the closed port after reaping is the evidence).
 
+mod control;
+mod logs;
 mod win32;
 
+pub use logs::{harness_logs_dir, prune_harness_log_files};
 pub use win32::SingleInstanceGuard;
 
 use crate::custody::{self, CustodyLedger};
@@ -39,17 +42,32 @@ use crate::ownership::{
     SpawnTicket,
 };
 use async_trait::async_trait;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use control::{
+    engine_child_env, run_control_command, run_control_command_timeout,
+    run_control_command_with_stdin, ControlOutcome,
+};
+use logs::prune_model_logs;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 use win32::{
     assign_to_job, create_kill_on_close_job, descendant_pids_of, resume_primary_thread,
     terminate_job, JobHandle, CREATE_NO_WINDOW,
 };
+
+#[cfg(test)]
+use std::collections::BTreeMap;
+
+#[cfg(test)]
+use std::process::Stdio;
+
+#[cfg(test)]
+use control::{child_env_baseline_from, control_child_env, OS_ENV_BASELINE};
+
+#[cfg(test)]
+use logs::{is_engine_log, is_harness_log};
 
 #[cfg(test)]
 use win32::DESCENDANT_CAP;
@@ -71,331 +89,6 @@ const CONTAINER_LOG_FETCH_CAP: usize = 8 * 1024 * 1024;
 /// plausible post-startup chatter while the startup `MemorySummary` record (written
 /// at startup, re-read only for a container this harness claimed) stays in view.
 const CONTAINER_LOG_TAIL_LINES: usize = 20_000;
-
-/// Windows env var names (case-insensitive) an engine child may keep (§5 locked
-/// decision, E3): external engines obey only harness-owned configuration, so a
-/// child's environment is this baseline plus what [`LaunchSpec`] declares — never
-/// the harness's own environment with its plaintext `SIMPLEHARN_TOKEN`, its
-/// `PYTHONPATH`/`VIRTUAL_ENV` (strata is a Python child: import-hijack risk), and
-/// every other stray var.
-const OS_ENV_BASELINE: &[&str] = &[
-    "SystemRoot",
-    "windir",
-    "COMSPEC",
-    "Path",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-];
-
-/// Builds the child baseline by copying the [`OS_ENV_BASELINE`] names out of
-/// `source` (the harness env at the spawn site), matching names case-insensitively:
-/// Windows env names are case-insensitive and [`std::env::vars`] preserves whatever
-/// spelling the parent carried, so lookups go through the uppercased key while the
-/// output uses the baseline's canonical spelling. A name supplied under several
-/// spellings (e.g. `PATH` and `Path`) collapses to one entry, first occurrence
-/// wins. `SystemRoot`, `windir`, `COMSPEC` and `PATHEXT` are never invented: absent
-/// from `source` they stay absent and the spawn fails loudly if Windows demands
-/// one. `Path`, `TEMP` and `TMP` are always present via [`baseline_fallback`].
-fn child_env_baseline_from<I>(source: I) -> Vec<(String, String)>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    let wanted: HashSet<String> = OS_ENV_BASELINE
-        .iter()
-        .map(|name| name.to_uppercase())
-        .collect();
-    let mut found: HashMap<String, String> = HashMap::new();
-    for (name, value) in source {
-        let upper = name.to_uppercase();
-        if wanted.contains(&upper) {
-            found.entry(upper).or_insert(value);
-        }
-    }
-    OS_ENV_BASELINE
-        .iter()
-        .filter_map(|name| {
-            let upper = name.to_uppercase();
-            let value = found
-                .get(&upper)
-                .cloned()
-                .or_else(|| baseline_fallback(&upper))?;
-            Some(((*name).to_string(), value))
-        })
-        .collect()
-}
-
-/// The always-present baseline values the harness env may lack: `Path` falls back
-/// to the harness's own directory and `TEMP`/`TMP` to [`std::env::temp_dir`];
-/// every other name returns `None` and is omitted rather than invented.
-///
-/// # Panics
-///
-/// Only when `name_upper` is `"PATH"` and the harness executable path cannot be
-/// resolved — there is no honest substitute for `Path`.
-fn baseline_fallback(name_upper: &str) -> Option<String> {
-    match name_upper {
-        "PATH" => Some(
-            std::env::current_exe()
-                .expect("invariant: the harness exe path resolves; Path has no other fallback")
-                .parent()
-                .expect("invariant: the harness exe lives in a directory")
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        "TEMP" | "TMP" => Some(std::env::temp_dir().to_string_lossy().into_owned()),
-        _ => None,
-    }
-}
-
-/// The complete environment for one engine child: the baseline copied from
-/// `source` (the harness env at the spawn site), then every `spec_env` entry
-/// applied last so a declared var overrides its baseline twin. Names are
-/// case-insensitive on Windows, so a spec entry first removes any baseline pair
-/// whose uppercased key equals its own, then appends under its own spelling —
-/// the assembly never carries two spellings of one name.
-///
-/// Applies to `LaunchSpec`-driven engine spawns and, with an empty `spec_env`, to
-/// the harness-internal WSL control commands built by [`run_control_command`] —
-/// nothing spawned by this module inherits the harness environment any more
-/// (FINDINGS2-0910 [4]). Shared by the spawn site and the tests so the tests
-/// exercise the real production assembly.
-fn engine_child_env<I>(source: I, spec_env: &BTreeMap<String, String>) -> Vec<(String, String)>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
-    let mut env = child_env_baseline_from(source);
-    for (key, value) in spec_env {
-        let upper = key.to_uppercase();
-        env.retain(|(name, _)| name.to_uppercase() != upper);
-        env.push((key.clone(), value.clone()));
-    }
-    env
-}
-
-/// What a harness-internal control command may carry: exactly the OS baseline
-/// ([`OS_ENV_BASELINE`]) and nothing else — no `SIMPLEHARN_TOKEN`, no `PYTHONPATH`,
-/// no stray harness name (FINDINGS2-0910 [4]).
-///
-/// The earlier ruling here was "control commands run harness code, not operator
-/// config, so they keep inheriting"; that justified the *inbound* direction only.
-/// The two WSL control commands execute *outbound* — their whole purpose is to run
-/// inside the operator's distro, the very boundary E3 called worse than a Windows
-/// child environment — so inheriting was an outbound secret leak. They need nothing
-/// but `SystemRoot`/`windir`/`Path`/`PATHEXT`/`COMSPEC`/`TEMP`/`TMP`, i.e. what
-/// `wsl.exe` itself requires, so no separate control-only list was invented: one
-/// baseline, one rule, nothing to drift.
-fn control_child_env() -> Vec<(String, String)> {
-    engine_child_env(std::env::vars(), &BTreeMap::new())
-}
-
-/// How one harness-internal control command finished.
-#[derive(Debug)]
-enum ControlOutcome {
-    /// The command ran and reported; the caller judges the exit status and stdout.
-    Ran(std::process::Output),
-    /// The command could not be started at all (no `wsl.exe`, spawn refused).
-    Failed(String),
-    /// The command outlived [`CONTROL_TIMEOUT`].
-    TimedOut,
-}
-
-/// The deadline every control command gets: a wedged `wsl.exe`/docker call must not
-/// park a boot reconcile or an unload indefinitely.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The ONE site through which a harness-internal control command is built and run:
-/// hidden (`CREATE_NO_WINDOW`), `kill_on_drop` so a timed-out client cannot
-/// accumulate as an orphan, and with the scrubbed [`control_child_env`] rather than
-/// the inherited environment (FINDINGS2-0910 [4]). Both WSL control commands go
-/// through here; neither may build its own [`Command`], which is what made the
-/// asymmetry between engine children and control commands possible in the first
-/// place.
-async fn run_control_command(program: &str, args: &[String]) -> ControlOutcome {
-    run_control_command_with_stdin(program, args, &[]).await
-}
-
-/// [`run_control_command`] with an explicit deadline — the ONE control-command
-/// builder shared by the WSL commands and the R11 fit probes, so a probe gets
-/// the same hidden / kill-on-drop / scrubbed-environment posture and only the
-/// timeout is the caller's (the fit probes outlive the 10 s WSL default only
-/// by operator calibration, never by a new spawn path).
-async fn run_control_command_timeout(
-    program: &str,
-    args: &[String],
-    timeout: Duration,
-) -> ControlOutcome {
-    run_control_command_with_stdin_timeout(program, args, &[], timeout).await
-}
-
-/// [`run_control_command`] with a stdin payload. The ONLY legitimate use is the
-/// staging driver: a program that must reach the distro shell *as data*, never as
-/// argv — the login-shell re-tokenization GOTCHAS `[ps]` warns about cannot touch
-/// bytes that ride a pipe, and no path (Windows or otherwise) ever appears in the
-/// command line. Writing the payload to the child's stdin to EOF precedes waiting,
-/// so a child that never reads cannot wedge the control timeout into `TimedOut`
-/// without also being reaped by `kill_on_drop`.
-async fn run_control_command_with_stdin(
-    program: &str,
-    args: &[String],
-    stdin: &[u8],
-) -> ControlOutcome {
-    run_control_command_with_stdin_timeout(program, args, stdin, CONTROL_TIMEOUT).await
-}
-
-/// The body behind [`run_control_command`], [`run_control_command_timeout`] and
-/// [`run_control_command_with_stdin`]: the ONE place a control [`Command`] is
-/// built, with the deadline as the only varying parameter.
-async fn run_control_command_with_stdin_timeout(
-    program: &str,
-    args: &[String],
-    stdin: &[u8],
-    timeout: Duration,
-) -> ControlOutcome {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .kill_on_drop(true)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in control_child_env() {
-        command.env(key, value);
-    }
-    let run = async {
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
-        let mut pipe = child
-            .stdin
-            .take()
-            .unwrap_or_else(|| unreachable!("invariant: stdin is piped above"));
-        // A stdin write that fails because the child already died (a `bash` that
-        // rejects the invocation outright) is not the failure to report: the exit
-        // status and stderr below name the real one.
-        let _ = pipe.write_all(stdin).await;
-        drop(pipe);
-        child
-            .wait_with_output()
-            .await
-            .map_err(|error| error.to_string())
-    };
-    match tokio::time::timeout(timeout, run).await {
-        Ok(Ok(output)) => ControlOutcome::Ran(output),
-        Ok(Err(error)) => ControlOutcome::Failed(error),
-        Err(_) => ControlOutcome::TimedOut,
-    }
-}
-
-/// The directory every harness log file lands in: `logs/` beside the current
-/// executable, falling back to the working directory. Shared by the captured engine
-/// children and [`crate::observability`]'s boot log, so the two can never disagree
-/// about where the operator's `logs/` lives.
-#[must_use]
-pub fn harness_logs_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("logs")))
-        .unwrap_or_else(|| PathBuf::from("logs"))
-}
-
-/// Whether a path is the harness's own boot log rather than a captured engine child.
-/// Matched on the file stem, so the rolled `harness-<epoch>.log.1`, `.log.2`, … (whose
-/// extension is a generation number) still count as harness logs and cannot leak out of
-/// the harness budget into the engine one.
-fn is_harness_log(path: &std::path::Path) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.starts_with(crate::observability::HARNESS_LOG_PREFIX))
-}
-
-fn is_engine_log(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("log") && !is_harness_log(path)
-}
-
-/// Deletes the oldest files beyond `keep` in `dir` that `wants` claims. `kind` names
-/// them in the one warning this can emit, so a failure says which budget broke.
-fn prune_matching(
-    dir: &std::path::Path,
-    keep: usize,
-    kind: &str,
-    wants: impl Fn(&std::path::Path) -> bool,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| wants(path))
-        .filter_map(|path| {
-            let modified = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .ok()?;
-            Some((modified, path))
-        })
-        .collect();
-    if files.len() <= keep {
-        return;
-    }
-    files.sort_by_key(|(modified, _)| *modified); // oldest first
-    let excess = files.len() - keep;
-    for (_, path) in files.into_iter().take(excess) {
-        if let Err(error) = std::fs::remove_file(&path) {
-            tracing::warn!(error = %error, path = %path.display(), "cannot prune old {kind} log");
-        }
-    }
-}
-
-/// Whether a path is one of the R9 container-log snapshots (`<model>-<epoch>.container.log`),
-/// as opposed to a client capture (`<model>-<epoch>.log`).
-fn is_container_log(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".container.log"))
-        && !is_harness_log(path)
-}
-
-/// Per-model forensic retention (R9): keep the newest `keep` client captures **and**
-/// the newest `keep` container snapshots for one model, deleting the older ones of
-/// each class. Scoped to one model so a swap-heavy model can never evict another
-/// model's forensic log — the defect of the old global budget. The scope is the exact
-/// minted shape `{model}-{epoch}[.container].log` — epoch all digits — NOT a bare
-/// `{model}-` prefix: model names legally contain `-`, so a prefix match let model
-/// `swift`'s keep-N claim (and delete) `swift-7b`'s files. Harness boot logs are
-/// excluded from both classes by [`is_harness_log`]. The caller passes the ONE
-/// forensic pool key — [`sanitize_slug`] of the model, the same stem both mint
-/// sites use (R2-08-03) — never a raw name or a private spelling.
-fn prune_model_logs(dir: &std::path::Path, prefix: &str, keep: usize) {
-    let owned_prefix = format!("{prefix}-");
-    let matches_model = |path: &std::path::Path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                let Some(rest) = name.strip_prefix(owned_prefix.as_str()) else {
-                    return false;
-                };
-                // `{epoch}.log` or `{epoch}.container.log`, epoch all digits.
-                let epoch = rest
-                    .strip_suffix(".container.log")
-                    .or_else(|| rest.strip_suffix(".log"))
-                    .unwrap_or(rest);
-                !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit())
-            })
-    };
-    prune_matching(dir, keep, "engine", |path| {
-        is_engine_log(path) && !is_container_log(path) && matches_model(path)
-    });
-    prune_matching(dir, keep, "container", |path| {
-        is_container_log(path) && matches_model(path)
-    });
-}
-
-/// Keeps the newest `keep` harness boot logs (rotations included). Called by
-/// [`crate::observability::attach_file_sink`] at boot.
-pub fn prune_harness_log_files(dir: &std::path::Path, keep: usize) {
-    prune_matching(dir, keep, "harness", is_harness_log);
-}
 
 /// What the engine table says about a kill/release request for a port.
 #[derive(Debug, PartialEq, Eq)]
