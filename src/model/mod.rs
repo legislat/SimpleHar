@@ -701,6 +701,50 @@ pub enum CostSource {
     Undeclared,
 }
 
+/// Which rung of the RAM ladder a CPU-resident row charges (operator ruling
+/// 2026-11-05: RAM is its own resource ladder, so its basis vocabulary is
+/// the `cost_basis` words that apply to it — no card rung can answer for a
+/// row that books no card bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamCostBasis {
+    /// The declared `ram_gb` floor stands: the measured pair is absent or
+    /// does not exceed it (the floor is never undercut).
+    Declared,
+    /// The trusted measured working set exceeds the floor, or is the only
+    /// figure the row has (max truth, DOCTRINE 12). The pair can only carry
+    /// `per_process` tree truth: a `total_diff` reading is refused at the
+    /// fold and a `cpu_offload` flip voids the pair at scan.
+    Measured,
+    /// No `ram_gb` and no trusted pair: the GGUF-size estimate
+    /// (`size x 1.0 + 2`) books — weights page in, no KV-pinned card overhead.
+    Estimate,
+}
+
+impl RamCostBasis {
+    /// The wire token for this basis — the same vocabulary `/har/models`
+    /// `cost_basis` uses on its VRAM rungs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RamCostBasis::Declared => "declared",
+            RamCostBasis::Measured => "measured",
+            RamCostBasis::Estimate => "estimate",
+        }
+    }
+
+    /// Whose number the basis charges: the measured rung is always the
+    /// engine's own process-tree sum (`per_process` — the only attribution a
+    /// RAM figure can hold); a floor or estimate is arithmetic over the row's
+    /// own declaration (`declared`).
+    #[must_use]
+    pub fn source(self) -> &'static str {
+        match self {
+            RamCostBasis::Measured => "per_process",
+            RamCostBasis::Declared | RamCostBasis::Estimate => "declared",
+        }
+    }
+}
+
 impl ModelEntry {
     /// Whether the measured pair is present with a provenance that may book: an
     /// absent stamp is a legacy figure, grandfathered (see
@@ -845,6 +889,40 @@ impl ModelEntry {
             return CostSource::Undeclared;
         }
         CostSource::Estimate
+    }
+
+    /// The CPU-resident booking ladder in ONE derivation (operator ruling
+    /// 2026-11-05; the gate, `/har/models`, and the `/har/status` slot row
+    /// all read this — a second derivation is how a page would show a number
+    /// the gate ignores). The floor first — declared `ram_gb`, else the GGUF
+    /// estimate `size x 1.0 + 2` — then the max truth (DOCTRINE 12 amended
+    /// ruling): the trusted measured working set books when it exceeds the
+    /// floor, and the declared floor is never undercut. `None` is
+    /// under-specified: the gate refuses rather than guess the host's
+    /// footprint. A `cpu_offload` flip voids the pair at scan
+    /// (`read_measured_ram`) and a `total_diff` reading never persists into
+    /// it, so the measured rung can only ever carry `per_process` tree truth.
+    /// The VRAM cost ladder is never consulted here: a CPU row's `vram_gb`
+    /// changes no RAM figure, and a `ram_gb` changes no VRAM figure.
+    #[must_use]
+    pub fn ram_booking(&self) -> Option<(f64, RamCostBasis)> {
+        let declared = self.ram_gb;
+        let floor = declared.or_else(|| self.gguf_size_gb.map(|size| size * 1.0 + 2.0));
+        match (floor, self.measured_ram_gb) {
+            (Some(floor), Some(measured)) if measured > floor => {
+                Some((measured, RamCostBasis::Measured))
+            }
+            (Some(floor), _) => Some((
+                floor,
+                if declared.is_some() {
+                    RamCostBasis::Declared
+                } else {
+                    RamCostBasis::Estimate
+                },
+            )),
+            (None, Some(measured)) => Some((measured, RamCostBasis::Measured)),
+            (None, None) => None,
+        }
     }
 }
 

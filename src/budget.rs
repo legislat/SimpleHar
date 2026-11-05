@@ -160,7 +160,9 @@ pub fn grade_card_occupancy(
 }
 
 /// How far apart two GiB figures must be before the refusal bothers naming both.
-const DISAGREE_GIB: f64 = 0.05;
+/// The `/har/status` slot-row join reuses this band as the project's GiB
+/// epsilon for "the same figure" (W3-01).
+pub(crate) const DISAGREE_GIB: f64 = 0.05;
 
 /// What the refusal knows about WAITING, beside the named holders: an estimate
 /// and a queue place, each `None` when the harness has no basis to quote it.

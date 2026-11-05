@@ -21,14 +21,15 @@ Prebuilt binaries: see the GitHub Releases page of this repository.
 You run local LLMs on Windows with one NVIDIA GPU. You want several models that swap
 quickly, each on its own OpenAI-compatible endpoint, with no console windows to manage.
 You want one safe budget manager that never force-loads onto a full GPU and names the
-blockers and the numbers on every refusal.
+blockers and the numbers on every refusal. You do not want to deal with software juggernauts
+with million different options, built in chat, downloader and delivery of dairy products.
 
 The `llama` path (llama.cpp) works on any machine that can run `llama-server.exe`. The
 `strata`, `basalt`, and `ninfer` paths are supported for this operator's own setup. They
 may not fit other machines. Compared with llama-swap, which also swaps models, SimpleHarn
 adds a memory-accounting scheduler that refuses to overcommit. What this is not: it is
 not multi-user, it is not a router for remote or cloud engines, and it is not a replacement
-for llama-swap. It runs and supervises local engines on one machine only.
+for llama-swap. It runs and supervises local engines on one machine only. 
 
 This software is provided AS-IS, with no warranty of any kind. See
 [LICENSE](LICENSE) (Apache-2.0).

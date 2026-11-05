@@ -131,17 +131,48 @@ booking.
   witness returned no sample.
 - `mem.container_reported_gb`: the sum of the loaded containers' own reserved
   figures. It is `null` when no container reported a figure.
+- `mem.booked_ram_gb`: the sum of the installed CPU-resident rows' RAM
+  bookings. It equals the sum of the slot rows below and never counts a GPU
+  row. An host that loads nothing CPU reads `0.0`.
+- `mem.ram_reserve_gb`: the reserve the RAM gate subtracts before it
+  compares. It rides beside the host reading.
 - `slots[].container_reported_gb`: the occupant container's own reserved
   figure. It is present only for a ninfer container whose `engine_report`
   anchored the current launch.
+- `slots[].booked_ram_gb`: the GiB a CPU-resident occupant books in host
+  RAM.
+- `slots[].ram_cost_basis`: the booked RAM rung: `declared`, `measured`,
+  or `estimate`.
+- `slots[].ram_source`: whose number the booking is: `per_process` when
+  the measured rung books, `declared` when the floor or the estimate books.
+
+The harness emits these three fields together, and only on a
+CPU-resident row whose booked figure its catalog row still proves. The
+harness omits all three when they cannot be proven against the ledger.
+The row may have vanished after the load. A cost-only edit may have
+moved the row's rung under the loaded resident. A same-model twin may
+keep a booking that a fold did not re-book. Absent means "no claim":
+never a re-label and never zero.
 
 `/har/models` and the SSE `har_state` document carry these per-model fields:
 
 - `cost_basis`: `declared`, `measured`, `fit`, `estimate`, or `undeclared`.
+  On a `cpu_offload` row it names the booked **RAM** rung, never a VRAM
+  rung; on a GPU row it keeps the VRAM ladder unchanged.
 - `measured_attribution`: `engine_report`, `per_process`, `total_diff`, or
   `null`.
 - `required_to_free_gb`: the figure the model needs free. It is present only
   when `cost_basis` is `measured`.
+
+The RAM cost surface rides a `cpu_offload` row only. A GPU row carries none
+of these keys:
+
+- `ram_gb`: the declared RAM floor in GiB, or `null`.
+- `measured_ram_gb`, `measured_ram_min_gb`: the trusted measured RAM pair,
+  `null` until a load measured it. The harness writes the pair back.
+- `est_ram_gb`: the GGUF RAM estimate. It is present only when the estimate
+  is what books.
+- `ram_source`: `per_process` or `declared`, the same rule as the slot rows.
 
 A guarded `engine_report` above the declared `vram_gb` books instead of the
 declaration (max truth). A declaration at or above the report stands.

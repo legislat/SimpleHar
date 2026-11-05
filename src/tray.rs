@@ -941,6 +941,9 @@ mod tests {
             launched_at: None,
             stale_config: None,
             container_reported_gb: None,
+            booked_ram_gb: None,
+            ram_cost_basis: None,
+            ram_source: None,
             loaded_at: std::time::Instant::now(),
         }
     }

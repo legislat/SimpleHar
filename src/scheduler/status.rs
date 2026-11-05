@@ -91,6 +91,34 @@ pub struct SlotStatus {
     /// annotation unreachable for a token-gated, poll-only page); display only,
     /// never a gate input.
     pub container_reported_gb: Option<f64>,
+    /// The host-RAM booking this CPU-resident occupant debits (GiB), straight
+    /// from the actor's `ram_need` — the ledger truth, not a re-derivation
+    /// (W3, operator ruling 2026-11-05). Emitted only when the catalog row's
+    /// ladder figure still agrees with that booking (W3-01): a row that
+    /// vanished or moved its rung under the resident proves nothing, and all
+    /// three RAM fields then stay absent together — never re-labeled, never
+    /// guessed. **Absent on every GPU row and every empty slot**
+    /// (`skip_serializing_if`), so their wire shape is exactly what it was
+    /// before the RAM surface existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub booked_ram_gb: Option<f64>,
+    /// Which rung of the RAM ladder produced this resident's booking:
+    /// `declared`, `measured`, or `estimate` — the same vocabulary
+    /// `/har/models` `cost_basis` uses, answered by the entry's one ladder
+    /// derivation (`ModelEntry::ram_booking`). Present exactly when
+    /// `booked_ram_gb` is present: the catalog row still names the resident
+    /// and its ladder figure equals the ledger booking (absence is "no
+    /// claim", never a re-label of a stale figure).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_cost_basis: Option<&'static str>,
+    /// Whose number the booked RAM is: `per_process` when the measured
+    /// working set booked (the engine's own process-tree sum — the only
+    /// attribution a RAM figure can hold), `declared` when the floor or the
+    /// estimate booked. Same presence rule as `ram_cost_basis`: the three
+    /// RAM fields stand together or stay absent together. Absent on every
+    /// GPU row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_source: Option<&'static str>,
     /// When the occupant was loaded (copy of the actor's `Occupant::loaded_at`).
     /// Empty slots carry the snapshot time, mirroring the `map_or(Instant::now(),
     /// |o| o.loaded_at)` policy of the scheduler's own LRU picks. Not serialized:
@@ -110,6 +138,16 @@ impl ActorState {
     /// quote ONE source (review 2026-10-31: threading the sum only through the SSE
     /// build left the poll path — the only path a token-gated page has — forever
     /// null, and a fixture carrying the value hid it).
+    /// Whether the catalog row's RAM ladder figure still describes this
+    /// occupant's ledger booking (W3-01). Equal means equal within the
+    /// project's GiB epsilon — the same band that decides when two figures
+    /// are worth naming apart (`budget::DISAGREE_GIB`). NaN never agrees: a
+    /// NaN difference fails the band, so a garbage figure silences the
+    /// labels instead of lending them credibility.
+    fn ram_figures_agree(ladder: f64, booked: f64) -> bool {
+        (ladder - booked).abs() < crate::budget::DISAGREE_GIB
+    }
+
     fn container_reported_gb(&self, slot: &Slot) -> Option<f64> {
         let occupant = slot.occupant.as_ref()?;
         let job = self.jobs.iter().find_map(|(_, job)| {
@@ -147,30 +185,59 @@ impl ActorState {
             slots: self
                 .slots
                 .iter()
-                .map(|s| SlotStatus {
-                    category: s.category,
-                    index: s.index,
-                    model: s.occupant.as_ref().map(|o| o.model.clone()),
-                    port: s.occupant.as_ref().map(|o| o.port),
-                    pid: s.occupant.as_ref().map(|o| o.ticket.pid),
-                    need_gib: s.occupant.as_ref().map(|o| o.need.0),
-                    idle_s: s.occupant.as_ref().map(|o| {
-                        let last = state_last_used(o, &self.last_used);
-                        now.duration_since(last).as_secs()
-                    }),
-                    serve_id: s.occupant.as_ref().and_then(|o| o.serve_id.clone()),
-                    loading_job: s.job,
-                    // The one derivation of the slot label (see
-                    // `ActorState::slot_state`): a committed release reads
-                    // `releasing` until the driver confirms it.
-                    state: self.slot_state(s).to_string(),
-                    launched_at: s
-                        .occupant
-                        .as_ref()
-                        .map(|o| crate::model::iso8601_utc(o.launched_at_wall)),
-                    stale_config: s.occupant.as_ref().map(|o| o.stale_config),
-                    container_reported_gb: self.container_reported_gb(s),
-                    loaded_at: s.occupant.as_ref().map_or(now, |o| o.loaded_at),
+                .map(|s| {
+                    // The RAM booking story (W3, W3-01 ruling): the figure is
+                    // the actor's own `ram_need` (ledger truth) and the labels
+                    // are the catalog row's one ladder derivation, joined in
+                    // pure memory — the same snapshot-purity rule every other
+                    // field obeys. But the ladder only speaks for this
+                    // occupant while its figure agrees with the ledger
+                    // booking. Legal transitions move the row's rung off a
+                    // resident the gate booked differently (a cost-only pair
+                    // edit under a loaded row; a same-model twin whose fold
+                    // re-booked only the other slot), and re-labelling the
+                    // stale figure would print a provenance the gate never
+                    // took for it (DOCTRINE 12). A row that vanished or no
+                    // longer agrees therefore omits all three fields:
+                    // absence is "no claim", never a re-label.
+                    let ram = s.occupant.as_ref().and_then(|o| {
+                        let booked = o.ram_need?;
+                        let (_, basis) = self
+                            .catalog
+                            .iter()
+                            .find(|m| m.name == o.model)
+                            .and_then(|entry| entry.ram_booking())
+                            .filter(|(figure, _)| Self::ram_figures_agree(*figure, booked.0))?;
+                        Some((booked.0, basis))
+                    });
+                    SlotStatus {
+                        category: s.category,
+                        index: s.index,
+                        model: s.occupant.as_ref().map(|o| o.model.clone()),
+                        port: s.occupant.as_ref().map(|o| o.port),
+                        pid: s.occupant.as_ref().map(|o| o.ticket.pid),
+                        need_gib: s.occupant.as_ref().map(|o| o.need.0),
+                        idle_s: s.occupant.as_ref().map(|o| {
+                            let last = state_last_used(o, &self.last_used);
+                            now.duration_since(last).as_secs()
+                        }),
+                        serve_id: s.occupant.as_ref().and_then(|o| o.serve_id.clone()),
+                        loading_job: s.job,
+                        // The one derivation of the slot label (see
+                        // `ActorState::slot_state`): a committed release reads
+                        // `releasing` until the driver confirms it.
+                        state: self.slot_state(s).to_string(),
+                        launched_at: s
+                            .occupant
+                            .as_ref()
+                            .map(|o| crate::model::iso8601_utc(o.launched_at_wall)),
+                        stale_config: s.occupant.as_ref().map(|o| o.stale_config),
+                        container_reported_gb: self.container_reported_gb(s),
+                        booked_ram_gb: ram.map(|(figure, _)| figure),
+                        ram_cost_basis: ram.map(|(_, basis)| basis.as_str()),
+                        ram_source: ram.map(|(_, basis)| basis.source()),
+                        loaded_at: s.occupant.as_ref().map_or(now, |o| o.loaded_at),
+                    }
                 })
                 .collect(),
             jobs: self

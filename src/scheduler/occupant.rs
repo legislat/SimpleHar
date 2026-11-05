@@ -412,9 +412,11 @@ impl ActorState {
     /// churn below it must not oscillate the booking or rewrite the yaml —
     /// and unlike [`ActorState::elastic_refresh`]'s asymmetric rule (rise
     /// free, fall banded) this band is SYMMETRIC: the measured working set is
-    /// a noisy witness reading, not the engine's own static word, and the
-    /// DESIGN ruling names the reserve band the standing tolerance in both
-    /// directions, so a rise inside the band is noise too. The fold itself
+    /// a noisy witness reading, not the engine's own static word, so a rise
+    /// inside the band is noise too. The ruling's standing tolerance for
+    /// growth past the booking is the GATE's reserve — the DESIGN ruling
+    /// words it "The reserve band is the standing allowance" — not this
+    /// sampler band, which only keeps noise out of the fold. The fold itself
     /// stays pure bookkeeping (it re-books on any changed figure); the band
     /// keeps the churn out of the SAMPLER.
     pub(super) const RAM_REBOOK_BAND_GIB: f64 = 1.0;

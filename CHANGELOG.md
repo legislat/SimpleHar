@@ -23,8 +23,15 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
   key `ram_gb` (a GGUF estimate is the floor without it) and config key `ram_reserve_gb`
   (default 8). A RAM shortfall refuses with named blockers and numbers as `unavailable`
   (503). RAM and VRAM keep separate ledgers: a CPU row never debits or blocks the card,
-  and a GPU job is never evicted because a CPU row holds RAM. Eviction of CPU rows under
-  RAM pressure, measured-RAM booking, and the page surface land in the next wave.
+  and a GPU job is never evicted because a CPU row holds RAM. A CPU row can now be
+  evicted under RAM pressure, and the RAM planner considers CPU residents only. The
+  harness measures a served CPU row's working set, persists the trusted pair as
+  `measured_ram_gb` / `measured_ram_gb_min`, and books it above the floor. The surface
+  shows it: `/har/status` slot rows carry `booked_ram_gb`, `ram_cost_basis`, and
+  `ram_source` (CPU rows only), the `mem` block carries `booked_ram_gb` and
+  `ram_reserve_gb`, `/har/models` prices a CPU row on the RAM ladder with its
+  `ram_source`, and the page Cost cell shows the booked RAM figure with provenance in
+  the tooltip. A GPU row carries no RAM key anywhere: its wire shape is unchanged.
 - A per-row `min_turn` guard: admission refuses to evict a model that has served less
   than the configured seconds.
 - Memory refusals carry `queue_position` and `expected_release_s` (a rolling median of

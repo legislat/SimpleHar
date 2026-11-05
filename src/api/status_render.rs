@@ -173,6 +173,14 @@ pub(super) fn model_json(
     loaded: Option<&LoadedRow>,
     fit_validated: bool,
 ) -> Value {
+    // A CPU-resident row books host RAM and no card bytes, so its cost basis
+    // is the RAM ladder's rung (operator ruling 2026-11-05: RAM is its own
+    // resource ladder — a card rung would describe a booking that never
+    // happens). GPU rows keep their exact pre-RAM shape: no RAM keys, the
+    // VRAM ladder's answer.
+    let ram = (entry.resource() == crate::model::Resource::Ram)
+        .then(|| entry.ram_booking())
+        .flatten();
     let mut body = json!({
         "id": entry.name,
         "object": "model",
@@ -196,13 +204,19 @@ pub(super) fn model_json(
         "measured_offload": entry.measured_offload,
         // Which figure admission actually books, stated by the gate's own decision
         // (one derivation; the page renders this and never re-computes the
-        // precedence — the duplication-review rule made visible for R9).
-        "cost_basis": match entry.cost_source() {
-            crate::model::CostSource::Declared => "declared",
-            crate::model::CostSource::Measured => "measured",
-            crate::model::CostSource::Fit => "fit",
-            crate::model::CostSource::Estimate => "estimate",
-            crate::model::CostSource::Undeclared => "undeclared",
+        // precedence — the duplication-review rule made visible for R9). On a
+        // CPU-resident row the figure the gate books is RAM, so the answer
+        // names the RAM rung (`declared` | `measured` | `estimate` — the same
+        // vocabulary, the resource's own ladder).
+        "cost_basis": match ram {
+            Some((_, basis)) => basis.as_str(),
+            None => match entry.cost_source() {
+                crate::model::CostSource::Declared => "declared",
+                crate::model::CostSource::Measured => "measured",
+                crate::model::CostSource::Fit => "fit",
+                crate::model::CostSource::Estimate => "estimate",
+                crate::model::CostSource::Undeclared => "undeclared",
+            },
         },
         // R9/R1: whose number the measured pair is. The page shows it and admits
         // nothing from it — only a `cost_basis: "measured"` row ever renders a
@@ -234,6 +248,23 @@ pub(super) fn model_json(
         "serve_model": entry.serve_model,
         "model_ref": entry.model_ref,
     });
+    // W3: the RAM cost surface rides CPU-resident rows ONLY — a GPU row's
+    // document stays byte-identical to its pre-RAM shape. The displayed
+    // figure follows the basis exactly as the VRAM rungs do: the declared
+    // floor, the GGUF estimate only when the estimate is what books, and the
+    // measured pair whenever the ladder may need it; `ram_source` says whose
+    // number the booked figure is (`per_process` tree sum or `declared`
+    // arithmetic) so the page never infers provenance from which key happens
+    // to carry a value.
+    if let Some((booked, basis)) = ram {
+        body["ram_gb"] = json!(entry.ram_gb);
+        body["measured_ram_gb"] = json!(entry.measured_ram_gb);
+        body["measured_ram_min_gb"] = json!(entry.measured_ram_min_gb);
+        if let Some(estimate) = (basis == crate::model::RamCostBasis::Estimate).then_some(booked) {
+            body["est_ram_gb"] = json!(estimate);
+        }
+        body["ram_source"] = json!(basis.source());
+    }
     // R11: the Fit projection rides the payload only when it exists — a key
     // that is absent is not a key that is null (not-probed is a state), and a
     // fixture row that has never been probed keeps its byte-identical shape.
@@ -372,10 +403,28 @@ async fn mem_section(state: &ApiState, scheduler: &crate::scheduler::SchedulerSt
         }),
     };
     // A1: host RAM is informational context next to the VRAM bars (§0.4 keeps it
-    // out of admission).
+    // out of admission). Since the RAM ladder landed (operator ruling 2026-11-05)
+    // the block also states the RAM side of the gate: the reservation the loaded
+    // CPU residents debit (the SAME figures the slot rows carry, so bar and rows
+    // cannot quote two numbers), the RAM reserve the gate subtracts before
+    // comparing, and the live host reading. `booked_ram_gb` counts installed RAM
+    // residents whose booking their catalog row still proves (W3-01: a resident
+    // the row cannot prove carries no figure on either side) —
+    // the RAM twin of `container_reported_gb`'s loaded-sum rule; a GPU row's host
+    // RAM rides `ram_used_gb` and never a ledger.
     if let Value::Object(fields) = &mut section {
+        let booked_ram_gb: f64 = scheduler
+            .slots
+            .iter()
+            .filter_map(|slot| slot.booked_ram_gb)
+            .sum();
         fields.insert("ram_total_gb".to_string(), json!(ram.map(|r| r.total_gib)));
         fields.insert("ram_used_gb".to_string(), json!(ram.map(|r| r.used_gib)));
+        fields.insert("booked_ram_gb".to_string(), json!(booked_ram_gb));
+        fields.insert(
+            "ram_reserve_gb".to_string(),
+            json!(state.config.ram_reserve_gb),
+        );
     }
     section
 }

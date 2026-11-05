@@ -38,7 +38,9 @@ edit never leaves a half-written model file in use.
 | `vram_gb` | Declared admission cost in GiB. `fixed` falls back to `file size x 1.15 + 2`. `exact` refuses without it. |
 | `cost` | `fixed` (default): the declared size binds admission. `greedy`: the model offloads to RAM/SSD; the size never refuses, but a launch floor is mandatory. `exact`: an engine-computed number, required and binding. |
 | `launch_only_with_at_least_vram_free` | GiB, or the keyword `whole`. GiB: the harness refuses the load **before spawn** unless free VRAM reaches this floor. The reserve is deducted. Free VRAM that meets the floor counts only what the harness itself can make free: its own releasable residents. Foreign occupancy never counts toward the floor. When no release the harness can perform would reach the floor, the refusal says so: "No releases allow for the VRAM floor. Check foreign residents." This is the thrash guard for large and greedy quants. Greedy models without this key inherit `greedy_launch_min_free_gb`. Set `0` on a model to opt out. `whole`: a wait posture, not a number (operator ruling 2026-11-04). The load starts only when the rest of the card is free, and the harness evicts nothing to get there: the refusal names every holder and the client retries. The card counts as free when the read free VRAM, credited for the occupant in the request's own slot, reaches the whole budget minus the reserve; what no release can reclaim must sit inside the reserve band. A load onto a slot that already holds a model replaces that occupant: the request named it. Any other holder stops the load. `whole` also replaces the greedy launch floor: a `greedy` row with `whole` never inherits `greedy_launch_min_free_gb`. `/har/models` reports a `whole` row with `launch_floor_gb: null`. |
-| `cpu_offload` | `true`/`1`/`yes`/`on` forces `-ngl 0` (**llama only**). Other engines report an `inert_key` hint, and the page offers no CPU control for them. |
+| `cpu_offload` | `true`/`1`/`on` forces `-ngl 0` (**llama only**). Other engines report an `inert_key` hint, and the page offers no CPU control for them. |
+| `ram_gb` | Declared host-RAM booking floor in GiB (**CPU-resident rows only**). Only a row with `cpu_offload` on consumes it; on any other row it is inert and never changes a VRAM booking. Without it the row books the GGUF estimate `file size x 1.0 + 2`. A row with neither number is under-specified: the RAM gate refuses rather than guess. |
+| `measured_ram_gb` / `measured_ram_gb_min` | The RAM working-set range the harness measured while a CPU-resident row served; the high end and the low end. The harness writes them back after a witnessed serve (harness-owned keys). A trusted pair above the floor books instead of it (max truth); the declared floor is never undercut. Only a `per_process` process-tree figure can book a RAM pair; a `total_diff` reading never persists. A `cpu_offload` flip voids the pair. |
 | `serve_model` | The expected engine-reported id. A mismatch records a warning; the harness never trusts it. |
 | `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served: `measured_gb` is the high end and `measured_gb_min` the low end. The harness writes them back after a load. When `vram_gb` is absent, admission books `measured_gb`. The `measured_attribution` stamp decides whose number it is, and only these attributions book: `engine_report` (the container's own startup reservation), `engine_status` (a process engine's own status endpoint stated the footprint), and `per_process` (the witness attributed the bytes to the engine's own process tree). A `total_diff` figure (a free-memory delta) displays but never books. An **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure, whatever the provenance, because it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes. The identity is the profile name, plus the resolved `kv` for an override line. An edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, because the reservation follows the KV pool. The write-back also records `measured_offload`, the `cpu_offload` state the pair was taken under; a later flip voids the pair. |
 | `is_embedding_model` | A truthy value forces category `EMB`. It conflicts with another explicit category. |
@@ -110,6 +112,15 @@ it against the calculator's exact version on every launch. On the page a Fit
 row reads amber "engine-projected" until a witnessed serve confirms it
 within the margin, then it turns green. The colour is a confidence signal;
 the number never changes between the two.
+
+**CPU-resident rows price on RAM, not VRAM** (operator ruling 2026-11-05).
+A row with `cpu_offload` on books the host RAM ladder, judged against
+`ram_total - ram_reserve_gb - observed ram_used`: the declared `ram_gb`
+floor, else the GGUF estimate `size x 1.0 + 2`, and the trusted measured
+working set above both. The same ladder words the surface: `/har/models`
+`cost_basis` names the booked RAM rung, and a `cpu_offload` flip moves the
+row to the other ladder at once. A `ram_gb` never moves a VRAM figure, and
+`vram_gb` never moves a RAM figure.
 
 ### Strata engines
 

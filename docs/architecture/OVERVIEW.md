@@ -147,6 +147,23 @@ One harness process, one tokio runtime, plus OS-level children:
   (`MeasuredAttribution::bookable`). The llama Fit class (`src/engine/fit.rs`)
   asks the engine's own `llama-fit-params` before spawn; a Fit figure is never
   persisted and is recomputed per proven change; the scheduler owns the cache.
+- Resource routing (operator ruling 2026-11-05): a row's `cpu_offload`
+  chooses the ladder, never the engine family. A CPU-resident row is
+  scheduled against host RAM: the gate compares
+  `ram_total - ram_reserve_gb - observed ram_used` (the host reading from
+  `witness::ram_sample`), and the booking follows the ONE RAM ladder in
+  `ModelEntry::ram_booking` — declared `ram_gb` floor, else the GGUF
+  estimate `size x 1.0 + 2`, and the trusted measured working set above
+  both (max truth, floor never undercut). Only a `per_process` tree pair
+  can book a RAM figure; a `total_diff` reading never persists, and a
+  `cpu_offload` flip voids the pair at scan. The RAM planner considers RAM
+  residents only: a GPU resident's host RAM rides the reading, never the
+  releasable set, and rides the refusal as an uncontrolled holder. The
+  working-set sampler polls the trusted pair inside the rebook band
+  (`occupant.rs`, `RAM_REBOOK_BAND_GIB`). `/har/status` slot rows and
+  `/har/models` carry the booked figure with its rung (slot rows
+  `ram_cost_basis`, model rows `cost_basis`) and source (`ram_source`);
+  a GPU row carries no RAM key at all.
 - Process-engine measurement (`basalt`, `strata`; `TASK-ENGINE-MEASUREMENT`):
   at readiness the sampler reads the `engine` block of the engine's own
   `GET /metrics` snapshot and books its figure as `engine_status`, the

@@ -1177,6 +1177,29 @@ const driver = `
         cost_basis: "declared", fit_gb: 20.0, fit_validated: true,
         launch_floor_gb: null, measured_gb: null, measured_min_gb: null, context: null,
         model_ref: "F:/d.gguf", serve_model: null, cpu_offload: false },
+      // W3 RAM ladder: a cpu_offload row is priced in RAM — cost_basis names
+      // the RAM rung, and a leftover card figure on the same row never shows.
+      { id: "cpudeclared", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "declared", ram_gb: 2, ram_source: "declared",
+        launch_floor_gb: null, measured_gb: 30, measured_min_gb: null, est_vram_gb: 29.4,
+        measured_ram_gb: null, measured_ram_min_gb: null, context: null,
+        model_ref: "F:/c.gguf", serve_model: null, cpu_offload: true },
+      { id: "cpumeasured", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "measured", ram_gb: 2, ram_source: "per_process",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, est_vram_gb: null,
+        measured_ram_gb: 9.4, measured_ram_min_gb: 8.2, context: null,
+        model_ref: "F:/m.gguf", serve_model: null, cpu_offload: true },
+      { id: "cpuestimate", engine: "llama", category: "WORK", vram_gb: null, cost: "fixed",
+        cost_basis: "estimate", ram_gb: null, ram_source: "declared",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, est_vram_gb: null,
+        est_ram_gb: 3.6, measured_ram_gb: null, measured_ram_min_gb: null, context: null,
+        model_ref: "F:/e.gguf", serve_model: null, cpu_offload: true },
+      // The flip twin: the same row with offload back off keeps the VRAM ladder
+      // the inert ram_gb rides but never prices a card row.
+      { id: "flippedone", engine: "llama", category: "WORK", vram_gb: 24, cost: "fixed",
+        cost_basis: "declared", ram_gb: 8, ram_source: "declared",
+        launch_floor_gb: null, measured_gb: null, measured_min_gb: null, est_vram_gb: null,
+        context: null, model_ref: "F:/g.gguf", serve_model: null, cpu_offload: false },
     ],
   });
   const costs = {};
@@ -1250,6 +1273,34 @@ const driver = `
     costs["declaredfit"].cls.includes("sh-cost-unchecked") &&
       !costs["declaredfit"].title.includes("confirmed"),
     JSON.stringify(costs["declaredfit"]));
+  // W3: the CPU row's Cost cell is the RAM booking, rung-labelled in the
+  // tooltip, colour still the provenance; a leftover card figure on the row
+  // never shows, and the tooltip leaks no file path.
+  check("a CPU row shows the declared RAM floor, never the leftover card figure",
+    costs["cpudeclared"].text === "2 GiB" &&
+      costs["cpudeclared"].cls.includes("sh-cost-unchecked") &&
+      costs["cpudeclared"].title.includes("RAM 2 GiB · declared") &&
+      !costs["cpudeclared"].text.includes("30"), JSON.stringify(costs["cpudeclared"]));
+  check("a CPU row's measured RAM pair books and shows its range",
+    costs["cpumeasured"].text === "8.2-9.4 GiB" &&
+      costs["cpumeasured"].cls.includes("sh-cost-checked") &&
+      costs["cpumeasured"].title.includes("measured") &&
+      costs["cpumeasured"].title.includes("summed from the processes"),
+    JSON.stringify(costs["cpumeasured"]));
+  check("a CPU row's estimate rung is unchecked and named",
+    costs["cpuestimate"].text === "3.6 GiB" &&
+      costs["cpuestimate"].cls.includes("sh-cost-unchecked") &&
+      costs["cpuestimate"].title.includes("GGUF estimate"),
+    JSON.stringify(costs["cpuestimate"]));
+  check("a card row keeps the VRAM ladder even with an inert ram_gb",
+    costs["flippedone"].text === "24 GiB" &&
+      !costs["flippedone"].title.includes("RAM"), JSON.stringify(costs["flippedone"]));
+  check("a RAM tooltip quotes figures, never a file path",
+    !costs["cpudeclared"].title.includes("F:/") &&
+      !costs["cpumeasured"].title.includes("F:/") &&
+      !costs["cpuestimate"].title.includes("F:/"),
+    [costs["cpudeclared"].title, costs["cpumeasured"].title,
+      costs["cpuestimate"].title].join(" | "));
   // cpu_offload engine scoping: the CPU column (td 3) offers its control only
   // for OFFLOAD_ENGINES rows; a strata row gets a dash and NO checkbox.
   const cpuBoxes = {};

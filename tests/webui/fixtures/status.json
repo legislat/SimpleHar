@@ -684,9 +684,11 @@
   "total_gb": 71.6943359375,
   "attributed_gb": 12.3,
   "attribution": "per_process",
-  "container_reported_gb": 31.2,
-  "booked_gb": 18
- },
+   "container_reported_gb": 31.2,
+   "booked_gb": 18,
+   "booked_ram_gb": 0.0,
+   "ram_reserve_gb": 8
+  },
  "slots": [
   {
    "category": "WORK",

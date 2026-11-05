@@ -645,7 +645,48 @@ function modelRow(status, model, category) {
   let costText;
   let costChecked = false;
   let costTitle;
-  if (slotReported) {
+  if (model.cpu_offload === true) {
+    // A CPU-resident row is booked on the RAM ladder (operator ruling
+    // 2026-11-05): the gate's `cost_basis` names the RAM rung and the cell
+    // shows exactly the RAM figure the gate books — never a VRAM figure, so
+    // this branch precedes the VRAM ladder, and the container's self-report
+    // (a card number) can never capture a RAM row. Green is the measured
+    // rung the gate books; declared floors and estimates stay yellow until
+    // a load measures. Provenance stays colour plus tooltip, never prose.
+    const ramMeasured =
+      model.cost_basis === "measured" &&
+      model.measured_ram_gb !== null &&
+      model.measured_ram_gb !== undefined;
+    const ramRange = ramMeasured
+      ? model.measured_ram_min_gb !== null &&
+        model.measured_ram_min_gb !== undefined &&
+        model.measured_ram_min_gb < model.measured_ram_gb
+        ? model.measured_ram_min_gb.toFixed(1) + "-" + model.measured_ram_gb.toFixed(1)
+        : model.measured_ram_gb.toFixed(1)
+      : null;
+    if (ramMeasured) {
+      costText = `${ramRange} GiB`;
+      costChecked = true;
+      costTitle =
+        `RAM ${ramRange} GiB · measured · the gate books it · ` +
+        (model.ram_source === "per_process" ? "summed from the processes" : "harness-declared");
+    } else if (
+      model.cost_basis === "estimate" &&
+      model.est_ram_gb !== null &&
+      model.est_ram_gb !== undefined
+    ) {
+      costText = `${model.est_ram_gb.toFixed(1)} GiB`;
+      costTitle =
+        `RAM ${model.est_ram_gb.toFixed(1)} GiB · GGUF estimate · unchecked ` +
+        "until a load measures it";
+    } else if (model.ram_gb !== null && model.ram_gb !== undefined) {
+      costText = `${model.ram_gb} GiB`;
+      costTitle = `RAM ${model.ram_gb} GiB · declared · unchecked until a load measures it`;
+    } else {
+      costText = "—";
+      costTitle = "RAM: nothing the gate can book yet";
+    }
+  } else if (slotReported) {
     costText = `${slotReported.toFixed(1)} GiB`;
     costChecked = true;
     costTitle = `engine-reported: this container reserves ${slotReported.toFixed(1)} GiB`;

@@ -477,8 +477,10 @@ impl ActorState {
             // never need a different default.
             ram_witness: Arc::new(crate::witness::GlobalRamWitness),
             // The RAM tree probe's default is the live working-set query; the
-            // sampler only ever runs it for a CPU-resident occupant, and the
-            // pins that install one swap it for their fake (W2 step 3).
+            // sampler only ever runs it for a CPU-resident occupant, and every
+            // pin that seats one swaps this default for its counting fake —
+            // structurally, not by cadence — so no gate test reaches the real
+            // API (W2 step 3, made structural by the W23-02 fold).
             working_set_probe: Arc::new(crate::process::Win32WorkingSetProbe),
             events: tokio::sync::broadcast::channel(64).0,
             tx,
