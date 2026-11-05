@@ -293,6 +293,7 @@ mod tests {
             engine: "llama".to_string(),
             category: CategoryId::Work,
             vram_gb: Some(1.0),
+            ram_gb: None,
             gguf_size_gb: None,
             cost: crate::model::CostClass::Fixed,
             vram_gate: crate::model::VramGate::default(),

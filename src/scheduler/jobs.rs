@@ -211,6 +211,15 @@ pub(super) struct Job {
     pub(super) outcome: Option<String>,
     pub(super) error: Option<SchedulerError>,
     pub(super) need: Option<Gibibytes>,
+    /// The resource this row reserves against — derived from the catalog
+    /// entry at registration (operator ruling 2026-11-05), frozen like the
+    /// other derived keys: a reload must not flip a row mid-swap between
+    /// ladders.
+    pub(super) resource: crate::model::Resource,
+    /// Host RAM booked for a CPU-resident load, armed in `start_queued_load`
+    /// exactly where a VRAM row arms `need`; `None` for every VRAM row. A
+    /// RAM row's `need` is 0 (it books no card bytes).
+    pub(super) ram_need: Option<Gibibytes>,
     /// Cost class from the model yaml (fixed|greedy|exact) — drives the gate shape.
     pub(super) cost: crate::model::CostClass,
     /// The row's VRAM gate, frozen at registration with the other derived

@@ -30,9 +30,9 @@ impl ActorState {
         let state = job.state;
         // The admission decision is witness-driven (Step 4); every other step
         // matches its expected state.
-        if let Event::Admitted(sample) = event {
+        if let Event::Admitted(card, ram) = event {
             if state == SwapState::Admit {
-                self.finish_admit(job_id, sample);
+                self.finish_admit(job_id, card, ram);
             } else {
                 tracing::warn!(%job_id, ?state, "stale admission sample ignored");
             }
@@ -277,9 +277,10 @@ impl ActorState {
             // Extract first: `clear_occupant` needs `&mut self`, and a replaced
             // occupant's sampler must die with it (review, 2026-10-27).
             let job = &self.jobs[&job_id];
-            let (job_model, job_need, job_ticket) = (
+            let (job_model, job_need, job_ram_need, job_ticket) = (
                 job.model.clone(),
                 job.need.unwrap_or_default(),
+                job.ram_need,
                 job.spawned
                     .clone()
                     .expect("invariant: install only happens after a spawn"),
@@ -315,6 +316,7 @@ impl ActorState {
             self.slots[slot].occupant = Some(Occupant {
                 model: job_model,
                 need: job_need,
+                ram_need: job_ram_need,
                 port: port.port,
                 ticket: job_ticket.clone(),
                 loaded_at: Instant::now(),
@@ -335,23 +337,32 @@ impl ActorState {
         // `MemorySummary` stands in ahead of even that, so the sampler fetches it
         // first. What to charge is the actor's call alone: it knows who else is booked
         // and which engine actually holds the slot.
-        let sampler_ctx = self.jobs.get(&job_id).map(|job| {
-            let ticket = job
-                .spawned
-                .clone()
-                .expect("invariant: install only happens after a spawn");
-            SamplerCtx {
-                model: job.model.clone(),
-                own_pids: if job.container.is_none() {
-                    vec![ticket.pid]
-                } else {
-                    Vec::new()
-                },
-                ticket,
-                container: job.container.clone(),
-                engine: job.engine.clone(),
-            }
-        });
+        let sampler_ctx = self
+            .jobs
+            .get(&job_id)
+            // A CPU-resident resident is not a VRAM story: its card-witness
+            // sampler would fold host-RAM growth into the yaml's `measured_gb`
+            // (a VRAM figure), so it never starts (operator ruling 2026-11-05;
+            // the measured-RAM write-back is its own later decision, on the
+            // RAM ladder's own keys).
+            .filter(|job| job.ram_need.is_none())
+            .map(|job| {
+                let ticket = job
+                    .spawned
+                    .clone()
+                    .expect("invariant: install only happens after a spawn");
+                SamplerCtx {
+                    model: job.model.clone(),
+                    own_pids: if job.container.is_none() {
+                        vec![ticket.pid]
+                    } else {
+                        Vec::new()
+                    },
+                    ticket,
+                    container: job.container.clone(),
+                    engine: job.engine.clone(),
+                }
+            });
         let baseline_free = self.post_release_free(job_id);
         if let (Some(slot), Some(ctx)) = (slot, sampler_ctx) {
             let witness = Arc::clone(&self.witness);

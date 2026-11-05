@@ -19,6 +19,12 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
 ### Added
 
+- A CPU-only llama row (`cpu_offload: true`) books host RAM instead of VRAM. New model
+  key `ram_gb` (a GGUF estimate is the floor without it) and config key `ram_reserve_gb`
+  (default 8). A RAM shortfall refuses with named blockers and numbers as `unavailable`
+  (503). RAM and VRAM keep separate ledgers: a CPU row never debits or blocks the card,
+  and a GPU job is never evicted because a CPU row holds RAM. Eviction of CPU rows under
+  RAM pressure, measured-RAM booking, and the page surface land in the next wave.
 - A per-row `min_turn` guard: admission refuses to evict a model that has served less
   than the configured seconds.
 - Memory refusals carry `queue_position` and `expected_release_s` (a rolling median of

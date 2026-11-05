@@ -312,14 +312,41 @@ async fn smi(args: &[&str]) -> Result<String, String> {
     .map_err(|_| "nvidia-smi timed out".to_string())?
 }
 
-/// Host RAM numbers for the header bar (A1, the v3.3 `GlobalMemoryStatusEx` source).
-/// Display only — admission budgets VRAM, never RAM (§0.4).
+/// Host RAM numbers: the header bar (A1, the v3.3 `GlobalMemoryStatusEx`
+/// source) and the RAM admission gate's witness (operator ruling 2026-11-05:
+/// RAM is its own resource ladder — a CPU-resident row budgets against these
+/// numbers, never against the card).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RamSample {
     /// Installed physical memory in GiB.
     pub total_gib: f64,
     /// In-use physical memory in GiB (total minus available).
     pub used_gib: f64,
+}
+
+/// The RAM counterpart of [`crate::budget::VramWitness`]: the host-memory
+/// truth a CPU-resident admission is judged against. A `None` sample refuses
+/// the load fail-closed, exactly as a dead card witness does (DOCTRINE 4) —
+/// there is no ledger-only mode for RAM: the gate releases no RAM, so an
+/// unattributable ledger would be a guess at what the host already holds.
+///
+/// Sync by design: one `GlobalMemoryStatusEx` call per `sample()`, no cache
+/// and no TTL — a syscall cannot spawn the process storm the card witness's
+/// `nvidia-smi` fallback needed a cache against.
+pub trait RamWitness: Send + Sync {
+    /// Reads the host's RAM once. `None` = no honest number exists.
+    fn sample(&self) -> Option<RamSample>;
+}
+
+/// The live witness: one `GlobalMemoryStatusEx` syscall per sample, no cache
+/// (see [`RamWitness`]); bytes reach the caller already converted to GiB by
+/// [`ram_sample`], so no MiB/bytes figure ever crosses into the gate.
+pub struct GlobalRamWitness;
+
+impl RamWitness for GlobalRamWitness {
+    fn sample(&self) -> Option<RamSample> {
+        ram_sample()
+    }
 }
 
 /// Samples host RAM via `GlobalMemoryStatusEx`; `None` when the call is nonsense
@@ -361,6 +388,27 @@ mod tests {
             "used {} vs total {}",
             sample.used_gib,
             sample.total_gib
+        );
+    }
+
+    /// The witness-boundary conversion pin (bytes→GiB lives ONLY in
+    /// `ram_sample`): the gate's trait object answers with the same GiB
+    /// struct as the free function, so no MiB or raw-bytes figure can
+    /// reach an admission comparison. Falsifier: a `RamWitness` impl that
+    /// quoted MiB (or bytes) would disagree with `ram_sample()` here.
+    #[test]
+    fn the_ram_witness_answers_in_gib_like_the_free_function() {
+        let live = GlobalRamWitness
+            .sample()
+            .expect("GlobalMemoryStatusEx works on Windows");
+        let direct = ram_sample().expect("same call, same truth");
+        assert_eq!(live, direct, "one syscall, one figure, GiB both sides");
+        // GiB plausibility, stated at the witness boundary: a bytes figure
+        // would read as absurdly large, a MiB figure as absurdly small.
+        assert!(
+            live.total_gib > 0.5 && live.total_gib < 1_000_000.0,
+            "GiB-scale total, got {}",
+            live.total_gib
         );
     }
 

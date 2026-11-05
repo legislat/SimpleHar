@@ -69,6 +69,15 @@ impl BudgetFacts {
     /// (review 2026-10-26: `free 69.7 GiB` printed while the card held 1.8 GiB).
     #[must_use]
     pub fn detail(&self, compared: Gibibytes) -> String {
+        self.detail_as(compared, "card")
+    }
+
+    /// [`Self::detail`] with the holder noun chosen by the refusal: the VRAM
+    /// refusals name the card, the RAM refusals name RAM (operator ruling
+    /// 2026-11-05 — one shape, two resources, never a RAM refusal that
+    /// claims the card holds host memory).
+    #[must_use]
+    pub fn detail_as(&self, compared: Gibibytes, holds: &str) -> String {
         let mut parts = Vec::new();
         if let Some(budget) = self
             .budget
@@ -94,7 +103,7 @@ impl BudgetFacts {
             Some(u) if u.0 > DISAGREE_GIB => {
                 let mut names = Vec::new();
                 if let Some(used) = self.used_gib {
-                    names.push(format!("card holds {used}"));
+                    names.push(format!("{holds} holds {used}"));
                 }
                 if let Some(booked) = self.booked_total {
                     names.push(format!("booked {booked}"));
@@ -155,11 +164,11 @@ const DISAGREE_GIB: f64 = 0.05;
 
 /// What the refusal knows about WAITING, beside the named holders: an estimate
 /// and a queue place, each `None` when the harness has no basis to quote it.
-/// The three memory refusals (`BelowLaunchFloor`, `Insufficient`,
-/// `WholeMachineBusy`) carry this struct; the API renders `Some` figures
-/// as structured JSON fields. Neither figure is a promise: the harness runs no
-/// wait queue, so both describe the decision moment only (operator ruling
-/// 2026-11-04: "an estimate, never a promise").
+/// The four memory refusals (`BelowLaunchFloor`, `Insufficient`,
+/// `InsufficientRam`, `WholeMachineBusy`) carry this struct; the API renders
+/// `Some` figures as structured JSON fields. Neither figure is a promise: the
+/// harness runs no wait queue, so both describe the decision moment only
+/// (operator ruling 2026-11-04: "an estimate, never a promise").
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WaitHint {
     /// Rolling median of the harness's own measured release durations in
@@ -227,6 +236,37 @@ pub enum AdmissionError {
         /// Candidates the planner considered (may be empty when none exist).
         victims_considered: Vec<VictimInfo>,
         /// Models that cannot be evicted, with reasons.
+        blockers: Vec<BlockerInfo>,
+        /// What the decision knows about waiting (estimate + place), computed
+        /// at refusal time beside these numbers.
+        wait_hint: WaitHint,
+    },
+    /// The host-RAM gate refused a CPU-resident load and nothing the RAM
+    /// gate may release covers the deficit: the same Step 6 refusal contract
+    /// as [`AdmissionError::Insufficient`], judged on the RAM ladder —
+    /// `ram_total - ram_reserve - observed ram_used`, credited once for the
+    /// same-slot RAM resident (operator ruling 2026-11-05). In this wave the
+    /// RAM gate releases nothing (no RAM eviction exists), so every host
+    /// holder the harness can name rides `blockers`; unattributable host RAM
+    /// rides the `unreleasable` figure.
+    #[error("insufficient RAM: need {need}, free {free}, reserve {reserve}{detail}{tail}",
+        detail = .facts.detail_as(*free, "RAM"),
+        tail = insufficient_tail(.victims_considered, .blockers)
+    )]
+    InsufficientRam {
+        /// Declared or estimated RAM cost of the wanted load.
+        need: Gibibytes,
+        /// The figure the RAM gate actually compared.
+        free: Gibibytes,
+        /// `ram_reserve_gb` subtracted before the gate.
+        reserve: Gibibytes,
+        /// The RAM inputs `free` was derived from (`ram_used` beside the RAM
+        /// ledger, so "who holds RAM" is diagnosable from the message alone).
+        facts: Box<BudgetFacts>,
+        /// Candidates the RAM planner considered; empty while the RAM gate
+        /// plans no eviction.
+        victims_considered: Vec<VictimInfo>,
+        /// Host holders the RAM gate may not release, with reasons.
         blockers: Vec<BlockerInfo>,
         /// What the decision knows about waiting (estimate + place), computed
         /// at refusal time beside these numbers.

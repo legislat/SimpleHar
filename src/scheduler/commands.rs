@@ -409,6 +409,11 @@ impl ActorState {
             outcome: None,
             error: None,
             need: None,
+            // An unload row books neither resource: it never stands before a
+            // gate, and both in-flight sums count `Load` rows only. The tag
+            // is the inert default, never a claim about the departing row.
+            resource: crate::model::Resource::Gpu,
+            ram_need: None,
             cost: crate::model::CostClass::Fixed,
             vram_gate: crate::model::VramGate::default(),
             load_timeout_s: None,

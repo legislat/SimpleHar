@@ -3220,6 +3220,7 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
             engine: "basalt".to_string(),
             category: crate::config::CategoryId::Work,
             vram_gb: Some(10.0),
+            ram_gb: None,
             gguf_size_gb: None,
             cost: crate::model::CostClass::Fixed,
             vram_gate: crate::model::VramGate::default(),

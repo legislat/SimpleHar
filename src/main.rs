@@ -1699,6 +1699,7 @@ Start Port    End Port
             engine: engine.to_string(),
             category: CategoryId::Work,
             vram_gb: None,
+            ram_gb: None,
             gguf_size_gb: None,
             cost: simpleharn::model::CostClass::Fixed,
             vram_gate: simpleharn::model::VramGate::default(),

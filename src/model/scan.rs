@@ -128,6 +128,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "category",
     "is_embedding_model",
     "vram_gb",
+    "ram_gb",
     "cost",
     "launch_only_with_at_least_vram_free",
     "load_timeout",
@@ -885,6 +886,39 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                             reason: problem.into_engine_error().to_string(),
                         });
                         continue;
+                    }
+                }
+                // The CPU-resident row shapes (operator ruling 2026-11-05):
+                // a `cpu_offload`-truthy row books host RAM, so the VRAM
+                // gate keys describe a resource it does not hold. `whole` is
+                // a contradiction that would refuse the row at every load
+                // forever, so the scan refuses it here with the named
+                // problem — the doomed-launch-before-eviction posture, same
+                // door as the basalt validation above. A numeric launch
+                // floor is only dead config: the inert-key warn, the entry
+                // publishes (ruling D's posture).
+                if entry.cpu_resident() {
+                    if entry.vram_gate == crate::model::VramGate::Whole {
+                        catalog.errors.push(ScanError {
+                            kind: ScanKind::PolicyRefused,
+                            file: file_name.clone(),
+                            reason: "`cpu_offload` books host RAM, never VRAM \u{2014} the \
+                                     `whole` machine gate can never apply to this row; \
+                                     remove `launch_only_with_at_least_vram_free: whole` \
+                                     (or the `cpu_offload` line)"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    if entry.vram_gate.floor().is_some() {
+                        catalog.errors.push(ScanError {
+                            kind: ScanKind::InertKey,
+                            file: file_name.clone(),
+                            reason: "`launch_only_with_at_least_vram_free` gates VRAM \u{2014} a \
+                                     `cpu_offload` row holds no VRAM booking; this key does \
+                                     nothing here"
+                                .to_string(),
+                        });
                     }
                 }
                 // Unknown keys are reported, never fatal (README doctrine), but
@@ -3012,6 +3046,7 @@ mod tests {
              category: WORK\n\
              is_embedding_model: false\n\
              vram_gb: 12\n\
+             ram_gb: 9\n\
              cost: greedy\n\
              launch_only_with_at_least_vram_free: 6\n\
              load_timeout: 600\n\
@@ -3132,6 +3167,77 @@ mod tests {
         }
     }
 
+    /// The CPU-resident row shapes (operator ruling 2026-11-05): a truthy
+    /// `cpu_offload` on an engine that reads the knob gates on RAM, so the
+    /// `whole` machine gate is a permanent contradiction — the scan refuses
+    /// the row with the named problem rather than publishing a row that can
+    /// never load. Falsifier: drop the refusal leg and the row publishes to
+    /// wait forever at load time.
+    #[test]
+    fn a_cpu_row_claiming_the_whole_gate_is_refused() {
+        let dir = crate::testutil::temp_dir("scan-cpu-whole");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("cpu.yaml"),
+            "engine: llama\ncpu_offload: true\nlaunch_only_with_at_least_vram_free: whole\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(
+            catalog.models.iter().all(|m| m.name != "cpu"),
+            "the contradictory row must not publish: {:?}",
+            catalog.models
+        );
+        let problem = catalog
+            .errors
+            .iter()
+            .find(|e| e.file == "cpu.yaml")
+            .expect("the row is refused with a named problem");
+        assert_eq!(problem.kind, ScanKind::PolicyRefused, "{problem:?}");
+        assert!(
+            problem.reason.contains("cpu_offload")
+                && problem.reason.contains("whole")
+                && problem.reason.contains("RAM"),
+            "the line names both keys and the resource: {}",
+            problem.reason
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same row shape without the contradiction: a numeric VRAM launch
+    /// floor on a CPU row is dead config, not an error — the inert-key warn
+    /// (entry publishes), same posture as every knob scoped out by the
+    /// knob table. Falsifier: dropping the warn makes the key look live to
+    /// the operator.
+    #[test]
+    fn a_numeric_vram_floor_on_a_cpu_row_warns_as_inert() {
+        let dir = crate::testutil::temp_dir("scan-cpu-floor");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("cpu.yaml"),
+            "engine: llama\ncpu_offload: true\nlaunch_only_with_at_least_vram_free: 8\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        let entry = catalog
+            .models
+            .iter()
+            .find(|m| m.name == "cpu")
+            .expect("the row still publishes");
+        assert_eq!(entry.vram_gate.floor(), Some(8.0));
+        assert!(
+            catalog.errors.iter().any(|e| {
+                e.kind == ScanKind::InertKey
+                    && e.file == "cpu.yaml"
+                    && e.reason.contains("launch_only_with_at_least_vram_free")
+                    && e.reason.contains("cpu_offload")
+            }),
+            "the dead VRAM floor must be warned, not silent: {:?}",
+            catalog.errors
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review 2026-10-31 (H1): the fold's persist→rescan round trip. The writer
     /// (`MeasuredData::edits` in the scheduler) stamps every serving model with the
     /// measured quartet; the scanner must read those keys back silently — a
@@ -3181,6 +3287,7 @@ mod tests {
             "category",
             "is_embedding_model",
             "vram_gb",
+            "ram_gb",
             "cost",
             "launch_only_with_at_least_vram_free",
             "load_timeout",

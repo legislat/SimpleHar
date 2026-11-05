@@ -313,6 +313,16 @@ impl From<SchedulerError> for ApiError {
                             wait_hint: Some(wait_hint),
                         }
                     }
+                    // The RAM refusal (operator ruling 2026-11-05) is the same
+                    // wait posture as plain over-commit on its own resource:
+                    // the client retries, the hint rides, and every number
+                    // stays in the message.
+                    crate::budget::AdmissionError::InsufficientRam { wait_hint, .. } => {
+                        ApiError::Unavailable {
+                            reason,
+                            wait_hint: Some(wait_hint),
+                        }
+                    }
                     // The whole-machine refusal (ruling 2026-11-04) is the same wait
                     // posture as plain over-commit: the client retries, and the B2
                     // hint rides it. `below_launch_floor` would quote a `min_free`
@@ -3484,6 +3494,7 @@ mod tests {
             engine: "llama".to_string(),
             category: CategoryId::Work,
             vram_gb: Some(4.0),
+            ram_gb: None,
             gguf_size_gb: None,
             cost: crate::model::CostClass::Fixed,
             vram_gate: crate::model::VramGate::default(),
@@ -3544,6 +3555,7 @@ mod tests {
                 engine: "llama".to_string(),
                 category: CategoryId::Work,
                 vram_gb: Some(24.0),
+                ram_gb: None,
                 gguf_size_gb: None,
                 cost: crate::model::CostClass::Fixed,
                 vram_gate: crate::model::VramGate::default(),
@@ -3589,11 +3601,13 @@ mod tests {
         let fit_row = |fit: Option<f64>, declared: Option<f64>| ModelEntry {
             fit_gb: fit,
             vram_gb: declared,
+            ram_gb: None,
             ..ModelEntry {
                 name: "m".to_string(),
                 engine: "llama".to_string(),
                 category: CategoryId::Work,
                 vram_gb: None,
+                ram_gb: None,
                 gguf_size_gb: None,
                 cost: crate::model::CostClass::Fixed,
                 vram_gate: crate::model::VramGate::default(),
@@ -3643,6 +3657,7 @@ mod tests {
             engine: "llama".to_string(),
             category: CategoryId::Work,
             vram_gb: None,
+            ram_gb: None,
             gguf_size_gb: Some(23.0),
             cost: crate::model::CostClass::Fixed,
             vram_gate: crate::model::VramGate::default(),
@@ -3879,6 +3894,41 @@ mod tests {
         assert!(
             mapped.to_string().contains("nvidia-smi timed out"),
             "the witness's reason must travel: {mapped}"
+        );
+    }
+
+    /// The RAM refusal is a plain over-commit wait on its own resource
+    /// (operator ruling 2026-11-05): `unavailable` (503), the numbers in
+    /// the message, the decision's wait hint on the typed error — the same
+    /// shape `Insufficient` has, judged on host RAM.
+    #[test]
+    fn the_ram_refusal_maps_to_unavailable_with_its_numbers() {
+        let admission = SchedulerError::Admission(crate::budget::AdmissionError::InsufficientRam {
+            need: crate::budget::Gibibytes(24.0),
+            free: crate::budget::Gibibytes(6.0),
+            reserve: crate::budget::Gibibytes(8.0),
+            facts: Box::new(crate::budget::BudgetFacts::default()),
+            victims_considered: Vec::new(),
+            blockers: Vec::new(),
+            wait_hint: crate::budget::WaitHint {
+                expected_release_s: None,
+                queue_position: Some(3),
+            },
+        });
+        let mapped = ApiError::from(admission);
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code(), "unavailable");
+        let msg = mapped.to_string();
+        assert!(
+            msg.contains("need 24.0 GiB")
+                && msg.contains("free 6.0 GiB")
+                && msg.contains("reserve 8.0 GiB"),
+            "the RAM numbers must travel: {msg}"
+        );
+        assert_eq!(
+            mapped.wait_hint().and_then(|h| h.queue_position),
+            Some(3),
+            "the decision's queue place rides the typed error"
         );
     }
 

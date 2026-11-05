@@ -34,6 +34,16 @@ impl ActorState {
     /// ever gets. Only a deliberately silent (`ledger_only`) witness is waved
     /// through (review, 2026-10-26).
     pub(super) fn spawn_settle_task(&mut self, job_id: JobId) {
+        // A CPU-resident row's release freed host RAM (or, replacing a GPU
+        // resident, VRAM it never needed): comparing the card against a VRAM
+        // gate target it does not have would block a CPU load behind the very
+        // card the RAM ladder rules out (operator ruling 2026-11-05). The
+        // driver-confirmed release above is this row's whole physical proof;
+        // the release is done, so the spawn proceeds.
+        if self.jobs[&job_id].resource == crate::model::Resource::Ram {
+            self.begin_spawn(job_id);
+            return;
+        }
         let tolerance = self.cfg.witness_tolerance_gb;
         let reserve = self.cfg.vram_reserve_gb;
         let gate = self.jobs[&job_id].gate_target.unwrap_or(0.0);

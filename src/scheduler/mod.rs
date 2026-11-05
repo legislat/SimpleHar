@@ -631,8 +631,15 @@ enum Event {
     /// self-reported model id when ready and discoverable (Step 10, F-4).
     Probed(Probe, Option<String>),
     /// Witness sample for admission returned (Err = no reading, which refuses unless
-    /// the witness declares `ledger_only`).
-    Admitted(Result<crate::budget::MemorySample, String>),
+    /// the witness declares `ledger_only`). The two slots mirror the two ladders:
+    /// a VRAM row carries `Some(card)` and `None` ram (its gate never reads the
+    /// host, and the host witness is never spent on it); a RAM row carries
+    /// `None` card and the host reading (which refuses fail-closed when absent,
+    /// operator ruling 2026-11-05).
+    Admitted(
+        Option<Result<crate::budget::MemorySample, String>>,
+        Option<crate::witness::RamSample>,
+    ),
     /// Post-release memory settle finished (Err carries the numbers).
     Settled(Result<(), String>),
 }
@@ -641,6 +648,12 @@ enum Event {
 struct Occupant {
     model: String,
     need: Gibibytes,
+    /// Host RAM booked by a CPU-resident resident (`Some` exactly for
+    /// [`crate::model::Resource::Ram`] rows, operator ruling 2026-11-05).
+    /// The VRAM `need` of such a resident is 0: it holds no VRAM booking,
+    /// is never a VRAM ledger summand or victim, and its host RAM enters
+    /// only `ram_ledger_sum` and the host's own `ram_used` reading.
+    ram_need: Option<Gibibytes>,
     port: u16,
     ticket: SpawnTicket,
     loaded_at: Instant,
@@ -680,6 +693,11 @@ struct ActorState {
     adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
     runtime: Arc<dyn EngineRuntime>,
     witness: Arc<dyn crate::budget::VramWitness>,
+    /// The host-RAM witness the CPU-resident gate leg is judged against
+    /// (operator ruling 2026-11-05): the RAM ladder's twin of `witness`.
+    /// A `None` sample refuses fail-closed — there is no ledger-only mode
+    /// for RAM.
+    ram_witness: Arc<dyn crate::witness::RamWitness>,
     events: tokio::sync::broadcast::Sender<SchedulerStatus>,
     tx: mpsc::UnboundedSender<ActorMsg>,
     /// Containers with a detached failed-launch log snapshot in flight (R9 C1).
@@ -1010,6 +1028,11 @@ impl ActorState {
             adapters,
             runtime,
             witness,
+            // The RAM ladder's default witness is the live host reading (one
+            // `GlobalMemoryStatusEx` per admit). Tests swap it in place — the
+            // scripted pins drive `finish_admit` with their own sample and
+            // never need a different default.
+            ram_witness: Arc::new(crate::witness::GlobalRamWitness),
             events: tokio::sync::broadcast::channel(64).0,
             tx,
             snapshot_in_flight: HashSet::new(),
@@ -1344,7 +1367,26 @@ impl ActorState {
             self.slots
                 .iter()
                 .filter_map(|s| s.occupant.as_ref())
+                // A CPU-resident resident books host RAM, not the card
+                // (operator ruling 2026-11-05): it is invisible to every VRAM
+                // budget, victim plan, and holder list.
+                .filter(|o| o.ram_need.is_none())
                 .map(|o| o.need.0)
+                .sum(),
+        )
+    }
+
+    /// GiB booked on the host RAM by installed CPU-resident residents — the
+    /// RAM ladder's twin of [`Self::ledger_sum`], read only by the RAM gate
+    /// leg and its refusal's `booked` figure. GPU residents never enter it
+    /// (their host RAM rides the witness's `ram_used`, never the ledger).
+    fn ram_ledger_sum(&self) -> Gibibytes {
+        Gibibytes(
+            self.slots
+                .iter()
+                .filter_map(|s| s.occupant.as_ref())
+                .filter_map(|o| o.ram_need)
+                .map(|need| need.0)
                 .sum(),
         )
     }
@@ -1358,7 +1400,31 @@ impl ActorState {
     /// A `greedy` load still in `Admit` has no `need` yet and contributes 0; it is
     /// protected by its launch floor, and once the greedy booking is recorded it is
     /// debited like any other.
+    ///
+    /// CPU-resident rows never appear: they debit the RAM ladder
+    /// ([`Self::ram_in_flight_need`]), never the card — the two ladders spend
+    /// separate resources, and one resource's in-flight debit must never
+    /// shrink the other's free (operator ruling 2026-11-05).
     fn in_flight_need(&self, except: JobId) -> f64 {
+        self.jobs
+            .iter()
+            .filter(|(id, job)| {
+                **id != except
+                    && job.kind == JobKind::Load
+                    && !job.terminal
+                    && job.ram_need.is_none()
+                    && job.state.reserves_vram()
+            })
+            .map(|(_, job)| job.need.map_or(0.0, |need| need.0))
+            .sum()
+    }
+
+    /// GiB of host RAM committed to *other* loads admitted but not yet
+    /// installed — the RAM ladder's debit, read only by the RAM gate leg
+    /// (operator ruling 2026-11-05). The mirror-image rule to
+    /// [`Self::in_flight_need`]: a VRAM row never spends RAM bytes here, a
+    /// RAM row never spends card bytes there.
+    fn ram_in_flight_need(&self, except: JobId) -> f64 {
         self.jobs
             .iter()
             .filter(|(id, job)| {
@@ -1367,7 +1433,8 @@ impl ActorState {
                     && !job.terminal
                     && job.state.reserves_vram()
             })
-            .map(|(_, job)| job.need.map_or(0.0, |need| need.0))
+            .filter_map(|(_, job)| job.ram_need)
+            .map(|need| need.0)
             .sum()
     }
 

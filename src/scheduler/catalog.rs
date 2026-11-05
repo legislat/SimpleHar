@@ -369,6 +369,18 @@ impl ActorState {
             {
                 continue;
             }
+            // A RAM resident books no card figure (operator ruling
+            // 2026-11-05, review W1-01): the VRAM ladder must never answer
+            // for it, and a cost edit it cannot see must not write a VRAM
+            // figure its release credit would bill a GPU replacement for —
+            // the stranger's-paper-number class the re-book exists to close.
+            // The RAM booking follows only a reload (wave 2 owns its
+            // measured rung); the judged bytes still ride the capture, so a
+            // cost-only edit neither re-books nor ambers a healthy resident.
+            if occupant.ram_need.is_some() {
+                occupant.spawn_config = Some((file, now));
+                continue;
+            }
             // The booking the new bytes justify, by the ONE decision a fresh
             // load takes. A row that cannot answer it (a stripped `exact`) is
             // invalidated, not re-booked: the marker round below ambers it,

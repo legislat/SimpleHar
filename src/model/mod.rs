@@ -153,6 +153,21 @@ impl VramGate {
     }
 }
 
+/// The admission resource one row reserves against (operator ruling
+/// 2026-11-05: RAM is its own resource ladder, never a card booking).
+/// A `cpu_offload`-truthy row on an engine whose policy row reads the knob
+/// serves from host RAM and gates on RAM; every other row gates on VRAM.
+/// The tag is **derived** from the row's keys and the engine knob table
+/// ([`ModelEntry::resource`]) — never a stored yaml key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resource {
+    /// The load reserves VRAM on the card (the ordinary gate, Step 4).
+    Gpu,
+    /// The load reserves host RAM (a CPU-resident llama row); the gate
+    /// never reads the card for it, and the card's gate never sees it.
+    Ram,
+}
+
 /// How a measured footprint figure was obtained, and therefore whether it may book
 /// (R1, DECISIONS LOCKED 2026-10-30). Written by `on_measured` as the
 /// `measured_attribution:` stamp and read back at scan; never upgraded post-hoc.
@@ -230,6 +245,11 @@ pub struct ModelEntry {
     /// Declared admission cost in GiB (Step 4 rule 1); `None` falls back to the
     /// GGUF-size formula.
     pub vram_gb: Option<f64>,
+    /// Declared host-RAM footprint in GiB (`ram_gb:`) — the booking figure
+    /// for a CPU-resident row (operator ruling 2026-11-05). Booking-
+    /// relevant only for rows whose [`Self::resource`] is [`Resource::Ram`];
+    /// on any other row it is inert, and it never changes a VRAM booking.
+    pub ram_gb: Option<f64>,
     /// GiB size of the backing GGUF file, recorded by the scanner (None for
     /// sentinels, missing files, and synthetic entries) — the estimate input at
     /// admission (DESIGN Step 4 rule 1).
@@ -681,6 +701,34 @@ impl ModelEntry {
             && crate::engine::policy::fit_capable(&self.engine)
     }
 
+    /// Whether this row serves CPU-resident: the engine's policy row reads
+    /// the `cpu_offload` knob **and** the row's value is in the harness truth
+    /// set — composed from the knob table ([`crate::engine::policy::knob_live`])
+    /// and the canonical read ([`crate::engine::llama::jinja_on`], the words
+    /// `true`|`1`|`on` case-sensitively), never re-parsed here. `mock`
+    /// impersonates engines in tests but reads no offload knob, so a truthy
+    /// value on it stays the inert-key warn the scan already names.
+    #[must_use]
+    pub fn cpu_resident(&self) -> bool {
+        crate::engine::llama::offload_live(&self.engine)
+            && self
+                .raw
+                .get("cpu_offload")
+                .is_some_and(|value| crate::engine::llama::jinja_on(value))
+    }
+
+    /// The one resource this row reserves against: a CPU-resident row gates
+    /// on host RAM, everything else on the card. Derived at every read, never
+    /// stored — the same one derivation the gate and the ledger walk.
+    #[must_use]
+    pub fn resource(&self) -> Resource {
+        if self.cpu_resident() {
+            Resource::Ram
+        } else {
+            Resource::Gpu
+        }
+    }
+
     /// The booking precedence: declared → measured (only where the cost class may
     /// book it, per `Self::may_book_measured`) → the R11 Fit projection → GGUF
     /// estimate, with `exact`-without-`vram_gb`-and-without-a-real-source refused.
@@ -774,6 +822,25 @@ impl ModelEntry {
                 if v == 0.0 {
                     return Err(ModelError::BadNumber {
                         field: "vram_gb".to_string(),
+                        value: raw.to_string(),
+                    });
+                }
+                Some(v)
+            }
+            None => None,
+        };
+        // The RAM twin of `vram_gb` (operator ruling 2026-11-05): parsed by the
+        // one GiB parser like every size-valued key, and a declared 0 is refused
+        // for the same reason — a footprint no model has. Booking reads it only
+        // through [`Self::resource`] == Ram; on a GPU row it stays inert config
+        // the scan still sees as consumed (a real read exists, just not for
+        // every row shape).
+        let ram_gb = match keys.get("ram_gb") {
+            Some(raw) => {
+                let v = parse_gib("ram_gb", raw)?;
+                if v == 0.0 {
+                    return Err(ModelError::BadNumber {
+                        field: "ram_gb".to_string(),
                         value: raw.to_string(),
                     });
                 }
@@ -876,6 +943,7 @@ impl ModelEntry {
             engine,
             category,
             vram_gb,
+            ram_gb,
             gguf_size_gb: None,
             cost,
             vram_gate,
@@ -961,6 +1029,66 @@ mod tests {
         ] {
             assert!(!truthy(value), "{value} must read false");
         }
+    }
+
+    /// The RAM twin of the GiB-key pins (operator ruling 2026-11-05): the
+    /// one parser accepts a plain size and refuses a non-positive or
+    /// nonsense figure naming `ram_gb` — `nan`/`inf`/`1e400` included, or
+    /// every gate comparison against it would be false and read as "fits".
+    #[test]
+    fn ram_gb_parses_like_every_other_gi_b_key() {
+        let entry =
+            ModelEntry::from_flat(&flat(&[("name", "m"), ("ram_gb", "24.5")]), "m").expect("valid");
+        assert_eq!(entry.ram_gb, Some(24.5));
+        assert_eq!(entry.vram_gb, None, "a `ram_gb` never moves a VRAM figure");
+        for bad in ["0", "0.0", "-4", "nan", "inf", "1e400", "x"] {
+            let err = ModelEntry::from_flat(&flat(&[("name", "m"), ("ram_gb", bad)]), "m");
+            assert!(
+                matches!(&err, Err(ModelError::BadNumber { field, value })
+                        if field == "ram_gb" && value == bad),
+                "`ram_gb: {bad}` must be refused naming the key, got {err:?}"
+            );
+        }
+    }
+
+    /// The `cpu_resident` composition (operator ruling 2026-11-05): the knob
+    /// table answers *whether the engine reads the key*, `jinja_on` answers
+    /// whether the row's value is truthy — the engine's case-SENSITIVE set
+    /// (`true`|`1`|`on`), NOT the generic `truthy`. `mock` impersonates
+    /// engines but reads no offload knob, so a truthy value there stays an
+    /// inert-key warn, never a resource flip. Falsifier: composing with
+    /// `truthy` admits `yes`/`True`; composing without the knob table makes
+    /// `mock: cpu_offload true` a RAM row.
+    #[test]
+    fn cpu_resident_composes_the_knob_table_with_the_engine_truth_set() {
+        let resident = |engine: &str, value: &str| {
+            ModelEntry::from_flat(
+                &flat(&[("name", "m"), ("engine", engine), ("cpu_offload", value)]),
+                "m",
+            )
+            .expect("valid")
+            .resource()
+        };
+        for word in ["true", "1", "on"] {
+            assert_eq!(resident("llama", word), Resource::Ram, "{word}");
+        }
+        for word in ["yes", "True", "ON", "TRUE", "2", ""] {
+            assert_eq!(
+                resident("llama", word),
+                Resource::Gpu,
+                "the engine truth set is exactly true|1|on, case-sensitively: {word}"
+            );
+        }
+        assert_eq!(
+            resident("llama", "false"),
+            Resource::Gpu,
+            "an explicit false stays a VRAM row"
+        );
+        assert_eq!(
+            resident("mock", "true"),
+            Resource::Gpu,
+            "mock reads no offload knob: the inert-key warn posture, not a resource flip"
+        );
     }
 
     /// Full `extra_args` enforcement (slice 10c): a hostile operator-extra

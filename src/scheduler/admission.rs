@@ -54,6 +54,8 @@ impl ActorState {
             outcome: None,
             error: None,
             need: None,
+            resource: entry.resource(),
+            ram_need: None,
             free_at_admit: None,
             observed_at_admit: None,
             release_first: false,
@@ -140,6 +142,26 @@ impl ActorState {
         }
     }
 
+    /// The CPU-resident booking ladder (operator ruling 2026-11-05): the
+    /// declared `ram_gb` first, else the GGUF-size estimate
+    /// `gguf_size_gb * 1.0 + 2.0` GiB — the weights page in, not the card's
+    /// `x 1.15 + 2` KV multiplier, because an offloaded row holds the file
+    /// and its working set, not VRAM-pinned KV. Measured-RAM figures join the
+    /// ladder when the measured-RAM write-back lands; the VRAM cost ladder is
+    /// never consulted here — a CPU row's `vram_gb` changes no RAM figure,
+    /// and a `ram_gb` changes no VRAM figure. No basis at all (no `ram_gb`,
+    /// no GGUF size) is under-specified: the gate refuses rather than guess
+    /// the host's footprint.
+    pub(super) fn ram_booking(entry: &ModelEntry) -> Result<Gibibytes, AdmissionError> {
+        if let Some(declared) = entry.ram_gb {
+            return Ok(Gibibytes(declared));
+        }
+        entry
+            .gguf_size_gb
+            .map(|size| Gibibytes(size * 1.0 + 2.0))
+            .ok_or(AdmissionError::UnderSpecified)
+    }
+
     /// Arms a registered load row: takes over its slot, books the need, records the
     /// occupant it must release, and starts the witness sample that drives `Admit`.
     /// Arming clears any unload still queued behind a cancelled swap on that slot
@@ -151,7 +173,11 @@ impl ActorState {
         // hit books the projection (through `cost_source`), a miss books the
         // ladder now and fires the probe fire-and-forget (never parking the
         // admit behind a volume). The version epoch rides every llama admit.
-        self.refresh_fit_on_admit(&mut entry);
+        // A CPU-resident row is skipped: the VRAM calculator answers a
+        // question this row's gate never asks (operator ruling 2026-11-05).
+        if entry.resource() == crate::model::Resource::Gpu {
+            self.refresh_fit_on_admit(&mut entry);
+        }
         // R10 separation (operator 2026-11-01: "8003-8005 are manual only"): a
         // container's internal port is a third namespace; a row claiming a manual
         // or harness number is refused BEFORE spawn, whatever docker would have
@@ -167,17 +193,35 @@ impl ActorState {
                 return;
             }
         }
-        // The gate's figure, by the one decision the page also reads.
-        let booking = match Self::booking_need(&entry) {
-            Ok(booking) => booking,
-            Err(error) => {
-                let error = SchedulerError::Admission(error);
-                self.slots[slot].job = Some(job_id);
-                self.step(job_id, SwapState::Admit);
-                self.step(job_id, SwapState::AdmitFail);
-                self.log_refusal(job_id, &error, "need");
-                self.finish(job_id, Err(error), "under-specified");
-                return;
+        // The gate's figure, by the one decision the page also reads. The
+        // two ladders answer separately (operator ruling 2026-11-05): a
+        // CPU-resident row books host RAM and zero VRAM; a VRAM row books
+        // exactly as before and holds no RAM figure.
+        let (booking, ram_booking) = if entry.resource() == crate::model::Resource::Ram {
+            match Self::ram_booking(&entry) {
+                Ok(ram) => (Some(Gibibytes(0.0)), Some(ram)),
+                Err(error) => {
+                    let error = SchedulerError::Admission(error);
+                    self.slots[slot].job = Some(job_id);
+                    self.step(job_id, SwapState::Admit);
+                    self.step(job_id, SwapState::AdmitFail);
+                    self.log_refusal(job_id, &error, "need");
+                    self.finish(job_id, Err(error), "under-specified");
+                    return;
+                }
+            }
+        } else {
+            match Self::booking_need(&entry) {
+                Ok(booking) => (booking, None),
+                Err(error) => {
+                    let error = SchedulerError::Admission(error);
+                    self.slots[slot].job = Some(job_id);
+                    self.step(job_id, SwapState::Admit);
+                    self.step(job_id, SwapState::AdmitFail);
+                    self.log_refusal(job_id, &error, "need");
+                    self.finish(job_id, Err(error), "under-specified");
+                    return;
+                }
             }
         };
         let victim = self.slots[slot].occupant.as_ref().map(|o| Victim {
@@ -189,20 +233,27 @@ impl ActorState {
         });
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.need = booking;
+            job.ram_need = ram_booking;
             job.victim = victim;
         }
         self.slots[slot].job = Some(job_id);
         self.step(job_id, SwapState::Admit);
         // Step 4 (as amended 2026-10-26): the gate is evaluated against the card's own
         // reading, sampled on a task — never inline in the actor, which must not stall
-        // behind a witness call.
+        // behind a witness call. The two ladders sample their own witness (operator
+        // ruling 2026-11-05): a CPU-resident row never reads the card (not even to
+        // waste a cached sample on it), and a VRAM row never spends the host reading.
         let witness = Arc::clone(&self.witness);
+        let ram_witness = Arc::clone(&self.ram_witness);
+        let ram_row = self.jobs[&job_id].resource == crate::model::Resource::Ram;
         let tx = self.tx.clone();
         let handle = tokio::spawn(async move {
-            let _ = tx.send(ActorMsg::Event {
-                job: job_id,
-                event: Event::Admitted(witness.sample().await),
-            });
+            let event = if ram_row {
+                Event::Admitted(None, ram_witness.sample())
+            } else {
+                Event::Admitted(Some(witness.sample().await), None)
+            };
+            let _ = tx.send(ActorMsg::Event { job: job_id, event });
         });
         self.jobs
             .get_mut(&job_id)
@@ -216,11 +267,23 @@ impl ActorState {
     /// credited for the occupant this job is about to release and debited for what
     /// other loads have already committed. The ledger survives only as the `budget`
     /// figure a refusal quotes, and as the whole basis of `ledger_only` witness mode.
+    ///
+    /// The two ladders decide here and share one admitted tail: a RAM row is
+    /// dispatched to [`Self::finish_admit_ram`] and the card is never consulted
+    /// for it (operator ruling 2026-11-05); the VRAM leg below is unchanged.
     pub(super) fn finish_admit(
         &mut self,
         job_id: JobId,
-        sample: Result<crate::budget::MemorySample, String>,
+        card: Option<Result<crate::budget::MemorySample, String>>,
+        ram: Option<crate::witness::RamSample>,
     ) {
+        if self.jobs[&job_id].resource == crate::model::Resource::Ram {
+            self.finish_admit_ram(job_id, ram);
+            return;
+        }
+        // A RAM row never gets here, so the absent-card slot can only mean the
+        // dispatcher forgot the reading — named, never silently waved through.
+        let sample = card.unwrap_or_else(|| Err("no card sample was dispatched".to_string()));
         // A real witness that cannot answer is a refusal, never a fallback onto a
         // bookkeeping guess (F-3/F-7: this is exactly how v3.3 over-committed).
         if sample.is_err() && !self.witness.ledger_only() {
@@ -526,31 +589,8 @@ impl ActorState {
                 job.need = Some(Gibibytes(booked));
             }
         }
-        // The one rung derivation, at the single point where the gate has
-        // said yes: `release_first` marks the same-slot door, a planned
-        // victim set marks the drain, neither means the card already held
-        // room (a same-slot replacement alone is the request, not a rung).
-        // Refusal arms never reach here — each one already logs
-        // `admission refused` with its numbers through `log_refusal`, so
-        // this line names only the rung (B6: the decision quotes its rung,
-        // the numbers stay where they already live).
-        let path = if self.jobs[&job_id].release_first {
-            AdmissionPath::ReleaseFirst
-        } else if self.jobs[&job_id].victims.is_empty() {
-            AdmissionPath::FitsNow
-        } else {
-            AdmissionPath::Drain
-        };
-        if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.path = Some(path);
-        }
-        tracing::info!(
-            %job_id,
-            path = ?path,
-            model = %self.jobs[&job_id].model,
-            category = ?self.jobs[&job_id].category,
-            "admission path"
-        );
+        // The rung derivation and the release-or-spawn commit are the shared
+        // admitted tail — the gate leg above only proved the numbers.
         if crate::observability::extended_logging() {
             // Decision-level evidence for rehearsal post-checks (operator,
             // 2026-10-26): the exact numbers the gate compared on the pass path.
@@ -571,6 +611,33 @@ impl ActorState {
                 "admission decision (extended)"
             );
         }
+        self.finish_admit_tail(job_id);
+    }
+
+    /// The shared admitted tail of both ladders: the one rung derivation, at the
+    /// single point where a gate has said yes, and the release-or-spawn commit.
+    /// Refusal arms never reach here — each one already logs `admission refused`
+    /// with its numbers through `log_refusal`, so the rung line names only the
+    /// rung (B6: the decision quotes its rung, the numbers stay where they
+    /// already live).
+    fn finish_admit_tail(&mut self, job_id: JobId) {
+        let path = if self.jobs[&job_id].release_first {
+            AdmissionPath::ReleaseFirst
+        } else if self.jobs[&job_id].victims.is_empty() {
+            AdmissionPath::FitsNow
+        } else {
+            AdmissionPath::Drain
+        };
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.path = Some(path);
+        }
+        tracing::info!(
+            %job_id,
+            path = ?path,
+            model = %self.jobs[&job_id].model,
+            category = ?self.jobs[&job_id].category,
+            "admission path"
+        );
         // Chunk 10 [2]: everything the adapter validates about a launch — required
         // keys, profile/interpreter existence, WSL word and container legality — must
         // be settled *before* the eviction. Run after Dispose it would destroy the
@@ -598,6 +665,166 @@ impl ActorState {
         } else {
             self.begin_spawn(job_id);
         }
+    }
+
+    /// The Admit decision of the RAM ladder (operator ruling 2026-11-05). The
+    /// host reading is the budget, with the card's arithmetic and the card's
+    /// honesty rules: `ram_total - ram_reserve - observed ram_used`, credited
+    /// once for the same-slot RAM resident this job is about to release and
+    /// debited for what other loads have already committed to RAM. No launch
+    /// floor, no `whole`, no VRAM deficit and no victim planner — the RAM gate
+    /// releases nothing, so every host holder the harness can name rides the
+    /// refusal as a blocker and unattributable host RAM rides the
+    /// `unreleasable` figure (the correct product outcome of DOCTRINE 3: a
+    /// refusal that explains itself). A missing host reading refuses
+    /// fail-closed, exactly as a dead card witness does (DOCTRINE 4): there is
+    /// no ledger-only mode for RAM.
+    fn finish_admit_ram(&mut self, job_id: JobId, ram: Option<crate::witness::RamSample>) {
+        let Some(sample) =
+            ram.filter(|s| s.total_gib.is_finite() && s.used_gib.is_finite() && s.total_gib > 0.0)
+        else {
+            self.step(job_id, SwapState::AdmitFail);
+            let error = SchedulerError::Admission(AdmissionError::WitnessUnavailable {
+                reason: "ram witness: no host reading to budget against".to_string(),
+            });
+            self.log_refusal(job_id, &error, "witness");
+            self.finish(job_id, Err(error), "ram witness down");
+            return;
+        };
+        let need = self.jobs[&job_id].ram_need.unwrap_or_default();
+        let reserve = Gibibytes(self.cfg.ram_reserve_gb);
+        // Defense in depth (the card leg's rule, mirrored): a NaN need would
+        // make every comparison false and read as "fits".
+        if need.0.is_nan() {
+            self.step(job_id, SwapState::AdmitFail);
+            let error = SchedulerError::Admission(AdmissionError::UnderSpecified);
+            self.log_refusal(job_id, &error, "bad-size");
+            self.finish(job_id, Err(error), "under-specified");
+            return;
+        }
+        // The bytes this job is about to reclaim are still physically held at
+        // sample time, so they are credited — once, through the RAM ledger
+        // (a GPU resident's host RAM is never credited: it is not booked
+        // anywhere, it rides the reading). What other loads have committed to
+        // RAM but not yet installed is debited, or two concurrent loads spend
+        // the same host GiB.
+        let same_slot_credit = self.jobs[&job_id].slot.map_or(0.0, |slot| {
+            self.slots[slot]
+                .occupant
+                .as_ref()
+                .and_then(|o| o.ram_need)
+                .map_or(0.0, |n| n.0)
+        });
+        let in_flight = self.ram_in_flight_need(job_id);
+        let free = Gibibytes(
+            sample.total_gib - self.cfg.ram_reserve_gb - sample.used_gib + same_slot_credit
+                - in_flight,
+        );
+        self.set_timing(job_id, |t| &mut t.admit_ms);
+        let gate_target = need.0;
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.gate_target = Some(gate_target);
+        }
+        if free.0 < need.0 {
+            self.step(job_id, SwapState::AdmitFail);
+            let facts = BudgetFacts {
+                budget: Some(budget::free_gb(
+                    Gibibytes(sample.total_gib),
+                    reserve,
+                    self.ram_ledger_sum(),
+                )),
+                observed_free: Some(Gibibytes(sample.total_gib - sample.used_gib)),
+                // Everything the host holds beyond the same-slot credit the
+                // RAM gate cannot release: foreign memory and the OS, named
+                // as a figure (and, where the harness owns the holder, as a
+                // blocker below).
+                unreleasable: Some(Gibibytes((sample.used_gib - same_slot_credit).max(0.0))),
+                used_gib: Some(Gibibytes(sample.used_gib)),
+                booked_total: Some(self.ram_ledger_sum()),
+            };
+            let error = AdmissionError::InsufficientRam {
+                need,
+                // G13: the compared figure, never the flattering one.
+                free,
+                reserve,
+                facts: Box::new(facts),
+                victims_considered: Vec::new(),
+                blockers: self.ram_blockers(job_id),
+                wait_hint: self.wait_hint(job_id),
+            };
+            self.log_refusal(job_id, &SchedulerError::Admission(error.clone()), "gate");
+            self.finish(
+                job_id,
+                Err(SchedulerError::Admission(error)),
+                "admission refused",
+            );
+            return;
+        }
+        if crate::observability::extended_logging() {
+            let job = &self.jobs[&job_id];
+            tracing::info!(
+                %job_id,
+                model = %job.model,
+                resource = ?job.resource,
+                ram_need_gib = job.ram_need.map(|n| n.0),
+                ram_free_gib = free.0,
+                ram_used_gib = sample.used_gib,
+                ram_total_gib = sample.total_gib,
+                reserve_gib = self.cfg.ram_reserve_gb,
+                booked_gib = self.ram_in_flight_need(job_id),
+                victim = ?job.victim.as_ref().map(|v| v.model.clone()),
+                gate_gib = gate_target,
+                "admission decision (extended)"
+            );
+        }
+        self.finish_admit_tail(job_id);
+    }
+
+    /// Every named host holder a RAM refusal must blame: an occupant of a slot
+    /// other than the load's own (the own-slot RAM resident is the credited
+    /// replacement, never a blocker — the same-slot replacement rule of the
+    /// card leg holds on both ladders). A GPU resident's host RAM rides the
+    /// witness reading and is never under the harness's RAM control; a RAM
+    /// resident's bytes are booked but this gate releases none of them (no RAM
+    /// eviction exists), so the honest refusal names it too. Unattributable
+    /// host memory the harness cannot name rides the `unreleasable` figure,
+    /// exactly as foreign card holders ride it on the card refusals.
+    fn ram_blockers(&self, job_id: JobId) -> Vec<crate::budget::BlockerInfo> {
+        let own_slot = self.jobs[&job_id].slot;
+        let mut blockers = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if Some(index) == own_slot {
+                continue;
+            }
+            let Some(occupant) = &slot.occupant else {
+                continue;
+            };
+            blockers.push(crate::budget::BlockerInfo {
+                model: occupant.model.clone(),
+                category: slot.category.to_string(),
+                reason: if occupant.ram_need.is_some() {
+                    "host RAM held by a resident the RAM gate does not release".to_string()
+                } else {
+                    "a GPU resident's RAM rides the host reading and is never under \
+                     the RAM gate's control"
+                        .to_string()
+                },
+            });
+        }
+        blockers
+    }
+
+    /// The card leg under its one-reading shape, for pins that drive the VRAM
+    /// gate directly: a VRAM row never carries a host reading (the dispatcher
+    /// in [`Self::start_queued_load`] sends it `None` RAM exactly like this),
+    /// so this is the real dispatched shape, not a test stand-in.
+    #[cfg(test)]
+    pub(super) fn finish_admit_card(
+        &mut self,
+        job_id: JobId,
+        sample: Result<crate::budget::MemorySample, String>,
+    ) {
+        self.finish_admit(job_id, Some(sample), None);
     }
 
     /// What this refusal honestly knows about waiting, computed at decision
@@ -652,6 +879,13 @@ impl ActorState {
                 continue;
             }
             if let Some(occupant) = &slot.occupant {
+                if occupant.ram_need.is_some() {
+                    // A CPU-resident holder holds no card bytes: the
+                    // whole-machine gate is a card posture (operator ruling
+                    // 2026-11-05), and a `whole` GPU request is never blocked
+                    // by a host-RAM resident.
+                    continue;
+                }
                 holders.push(crate::budget::BlockerInfo {
                     model: occupant.model.clone(),
                     category: slot.category.to_string(),
@@ -663,6 +897,7 @@ impl ActorState {
             if *id == job_id
                 || job.kind != JobKind::Load
                 || job.terminal
+                || job.ram_need.is_some()
                 || !job.state.reserves_vram()
             {
                 continue;
@@ -713,6 +948,13 @@ impl ActorState {
             let Some(occupant) = &slot.occupant else {
                 continue;
             };
+            // A CPU-resident resident holds no VRAM to evict for (operator
+            // ruling 2026-11-05): never a candidate, never even "considered",
+            // and never a named blocker of a VRAM refusal — the two ladders
+            // never reach into each other's resources.
+            if occupant.ram_need.is_some() {
+                continue;
+            }
             let allowed_list = evictable_by(slot.category);
             if allowed_list.contains(&load_category) {
                 // `min_turn` juggle guard (operator ruling 2026-11-04): a holder

@@ -104,6 +104,13 @@ fn default_vram_reserve() -> f64 {
     2.0
 }
 
+/// Host RAM kept unreachable by admission for a CPU-resident load
+/// (operator ruling 2026-11-05): the OS and the desktop need real headroom,
+/// and a refused load costs one retry.
+fn default_ram_reserve() -> f64 {
+    8.0
+}
+
 fn default_vram_total() -> f64 {
     72.0
 }
@@ -558,6 +565,11 @@ pub struct AppConfig {
     /// GiB kept unreachable by admission (Step 4 rule 2).
     #[serde(default = "default_vram_reserve")]
     pub vram_reserve_gb: f64,
+    /// Host GiB kept unreachable by admission for CPU-resident rows
+    /// (operator ruling 2026-11-05: the RAM ladder's reserve, the twin of
+    /// `vram_reserve_gb` on its own resource).
+    #[serde(default = "default_ram_reserve")]
+    pub ram_reserve_gb: f64,
     /// Total VRAM of the card in GiB; the ceiling the budget is measured against
     /// (Step 4).
     #[serde(default = "default_vram_total")]
@@ -676,6 +688,7 @@ impl fmt::Debug for AppConfig {
             internal_host,
             categories,
             vram_reserve_gb,
+            ram_reserve_gb,
             vram_total_gb,
             protected_ports,
             release_timeout_s,
@@ -704,6 +717,7 @@ impl fmt::Debug for AppConfig {
             .field("internal_host", internal_host)
             .field("categories", categories)
             .field("vram_reserve_gb", vram_reserve_gb)
+            .field("ram_reserve_gb", ram_reserve_gb)
             .field("vram_total_gb", vram_total_gb)
             .field("protected_ports", protected_ports)
             .field("release_timeout_s", release_timeout_s)
@@ -732,6 +746,7 @@ impl Default for AppConfig {
             internal_host: default_internal_host(),
             categories: default_categories(),
             vram_reserve_gb: default_vram_reserve(),
+            ram_reserve_gb: default_ram_reserve(),
             vram_total_gb: default_vram_total(),
             protected_ports: default_protected_ports(),
             release_timeout_s: default_release_timeout(),
@@ -1149,6 +1164,16 @@ impl AppConfig {
                     .to_string(),
             });
         }
+        if !(self.ram_reserve_gb.is_finite() && self.ram_reserve_gb >= 0.0) {
+            errors.push(ConfigError::Invalid {
+                field: "ram_reserve_gb".to_string(),
+                reason: "must be a finite number greater than or equal to 0 (the host headroom \
+                         kept unreachable by admission for CPU-resident rows; 0 means no \
+                         reserve, while a negative reserve makes the RAM budget grow as more \
+                         reserve is asked for)"
+                    .to_string(),
+            });
+        }
         if !(self.witness_tolerance_gb.is_finite() && self.witness_tolerance_gb >= 0.0) {
             errors.push(ConfigError::Invalid {
                 field: "witness_tolerance_gb".to_string(),
@@ -1536,6 +1561,7 @@ mod tests {
     fn the_config_debug_prints_every_non_secret_field() {
         let cfg = AppConfig {
             vram_reserve_gb: 2.5,
+            ram_reserve_gb: 9.5,
             vram_total_gb: 47.5,
             protected_ports: [8003, 18203].into_iter().collect(),
             release_timeout_s: 11,
@@ -1560,6 +1586,7 @@ mod tests {
             ("internal_host", "127.0.0.1"),
             ("categories", "CategoryConfig"),
             ("vram_reserve_gb", "2.5"),
+            ("ram_reserve_gb", "9.5"),
             ("vram_total_gb", "47.5"),
             ("protected_ports", "8003"),
             ("release_timeout_s", "11"),
@@ -2224,6 +2251,34 @@ mod tests {
         };
         assert!(fails_with(&nan, "vram_reserve_gb"));
         let legal = AppConfig::parse("{\"vram_reserve_gb\": 0.0}").expect("parses");
+        assert!(
+            legal.validate().is_empty(),
+            "0 means no reserve and is legal: {:?}",
+            legal.validate()
+        );
+    }
+
+    /// The RAM ladder's reserve, pinned like its VRAM twin (operator ruling
+    /// 2026-11-05): the default is the ruling's 8 GiB, a negative reserve
+    /// would grow the RAM budget the more reserve is asked for, and 0 means
+    /// "no reserve" and stays legal.
+    #[test]
+    fn ram_reserve_defaults_to_eight_and_stays_finite_and_non_negative() {
+        assert_eq!(default_ram_reserve(), 8.0);
+        assert_eq!(AppConfig::default().ram_reserve_gb, 8.0);
+        let negative = AppConfig::parse("{\"ram_reserve_gb\": -1000.0}").expect("parses");
+        assert!(fails_with(&negative, "ram_reserve_gb"));
+        let nan = AppConfig {
+            ram_reserve_gb: f64::NAN,
+            ..AppConfig::default()
+        };
+        assert!(fails_with(&nan, "ram_reserve_gb"));
+        let inf = AppConfig {
+            ram_reserve_gb: f64::INFINITY,
+            ..AppConfig::default()
+        };
+        assert!(fails_with(&inf, "ram_reserve_gb"));
+        let legal = AppConfig::parse("{\"ram_reserve_gb\": 0.0}").expect("parses");
         assert!(
             legal.validate().is_empty(),
             "0 means no reserve and is legal: {:?}",

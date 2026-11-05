@@ -531,6 +531,7 @@ mod tests {
             engine: "basalt".to_string(),
             category: CategoryId::Work,
             vram_gb: Some(10.0),
+            ram_gb: None,
             gguf_size_gb: None,
             cost: CostClass::Fixed,
             vram_gate: crate::model::VramGate::default(),
