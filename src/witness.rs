@@ -393,23 +393,37 @@ mod tests {
 
     /// The witness-boundary conversion pin (bytes→GiB lives ONLY in
     /// `ram_sample`): the gate's trait object answers with the same GiB
-    /// struct as the free function, so no MiB or raw-bytes figure can
+    /// struct shape as the free function, so no MiB or raw-bytes figure can
     /// reach an admission comparison. Falsifier: a `RamWitness` impl that
-    /// quoted MiB (or bytes) would disagree with `ram_sample()` here.
+    /// quoted MiB (or bytes) would leave the GiB-scale band below.
+    /// The volatile `used_gib` fields are deliberately NOT compared across
+    /// two reads: a busy card drifts kilobytes between consecutive
+    /// `GlobalMemoryStatusEx` calls (flaky FAIL 2026-11-05, 3/4 red on a
+    /// 95 GiB box), and the unit claim needs only the stable `total_gib`
+    /// equality plus the scale band on each reader.
     #[test]
     fn the_ram_witness_answers_in_gib_like_the_free_function() {
         let live = GlobalRamWitness
             .sample()
             .expect("GlobalMemoryStatusEx works on Windows");
         let direct = ram_sample().expect("same call, same truth");
-        assert_eq!(live, direct, "one syscall, one figure, GiB both sides");
-        // GiB plausibility, stated at the witness boundary: a bytes figure
-        // would read as absurdly large, a MiB figure as absurdly small.
-        assert!(
-            live.total_gib > 0.5 && live.total_gib < 1_000_000.0,
-            "GiB-scale total, got {}",
-            live.total_gib
+        assert_eq!(
+            live.total_gib, direct.total_gib,
+            "one kernel figure, GiB both sides"
         );
+        for (name, sample) in [("trait", &live), ("free fn", &direct)] {
+            assert!(
+                sample.total_gib > 0.5 && sample.total_gib < 1_000_000.0,
+                "GiB-scale total from {name}, got {}",
+                sample.total_gib
+            );
+            assert!(
+                sample.used_gib >= 0.0 && sample.used_gib <= sample.total_gib,
+                "GiB-scale used from {name}, got {} of {}",
+                sample.used_gib,
+                sample.total_gib
+            );
+        }
     }
 
     #[test]
