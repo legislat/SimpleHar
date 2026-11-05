@@ -45,6 +45,12 @@ html[data-theme="dark"] {
   --sh-warn-tint: #d89b1d2e;
   /* Matte olive lightened for the dark card (6.9:1) - see :root. */
   --sh-accent-solid: #8fae6f;
+  /* Button edge (approved ramp, operator 2026-11-05): Pico's dark primary
+   * border equals its fill (#0172ad), so the border read as nothing. One
+   * step darker blue makes it an edge; hover pairs the same step. Nothing
+   * else in dark moves. */
+  --pico-primary-border: #015c8f;
+  --pico-primary-hover-border: #01699e;
 }
 :root:not([data-theme="dark"]), html[data-theme="light"] {
   /* Warm parchment (operator 2026-11-05): the cool paper read clinical against
@@ -63,33 +69,39 @@ html[data-theme="dark"] {
    * 4.9:1 on its amber hover fill (the dark hover fill is deeper for the same
    * reason - UR-02); the selected pill's ink on the green wash 6.2:1. The
    * amber BORDER stays the graphic --sh-warn (the button carries a text
-    * label, so the border marks, never names). Depth (operator screenshot
-    * 2026-11-05): the chrome must sit DEEPER than the parchment, not paler -
-    * border #d9c9b2 is a measured 1.44:1 step below the page (#e6dccb was
-    * 1.21:1 and read as light haze), the chrome surface #efe6d6 sits 1.10:1
-    * below the page and 1.19:1 below the card, the tab/header ink #373c44 is
-    * 9.0:1 on it and the muted port label 4.9:1. These depth tokens are
-    * declared ONLY here: every consumer falls back to the pre-fix value, so
-    * the dark theme computes byte-identical. */
+ * label, so the border marks, never names). The approved ramp (operator
+     2026-11-05): page #f7f1e6, panel/table/row surface #f2eadc one step
+     below it, control fill #efe6d6 one step below that, every structural
+     border #d6c5a8 below its fill, row separators #e2d5be; the header is
+     the surface with muted ink, never a band. These ramp tokens are
+   * declared ONLY here: every consumer falls back to the pre-ramp value, so
+   * the dark theme computes byte-identical. */
   --pico-background-color: #f7f1e6;
-  --pico-card-background-color: #fffaf3;
-  --pico-card-border-color: #d9c9b2;
+  --pico-card-background-color: #f2eadc;
+  --pico-card-border-color: #d6c5a8;
   --pico-muted-color: #6b6152;
   /* Pico paints thead/tfoot cells with --pico-background-color (the PAGE
    * token - repurposing it would move the page itself) and rules them with
    * --pico-table-border-color, whose light default is a cool near-white haze.
-   * The rules take the same warm hex as every other border; the header
-   * surface gets the own chrome token below. */
-  --pico-table-border-color: #d9c9b2;
+   * The approved ramp (operator 2026-11-05): the header is the table
+   * SURFACE, not a band, and the row separators take their own one-step
+   * line #e2d5be below the surface; every structural border is the darker
+   * #d6c5a8. */
+  --pico-table-border-color: #e2d5be;
   /* Border audit (operator 2026-11-05: "the border is still lighter than the
    * background"): Pico's cool muted-border rgb(231, 234, 239.5) is LIGHTER
    * than the parchment and still feeds the accordion border chain (the log
    * details) and hr. It takes the same warm hex - one line, every remaining
    * consumer, measured 1.44:1 below the page. */
-  --pico-muted-border-color: #d9c9b2;
+  --pico-muted-border-color: #d6c5a8;
+  /* Control fill (approved ramp): the button/select/toggle plate; the band
+   * use is retired - the header now takes the panel surface token. */
   --sh-chrome-bg: #efe6d6;
   --sh-tab-idle-bg: var(--sh-chrome-bg);
   --sh-panel-head-rule: 1px solid var(--pico-card-border-color);
+  /* Header ink on the surface (approved ramp): the table head text is muted.
+   * Light-only; the dark fallback keeps Pico's own th ink byte-identical. */
+  --sh-head-ink: #6b6152;
   /* The approved tab scheme, extended (operator 2026-11-05: "apply this color
    * scheme to the remaining blue buttons"). Pico routes EVERY default button,
    * outline button, link, checkbox accent and focus ring through these
@@ -107,7 +119,7 @@ html[data-theme="dark"] {
   --pico-primary-hover: #5a4a2b;
   --pico-primary-underline: rgba(111, 91, 54, 0.5);
   --pico-primary-background: #efe6d6;
-  --pico-primary-border: #d9c9b2;
+  --pico-primary-border: #d6c5a8;
   --pico-primary-hover-background: #e6dac3;
   --pico-primary-hover-border: #cdba9d;
   --pico-primary-inverse: #373c44;
@@ -125,14 +137,15 @@ html[data-theme="dark"] {
    * Since 2026-11-05 the light overrides this plate with transparent (the
    * strip's own parchment); the token stays so dark keeps it byte-identical. */
   --sh-tab-side-bg: #fffaf3;
-  /* Warm block (operator 2026-11-05): the table panel sits on the PAGE
-   * parchment, not the card hex - no near-white surface inside the block.
-   * Light-only; dark falls back to the card token, byte-identical. */
-  --sh-panel-bg: var(--pico-background-color);
+  /* Warm block (approved ramp, operator 2026-11-05): the panel/table/row
+   * surface is #f2eadc - one step under the page - and the header IS this
+   * surface (no band). Light-only; dark falls back to the card token,
+   * byte-identical. */
+  --sh-panel-bg: #f2eadc;
   /* The header strip joins the warm block (operator 2026-11-05): with no
-   * plate behind the tab-side, its background must be the parchment too -
+   * plate behind the tab-side, its background is the same surface token -
    * light-only, dark falls back to the card token. */
-  --sh-header-bg: var(--pico-background-color);
+  --sh-header-bg: #f2eadc;
   --sh-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
@@ -362,7 +375,7 @@ header.sh-header {
 .sh-tablewrap { overflow-x: auto; }
 /* Operator (2026-11-05, "the table border is still white"): the owner was
  * never a border - every computed border around the table reads the warm
- * #d9c9b2 already. With the table wider than the wrapper, the horizontal
+ * #d6c5a8 already. With the table wider than the wrapper, the horizontal
  * scrollbar's default WHITE trough drew a white band under the table. Light
  * paints it warm (thumb: the border token, track: the chrome plate); dark
  * keeps the platform scrollbar untouched. */
@@ -409,9 +422,9 @@ table.sh-models :is(th, td):first-child:not(.sh-empty) { padding-left: 0; }
 }
 
 /* The default chip's own row, in the panel head's empty space (operator 2026-11-01).
- * Depth (operator 2026-11-05): the head is a chrome surface over the card in
- * light, closed by a border; both tokens are light-only, so dark keeps the
- * transparent head and no rule exactly as before. */
+ * The approved ramp (operator 2026-11-05): the head sits on the panel/row
+ * surface token closed by one bottom rule (no band); both stay light-only,
+ * so dark keeps the transparent head and no rule exactly as before. */
 .sh-panel-head {
   display: flex;
   gap: 0.5rem;
@@ -419,19 +432,20 @@ table.sh-models :is(th, td):first-child:not(.sh-empty) { padding-left: 0; }
   color: var(--pico-muted-color);
   font-size: 0.8rem;
   padding: 0.1rem 0.1rem 0.45rem;
-  background: var(--sh-chrome-bg, transparent);
+  background: var(--sh-panel-bg, transparent);
   border-bottom: var(--sh-panel-head-rule, 0);
 }
 
 table.sh-models { margin-bottom: 0; }
 table.sh-models td, table.sh-models th { padding: 0.45rem 0.6rem; }
-/* Pico rules thead/tfoot cells with the PAGE background token and a cool
- * near-white border (there is no sectioning variable for them here), so the
- * header surface is set on the table directly. The fallback is that same page
- * token, keeping the dark header byte-identical; the bottom rule comes from
- * --pico-table-border-color, now the same warm hex as every other border. */
+/* The header is the surface, not a band (approved ramp, operator
+ * 2026-11-05): the head takes the panel/row surface token (dark falls back
+ * to the card - the panel itself), its text is muted in light only (the
+ * dark fallback is Pico's own th ink), and the one bottom rule stays
+ * Pico's --pico-table-border-color line. */
 table.sh-models thead th {
-  background: var(--sh-chrome-bg, var(--pico-background-color));
+  background: var(--sh-panel-bg, var(--pico-card-background-color));
+  color: var(--sh-head-ink, var(--pico-color));
 }
 /* Row-level separators (operator 2026-11-05): the line under a row was built
  * from eight per-cell 1px borders, so any cell that stops painting - the old

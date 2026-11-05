@@ -372,7 +372,7 @@ mod tests {
         assert!(
             STYLE_CSS.contains("--pico-primary-background: #efe6d6")
                 && STYLE_CSS.matches("--pico-primary-background:").count() == 1
-                && STYLE_CSS.contains("--pico-muted-border-color: #d9c9b2")
+                && STYLE_CSS.contains("--pico-muted-border-color: #d6c5a8")
                 && STYLE_CSS.matches("--pico-muted-border-color:").count() == 1,
             "the served stylesheet carries the warm Pico-primary scheme and \
               the warm muted-border once, in the light block only (dark keeps \
@@ -393,17 +393,21 @@ mod tests {
              equalising floor, no grow) and left-aligned in the served stylesheet"
         );
         assert!(
-            STYLE_CSS.contains("--sh-panel-bg: var(--pico-background-color)")
-                && STYLE_CSS.contains("--sh-header-bg: var(--pico-background-color)")
+            STYLE_CSS.contains("--sh-panel-bg: #f2eadc")
+                && STYLE_CSS.contains("--sh-header-bg: #f2eadc")
+                && STYLE_CSS.contains("--pico-table-border-color: #e2d5be")
+                && STYLE_CSS.matches("--pico-table-border-color:").count() == 1
+                && STYLE_CSS.contains("color: var(--sh-head-ink, var(--pico-color))")
+                && STYLE_CSS.contains("--pico-primary-border: #015c8f")
                 && STYLE_CSS
                     .contains("background: var(--sh-panel-bg, var(--pico-card-background-color))")
                 && STYLE_CSS
                     .contains("background: var(--sh-header-bg, var(--pico-card-background-color))",)
                 && STYLE_CSS.contains("html[data-theme=\"light\"] .sh-unload:not(:hover)")
                 && !STYLE_CSS.contains("[data-theme=\"dark\"] .sh-unload"),
-            "the whole light strip sits on the page parchment (header and panel \
-             tokens with card fallbacks, transparent cells, no plate behind any \
-             unload); dark keeps its card block and its plates byte-identical"
+            "the approved ramp ships: surface #f2eadc (panel, header, table head - \
+             no band), separator #e2d5be, blue buttons get a darker blue edge in \
+             dark, and the light strip carries no plate behind any unload"
         );
         assert!(
             STYLE_CSS.contains(":root:not([data-theme=\"dark\"]) table.sh-models tbody td")
@@ -419,10 +423,10 @@ mod tests {
             "the table wrapper scrollbar carries the warm light tokens: its \
              white trough was the white \"border\" under the table"
         );
-        for parchment in ["#f7f1e6", "#fffaf3", "#d9c9b2", "#efe6d6"] {
+        for ramp in ["#f7f1e6", "#f2eadc", "#efe6d6", "#d6c5a8", "#e2d5be"] {
             assert!(
-                STYLE_CSS.contains(parchment),
-                "the warm parchment palette needs {parchment} in the served stylesheet"
+                STYLE_CSS.contains(ramp),
+                "the warm ramp needs {ramp} in the served stylesheet"
             );
         }
     }

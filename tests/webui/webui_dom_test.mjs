@@ -679,8 +679,8 @@ const driver = `
     const lightBody = bodyOf('html[data-theme="light"]');
     check("the light theme is the warm parchment palette",
       !!lightBody && lightBody.indexOf("--pico-background-color: #f7f1e6") >= 0 &&
-        lightBody.indexOf("--pico-card-background-color: #fffaf3") >= 0 &&
-        lightBody.indexOf("--pico-card-border-color: #d9c9b2") >= 0 &&
+        lightBody.indexOf("--pico-card-background-color: #f2eadc") >= 0 &&
+        lightBody.indexOf("--pico-card-border-color: #d6c5a8") >= 0 &&
         lightBody.indexOf("--pico-muted-color: #6b6152") >= 0,
       lightBody || "missing");
     // The warm palette is the DEFAULT: its selector list must match an html
@@ -769,11 +769,12 @@ const driver = `
     // consumer falls back to the pre-fix value, so dark computes identical
     // (the dark/root absence half of this leg is the dark-unchanged guard).
     const rootBody = bodyOf(":root {");
-    check("light depth tokens exist (table rules, muted rules, chrome surface, idle tab, head rule)",
-      !!lightBody && lightBody.indexOf("--pico-card-border-color: #d9c9b2") >= 0 &&
-        lightBody.indexOf("--pico-table-border-color: #d9c9b2") >= 0 &&
-        lightBody.indexOf("--pico-muted-border-color: #d9c9b2") >= 0 &&
+    check("light ramp tokens exist (table rules, muted rules, control fill, idle tab, head rule)",
+      !!lightBody && lightBody.indexOf("--pico-card-border-color: #d6c5a8") >= 0 &&
+        lightBody.indexOf("--pico-table-border-color: #e2d5be") >= 0 &&
+        lightBody.indexOf("--pico-muted-border-color: #d6c5a8") >= 0 &&
         lightBody.indexOf("--sh-chrome-bg: #efe6d6") >= 0 &&
+        lightBody.indexOf("--sh-head-ink: #6b6152") >= 0 &&
         lightBody.indexOf("--sh-tab-idle-bg: var(--sh-chrome-bg)") >= 0 &&
         lightBody.indexOf("--sh-panel-head-rule: 1px solid var(--pico-card-border-color)") >= 0,
       lightBody || "missing");
@@ -793,14 +794,16 @@ const driver = `
         idleTabBody.indexOf("background: var(--sh-tab-idle-bg, var(--pico-background-color))") >= 0,
       idleTabBody || "missing");
     const headBody = bodyOf(".sh-panel-head {");
-    check("the panel head sits on the chrome surface with a light-only bottom rule",
-      !!headBody && headBody.indexOf("background: var(--sh-chrome-bg, transparent)") >= 0 &&
+    check("the panel head sits on the surface token with a light-only bottom rule",
+      !!headBody && headBody.indexOf("background: var(--sh-panel-bg, transparent)") >= 0 &&
         headBody.indexOf("border-bottom: var(--sh-panel-head-rule, 0)") >= 0,
       headBody || "missing");
     const thBody = bodyOf("table.sh-models thead th {");
-    check("the table head takes the chrome surface, falling back to the Pico page token",
+    check("the table head IS the surface (no band) with muted light ink",
       !!thBody &&
-        thBody.indexOf("background: var(--sh-chrome-bg, var(--pico-background-color))") >= 0,
+        thBody.indexOf("background: var(--sh-panel-bg, var(--pico-card-background-color))") >= 0 &&
+        thBody.indexOf("color: var(--sh-head-ink, var(--pico-color))") >= 0 &&
+        thBody.indexOf("--sh-chrome-bg") < 0,
       thBody || "missing");
     // Luminance truth: the chrome and border hexes must sit BELOW the page
     // (darker), not above it - the exact defect the screenshot showed.
@@ -816,19 +819,23 @@ const driver = `
       }
       return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
     };
-    check("the light chrome and border hexes compute darker than the parchment page",
-      lumOf("#efe6d6") < lumOf("#f7f1e6") && lumOf("#d9c9b2") < lumOf("#f7f1e6") &&
-        lumOf("#efe6d6") < lumOf("#fffaf3") && lumOf("#d9c9b2") < lumOf("#fffaf3") &&
+    check("the light ramp hexes compute in the approved darker order",
+      lumOf("#f2eadc") < lumOf("#f7f1e6") &&
+        lumOf("#efe6d6") < lumOf("#f2eadc") &&
+        lumOf("#e2d5be") < lumOf("#f2eadc") &&
+        lumOf("#d6c5a8") < lumOf("#efe6d6") &&
+        lumOf("#d6c5a8") < lumOf("#f2eadc") &&
         lumOf("#6f5b36") < lumOf("#f7f1e6") && lumOf("#e6dac3") < lumOf("#f7f1e6"),
-      "chrome=" + lumOf("#efe6d6").toFixed(4) + " border=" + lumOf("#d9c9b2").toFixed(4) +
-        " page=" + lumOf("#f7f1e6").toFixed(4) + " card=" + lumOf("#fffaf3").toFixed(4));
+      "page=" + lumOf("#f7f1e6").toFixed(4) + " surface=" + lumOf("#f2eadc").toFixed(4) +
+        " fill=" + lumOf("#efe6d6").toFixed(4) + " sep=" + lumOf("#e2d5be").toFixed(4) +
+        " border=" + lumOf("#d6c5a8").toFixed(4));
     // Remaining Pico-primary controls (operator 2026-11-05: "apply this color
     // scheme to the remaining blue buttons"): the recolor rides Pico's own
     // primary variables inside the light block, once for every button,
     // outline, link, checkbox accent and focus ring.
-    check("light Pico-primary variables resolve to the warm chrome scheme",
+    check("light Pico-primary variables resolve to the warm control scheme",
       !!lightBody && lightBody.indexOf("--pico-primary-background: #efe6d6") >= 0 &&
-        lightBody.indexOf("--pico-primary-border: #d9c9b2") >= 0 &&
+        lightBody.indexOf("--pico-primary-border: #d6c5a8") >= 0 &&
         lightBody.indexOf("--pico-primary-hover-background: #e6dac3") >= 0 &&
         lightBody.indexOf("--pico-primary-hover-border: #cdba9d") >= 0 &&
         lightBody.indexOf("--pico-primary-inverse: #373c44") >= 0 &&
@@ -841,8 +848,10 @@ const driver = `
         lightBody.indexOf("--pico-form-element-background-color: var(--sh-chrome-bg)") >= 0 &&
         lightBody.indexOf("--pico-form-element-border-color: var(--pico-card-border-color)") >= 0,
       lightBody || "missing");
-    check("no primary or form recolor leaks to dark or the :root defaults",
-      !!darkBody && darkBody.indexOf("--pico-primary") < 0 &&
+    check("no primary or form recolor leaks to dark beyond the approved button edge",
+      !!darkBody && darkBody.split("--pico-primary").length - 1 === 2 &&
+        darkBody.indexOf("--pico-primary-border: #015c8f") >= 0 &&
+        darkBody.indexOf("--pico-primary-hover-border: #01699e") >= 0 &&
         darkBody.indexOf("--pico-form-element") < 0 &&
         darkBody.indexOf("--pico-muted-border-color") < 0 &&
         !!rootBody && rootBody.indexOf("--pico-primary") < 0 &&
@@ -934,9 +943,9 @@ const driver = `
     // table goes transparent. The header pill keeps its plate.
     const panelBody = bodyOf(".sh-tabpanel {");
     const headerCssBody = bodyOf(".sh-header {");
-    check("the light strip sits on the page parchment, dark keeps the card",
-      !!lightBody && lightBody.indexOf("--sh-panel-bg: var(--pico-background-color)") >= 0 &&
-        lightBody.indexOf("--sh-header-bg: var(--pico-background-color)") >= 0 &&
+    check("the light strip sits on the surface token, dark keeps the card",
+      !!lightBody && lightBody.indexOf("--sh-panel-bg: #f2eadc") >= 0 &&
+        lightBody.indexOf("--sh-header-bg: #f2eadc") >= 0 &&
         !!panelBody &&
         panelBody.indexOf("background: var(--sh-panel-bg, var(--pico-card-background-color))") >= 0 &&
         !!headerCssBody &&
@@ -982,13 +991,13 @@ const driver = `
     }
     check("no border-bearing declaration uses a hex lighter than the page",
       lightBorder === "", lightBorder.trim() || "clean");
-    // Panel head and table head are one band of one token (operator 2026-11-05:
-    // "the same color, the darkest one"): both surfaces read --sh-chrome-bg,
-    // declared once as the warm chrome #efe6d6.
-    check("panel head and table head share the single chrome token",
-      !!headBody && headBody.indexOf("background: var(--sh-chrome-bg") >= 0 &&
-        !!thBody && thBody.indexOf("var(--sh-chrome-bg") >= 0 &&
-        !!lightBody && lightBody.indexOf("--sh-chrome-bg: #efe6d6") >= 0,
+    // The approved ramp (operator 2026-11-05): panel/header/table-head all
+    // read the ONE surface token --sh-panel-bg (#f2eadc in light, card
+    // fallback in dark) - the chrome band is retired from the header rules.
+    check("panel head and table head share the single surface token (no band)",
+      !!headBody && headBody.indexOf("background: var(--sh-panel-bg") >= 0 &&
+        !!thBody && thBody.indexOf("var(--sh-panel-bg") >= 0 &&
+        !!lightBody && lightBody.indexOf("--sh-panel-bg: #f2eadc") >= 0,
       "head=" + (headBody || "missing").slice(0, 40) + " th=" + (thBody || "missing").slice(0, 40));
   }
 
