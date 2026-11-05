@@ -406,6 +406,120 @@ impl ActorState {
         }
     }
 
+    /// The CPU-resident re-book band in GiB (`TASK-CPU-LLAMA-EVICTION` W2
+    /// step 3): the smallest working-set move worth a fold, a persist, and a
+    /// re-book. One GiB matches the elastic card ladder's floor step — page
+    /// churn below it must not oscillate the booking or rewrite the yaml —
+    /// and unlike [`ActorState::elastic_refresh`]'s asymmetric rule (rise
+    /// free, fall banded) this band is SYMMETRIC: the measured working set is
+    /// a noisy witness reading, not the engine's own static word, and the
+    /// DESIGN ruling names the reserve band the standing tolerance in both
+    /// directions, so a rise inside the band is noise too. The fold itself
+    /// stays pure bookkeeping (it re-books on any changed figure); the band
+    /// keeps the churn out of the SAMPLER.
+    pub(super) const RAM_REBOOK_BAND_GIB: f64 = 1.0;
+
+    /// The band predicate, split from the loop so the cadence is testable
+    /// without a runtime, a probe, or a clock.
+    pub(super) fn ram_rebook_due(current: f64, booked: f64) -> bool {
+        (current - booked).abs() > Self::RAM_REBOOK_BAND_GIB
+    }
+
+    /// The ONE place working-set bytes become GiB: a binary gibibyte, not the
+    /// decimal gigabyte a `MiB/1024`-style parser would sneak in. The probe
+    /// answers raw bytes (the Win32 `QUERY_MEMORY_INFORMATION` unit) and the
+    /// actor consumes the GiB newtype, so no MiB or byte figure ever crosses
+    /// a task or fold boundary (W2 step 3, falsifier-pinned).
+    pub(super) fn working_set_to_gib(bytes: u64) -> crate::budget::Gibibytes {
+        crate::budget::Gibibytes(bytes as f64 / (1024.0f64 * 1024.0 * 1024.0))
+    }
+
+    /// The engine's own pid plus every descendant at every depth, summed as
+    /// bytes (saturating — no working-set sum of a real tree overflows a u64,
+    /// and a saturating miss is absence, not a wrapped negative). A pid the
+    /// probe cannot read is skipped: a child that exited between the pid walk
+    /// and the query shrinks the tree honestly. Nothing readable at all is
+    /// absence: the caller treats it as the tree being gone and ends its
+    /// sampler. The unit stays bytes until [`Self::working_set_to_gib`].
+    pub(super) async fn tree_working_set_gib(
+        runtime: &Arc<dyn EngineRuntime>,
+        probe: &Arc<dyn crate::process::WorkingSetProbe>,
+        root_pid: u32,
+    ) -> Option<crate::budget::Gibibytes> {
+        let mut pids = vec![root_pid];
+        pids.extend(runtime.descendant_pids(root_pid).await);
+        let mut total: Option<u64> = None;
+        for pid in pids {
+            if let Some(bytes) = probe.working_set_bytes(pid) {
+                total = Some(total.map_or(bytes, |acc| acc.saturating_add(bytes)));
+            }
+        }
+        total.map(Self::working_set_to_gib)
+    }
+
+    /// The CPU-resident refresh loop (`TASK-CPU-LLAMA-EVICTION` W2 step 3):
+    /// the twin of [`ActorState::elastic_refresh`] for the RAM ladder, with
+    /// the engine's metrics endpoint replaced by the process-tree working-set
+    /// probe and the asymmetric band replaced by the symmetric
+    /// [`Self::ram_rebook_due`] one. `booked` starts at the admit-time RAM
+    /// booking — a floor, not a measurement — so the first real sample arrives
+    /// one `every` after install (the immediate interval tick is consumed,
+    /// the posture every sampler loop here carries: the state the load was
+    /// admitted in is not a serve-window reading). A reading crossing the
+    /// band is sent to the actor as `per_process` tree truth — the sampler is
+    /// the only writer of the `measured_ram_gb` pair and it never mints a
+    /// `total_diff` — and the fold it lands on re-books the resident through
+    /// the same max-truth ladder a fresh admit walks. Silence is a skip and
+    /// the last honest figure stays booked; the tree being gone (no pid
+    /// answerable at all) ends the loop, like any sampler whose subject
+    /// died; and the loop carries the same 24 h wall-clock bound, because a
+    /// serve is not a promise of eternity.
+    pub(super) async fn ram_refresh(
+        runtime: &Arc<dyn EngineRuntime>,
+        tx: &mpsc::UnboundedSender<ActorMsg>,
+        ctx: &SamplerCtx,
+        probe: &Arc<dyn crate::process::WorkingSetProbe>,
+        mut booked: f64,
+        every: std::time::Duration,
+    ) {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
+        loop {
+            tick.tick().await;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            let Some(ram_gib) = Self::tree_working_set_gib(runtime, probe, ctx.ticket.pid).await
+            else {
+                return; // the tree this sampler belongs to is gone
+            };
+            if !Self::ram_rebook_due(ram_gib.0, booked) {
+                continue;
+            }
+            if tx
+                .send(ActorMsg::MeasuredRam {
+                    model: ctx.model.clone(),
+                    ticket: ctx.ticket.clone(),
+                    ram_gib,
+                    attribution: crate::model::MeasuredAttribution::PerProcess,
+                })
+                .is_err()
+            {
+                return; // actor gone
+            }
+            tracing::info!(
+                model = %ctx.model,
+                ram_gib = ram_gib.0,
+                was_gib = booked,
+                band_gib = Self::RAM_REBOOK_BAND_GIB,
+                "CPU-resident working set crossed the re-book band"
+            );
+            booked = ram_gib.0;
+        }
+    }
+
     /// Snapshots a failed launch's container log (R9, C1): the autostart pre-reap the
     /// NEXT launch runs is `docker rm -f`, un-interceptable, so the engine evidence of
     /// a failed start must be on the Windows side before this job's reap completes —

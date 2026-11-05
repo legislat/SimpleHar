@@ -1094,6 +1094,8 @@ mod tests {
             measured_offload: None,
             measured_attribution: None,
             measured_profile: None,
+            measured_ram_gb: None,
+            measured_ram_min_gb: None,
             fit_gb: None,
             model_ref: Some("strata://test".to_string()),
             serve_model: Some("qwen3.8-flash-next".to_string()),

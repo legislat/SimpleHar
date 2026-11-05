@@ -138,6 +138,22 @@ pub(super) enum ActorMsg {
         measurement: crate::engine::EngineMeasurement,
         total_gib: f64,
     },
+    /// One CPU-resident RAM reading for a serving occupant
+    /// (`TASK-CPU-LLAMA-EVICTION` W2 step 3): the working set summed over the
+    /// engine's own pid plus every descendant, converted to the GiB newtype
+    /// once at the probe boundary — no MiB or raw-bytes figure crosses here.
+    /// The actor decides what folds: `attribution` is the provenance the
+    /// reading earned, and a `total_diff` host delta never books, never
+    /// persists, and never re-books (DOCTRINE 12). Like every measured
+    /// message, the ticket is the guard: a reading whose spawn is gone is
+    /// dropped, so a sampler that outlives its engine cannot fold a stranger's
+    /// working set into the old row.
+    MeasuredRam {
+        model: String,
+        ticket: SpawnTicket,
+        ram_gib: crate::budget::Gibibytes,
+        attribution: crate::model::MeasuredAttribution,
+    },
     /// A detached failed-launch log snapshot (R9 C1) has finished; release its
     /// in-flight mark so a later failure of the same container name re-snapshots.
     SnapshotDone(String),

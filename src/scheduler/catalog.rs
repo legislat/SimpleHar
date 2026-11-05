@@ -264,11 +264,19 @@ impl ActorState {
     /// cost field actually differs (a comment edit, a same-bytes re-save) is
     /// NOT a cost move: the marker round's conservatism stays in charge.
     fn cost_only_move(old: &ModelEntry, new: &ModelEntry) -> bool {
-        const COST_KEYS: [&str; 7] = [
+        // The RAM pair belongs to this surface exactly as its VRAM twin does
+        // (W2 step 3): the harness writes it from the working-set fold, and an
+        // operator correcting it is moving a booked number, not a launch
+        // flag — ambering it would accuse the resident of a config change its
+        // reload would not even re-read. The shared `measured_offload` stamp
+        // is already in the surface from the VRAM side.
+        const COST_KEYS: [&str; 9] = [
             "vram_gb",
             "cost",
             "measured_gb",
             "measured_gb_min",
+            "measured_ram_gb",
+            "measured_ram_gb_min",
             "measured_offload",
             "measured_attribution",
             "measured_profile",
@@ -300,6 +308,8 @@ impl ActorState {
             || old.cost != new.cost
             || old.measured_gb != new.measured_gb
             || old.measured_min_gb != new.measured_min_gb
+            || old.measured_ram_gb != new.measured_ram_gb
+            || old.measured_ram_min_gb != new.measured_ram_min_gb
             || old.measured_offload != new.measured_offload
             || old.measured_attribution != new.measured_attribution
             || old.measured_profile != new.measured_profile

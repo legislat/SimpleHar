@@ -41,6 +41,28 @@ pub(crate) use staging::{
     rendered_profiles_dir, sanitize_slug, staged_profile_name, strata_profiles_dir,
 };
 
+/// The per-pid working-set reader the CPU-resident sampler drives
+/// (`TASK-CPU-LLAMA-EVICTION` W2 step 3): the RAM twin of the witness seams.
+/// The live impl answers with one `GetProcessMemoryInfo` per pid
+/// ([`win32::working_set_bytes_of`]); tests inject their own reader, so the
+/// cardless gate never touches the real API. `None` is absence — the process
+/// is gone or unreadable — never a zero measurement (doctrine 4). Sync by
+/// design, like the host RAM witness: two cheap syscalls per pid, no cache,
+/// no TTL.
+pub(crate) trait WorkingSetProbe: Send + Sync {
+    /// Working-set bytes of `pid`, or `None` when no honest number exists.
+    fn working_set_bytes(&self, pid: u32) -> Option<u64>;
+}
+
+/// The live probe (see [`WorkingSetProbe`]).
+pub(crate) struct Win32WorkingSetProbe;
+
+impl WorkingSetProbe for Win32WorkingSetProbe {
+    fn working_set_bytes(&self, pid: u32) -> Option<u64> {
+        win32::working_set_bytes_of(pid)
+    }
+}
+
 use crate::custody::{self, CustodyLedger};
 use crate::engine::{http_probe, EngineRuntime, LaunchSpec, Probe, SpawnError, Spawned};
 use crate::ownership::{

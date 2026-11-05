@@ -151,6 +151,8 @@ const CONSUMED_KEYS: &[&str] = &[
     "fit_ctx",
     "measured_gb",
     "measured_gb_min",
+    "measured_ram_gb",
+    "measured_ram_gb_min",
     "measured_offload",
     "measured_attribution",
     "measured_profile",
@@ -3069,6 +3071,8 @@ mod tests {
              fit_ctx: 2048\n\
              measured_gb: 20.0\n\
              measured_gb_min: 10.0\n\
+             measured_ram_gb: 14.0\n\
+             measured_ram_gb_min: 10.0\n\
              measured_offload: false\n\
              measured_attribution: total_diff\n\
              measured_profile: b\n\
@@ -3298,6 +3302,8 @@ mod tests {
             "extra_args",
             "measured_gb",
             "measured_gb_min",
+            "measured_ram_gb",
+            "measured_ram_gb_min",
             "measured_offload",
             "strata_config",
             "strata_python",

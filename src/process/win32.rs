@@ -102,6 +102,37 @@ pub(super) fn descendant_pids_of(root: u32) -> Vec<u32> {
     descendants
 }
 
+/// Working-set bytes of `pid`, read with `GetProcessMemoryInfo`
+/// (`K32GetProcessMemoryInfo`, `TASK-CPU-LLAMA-EVICTION` W2 step 3): the RAM
+/// twin of the Toolhelp walk above — unlike WDDM per-PID VRAM (box-wide
+/// `[N/A]`), this query always answers for a live pid, so `None` means the
+/// process is gone or unreadable and nothing else. Every failure path — open
+/// refused, query refused — answers `None`: absence is reported, never a
+/// guess (doctrine 4). The caller owns the bytes→GiB conversion, exactly once
+/// at its own witness boundary.
+#[must_use]
+pub(super) fn working_set_bytes_of(pid: u32) -> Option<u64> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // Safety: `OpenProcess` requests read-only query rights for the given pid;
+    // every handle it returns is closed on every path below, and it is not
+    // used after the close. `PROCESS_MEMORY_COUNTERS` is passed with its exact
+    // size in `cb`, as the API contract requires, and its fields are read only
+    // after the call reported success.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        let read = GetProcessMemoryInfo(handle, &mut counters, counters.cb);
+        let _ = CloseHandle(handle);
+        read.ok()?;
+        Some(counters.WorkingSetSize as u64)
+    }
+}
+
 /// Holds the named mutex for the process lifetime (A10 single-instance guard).
 pub struct SingleInstanceGuard {
     handle: windows::Win32::Foundation::HANDLE,

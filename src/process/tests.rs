@@ -462,6 +462,8 @@ async fn a_fake_python_basalt_launch_serves_the_verified_id_end_to_end() {
         measured_offload: None,
         measured_attribution: None,
         measured_profile: None,
+        measured_ram_gb: None,
+        measured_ram_min_gb: None,
         fit_gb: None,
         model_ref: Some(weights.to_string_lossy().into_owned()),
         serve_model: Some("fake-alias".to_string()),

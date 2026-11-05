@@ -305,6 +305,20 @@ pub struct ModelEntry {
     /// so a profile change voids the pair at scan (the ninfer analog of
     /// `measured_offload`). Absent for non-ninfer engines and total-diff figures.
     pub measured_profile: Option<String>,
+    /// High end of the host-RAM working set the harness measured while this model
+    /// served CPU-resident (`measured_ram_gb:`): the engine's own pid plus every
+    /// descendant, summed by `GetProcessMemoryInfo` — the RAM sibling of the
+    /// `per_process` VRAM footprint (`per_process` by construction: the
+    /// process-tree sum attributes concrete bytes, and a `total_diff` host delta
+    /// is refused at the fold, so nothing this field can hold ever came from one).
+    /// RAM admission books `max(ram_gb, this)` (W2 step 3, operator ruling
+    /// 2026-11-05); a `cpu_offload` flip voids the pair exactly as it voids the
+    /// VRAM pair (same `measured_offload` stamp), and on a GPU row it stays inert:
+    /// the RAM ladder is never consulted there, and it never changes a VRAM figure.
+    pub measured_ram_gb: Option<f64>,
+    /// Low end of the measured RAM working-set pair (`measured_ram_gb_min:`), the
+    /// RAM twin of [`Self::measured_min_gb`].
+    pub measured_ram_min_gb: Option<f64>,
     /// Raw `model:` value — GGUF path or the engine-backed `scheme://` sentinel.
     /// Informational for managed models; used for stem/path aliases (Step 10).
     pub model_ref: Option<String>,
@@ -564,6 +578,71 @@ fn read_measured(engine: &str, keys: &BTreeMap<String, String>) -> Result<Measur
     measured.max = max;
     measured.min = min;
     Ok(measured)
+}
+
+/// Reads the CPU-resident working-set pair (`measured_ram_gb` /
+/// `measured_ram_gb_min`). One void condition, shared with the VRAM pair and
+/// read from the same stamp (see [`read_measured`]): a `cpu_offload` flip on an
+/// [`crate::engine::llama::offload_live`] engine means the stored figures no
+/// longer describe what this row would launch, and the pair is dropped.
+/// Provenance needs no second stamp: the only writer is the RAM fold, which
+/// refuses a `total_diff` reading before it can ever reach the file, so a
+/// pair on disk is always the process-tree truth (`per_process` by
+/// construction). Pair rules match the VRAM twin: a lone low end and an
+/// inverted pair are refused, and sub-quantum figures are the absence token
+/// the writer never emits.
+///
+/// # Errors
+///
+/// [`ModelError::BadNumber`] naming the offending field.
+fn read_measured_ram(
+    engine: &str,
+    keys: &BTreeMap<String, String>,
+    offload: Option<bool>,
+) -> Result<(Option<f64>, Option<f64>), ModelError> {
+    // The flip rule read verbatim from `read_measured`, on the same stamp: a
+    // pair voided for the card ladder describes the wrong resource class here
+    // too — it was taken under a launch this row no longer is.
+    let offload_now = keys
+        .get("cpu_offload")
+        .is_some_and(|v| crate::engine::llama::jinja_on(v));
+    if crate::engine::llama::offload_live(engine)
+        && offload.is_some_and(|stamped| stamped != offload_now)
+    {
+        return Ok((None, None));
+    }
+    let size = |field: &str, raw: &str| -> Result<f64, ModelError> {
+        let v = parse_gib(field, raw)?;
+        // Below the writer's 0.1 quantum: nothing was attributed — absence,
+        // not a measurement (the VRAM twin's rule, same reason).
+        if v < 0.05 {
+            return Err(ModelError::BadNumber {
+                field: field.to_string(),
+                value: raw.to_string(),
+            });
+        }
+        Ok(v)
+    };
+    let max = keys
+        .get("measured_ram_gb")
+        .map(|raw| size("measured_ram_gb", raw))
+        .transpose()?;
+    let min = keys
+        .get("measured_ram_gb_min")
+        .map(|raw| {
+            let v = size("measured_ram_gb_min", raw)?;
+            match max {
+                Some(max) if v <= max => Ok(v),
+                // A lone low end books nothing, and an inverted pair is a typo
+                // that would silently widen every range read from it.
+                Some(_) | None => Err(ModelError::BadNumber {
+                    field: "measured_ram_gb_min".to_string(),
+                    value: raw.to_string(),
+                }),
+            }
+        })
+        .transpose()?;
+    Ok((max, min))
 }
 
 /// Strict reading of the `measured_attribution:` provenance token this harness wrote:
@@ -938,6 +1017,10 @@ impl ModelEntry {
             }
         }
         let measured = read_measured(&engine, keys)?;
+        // The RAM pair rides the same stamp as the VRAM pair: the flip check
+        // needs the parsed `measured_offload`, so this reads after it.
+        let (measured_ram_gb, measured_ram_min_gb) =
+            read_measured_ram(&engine, keys, measured.offload)?;
         Ok(ModelEntry {
             name: name.trim().to_string(),
             engine,
@@ -954,6 +1037,8 @@ impl ModelEntry {
             measured_offload: measured.offload,
             measured_attribution: measured.attribution,
             measured_profile: measured.profile,
+            measured_ram_gb,
+            measured_ram_min_gb,
             model_ref: keys.get("model").cloned(),
             serve_model: keys.get("serve_model").filter(|v| !v.is_empty()).cloned(),
             // A hand-written `fit_gb:` in a yaml is inert by construction: the
@@ -1697,6 +1782,119 @@ mod tests {
                 "{engine}: and must not change what admission books"
             );
         }
+    }
+
+    /// M1 (`TASK-CPU-LLAMA-EVICTION` W2 step 3): the RAM pair reader obeys the
+    /// same shape rules as its VRAM twin — a lone low end, an inverted pair,
+    /// and a sub-quantum figure are all refused; a clean pair lands on the new
+    /// fields and nowhere else. Falsifier: dropping the orphan/inverted/quantum
+    /// arms of `read_measured_ram` makes one of these parses succeed.
+    #[test]
+    fn the_measured_ram_pair_reads_with_the_twin_s_shape_rules() {
+        let entry = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("cpu_offload", "true"),
+                ("measured_ram_gb", "14"),
+                ("measured_ram_gb_min", "10"),
+                ("measured_offload", "true"),
+            ]),
+            "m",
+        )
+        .expect("a clean RAM pair is a valid row");
+        assert_eq!(entry.measured_ram_gb, Some(14.0));
+        assert_eq!(entry.measured_ram_min_gb, Some(10.0));
+        assert_eq!(
+            entry.measured_gb, None,
+            "the RAM pair must not touch the VRAM fields"
+        );
+        for (label, keys) in [
+            (
+                "orphan low end",
+                vec![("name", "m"), ("measured_ram_gb_min", "10")],
+            ),
+            (
+                "inverted pair",
+                vec![
+                    ("name", "m"),
+                    ("measured_ram_gb", "10"),
+                    ("measured_ram_gb_min", "20"),
+                ],
+            ),
+            (
+                "sub-quantum high end",
+                vec![("name", "m"), ("measured_ram_gb", "0.03")],
+            ),
+        ] {
+            let err = ModelEntry::from_flat(&flat(&keys), "m");
+            assert!(
+                matches!(err, Err(ModelError::BadNumber { ref field, .. })
+                    if field.starts_with("measured_ram")),
+                "{label}: must be a refused RAM number, got {err:?}"
+            );
+        }
+    }
+
+    /// M2 (same task): the RAM pair shares the ONE `cpu_offload` void — the
+    /// pair was taken under a launch the row no longer is, and the flip rule
+    /// is the shared stamp, not a second stamp. The stamps survive the void
+    /// exactly like the VRAM pair's, and an engine that never reads the key
+    /// keeps its pair. Falsifier: dropping the flip guard in
+    /// `read_measured_ram` books a flipped row's stale working set; gating the
+    /// guard on a new key (instead of the shared stamp) orphans the pair on a
+    /// stampless flip.
+    #[test]
+    fn a_cpu_offload_flip_voids_the_ram_pair_on_the_shared_stamp() {
+        let flipped = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("measured_ram_gb", "14"),
+                ("measured_ram_gb_min", "10"),
+                ("measured_offload", "true"),
+                ("cpu_offload", "false"),
+            ]),
+            "m",
+        )
+        .expect("a voided pair is still a valid row");
+        assert_eq!(flipped.measured_ram_gb, None);
+        assert_eq!(flipped.measured_ram_min_gb, None);
+        assert_eq!(
+            flipped.measured_offload,
+            Some(true),
+            "the stamp survives the void, as the VRAM pair's does"
+        );
+        let agreed = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("measured_ram_gb", "14"),
+                ("measured_ram_gb_min", "10"),
+                ("measured_offload", "on"),
+                ("cpu_offload", "true"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            (agreed.measured_ram_gb, agreed.measured_ram_min_gb),
+            (Some(14.0), Some(10.0)),
+            "`on` is `true` for the flip check too — the twin's token set"
+        );
+        let inert = ModelEntry::from_flat(
+            &flat(&[
+                ("name", "m"),
+                ("engine", "mock"),
+                ("measured_ram_gb", "14"),
+                ("measured_offload", "false"),
+                ("cpu_offload", "true"),
+            ]),
+            "m",
+        )
+        .expect("valid");
+        assert_eq!(
+            inert.measured_ram_gb,
+            Some(14.0),
+            "an engine that never reads `cpu_offload` keeps its RAM pair"
+        );
     }
 
     #[test]

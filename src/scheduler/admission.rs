@@ -190,24 +190,39 @@ impl ActorState {
         }
     }
 
-    /// The CPU-resident booking ladder (operator ruling 2026-11-05): the
-    /// declared `ram_gb` first, else the GGUF-size estimate
-    /// `gguf_size_gb * 1.0 + 2.0` GiB — the weights page in, not the card's
+    /// The CPU-resident booking ladder (operator ruling 2026-11-05, W2 step 3
+    /// rung): the floor first — declared `ram_gb`, else the GGUF-size estimate
+    /// `gguf_size_gb * 1.0 + 2.0` GiB, the weights page in, not the card's
     /// `x 1.15 + 2` KV multiplier, because an offloaded row holds the file
-    /// and its working set, not VRAM-pinned KV. Measured-RAM figures join the
-    /// ladder when the measured-RAM write-back lands; the VRAM cost ladder is
-    /// never consulted here — a CPU row's `vram_gb` changes no RAM figure,
-    /// and a `ram_gb` changes no VRAM figure. No basis at all (no `ram_gb`,
-    /// no GGUF size) is under-specified: the gate refuses rather than guess
-    /// the host's footprint.
+    /// and its working set, not VRAM-pinned KV — then the max truth (DOCTRINE
+    /// 12 amended ruling): the trusted measured working set books when it
+    /// exceeds the floor, and the declared floor is never undercut. The pair
+    /// can only carry `per_process` tree truth here: the `cpu_offload` flip
+    /// voids it at scan (`read_measured_ram`) and the fold refuses a
+    /// `total_diff` reading before it can persist (`on_measured_ram`). The
+    /// VRAM cost ladder is never consulted here — a CPU row's `vram_gb`
+    /// changes no RAM figure, and a `ram_gb` changes no VRAM figure. No basis
+    /// at all (no `ram_gb`, no GGUF size, no trusted pair) is under-specified:
+    /// the gate refuses rather than guess the host's footprint.
     pub(super) fn ram_booking(entry: &ModelEntry) -> Result<Gibibytes, AdmissionError> {
-        if let Some(declared) = entry.ram_gb {
-            return Ok(Gibibytes(declared));
+        let floor = entry
+            .ram_gb
+            .map(Gibibytes)
+            .or_else(|| entry.gguf_size_gb.map(|size| Gibibytes(size * 1.0 + 2.0)));
+        let measured = entry.measured_ram_gb.map(Gibibytes);
+        match (floor, measured) {
+            // Max truth on the PartialOrd newtype (`Ord::max` is unavailable
+            // for an f64-backed GiB): the higher figure books, the declared
+            // floor is never undercut.
+            (Some(floor), Some(measured)) => Ok(if measured.0 > floor.0 {
+                measured
+            } else {
+                floor
+            }),
+            (Some(floor), None) => Ok(floor),
+            (None, Some(measured)) => Ok(measured),
+            (None, None) => Err(AdmissionError::UnderSpecified),
         }
-        entry
-            .gguf_size_gb
-            .map(|size| Gibibytes(size * 1.0 + 2.0))
-            .ok_or(AdmissionError::UnderSpecified)
     }
 
     /// Arms a registered load row: takes over its slot, books the need, records the

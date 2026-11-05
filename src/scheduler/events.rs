@@ -337,39 +337,47 @@ impl ActorState {
         // `MemorySummary` stands in ahead of even that, so the sampler fetches it
         // first. What to charge is the actor's call alone: it knows who else is booked
         // and which engine actually holds the slot.
-        let sampler_ctx = self
+        let sampler_ctx = self.jobs.get(&job_id).map(|job| {
+            let ticket = job
+                .spawned
+                .clone()
+                .expect("invariant: install only happens after a spawn");
+            SamplerCtx {
+                model: job.model.clone(),
+                own_pids: if job.container.is_none() {
+                    vec![ticket.pid]
+                } else {
+                    Vec::new()
+                },
+                ticket,
+                container: job.container.clone(),
+                engine: job.engine.clone(),
+            }
+        });
+        // A CPU-resident resident walks the RAM ladder's own sampler instead
+        // of the card witness one (operator ruling 2026-11-05, W2 step 3):
+        // the card sampler would fold host-RAM growth into the yaml's
+        // `measured_gb` — a VRAM figure — so the install branch ends before
+        // it ever starts, and the working-set loop takes the handle. Its
+        // `booked` starts at the admit-time booking: a floor, not a reading,
+        // so the loop's first sample arrives a full cadence after install.
+        let ram_seed = self
             .jobs
             .get(&job_id)
-            // A CPU-resident resident is not a VRAM story: its card-witness
-            // sampler would fold host-RAM growth into the yaml's `measured_gb`
-            // (a VRAM figure), so it never starts (operator ruling 2026-11-05;
-            // the measured-RAM write-back is its own later decision, on the
-            // RAM ladder's own keys).
-            .filter(|job| job.ram_need.is_none())
-            .map(|job| {
-                let ticket = job
-                    .spawned
-                    .clone()
-                    .expect("invariant: install only happens after a spawn");
-                SamplerCtx {
-                    model: job.model.clone(),
-                    own_pids: if job.container.is_none() {
-                        vec![ticket.pid]
-                    } else {
-                        Vec::new()
-                    },
-                    ticket,
-                    container: job.container.clone(),
-                    engine: job.engine.clone(),
-                }
-            });
+            .and_then(|job| job.ram_need)
+            .map(|need| need.0);
         let baseline_free = self.post_release_free(job_id);
         if let (Some(slot), Some(ctx)) = (slot, sampler_ctx) {
             let witness = Arc::clone(&self.witness);
             let runtime = Arc::clone(&self.runtime);
             let tx = self.tx.clone();
+            let probe = Arc::clone(&self.working_set_probe);
             let every = std::time::Duration::from_secs(self.cfg.measured_sample_s.max(1));
             let handle = tokio::spawn(async move {
+                if let Some(booked) = ram_seed {
+                    Self::ram_refresh(&runtime, &tx, &ctx, &probe, booked, every).await;
+                    return;
+                }
                 // The container's own startup report is demanded whenever a container
                 // is installed — it is a property of the engine, not of the witness,
                 // and a card the witness cannot observe (ledger-only, wedged driver)

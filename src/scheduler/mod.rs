@@ -187,6 +187,11 @@ struct ActorState {
     /// A `None` sample refuses fail-closed — there is no ledger-only mode
     /// for RAM.
     ram_witness: Arc<dyn crate::witness::RamWitness>,
+    /// The per-pid working-set reader the CPU-resident serve sampler drives
+    /// (W2 step 3): the tree probe behind the `measured_ram_gb` pair. The
+    /// live default is `GetProcessMemoryInfo`; tests swap it in place, so
+    /// no gate run ever calls the real API.
+    working_set_probe: Arc<dyn crate::process::WorkingSetProbe>,
     events: tokio::sync::broadcast::Sender<SchedulerStatus>,
     tx: mpsc::UnboundedSender<ActorMsg>,
     /// Containers with a detached failed-launch log snapshot in flight (R9 C1).
@@ -361,6 +366,12 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                 measurement,
                 total_gib,
             } => state.on_process_measurement(&model, &ticket, measurement, total_gib),
+            ActorMsg::MeasuredRam {
+                model,
+                ticket,
+                ram_gib,
+                attribution,
+            } => state.on_measured_ram(&model, &ticket, ram_gib, attribution),
             ActorMsg::SnapshotDone(container) => {
                 state.snapshot_in_flight.remove(&container);
             }
@@ -465,6 +476,10 @@ impl ActorState {
             // scripted pins drive `finish_admit` with their own sample and
             // never need a different default.
             ram_witness: Arc::new(crate::witness::GlobalRamWitness),
+            // The RAM tree probe's default is the live working-set query; the
+            // sampler only ever runs it for a CPU-resident occupant, and the
+            // pins that install one swap it for their fake (W2 step 3).
+            working_set_probe: Arc::new(crate::process::Win32WorkingSetProbe),
             events: tokio::sync::broadcast::channel(64).0,
             tx,
             snapshot_in_flight: HashSet::new(),

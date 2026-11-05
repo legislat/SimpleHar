@@ -24,6 +24,19 @@ pub(super) struct Reading {
     pub(super) used_gib: f64,
 }
 
+/// Which pair a fold writes. The two resource ladders share the fold, the
+/// persist, and the drain machinery, but never each other's keys: writing the
+/// VRAM pair from a RAM fold would book host bytes as card bytes (and the
+/// other way around would book a card footprint against the host), so the
+/// pair is decided once by the fold's caller and carried to the edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MeasuredPair {
+    /// The card footprint (`measured_gb` / `measured_gb_min`).
+    Vram,
+    /// The CPU-resident working set (`measured_ram_gb` / `measured_ram_gb_min`).
+    Ram,
+}
+
 /// One figure handed to [`ActorState::fold`], bundled with the launch it belongs to
 /// so the fold reads as "this spawn says this number" rather than seven positional
 /// arguments. `fold_range` is the second half of the provenance contract: a witness
@@ -38,6 +51,8 @@ pub(super) struct FoldPlan {
     pub(super) attribution: crate::model::MeasuredAttribution,
     pub(super) profile: Option<String>,
     pub(super) fold_range: bool,
+    /// Which ledger's pair this reading describes (W2 step 3).
+    pub(super) pair: MeasuredPair,
 }
 
 /// Everything one fold wrote to the catalog row: the pair and the provenance
@@ -51,6 +66,9 @@ pub(super) struct MeasuredData {
     pub(super) offload: Option<bool>,
     pub(super) attribution: Option<crate::model::MeasuredAttribution>,
     pub(super) profile: Option<String>,
+    /// Which pair these bytes were (W2 step 3): the persist-failure drain
+    /// must clear exactly the pair the write owned, never the stranger.
+    pub(super) pair: MeasuredPair,
 }
 
 impl MeasuredData {
@@ -60,16 +78,32 @@ impl MeasuredData {
     /// leave an orphan pair or a range booked under the wrong provenance (the
     /// scanner rejects the orphan outright — dropping the whole model).
     pub(super) fn edits(&self) -> Vec<(&'static str, Option<String>)> {
-        vec![
-            ("measured_gb", Some(format!("{:.1}", self.high))),
-            ("measured_gb_min", Some(format!("{:.1}", self.low))),
-            ("measured_offload", self.offload.map(|on| on.to_string())),
-            (
-                "measured_attribution",
-                self.attribution.map(|a| a.as_str().to_string()),
-            ),
-            ("measured_profile", self.profile.clone()),
-        ]
+        match self.pair {
+            MeasuredPair::Vram => vec![
+                ("measured_gb", Some(format!("{:.1}", self.high))),
+                ("measured_gb_min", Some(format!("{:.1}", self.low))),
+                ("measured_offload", self.offload.map(|on| on.to_string())),
+                (
+                    "measured_attribution",
+                    self.attribution.map(|a| a.as_str().to_string()),
+                ),
+                ("measured_profile", self.profile.clone()),
+            ],
+            // The RAM pair carries no attribution stamp: its only writer is the
+            // RAM fold, which refuses a `total_diff` reading before it can be
+            // persisted, so a pair on disk is `per_process` tree truth by
+            // construction. It rides the SHARED `measured_offload` stamp: the
+            // flip rule needs one word for the offload this launch ran under,
+            // a row is one resource at a time, and the pair the flip voids is
+            // always the one the other class left behind (review of the
+            // shared-stamp posture: a pair of class X is only ever booked
+            // while the row's resource is X, and any flip away voids both).
+            MeasuredPair::Ram => vec![
+                ("measured_ram_gb", Some(format!("{:.1}", self.high))),
+                ("measured_ram_gb_min", Some(format!("{:.1}", self.low))),
+                ("measured_offload", self.offload.map(|on| on.to_string())),
+            ],
+        }
     }
 }
 
@@ -157,12 +191,26 @@ impl MeasuredAnchor {
                     .get("cpu_offload")
                     .is_some_and(|value| crate::engine::llama::jinja_on(value))
             }),
-            range: match (entry.measured_gb, entry.measured_min_gb) {
-                (Some(high), Some(low)) => Some((high, low)),
-                // A lone high end is still the floor of what this spawn may book; a
-                // lone low end cannot exist (the scanner rejects an orphan pair).
-                (Some(high), None) => Some((high, high)),
-                (None, _) => None,
+            // The range a spawn continues must describe the resource it
+            // reserves: a CPU-resident spawn folds RAM figures, and seeding
+            // its range from a stray `measured_gb` (a card history a flip left
+            // behind without a stamp to void it) would fold host GiB against
+            // card GiB history.
+            range: match entry.resource() {
+                crate::model::Resource::Ram => {
+                    match (entry.measured_ram_gb, entry.measured_ram_min_gb) {
+                        (Some(high), Some(low)) => Some((high, low)),
+                        (Some(high), None) => Some((high, high)),
+                        (None, _) => None,
+                    }
+                }
+                crate::model::Resource::Gpu => match (entry.measured_gb, entry.measured_min_gb) {
+                    (Some(high), Some(low)) => Some((high, low)),
+                    // A lone high end is still the floor of what this spawn may book; a
+                    // lone low end cannot exist (the scanner rejects an orphan pair).
+                    (Some(high), None) => Some((high, high)),
+                    (None, _) => None,
+                },
             },
             serve_model: entry.serve_model.clone(),
             attribution: None,
@@ -219,6 +267,7 @@ impl ActorState {
             attribution,
             profile,
             fold_range,
+            pair,
         } = plan;
         let (model, high, low) = (model.as_str(), *high, *low);
         // The row that owns this reading is the spawn-era FILE, never whichever entry
@@ -286,12 +335,25 @@ impl ActorState {
             offload: anchor.offload,
             attribution: Some(*attribution),
             profile: profile.clone(),
+            pair: *pair,
         };
-        let entry_same = entry.measured_gb == Some(high)
-            && entry.measured_min_gb == Some(low)
-            && entry.measured_offload == data.offload
-            && entry.measured_attribution == data.attribution
-            && entry.measured_profile == data.profile;
+        let entry_same = match pair {
+            MeasuredPair::Vram => {
+                entry.measured_gb == Some(high)
+                    && entry.measured_min_gb == Some(low)
+                    && entry.measured_offload == data.offload
+                    && entry.measured_attribution == data.attribution
+                    && entry.measured_profile == data.profile
+            }
+            // The RAM pair carries no attribution or profile stamp, so its
+            // on-disk identity is the pair plus the shared offload stamp
+            // (W2 step 3).
+            MeasuredPair::Ram => {
+                entry.measured_ram_gb == Some(high)
+                    && entry.measured_ram_min_gb == Some(low)
+                    && entry.measured_offload == data.offload
+            }
+        };
         // The row is not the fold's only target: the slot's `container_reported_gb`
         // reads THIS launch's spawn anchor. Row-idempotence alone would hide a
         // lagging anchor whenever a fresh reading equals what an earlier launch
@@ -303,7 +365,10 @@ impl ActorState {
         if entry_same && anchor_same {
             return;
         }
-        if !entry_same {
+        if !entry_same && matches!(pair, MeasuredPair::Vram) {
+            // The drift voice belongs to the card ladder: the RAM pair's
+            // comparison figure is `ram_gb`, and the RAM ladder quotes its
+            // own numbers at the gate, so no warning rides here (W2 step 3).
             if let Some(declared) = entry.vram_gb {
                 let drift = (high - declared).abs();
                 if drift > (declared * 0.25).max(2.0) {
@@ -316,15 +381,26 @@ impl ActorState {
                 }
             }
         }
-        entry.measured_gb = Some(high);
-        entry.measured_min_gb = Some(low);
-        // The stamps are what this launch actually ran under — minted at spawn
-        // through `offload_live` + the engine's truth set, so the void rules keep
-        // stamps that describe the process rather than ones rewritten to agree with
-        // the yaml that arrived after it.
-        entry.measured_offload = data.offload;
-        entry.measured_attribution = data.attribution;
-        entry.measured_profile = data.profile.clone();
+        match pair {
+            MeasuredPair::Vram => {
+                entry.measured_gb = Some(high);
+                entry.measured_min_gb = Some(low);
+                // The stamps are what this launch actually ran under — minted at spawn
+                // through `offload_live` + the engine's truth set, so the void rules keep
+                // stamps that describe the process rather than ones rewritten to agree with
+                // the yaml that arrived after it.
+                entry.measured_offload = data.offload;
+                entry.measured_attribution = data.attribution;
+                entry.measured_profile = data.profile.clone();
+            }
+            MeasuredPair::Ram => {
+                entry.measured_ram_gb = Some(high);
+                entry.measured_ram_min_gb = Some(low);
+                // The same launch-describing stamp the VRAM pair writes: one
+                // word for the `cpu_offload` this launch ran under (W2 step 3).
+                entry.measured_offload = data.offload;
+            }
+        }
         // The spawn's own accumulator, so the next sample (and any reload in between)
         // still folds against the range and provenance this process produced. A
         // witness fold that follows the container's own report is refused upstream by
@@ -557,6 +633,7 @@ impl ActorState {
                 .then(|| anchor.profile.clone())
                 .flatten(),
             fold_range: true,
+            pair: MeasuredPair::Vram,
         });
     }
 
@@ -617,6 +694,7 @@ impl ActorState {
             profile,
             // Static for the life of the launch: never averaged into witness history.
             fold_range: false,
+            pair: MeasuredPair::Vram,
         });
     }
 
@@ -681,6 +759,7 @@ impl ActorState {
             // A footprint for this launch, not a point to be averaged into
             // this spawn's witness history.
             fold_range: false,
+            pair: MeasuredPair::Vram,
         });
         // Phase 4 (`TASK-ENGINE-MEASUREMENT`, the 2026-11-04 readmission
         // incident): the fold moved the row's max truth, but the resident's
@@ -817,18 +896,187 @@ impl ActorState {
         }) else {
             return;
         };
-        if entry.measured_gb == Some(data.high)
-            && entry.measured_min_gb == Some(data.low)
-            && entry.measured_offload == data.offload
-            && entry.measured_attribution == data.attribution
-            && entry.measured_profile == data.profile
-        {
-            entry.measured_gb = None;
-            entry.measured_min_gb = None;
-            entry.measured_offload = None;
-            entry.measured_attribution = None;
-            entry.measured_profile = None;
+        let landed = match data.pair {
+            MeasuredPair::Vram => {
+                entry.measured_gb == Some(data.high)
+                    && entry.measured_min_gb == Some(data.low)
+                    && entry.measured_offload == data.offload
+                    && entry.measured_attribution == data.attribution
+                    && entry.measured_profile == data.profile
+            }
+            MeasuredPair::Ram => {
+                entry.measured_ram_gb == Some(data.high)
+                    && entry.measured_ram_min_gb == Some(data.low)
+                    && entry.measured_offload == data.offload
+            }
+        };
+        if !landed {
+            return;
+        }
+        match data.pair {
+            MeasuredPair::Vram => {
+                entry.measured_gb = None;
+                entry.measured_min_gb = None;
+                entry.measured_offload = None;
+                entry.measured_attribution = None;
+                entry.measured_profile = None;
+            }
+            // The RAM drain clears only its own pair (W2 step 3): the shared
+            // `measured_offload` stamp describes the launch, not the pair, and
+            // the RAM ladder books its pair with or without it — while the
+            // card ladder's grandfather rule reads an un-stamped `measured_gb`
+            // as bookable, so the drain must not strip a stamp a card pair on
+            // this row may still carry.
+            MeasuredPair::Ram => {
+                entry.measured_ram_gb = None;
+                entry.measured_ram_min_gb = None;
+            }
+        }
+        self.publish();
+    }
+
+    /// Folds one CPU-resident working-set reading into the row's RAM pair
+    /// (`TASK-CPU-LLAMA-EVICTION` W2 step 3): the process-tree sum of the
+    /// engine's pid plus its descendants, sampled on the serve cadence. The
+    /// pair accumulates the serve window's extremes through the same anchor
+    /// range the witness fold averages (spawn-seeded from the row's RAM pair,
+    /// so a reload can never re-seed from a foreign resource class). Guards,
+    /// in the order every fold states them: the reading's provenance must be
+    /// the engine's own bytes — a `total_diff` host delta names no process,
+    /// so it never books, never persists, and the shared `measured_offload`
+    /// stamp keeps the pair honest across a `cpu_offload` flip exactly as it
+    /// does the VRAM pair (DOCTRINE 12 amended ruling, operator 2026-11-05);
+    /// the spawn must still own an uncontested serving window; and the figure
+    /// must be one this host could carry — the bound is the live RAM witness,
+    /// never the card, and a witness that does not answer is absence, so the
+    /// reading is skipped rather than guessed. Booking then flows through
+    /// [`ActorState::ram_booking`]'s max truth: the trusted pair books above
+    /// the declared floor and never undercuts it.
+    pub(super) fn on_measured_ram(
+        &mut self,
+        model: &str,
+        ticket: &SpawnTicket,
+        ram_gib: crate::budget::Gibibytes,
+        attribution: crate::model::MeasuredAttribution,
+    ) {
+        // The fold-site provenance guard: the live sampler only ever sends
+        // `per_process` tree sums, so anything else here is a caller bug or a
+        // host-delta route that must not exist. Refusing at the one writer is
+        // what lets the on-disk pair stay stamp-free: a pair on disk is tree
+        // truth by construction.
+        if !attribution.bookable() || attribution != crate::model::MeasuredAttribution::PerProcess {
+            tracing::warn!(
+                model,
+                ?attribution,
+                "measured RAM reading refused: only the engine's own process-tree bytes may book"
+            );
+            return;
+        }
+        if !self.serving_uncontested(model, ticket) {
+            return;
+        }
+        // The bound is the host: a working set larger than the machine's total
+        // RAM is a wedged counter, not a measurement, and the live witness is
+        // the same figure the RAM gate judges against. No sample, no verdict —
+        // absence is a skip, never a stand-in number.
+        let Some(sample) = self.ram_witness.sample() else {
+            return;
+        };
+        let Some(rounded) = Self::measurable_figure(ram_gib.0, sample.total_gib) else {
+            return;
+        };
+        self.fold(&FoldPlan {
+            model: model.to_string(),
+            ticket: ticket.clone(),
+            high: rounded,
+            low: rounded,
+            attribution,
+            // The profile stamp is ninfer's card-side identity; the RAM pair
+            // carries none, and its provenance needs no stamp either — this
+            // guard is the only writer and it has just ruled (W2 step 3).
+            profile: None,
+            // A serve-window reading: the pair keeps the window's extremes,
+            // the same accumulator the witness range averages for the card.
+            fold_range: true,
+            pair: MeasuredPair::Ram,
+        });
+        // The fold moved the row's max truth; the resident books from the SLOT,
+        // and the RAM gate's release credit reads that figure — a resident left
+        // on the admit-time floor would hand a same-slot replacement stale
+        // credit, the RAM twin of the 2026-11-04 readmission incident. Same
+        // single decision a fresh load takes, over the row the fold updated.
+        if self.rebook_ram_after_measurement(model, ticket) {
             self.publish();
         }
+    }
+
+    /// Refreshes the RAM resident's booked `ram_need` from the row its working
+    /// set just folded onto, through [`ActorState::ram_booking`]'s max truth —
+    /// the doctrine lives on [`ActorState::on_measured_ram`]. `true` only when
+    /// the booking actually moved (the caller publishes). The occupant is found
+    /// by `(model, ticket)` with `ram_need` set — the RAM twin of
+    /// [`Self::rebook_after_measurement`]'s slot identity rules: the spawn-era
+    /// FILE re-books, a row that went away re-books nothing, a re-minted twin
+    /// never touches a stranger, and an amber resident's row no longer
+    /// describes the process. Unlike the card ladder there is no greedy
+    /// refusal: the RAM ladder has no card-driven clamp to protect — a greedy
+    /// booking cannot exist on a RAM row, so every RAM booking is nominal and
+    /// measurement-refreshable.
+    fn rebook_ram_after_measurement(&mut self, model: &str, ticket: &SpawnTicket) -> bool {
+        let Some(slot) = self.slots.iter().position(|slot| {
+            slot.occupant
+                .as_ref()
+                .is_some_and(|o| o.model == model && &o.ticket == ticket && o.ram_need.is_some())
+        }) else {
+            return false;
+        };
+        // An amber the rescan earned says the row and the process diverged: the
+        // fold still records what the process holds, but the booking gesture is
+        // unload + reload, never a re-read of a stale row.
+        if self.slots[slot]
+            .occupant
+            .as_ref()
+            .is_some_and(|o| o.stale_config)
+        {
+            return false;
+        }
+        let Some(path) = self
+            .jobs
+            .iter()
+            .find(|(_, job)| job.model == model && job.spawned.as_ref() == Some(ticket))
+            .and_then(|(_, job)| job.measured.as_ref().and_then(|a| a.file.clone()))
+        else {
+            return false;
+        };
+        let Some(entry) = self
+            .catalog
+            .iter()
+            .find(|m| m.file.as_deref() == Some(path.as_path()))
+        else {
+            return false;
+        };
+        // A row whose basis went away mid-serve (operator stripped `ram_gb`, the
+        // GGUF size vanished) books nothing new — the fold's record stands, the
+        // resident keeps the figure it was admitted with.
+        let Ok(need) = Self::ram_booking(entry) else {
+            return false;
+        };
+        let Some(occupant) = self.slots[slot].occupant.as_mut() else {
+            return false;
+        };
+        let Some(booked) = occupant.ram_need else {
+            return false;
+        };
+        if booked == need {
+            return false;
+        }
+        tracing::info!(
+            model,
+            booked_gib = need.0,
+            was_gib = booked.0,
+            "measured working set re-booked the RAM resident's host need (max of the trusted pair and the declared floor)"
+        );
+        occupant.ram_need = Some(need);
+        true
     }
 }
