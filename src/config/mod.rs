@@ -139,6 +139,28 @@ fn default_measured_sample_s() -> u64 {
     60
 }
 
+/// Default measured-vs-declared drift ratio that raises the "measured footprint
+/// diverges" warning. `pub(crate)`-free: only serde and validation read it here; the
+/// scheduler reads the resolved field off `AppConfig`.
+fn default_measured_drift_warn_ratio() -> f64 {
+    0.25
+}
+
+/// Per-container ninfer log rotation size, in MiB, rendered into the canonical
+/// autostart script. `pub(crate)` so the ninfer adapter's standalone default and the
+/// config default share one literal (no drift between what a default render and a
+/// defaulted config produce). The historical value the harness always rendered.
+pub(crate) fn default_ninfer_log_max_size_mib() -> u32 {
+    25
+}
+
+/// Per-container ninfer log rotation file count, rendered into the canonical
+/// autostart script. `pub(crate)` for the same one-literal reason as
+/// [`default_ninfer_log_max_size_mib`].
+pub(crate) fn default_ninfer_log_max_files() -> u32 {
+    5
+}
+
 fn default_wsl_distro() -> String {
     "Ubuntu".to_string()
 }
@@ -195,6 +217,17 @@ fn default_protected_ports() -> BTreeSet<u16> {
 /// strip. A longer value is refused by [`AppConfig::validate`], naming the
 /// category and the cap.
 pub const CATEGORY_LABEL_MAX_CHARS: usize = 24;
+
+/// One day in seconds. The single source for the one-day bound every timeout
+/// ceiling shares, so a ceiling and its doc comment name the same figure.
+const ONE_DAY_SECS: u64 = 86_400;
+
+/// The validation ceiling for every timeout key: the config `*_timeout_s` fields
+/// and the per-model `load_timeout` and `min_turn` rows. One day. A `u64` parse
+/// already rejects `nan`, `inf`, and `1e400`; this guards the mistyped-digit typo
+/// that a readiness, dispose, or settle deadline would otherwise honor for years.
+/// Cross-module because `model` validates the per-model rows against the same bound.
+pub(crate) const MAX_TIMEOUT_S: u64 = ONE_DAY_SECS;
 
 /// One declarative category: slot count, listener, and policy as data (DESIGN Step 5).
 ///
@@ -513,6 +546,16 @@ pub struct AppConfig {
     /// wider max, while a slower one can miss the peak entirely.
     #[serde(default = "default_measured_sample_s")]
     pub measured_sample_s: u64,
+    /// Ratio of a model's declared `vram_gb` beyond which a fresh measured high
+    /// figure warns the operator that the measured footprint diverged from the
+    /// declared booking. The warning fires past the wider of `declared * ratio` and
+    /// the fixed `MEASURED_DRIFT_FLOOR_GB` GiB floor. `0.0` silences the warning
+    /// entirely; the floor still applies to any non-zero ratio. Validation accepts
+    /// `0.0..=1.0`. Absent means `0.25`, the value the harness always used, so an
+    /// unchanged file warns exactly as it did before. This gates a log line only; it
+    /// never changes admission, the booking, or the persisted measured range.
+    #[serde(default = "default_measured_drift_warn_ratio")]
+    pub measured_drift_warn_ratio: f64,
     /// Whether the tray icon starts with the harness (Step 15; loopback tool knob, G9).
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
@@ -549,6 +592,19 @@ pub struct AppConfig {
         deserialize_with = "trimmed_opt"
     )]
     pub wsl_user: Option<String>,
+    /// Per-container ninfer log rotation size, in MiB, rendered into the canonical
+    /// autostart script's `--log-opt max-size`. Validation accepts `1..=1024`. Absent
+    /// means `25`, the literal the harness always rendered, so an unchanged file
+    /// produces byte-identical L3. The harness owns this launch input (DOCTRINE 2),
+    /// so it lives in the config and never in an engine-side file.
+    #[serde(default = "default_ninfer_log_max_size_mib")]
+    pub ninfer_log_max_size_mib: u32,
+    /// Per-container ninfer log rotation file count, rendered into the canonical
+    /// autostart script's `--log-opt max-file`. Validation accepts `1..=50`. Absent
+    /// means `5`, the literal the harness always rendered. Same harness-owned-input
+    /// rule as [`AppConfig::ninfer_log_max_size_mib`].
+    #[serde(default = "default_ninfer_log_max_files")]
+    pub ninfer_log_max_files: u32,
     /// The file this config was loaded from (`SIMPLEHARN_CONFIG` or beside the exe),
     /// stamped by the boot loader. `#[serde(skip)]` so it never enters the persisted
     /// JSON. `default_model` write-back targets this exact path — read and write must
@@ -617,6 +673,7 @@ impl fmt::Debug for AppConfig {
             release_timeout_s,
             load_timeout_s,
             measured_sample_s,
+            measured_drift_warn_ratio,
             tray_enabled,
             llama_server_exe,
             modelconf_dir,
@@ -625,6 +682,8 @@ impl fmt::Debug for AppConfig {
             greedy_launch_min_free_gb,
             wsl_distro,
             wsl_user,
+            ninfer_log_max_size_mib,
+            ninfer_log_max_files,
             source_path,
             control_token,
             allow_mock_engine,
@@ -646,6 +705,7 @@ impl fmt::Debug for AppConfig {
             .field("release_timeout_s", release_timeout_s)
             .field("load_timeout_s", load_timeout_s)
             .field("measured_sample_s", measured_sample_s)
+            .field("measured_drift_warn_ratio", measured_drift_warn_ratio)
             .field("tray_enabled", tray_enabled)
             .field("llama_server_exe", llama_server_exe)
             .field("modelconf_dir", modelconf_dir)
@@ -654,6 +714,8 @@ impl fmt::Debug for AppConfig {
             .field("greedy_launch_min_free_gb", greedy_launch_min_free_gb)
             .field("wsl_distro", wsl_distro)
             .field("wsl_user", wsl_user)
+            .field("ninfer_log_max_size_mib", ninfer_log_max_size_mib)
+            .field("ninfer_log_max_files", ninfer_log_max_files)
             .field("source_path", source_path)
             .field("control_token", &format_args!("REDACTED({presence})"))
             .field("allow_mock_engine", allow_mock_engine)
@@ -681,8 +743,11 @@ impl Default for AppConfig {
             witness_tolerance_gb: default_witness_tolerance(),
             greedy_launch_min_free_gb: default_greedy_min_free(),
             measured_sample_s: default_measured_sample_s(),
+            measured_drift_warn_ratio: default_measured_drift_warn_ratio(),
             wsl_distro: default_wsl_distro(),
             wsl_user: None,
+            ninfer_log_max_size_mib: default_ninfer_log_max_size_mib(),
+            ninfer_log_max_files: default_ninfer_log_max_files(),
             control_token: None,
             allow_mock_engine: false,
             prefetch_on_release: false,
@@ -1159,36 +1224,38 @@ impl AppConfig {
         // Same shape as the per-model `load_timeout` key (model/mod.rs): a u64 rejects
         // nan/inf outright, and the ceiling guards a typo that would park a load job in
         // readiness forever (FINDINGS-11 [6]).
-        if self.load_timeout_s == 0 || self.load_timeout_s > 86_400 {
+        if self.load_timeout_s == 0 || self.load_timeout_s > MAX_TIMEOUT_S {
             errors.push(ConfigError::Invalid {
                 field: "load_timeout_s".to_string(),
-                reason:
-                    "must be 1..=86400 (readiness deadline, Step 3): a zero deadline fails every \
+                reason: format!(
+                    "must be 1..={MAX_TIMEOUT_S} (readiness deadline, Step 3): a zero deadline fails every \
                      load instantly and one mistyped digit parks the job in `Loading` forever, \
                      holding its slot, port and VRAM"
-                        .to_string(),
+                ),
             });
         }
-        if self.release_timeout_s == 0 || self.release_timeout_s > 86_400 {
+        if self.release_timeout_s == 0 || self.release_timeout_s > MAX_TIMEOUT_S {
             errors.push(ConfigError::Invalid {
                 field: "release_timeout_s".to_string(),
-                reason: "must be 1..=86400 (G12 release-confirmation deadline, §0.3): a zero \
-                         timeout kills the victim and then fails its own confirmation, so the \
-                         dead model stays installed and the new load never spawns, while one \
-                         mistyped digit past a day parks the job in `Dispose` forever if the \
-                         release evidence never arrives"
-                    .to_string(),
+                reason: format!(
+                    "must be 1..={MAX_TIMEOUT_S} (G12 release-confirmation deadline, §0.3): a zero \
+                     timeout kills the victim and then fails its own confirmation, so the \
+                     dead model stays installed and the new load never spawns, while one \
+                     mistyped digit past a day parks the job in `Dispose` forever if the \
+                     release evidence never arrives"
+                ),
             });
         }
-        if self.settle_timeout_s == 0 || self.settle_timeout_s > 86_400 {
+        if self.settle_timeout_s == 0 || self.settle_timeout_s > MAX_TIMEOUT_S {
             errors.push(ConfigError::Invalid {
                 field: "settle_timeout_s".to_string(),
-                reason: "must be 1..=86400 (G12 memory-settle deadline after a confirmed \
-                         release, §0.3): a zero timeout is the same loss one step later, once \
-                         the eviction has already run, while one mistyped digit past a day \
-                         parks the job past the settle gate forever if the memory never \
-                         settles"
-                    .to_string(),
+                reason: format!(
+                    "must be 1..={MAX_TIMEOUT_S} (G12 memory-settle deadline after a confirmed \
+                     release, §0.3): a zero timeout is the same loss one step later, once \
+                     the eviction has already run, while one mistyped digit past a day \
+                     parks the job past the settle gate forever if the memory never \
+                     settles"
+                ),
             });
         }
         if self.measured_sample_s == 0 {
@@ -1197,6 +1264,35 @@ impl AppConfig {
                 reason:
                     "must be positive (a zero cadence would spin the witness; 60 is the default)"
                         .to_string(),
+            });
+        }
+        // Drift-warning ratio: a share of the declared figure, so a valid ratio is a
+        // fraction. `0.0` is a deliberate silence, not a typo; a NaN reads as outside
+        // the range and is refused. It gates only the warning, never a booking.
+        if !(0.0..=1.0).contains(&self.measured_drift_warn_ratio) {
+            errors.push(ConfigError::Invalid {
+                field: "measured_drift_warn_ratio".to_string(),
+                reason: "must be 0.0..=1.0 (a fraction of the declared vram_gb; 0.0 silences the \
+                         measured-drift warning entirely)"
+                    .to_string(),
+            });
+        }
+        // ninfer container log rotation: bounded so one mistyped digit cannot render a
+        // `max-size` or `max-file` that outruns the container's own log discipline.
+        // Both land byte-identical at the default (25 MiB, 5 files).
+        if self.ninfer_log_max_size_mib == 0 || self.ninfer_log_max_size_mib > 1024 {
+            errors.push(ConfigError::Invalid {
+                field: "ninfer_log_max_size_mib".to_string(),
+                reason: "must be 1..=1024 (per-container log rotation size in MiB; 25 is the \
+                         default)"
+                    .to_string(),
+            });
+        }
+        if self.ninfer_log_max_files == 0 || self.ninfer_log_max_files > 50 {
+            errors.push(ConfigError::Invalid {
+                field: "ninfer_log_max_files".to_string(),
+                reason: "must be 1..=50 (per-container log rotation file count; 5 is the default)"
+                    .to_string(),
             });
         }
         // Engine ports: unique among themselves and disjoint from both namespaces.
@@ -2497,6 +2593,85 @@ mod tests {
                 e.to_string().contains("settle_timeout_s") && e.to_string().contains("1..=86400")
             }),
             "the settle deadline carries the same ceiling: {over:?}"
+        );
+    }
+
+    /// The ninfer container log rotation keys: absent means the literal the harness
+    /// always rendered (25 MiB, 5 files), the inclusive bounds parse, and 0 or a
+    /// mistyped digit is refused naming the field. Falsifier: widen a bound past the
+    /// test's `1024`/`50` legs (a bound edit to `1..=1025` or `..=51` goes green on the
+    /// bad leg) or change a default away from 25/5.
+    #[test]
+    fn ninfer_log_rotation_keys_default_and_are_bounded() {
+        let d = AppConfig::parse("{}").expect("defaults parse");
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+        assert_eq!(
+            d.ninfer_log_max_size_mib, 25,
+            "absent means today's MiB literal"
+        );
+        assert_eq!(
+            d.ninfer_log_max_files, 5,
+            "absent means today's file-count literal"
+        );
+
+        let hi = parse_mutated(|r| {
+            r["ninfer_log_max_size_mib"] = serde_json::json!(1024);
+            r["ninfer_log_max_files"] = serde_json::json!(50);
+        })
+        .expect("inclusive top bounds parse");
+        assert!(
+            hi.validate().is_empty(),
+            "the ceiling is inclusive: {:?}",
+            hi.validate()
+        );
+
+        let bad = parse_mutated(|r| {
+            r["ninfer_log_max_size_mib"] = serde_json::json!(1025);
+            r["ninfer_log_max_files"] = serde_json::json!(0);
+        })
+        .expect("out-of-range parses, validation names it");
+        let errs: Vec<String> = bad.validate().iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("ninfer_log_max_size_mib") && e.contains("1..=1024")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("ninfer_log_max_files") && e.contains("1..=50")),
+            "{errs:?}"
+        );
+    }
+
+    /// The measured-drift warning ratio: absent means the fixed `0.25` the harness
+    /// always used, `0.0` (a deliberate silence) and the whole fraction `0.0..=1.0`
+    /// validate, and a value outside the fraction is refused naming the field.
+    /// Falsifier: change the default away from `0.25`, or widen `0.0..=1.0` so the
+    /// `1.5` leg goes green.
+    #[test]
+    fn measured_drift_warn_ratio_defaults_and_is_bounded() {
+        let d = AppConfig::parse("{}").expect("defaults parse");
+        assert_eq!(
+            d.measured_drift_warn_ratio, 0.25,
+            "the default is today's fixed literal, so an unchanged file warns as before"
+        );
+        assert!(d.validate().is_empty(), "{:?}", d.validate());
+
+        let zero = parse_mutated(|r| r["measured_drift_warn_ratio"] = serde_json::json!(0.0))
+            .expect("parses");
+        assert!(
+            zero.validate().is_empty(),
+            "0.0 is a valid silence: {:?}",
+            zero.validate()
+        );
+
+        let over = parse_mutated(|r| r["measured_drift_warn_ratio"] = serde_json::json!(1.5))
+            .expect("parses");
+        let errs: Vec<String> = over.validate().iter().map(ToString::to_string).collect();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("measured_drift_warn_ratio") && e.contains("0.0..=1.0")),
+            "a non-fraction ratio must be refused: {errs:?}"
         );
     }
 

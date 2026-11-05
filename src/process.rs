@@ -122,6 +122,12 @@ const RELEASE_POLL: Duration = Duration::from_millis(100);
 /// model's forensic log — a failed launch's log must survive the second launch.
 const ENGINE_LOG_KEEP: usize = 5;
 
+/// Total budget on one engine-side HTTP read through the runtime's shared client:
+/// the engine's own status/metrics fetch and a readiness `http_probe`. A responsive
+/// engine answers in milliseconds; two seconds is a generous ceiling that still
+/// fails a wedged socket fast enough to keep a readiness check from stalling a slot.
+const ENGINE_STATUS_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// One tracked engine tree: the child plus its Job Object.
 struct EngineProc {
     child: Child,
@@ -218,7 +224,7 @@ impl ProcessRuntime {
             #[cfg(test)]
             profiles_root_overrides: BTreeMap::new(),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(2))
+                .timeout(ENGINE_STATUS_HTTP_TIMEOUT)
                 .build()
                 .expect("invariant: plain-HTTP client with a timeout needs no configuration"),
             logs_dir: harness_logs_dir(),

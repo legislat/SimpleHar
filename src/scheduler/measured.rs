@@ -12,6 +12,14 @@ use crate::model::ModelEntry;
 use crate::ownership::SpawnTicket;
 use std::path::PathBuf;
 
+/// The absolute GiB floor of the measured-vs-declared drift warning: a fresh
+/// measured high figure warns only past the wider of `declared * ratio` and this
+/// floor, so a small declared footprint is not ambered by ordinary sampling noise.
+/// It stays a fixed constant even when the configurable `measured_drift_warn_ratio`
+/// changes; only the ratio is an operator knob (a ratio of `0` silences the warning
+/// outright, below any floor).
+pub(super) const MEASURED_DRIFT_FLOOR_GB: f64 = 2.0;
+
 /// The two witness numbers for one fold: what the card grew by since this spawn's
 /// baseline, and what the driver attributed to the engine's own pids (R1: `None`
 /// means per-process attribution was unavailable, so the fold may only ever be
@@ -258,6 +266,18 @@ pub(super) fn serve_model_warning(
 }
 
 impl ActorState {
+    /// Whether a fresh measured `high` figure is far enough from the `declared`
+    /// `vram_gb` to warn. The threshold is the wider of `declared * ratio` and
+    /// [`MEASURED_DRIFT_FLOOR_GB`]. A `ratio` of `0.0` silences the warning outright
+    /// (an operator's explicit "do not nag me"), so the floor does not resurrect it.
+    /// Split from [`Self::fold`] so the rule is testable without a clock, an actor, or
+    /// a witness, and so it never touches admission: it gates a `tracing::warn!` line
+    /// only. The default `ratio` (0.25) plus the floor reproduce the fixed
+    /// `max(declared * 0.25, 2.0)` the harness always used.
+    pub(super) fn measured_drift_warns(ratio: f64, declared: f64, high: f64) -> bool {
+        ratio > 0.0 && (high - declared).abs() > (declared * ratio).max(MEASURED_DRIFT_FLOOR_GB)
+    }
+
     pub(super) fn fold(&mut self, plan: &FoldPlan) {
         let FoldPlan {
             model,
@@ -370,8 +390,7 @@ impl ActorState {
             // comparison figure is `ram_gb`, and the RAM ladder quotes its
             // own numbers at the gate, so no warning rides here (W2 step 3).
             if let Some(declared) = entry.vram_gb {
-                let drift = (high - declared).abs();
-                if drift > (declared * 0.25).max(2.0) {
+                if Self::measured_drift_warns(self.cfg.measured_drift_warn_ratio, declared, high) {
                     tracing::warn!(
                         model,
                         declared,
@@ -1078,5 +1097,62 @@ impl ActorState {
         );
         occupant.ram_need = Some(need);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MEASURED_DRIFT_FLOOR_GB;
+    use crate::config::AppConfig;
+    use crate::scheduler::ActorState;
+
+    /// Absent means today's value: the config default is the fixed `0.25`, the floor
+    /// is the fixed `2.0`, and at the default the predicate reproduces the one
+    /// `max(declared * 0.25, 2.0)` rule the harness always used, across a spread of
+    /// declared/measured shapes straddling the threshold. Admission reads neither this
+    /// ratio nor the warning, so an unchanged file cannot move a booking.
+    #[test]
+    fn default_drift_ratio_reproduces_the_historic_threshold() {
+        assert_eq!(AppConfig::default().measured_drift_warn_ratio, 0.25);
+        assert_eq!(MEASURED_DRIFT_FLOOR_GB, 2.0);
+        let cases: [(f64, f64); 10] = [
+            (20.0, 24.0),
+            (20.0, 25.0),
+            (20.0, 26.0),
+            (4.0, 5.9),
+            (4.0, 6.1),
+            (4.0, 4.0),
+            (80.0, 99.0),
+            (80.0, 101.0),
+            (1.0, 3.0),
+            (1.0, 3.1),
+        ];
+        for (declared, high) in cases {
+            let historic = (high - declared).abs() > (declared * 0.25).max(2.0);
+            assert_eq!(
+                ActorState::measured_drift_warns(0.25, declared, high),
+                historic,
+                "default ratio must not move the threshold: declared={declared} high={high}"
+            );
+        }
+    }
+
+    /// A non-zero override moves the threshold: a +7 GiB move off a declared 20 warns
+    /// at the default band (`max(5, 2) = 5`) but not at ratio `0.5`
+    /// (`max(10, 2) = 10`).
+    #[test]
+    fn a_drift_ratio_override_moves_the_warning_threshold() {
+        assert!(ActorState::measured_drift_warns(0.25, 20.0, 27.0));
+        assert!(!ActorState::measured_drift_warns(0.5, 20.0, 27.0));
+    }
+
+    /// A ratio of `0` silences the warning below any drift, and the GiB floor does not
+    /// resurrect it; the same numbers warn at the default, proving `0` changed the
+    /// outcome and that this is the knob's silence, not the floor.
+    #[test]
+    fn a_zero_drift_ratio_silences_the_warning_below_any_drift() {
+        assert!(!ActorState::measured_drift_warns(0.0, 20.0, 100.0));
+        assert!(!ActorState::measured_drift_warns(0.0, 0.1, 1.0e9));
+        assert!(ActorState::measured_drift_warns(0.25, 20.0, 100.0));
     }
 }

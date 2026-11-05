@@ -17,6 +17,7 @@
 //! (warn-only — README doctrine: unknown keys stay "preserved for reference").
 //! This module stays log-free: the actor reports every [`ScanError`] it applies.
 
+use crate::engine::ninfer::PROFILE_NAME_MAX_BYTES;
 use crate::model::ModelEntry;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -950,20 +951,20 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                     // engine/ninfer.rs — including its first-byte-lowercase rule,
                     // which keeps `ninfer_profile_9x` reportable — and that module
                     // remains the launch-time authority).
-                    let profile_override_key = key
-                        .strip_prefix("ninfer_profile_")
-                        .is_some_and(|suffix| !suffix.is_empty() && suffix.len() <= 16)
-                        && key
+                    let profile_override_key =
+                        key.strip_prefix("ninfer_profile_").is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.len() <= PROFILE_NAME_MAX_BYTES
+                        }) && key
                             .strip_prefix("ninfer_profile_")
                             .unwrap_or_default()
                             .bytes()
                             .next()
                             .is_some_and(|b| b.is_ascii_lowercase())
-                        && key
-                            .strip_prefix("ninfer_profile_")
-                            .unwrap_or_default()
-                            .chars()
-                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                            && key
+                                .strip_prefix("ninfer_profile_")
+                                .unwrap_or_default()
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
                     if profile_override_key {
                         // On a non-ninfer row the line is dead config like every
                         // foreign knob: warn (InertKey), never silently pass.

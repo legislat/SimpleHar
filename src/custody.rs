@@ -345,6 +345,11 @@ pub async fn reconcile(
 /// `STILL_ACTIVE`: what `GetExitCodeProcess` reports for a running process.
 const STILL_ACTIVE: u32 = 259;
 
+/// Poll pause while `port_closed` waits for a released port to stop accepting a
+/// loopback connect within its grace. A short fixed sleep: the check is a cheap
+/// connect attempt, and the deadline (not the cadence) bounds the wait.
+const PORT_CLOSE_POLL: Duration = Duration::from_millis(100);
+
 /// The real [`CustodyOs`]: Win32 pid identity through `OpenProcess` +
 /// `GetProcessTimes`, terminate through a re-verified handle. The start-time
 /// token is the process creation FILETIME as `u64` — the same "same for one
@@ -492,7 +497,7 @@ impl CustodyOs for WinCustodyOs {
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(PORT_CLOSE_POLL).await;
         }
     }
 }

@@ -87,6 +87,17 @@ use axum::http::Method;
 /// (FINDINGS-06 [7]).
 const PROXY_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
+/// Connect budget for the proxy's upstream client: a stalled handshake fails fast
+/// rather than holding the request open, and a loopback engine connects in well under
+/// a tenth of this. A fallback bound, never the mechanism the client waits on.
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-read budget for the proxy's upstream client: a live engine that keeps
+/// producing bytes is never reaped, while a socket that stops answering for ten
+/// minutes is a dead serve. Per-read, not a total timeout, so a long SSE generation
+/// is not cut mid-stream after the 200 (FINDINGS-06 [6]).
+const PROXY_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// The largest body any `/har/*` control route accepts. Every control body is a
 /// small JSON object, so the proxy's ceiling must not be reachable from the control
 /// surface (FINDINGS-06 [7]).
@@ -700,8 +711,8 @@ impl ApiState {
                 // generation mid-stream after the 200 (FINDINGS-06 [6]). `read_timeout`
                 // is per-read: a live engine that keeps producing bytes is never
                 // reaped, while a stalled socket still fails in bounded time.
-                .connect_timeout(Duration::from_secs(10))
-                .read_timeout(Duration::from_secs(600))
+                .connect_timeout(PROXY_CONNECT_TIMEOUT)
+                .read_timeout(PROXY_READ_TIMEOUT)
                 .build()
                 .expect("invariant: plain-HTTP client with timeouts needs no configuration"),
             state_events: Arc::new(state_events),

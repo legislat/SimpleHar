@@ -603,10 +603,13 @@ pub fn default_adapters(
     adapters.insert("basalt".to_string(), Arc::new(basalt::BasaltAdapter));
     adapters.insert(
         "ninfer".to_string(),
-        Arc::new(ninfer::NinferAdapter::new(
-            config.wsl_distro.clone(),
-            config.wsl_account().unwrap_or_default(),
-        )),
+        Arc::new(
+            ninfer::NinferAdapter::new(
+                config.wsl_distro.clone(),
+                config.wsl_account().unwrap_or_default(),
+            )
+            .with_log_rotation(config.ninfer_log_max_size_mib, config.ninfer_log_max_files),
+        ),
     );
     adapters
 }

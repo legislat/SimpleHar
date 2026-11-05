@@ -1033,7 +1033,7 @@ impl ModelEntry {
                         field: "load_timeout".to_string(),
                         value: raw.to_string(),
                     })?;
-                if v == 0 || v > 86_400 {
+                if v == 0 || v > crate::config::MAX_TIMEOUT_S {
                     return Err(ModelError::BadNumber {
                         field: "load_timeout".to_string(),
                         value: raw.to_string(),
@@ -1056,7 +1056,7 @@ impl ModelEntry {
                         field: "min_turn".to_string(),
                         value: raw.to_string(),
                     })?;
-                if v == 0 || v > 86_400 {
+                if v == 0 || v > crate::config::MAX_TIMEOUT_S {
                     return Err(ModelError::BadNumber {
                         field: "min_turn".to_string(),
                         value: raw.to_string(),

@@ -35,6 +35,13 @@ pub struct NinferDefaults {
     pub wsl_distro: String,
     /// WSL user owning the containers and autostart scripts.
     pub wsl_user: String,
+    /// Per-container log rotation size in MiB, rendered into the canonical script's
+    /// `--log-opt max-size`. Wired from config at boot; the standalone default is the
+    /// value the harness always rendered.
+    pub log_max_size_mib: u32,
+    /// Per-container log rotation file count, rendered into the canonical script's
+    /// `--log-opt max-file`.
+    pub log_max_files: u32,
 }
 
 /// Ninfer adapter: WSL container launched via the model's autostart script.
@@ -208,12 +215,19 @@ pub fn effective_context(raw: &BTreeMap<String, String>) -> Option<String> {
     Some(max_ctx)
 }
 
+/// The longest custom `ninfer_profile` name, in bytes. One rule, shared by the
+/// adapter's own refusal (`valid_profile_name`) and the scan that decides whether a
+/// `ninfer_profile_<suffix>` key is a live override or dead config
+/// (`crate::model::scan`): the launch-time authority and the report-time authority
+/// must name the same cap, so a suffix one accepts is never one the other rejects.
+pub(crate) const PROFILE_NAME_MAX_BYTES: usize = 16;
+
 /// A custom profile name: lowercase word, short, and safe to interpolate into the
 /// script and into the yaml key that carries its override.
 fn valid_profile_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     !bytes.is_empty()
-        && bytes.len() <= 16
+        && bytes.len() <= PROFILE_NAME_MAX_BYTES
         && bytes[0].is_ascii_lowercase()
         && bytes
             .iter()
@@ -349,6 +363,8 @@ struct NinferParams {
     gpu_device: String,
     model_id: Option<String>,
     env: Vec<String>,
+    log_max_size_mib: u32,
+    log_max_files: u32,
 }
 
 /// Reads one required template key, trimmed and non-empty; the error names the exact
@@ -440,7 +456,7 @@ fn profile_override(
     if !valid_profile_name(profile) {
         return Err(rejected(format!(
             "`ninfer_profile` must be one of {} or a custom name (lowercase \
-             [a-z0-9_], <=16 chars): {profile}",
+             [a-z0-9_], <={PROFILE_NAME_MAX_BYTES} chars): {profile}",
             BUILT_IN_PROFILES
                 .iter()
                 .map(|(name, ..)| *name)
@@ -504,7 +520,12 @@ fn profile_override(
 /// Collects and validates every template parameter from the model's yaml. Every
 /// refusal names the key the operator has to fix (G6); nothing is defaulted except
 /// the documented optional keys.
-fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, EngineError> {
+fn template_params(
+    model: &ModelEntry,
+    container: &str,
+    log_max_size_mib: u32,
+    log_max_files: u32,
+) -> Result<NinferParams, EngineError> {
     let row = super::policy::engine_policy(NINFER_ENGINE)
         .expect("the compiled-in table ships a ninfer row");
     // The one directory a key file may live in is the row's data-custody root,
@@ -677,6 +698,8 @@ fn template_params(model: &ModelEntry, container: &str) -> Result<NinferParams, 
         gpu_device,
         model_id,
         env,
+        log_max_size_mib,
+        log_max_files,
     })
 }
 
@@ -733,7 +756,9 @@ fn render_canonical(params: &NinferParams) -> Result<String, EngineError> {
         .replace("{{KEY}}", &params.key)
         .replace("{{GPU_DEVICE}}", &params.gpu_device)
         .replace("{{ENV_ARGS}}", &env_args)
-        .replace("{{MODEL_ID_ARG}}", &model_id_arg);
+        .replace("{{MODEL_ID_ARG}}", &model_id_arg)
+        .replace("{{LOG_MAX_SIZE_MIB}}", &params.log_max_size_mib.to_string())
+        .replace("{{LOG_MAX_FILES}}", &params.log_max_files.to_string());
     if script.contains("{{") {
         return Err(EngineError::Rejected {
             engine: NINFER_ENGINE.to_string(),
@@ -761,14 +786,30 @@ pub(crate) fn legacy_removed_sentence(script: &str) -> String {
 }
 
 impl NinferAdapter {
-    /// Creates the adapter with the config's WSL coordinates.
+    /// Creates the adapter with the config's WSL coordinates and the shipped log
+    /// rotation defaults. Production wires the rotation from config through
+    /// [`Self::with_log_rotation`]; a standalone adapter (tests, alternate installs)
+    /// renders the value the harness always rendered.
     pub fn new(wsl_distro: impl Into<String>, wsl_user: impl Into<String>) -> Self {
         NinferAdapter {
             defaults: NinferDefaults {
                 wsl_distro: wsl_distro.into(),
                 wsl_user: wsl_user.into(),
+                log_max_size_mib: crate::config::default_ninfer_log_max_size_mib(),
+                log_max_files: crate::config::default_ninfer_log_max_files(),
             },
         }
+    }
+
+    /// Overrides the per-container log rotation the canonical script renders, from
+    /// the config's `ninfer_log_max_size_mib` and `ninfer_log_max_files`. Boot wires
+    /// this so the launch obeys harness-owned configuration (DOCTRINE 2); the values
+    /// were validated at config parse. The defaults render byte-identical to history.
+    #[must_use]
+    pub fn with_log_rotation(mut self, log_max_size_mib: u32, log_max_files: u32) -> Self {
+        self.defaults.log_max_size_mib = log_max_size_mib;
+        self.defaults.log_max_files = log_max_files;
+        self
     }
 
     /// The autostart argv on the v3.3 positional contract: shared WSL client
@@ -845,7 +886,12 @@ impl EngineAdapter for NinferAdapter {
         // 2026-10-31). Every gate (the profile shape, the dead built-in-name
         // override line, the serve-args surface) is `template_params`' and
         // `profile_override`'s, so a refusal always names the exact key.
-        let params = template_params(model, &container)?;
+        let params = template_params(
+            model,
+            &container,
+            self.defaults.log_max_size_mib,
+            self.defaults.log_max_files,
+        )?;
         let script = render_canonical(&params)?;
         let script_path = format!(
             "{container}-{:016x}.sh",
@@ -1316,6 +1362,49 @@ mod tests {
         assert_eq!(spec.container.as_deref(), Some("ninfer-x"));
     }
 
+    /// The ninfer container log rotation is a config knob that reaches the rendered
+    /// script. A standalone (default) adapter renders the historic literal `25m` /
+    /// `5` byte-identical — equal to the config default, so an absent key leaves L3
+    /// unchanged — and `with_log_rotation` moves the bytes. Falsifier: drop either
+    /// `.replace` in `render_canonical` (the override leg keeps the placeholder and
+    /// the `{{` assertion fires, and the override bytes never appear), or point the
+    /// adapter's default at a number other than the config default (the equality
+    /// legs fail).
+    #[test]
+    fn ninfer_log_rotation_renders_the_default_and_honors_a_config_override() {
+        assert_eq!(crate::config::default_ninfer_log_max_size_mib(), 25);
+        assert_eq!(crate::config::default_ninfer_log_max_files(), 5);
+
+        let default_script = NinferAdapter::new("Ubuntu", "ops")
+            .spec(&entry(&template_pairs()), 18109)
+            .expect("default spec")
+            .script
+            .expect("renders");
+        assert!(
+            default_script.contains("--log-opt max-size=25m --log-opt max-file=5"),
+            "the default must equal the old literal: {default_script}"
+        );
+
+        let override_script = NinferAdapter::new("Ubuntu", "ops")
+            .with_log_rotation(7, 3)
+            .spec(&entry(&template_pairs()), 18109)
+            .expect("override spec")
+            .script
+            .expect("renders");
+        assert!(
+            override_script.contains("--log-opt max-size=7m --log-opt max-file=3"),
+            "a config override must reach the rendered script: {override_script}"
+        );
+        assert!(
+            !override_script.contains("max-size=25m"),
+            "the override replaces the default, not adds to it: {override_script}"
+        );
+        assert!(
+            !override_script.contains("{{"),
+            "both rotation placeholders must be filled: {override_script}"
+        );
+    }
+
     /// R10 (operator 2026-11-01): the container's inside is a third namespace. A
     /// row without `ninfer_internal_port` renders the SE internal number (8808,
     /// the harness's 87xx family at +100), and the gate's namespace helper
@@ -1576,7 +1665,12 @@ mod tests {
     fn a_profile_named_outside_the_shape_or_without_its_override_is_refused() {
         let mut pairs = template_pairs();
         pairs.push(("ninfer_profile", "LT"));
-        assert!(refused(&pairs).contains("ninfer_profile"));
+        let refusal = refused(&pairs);
+        assert!(refusal.contains("ninfer_profile"));
+        assert!(
+            refusal.contains(&format!("<={PROFILE_NAME_MAX_BYTES} chars")),
+            "the cap text keeps its historic shape: {refusal}"
+        );
         // A custom name the operator never defined is a MissingField naming the
         // exact override key to write — the same voice the required template keys
         // use, so the page says precisely what is absent.

@@ -45,10 +45,13 @@ it never applies silent defaults.
 | `greedy_launch_min_free_gb` | `4.0` | Launch floor for `cost: greedy` models without their own `launch_only_with_at_least_vram_free`. |
 | `load_timeout_s` | `120` | Readiness deadline per load. Range 1-86400 seconds; boot refuses a value outside it. A model can override it with the `load_timeout:` yaml key. |
 | `measured_sample_s` | `60` | Seconds between witness samples while a model serves. |
+| `measured_drift_warn_ratio` | `0.25` | Drift warning band. A new measured figure warns when it differs from the model's declared `vram_gb` by more than the larger of `declared * ratio` and 2 GiB. Range 0.0-1.0. Set `0.0` to silence the warning. Absent means `0.25`, today's value. It changes no booking and no admission decision. |
 | `release_timeout_s` | `60` | Kill-confirmation deadline. Range 1-86400 seconds; boot refuses a value outside it. |
 | `settle_timeout_s` | `30` | Memory-settle deadline after release. Range 1-86400 seconds; boot refuses a value outside it. |
 | `protected_ports` | small reserved set | Ports the harness must never bind or touch. Extend the set to cover servers you run manually outside this app. |
 | `wsl_distro` / `wsl_user` | `Ubuntu` / *(set for ninfer)* | WSL coordinates for ninfer containers. |
+| `ninfer_log_max_size_mib` | `25` | Per-container ninfer log rotation size, in MiB. The harness renders it into the canonical autostart script's `--log-opt max-size`. Range 1-1024. Absent means `25`, today's value, so an unchanged file renders byte-identical. |
+| `ninfer_log_max_files` | `5` | Per-container ninfer log rotation file count. The harness renders it into the script's `--log-opt max-file`. Range 1-50. Absent means `5`, today's value. |
 | `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary. Boot refuses a blank value; omit the key to keep the default. First start prefers a `llama-server.exe` found on PATH (absolute entries only) and records the winner in the created file. |
 | `engines.strata.python` / `engines.strata.cwd` | documented defaults | Interpreter and working directory for strata launches. The per-model `strata_python`/`strata_cwd` keys still override this section. |
 | `engines.llama.fit_probe` | `false` | When true, the harness asks the engine's own `llama-fit-params` calculator (a sibling of `llama_server_exe`) before spawn how much a llama row will need. The harness projects every llama row after boot and rescan, off the hot path. |

@@ -75,6 +75,12 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const RELEASE_POLL: Duration = Duration::from_millis(50);
 /// Idle sweep cadence (Step 5): thresholds are seconds, so a 2 s tick is ample.
 const IDLE_TICK: Duration = Duration::from_secs(2);
+/// Wall-clock bound on every serve sampler (one day in seconds): a sampler is not a
+/// promise of eternity, so each refresh loop stops after this even if its serve runs
+/// on. Bound by wall clock, not by tick count — a day of ticks at the 60 s default
+/// cadence would otherwise run for sixty days. Shared by the card stand-in
+/// (`events.rs`), the elastic card ladder, and the RAM ladder (`occupant.rs`).
+const SAMPLER_LIFETIME_BOUND: Duration = Duration::from_secs(86_400);
 /// What a parked load is answered with when the job it waited behind leaves the slot
 /// occupied (FINDINGS-02 [3]). `Cancelled` is the variant that fits: the API maps it
 /// to 409 (a conflict the caller can retry once the slot is free), the ledger records

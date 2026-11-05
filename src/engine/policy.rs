@@ -725,7 +725,7 @@ docker run -d --name "$NAME" \
   --restart no \
   --publish "127.0.0.1:${PUBLISH}:${PORT}" \
   --volume "$MODEL_DIR:/models:ro" \
-  --log-driver json-file --log-opt max-size=25m --log-opt max-file=5 \
+  --log-driver json-file --log-opt max-size={{LOG_MAX_SIZE_MIB}}m --log-opt max-file={{LOG_MAX_FILES}} \
   {{ENV_ARGS}}"$IMAGE" \
   "$SERVE_CMD" "/models/$ARTIFACT" \
   --host 0.0.0.0 \
@@ -1011,7 +1011,12 @@ static NINFER_ROW: EnginePolicy = EnginePolicy {
     custody_exec_roots: &[NINFER_STAGED_SCRIPTS_ROOT],
     custody_data_roots: &[NINFER_KEYS_ROOT],
     serve_template: Some(CANONICAL_NINFER_SCRIPT),
-    config_knobs: &["wsl_distro", "wsl_user"],
+    config_knobs: &[
+        "wsl_distro",
+        "wsl_user",
+        "ninfer_log_max_size_mib",
+        "ninfer_log_max_files",
+    ],
     supports_fit: false,
 };
 

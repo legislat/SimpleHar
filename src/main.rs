@@ -278,7 +278,7 @@ async fn main() -> ExitCode {
         tokio::spawn(async move {
             let card = match probed {
                 Some(total) => Some(total),
-                None => match tokio::time::timeout(Duration::from_secs(12), witness.sample()).await
+                None => match tokio::time::timeout(BOOT_CARD_SAMPLE_BUDGET, witness.sample()).await
                 {
                     Ok(Ok(sample)) => Some(firstrun::floor_gib(sample.total_gib)),
                     Ok(Err(reason)) => {
@@ -286,7 +286,10 @@ async fn main() -> ExitCode {
                         None
                     }
                     Err(_elapsed) => {
-                        tracing::debug!("cross-check skipped: card sample budget (12 s) expired");
+                        tracing::debug!(
+                            "cross-check skipped: card sample budget ({} s) expired",
+                            BOOT_CARD_SAMPLE_BUDGET.as_secs()
+                        );
                         None
                     }
                 },
@@ -409,6 +412,23 @@ const LISTENER_RETRY: Duration = Duration::from_secs(5);
 /// therefore delays first boot by ~2x this, not one shared deadline; steady boots
 /// (config file present) never run the probes at all.
 const FIRST_RUN_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Budget for the one detached boot cross-check sample of the card's total. The
+/// cross-check is a diagnostic, never a boot dependency, so a card that does not
+/// answer within this is reported as "not sampled" and boot continues.
+const BOOT_CARD_SAMPLE_BUDGET: Duration = Duration::from_secs(12);
+
+/// Budget the §0.2 boot ready gate waits for every listener's first verdict. Past
+/// it, listeners still pending are amber (no verdict), never certified healthy.
+const BOOT_VERDICT_GATE: Duration = Duration::from_secs(10);
+
+/// Poll cadence inside [`BOOT_VERDICT_GATE`]: a short fixed sleep, not a wake-on-event
+/// channel, so the gate adds at most this much latency after the last verdict lands.
+const BOOT_VERDICT_POLL: Duration = Duration::from_millis(5);
+
+/// Grace between aborting the listener supervisors and returning from `run`, so a
+/// supervisor mid-teardown finishes without racing the process exit.
+const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 /// First-start gate: materialization fires only for the beside-the-exe
 /// `simpleharn.json` that is absent — never for a differently named file, and
@@ -896,12 +916,12 @@ async fn run(
     // (bounded) for the supervisors' first verdict, then record the boot measures.
     // The gate counts VERDICTS, not entries: the registry is seeded `Pending` at
     // construction, so `len()` says nothing about readiness (FINDINGS-14 [7]).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + BOOT_VERDICT_GATE;
     loop {
         if state.listeners.pending().is_empty() || tokio::time::Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(BOOT_VERDICT_POLL).await;
     }
     {
         let verdict = gate_verdict(&state.listeners.snapshot());
@@ -931,7 +951,8 @@ async fn run(
             tracing::error!(
                 categories = %names,
                 serving = verdict.serving,
-                "listeners UNRESOLVED: [{names}] after the 10 s boot gate; they are amber (no verdict), not healthy"
+                "listeners UNRESOLVED: [{names}] after the {} s boot gate; they are amber (no verdict), not healthy",
+                BOOT_VERDICT_GATE.as_secs()
             );
         }
         // FINDINGS-14 [5] seam: the reclaim below is only legal AFTER this line.
@@ -1022,7 +1043,7 @@ async fn run(
     for supervisor in supervisors {
         supervisor.abort();
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(SHUTDOWN_DRAIN_GRACE).await;
     Ok(())
 }
 

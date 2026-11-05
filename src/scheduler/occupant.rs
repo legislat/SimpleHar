@@ -347,7 +347,7 @@ impl ActorState {
         // The first interval tick completes at once and is consumed: the fold
         // that handed this loop `booked` IS the reading that tick would take.
         tick.tick().await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
+        let deadline = tokio::time::Instant::now() + super::SAMPLER_LIFETIME_BOUND;
         loop {
             tick.tick().await;
             if tokio::time::Instant::now() >= deadline {
@@ -377,7 +377,8 @@ impl ActorState {
             else {
                 continue;
             };
-            let hysteresis = 1.0f64.max(sample.total_gib * 0.01);
+            let hysteresis =
+                Self::ELASTIC_FALL_FLOOR_GIB.max(sample.total_gib * Self::ELASTIC_FALL_RELATIVE);
             let rise = rounded > booked;
             let fall = booked - rounded > hysteresis;
             if !(rise || fall) {
@@ -405,6 +406,17 @@ impl ActorState {
             booked = rounded;
         }
     }
+
+    /// Absolute floor of the elastic card ladder's fall band, in GiB (the twin
+    /// of [`Self::RAM_REBOOK_BAND_GIB`] for the asymmetric card rule): a measured
+    /// fall re-books only past the wider of this and [`Self::ELASTIC_FALL_RELATIVE`]
+    /// of the card, so a 1 GiB step keeps page noise off the booking on a small card.
+    const ELASTIC_FALL_FLOOR_GIB: f64 = 1.0;
+
+    /// Relative floor of the elastic card ladder's fall band, as a share of the
+    /// card's total (one hundredth): a large card gets a proportionally wider fall
+    /// band, so a re-book needs a real working-set move, not a rounding step.
+    const ELASTIC_FALL_RELATIVE: f64 = 0.01;
 
     /// The CPU-resident re-book band in GiB (`TASK-CPU-LLAMA-EVICTION` W2
     /// step 3): the smallest working-set move worth a fold, a persist, and a
@@ -487,7 +499,7 @@ impl ActorState {
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
+        let deadline = tokio::time::Instant::now() + super::SAMPLER_LIFETIME_BOUND;
         loop {
             tick.tick().await;
             if tokio::time::Instant::now() >= deadline {

@@ -291,7 +291,9 @@ checksum on the distro before and after the atomic publish, and prunes to
 the newest renders of that container. The rendered launch carries the
 incident-review guarantees: `--restart no` (nothing revives on WSL boot
 without the harness deciding), a loopback-only publish, and bounded
-container logs (`json-file`, 25 MiB x 5). It also carries your profile,
+container logs (`json-file`; defaults 25 MiB x 5, set the keys
+`ninfer_log_max_size_mib` and `ninfer_log_max_files` in `CONFIG.md` to
+change them). It also carries your profile,
 key, and serve args. The engine logs a JSON memory summary at startup into
 the container log. The harness reads it from the container's own logs and
 books it as the `engine_report` measured figure. A container that never

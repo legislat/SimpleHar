@@ -424,7 +424,7 @@ impl ActorState {
                 tick.tick().await;
                 // Bounded by wall clock, not by tick count: a 86_400-iteration loop at
                 // the 60 s default would run for sixty days.
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
+                let deadline = tokio::time::Instant::now() + super::SAMPLER_LIFETIME_BOUND;
                 loop {
                     tick.tick().await;
                     if tokio::time::Instant::now() >= deadline {
