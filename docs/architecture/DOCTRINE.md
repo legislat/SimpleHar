@@ -52,9 +52,10 @@ non-ASCII punctuation in quotes is replaced with ASCII equivalents only.
 7. **Guard order is fixed; structural refusals precede the token.**
    "Structural refusals (Host, cross-site `Origin` -> 403, content-type ->
    415) precede the token (401); only `/`, `/index.html`, `/app.js`,
-   `/style.css`, `/pico.min.css` are unauthenticated, and `GET /health` is
-   token-gated." Consequence: the token decides who, never whether a request
-   shape is acceptable; a liveness probe must carry the token.
+   `/style.css`, `/pico.min.css`, `/favicon.png`, `/favicon.ico` are
+   unauthenticated, and `GET /health` is token-gated." Consequence: the token
+   decides who, never whether a request shape is acceptable; a liveness probe
+   must carry the token.
 8. **Client-facing `/v1/models` stays minimal.** "Client-facing `/v1/models`
    stays minimal (no local paths); control surface owns detail." Consequence:
    a public listener never leaks machine paths; `/har/*` owns the detail view.

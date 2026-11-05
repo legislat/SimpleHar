@@ -47,7 +47,8 @@ change and no ruling may be deleted.
   file. Tray red = listener down, not per-job errors.
 - Guard order: structural refusals (Host, cross-site `Origin` -> **403**, content-type -> 415)
   precede the token (401); only `/`, `/index.html`, `/app.js`, `/style.css`,
-  `/pico.min.css` are unauthenticated, and `GET /health` **is** token-gated.
+  `/pico.min.css`, `/favicon.png`, `/favicon.ico` are unauthenticated, and
+  `GET /health` **is** token-gated.
 - Client-facing `/v1/models` stays minimal (no local paths); control surface owns detail.
   Cost verdicts are data (operator 2026-10-28 audit): strata yamls declare `cost: greedy`
   with their launch floors (currently 60/65 in `ModelConf/`, not code); ninfer defaults to
@@ -646,3 +647,10 @@ recorded here so dated references to ARCHIVED still resolve:
   Card movement is CUDA-context only (~0.35 GiB per llama process), recorded
   honestly in `handoff/evidence/2026-11-05-cpu-llama/card-run/card-run.md`.
   | 2026-11-05 | `9e7ddb7..`
+
+- **Unauthenticated asset list grows to seven** (operator approval 2026-11-05):
+  `/favicon.png` and `/favicon.ico` join `/`, `/index.html`, `/app.js`,
+  `/style.css`, `/pico.min.css` as the only unauthenticated paths, so the
+  control page can serve its icon without a token. No other surface changes;
+  DOCTRINE item 7 and the standing guard-order entry above state the new list.
+  | 2026-11-05 | `8fe7d2c..`

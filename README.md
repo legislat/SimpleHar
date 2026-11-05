@@ -29,7 +29,7 @@ The `llama` path (llama.cpp) works on any machine that can run `llama-server.exe
 may not fit other machines. Compared with llama-swap, which also swaps models, SimpleHarn
 adds a memory-accounting scheduler that refuses to overcommit. What this is not: it is
 not multi-user, it is not a router for remote or cloud engines, and it is not a replacement
-for llama-swap. It runs and supervises local engines on one machine only. 
+for llama-swap. It runs and supervises local engines on one machine only.
 
 This software is provided AS-IS, with no warranty of any kind. See
 [LICENSE](LICENSE) (Apache-2.0).
