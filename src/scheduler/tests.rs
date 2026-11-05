@@ -4475,6 +4475,7 @@ fn the_writeback_mutator_set_stays_closed_to_the_rebaseline_table() {
             include_str!("../api/config_persist.rs"),
             1,
         ),
+        ("api/proxy.rs", include_str!("../api/proxy.rs"), 0),
         ("main.rs", include_str!("../main.rs"), 0),
         ("catalog.rs", include_str!("../catalog.rs"), 0),
         ("tray.rs", include_str!("../tray.rs"), 0),

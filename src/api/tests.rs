@@ -2754,7 +2754,7 @@ async fn the_badge_booleans_are_always_the_published_maps_own_verdicts() {
 /// `(0, None)` and the body assertion fails.
 #[test]
 fn a_swap_that_names_no_port_is_refused_rather_than_forwarded_to_zero() {
-    let source = include_str!("mod.rs");
+    let source = include_str!("proxy.rs");
     let start = source
         .find("async fn swap_for_port(")
         .expect("swap_for_port is still in this file");
@@ -2836,7 +2836,7 @@ fn the_wake_set_is_exactly_the_proxy_routes() {
         }
         out
     }
-    let source = include_str!("mod.rs");
+    let source = include_str!("proxy.rs");
     let start = source
         .find("fn wakes_slot(")
         .expect("wakes_slot is still in this file");
