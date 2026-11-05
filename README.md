@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor]
 source_of_truth_for: [product overview, quick start, safety, navigation]
-last_reviewed: 2026-11-04
+last_reviewed: 2026-11-05
 review_trigger: behavior-change, release
 ---
 
@@ -185,6 +185,7 @@ refusal (unload something; the harness never over-admits). The full list, with t
 | Binding invariants | [docs/architecture/DOCTRINE.md](docs/architecture/DOCTRINE.md) |
 | Architecture overview | [docs/architecture/OVERVIEW.md](docs/architecture/OVERVIEW.md) |
 | HTTP API reference | [docs/reference/API.md](docs/reference/API.md) |
+| OpenAI compatibility matrix | [docs/reference/COMPATIBILITY.md](docs/reference/COMPATIBILITY.md) |
 | Model schema reference | [docs/reference/MODELS.md](docs/reference/MODELS.md) |
 | Configuration reference | [docs/reference/CONFIG.md](docs/reference/CONFIG.md) |
 | Documentation map | [docs/DOCS_README.md](docs/DOCS_README.md) |

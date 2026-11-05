@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent, architect]
 source_of_truth_for: [documentation routing]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-05
 review_trigger: release, quarterly, new-decision
 ---
 
@@ -23,6 +23,7 @@ this file is the table of contents; other documents link to it.
 | Know the rules an agent must follow | [AGENTS.md](../AGENTS.md) |
 | Know a binding product invariant | [docs/architecture/DOCTRINE.md](architecture/DOCTRINE.md) |
 | Understand the system design | [docs/architecture/OVERVIEW.md](architecture/OVERVIEW.md) |
+| Know what the OpenAI surface does and does not do | [docs/reference/COMPATIBILITY.md](reference/COMPATIBILITY.md) |
 | Know why a decision was made | [docs/architecture/DECISIONS.md](architecture/DECISIONS.md) (and [DESIGN.md](../DESIGN.md) for history) |
 | Add or change code | [docs/process/ENGINEERING.md](process/ENGINEERING.md) |
 | Run the gate | [docs/process/VERIFICATION.md](process/VERIFICATION.md) |
@@ -90,6 +91,7 @@ durable and belongs in this tree.
 | [CONFIG.md](reference/CONFIG.md) | Harness config keys and eviction rules | active |
 | [MODELS.md](reference/MODELS.md) | ModelConf schema and engine-specific model keys | active |
 | [API.md](reference/API.md) | HTTP control API contract, error codes, memory provenance | active |
+| [COMPATIBILITY.md](reference/COMPATIBILITY.md) | OpenAI compatibility matrix, known-good configurations | active |
 | [OPERATIONS.md](reference/OPERATIONS.md) | Autostart, file layout, upgrade, uninstall, backup, log retention | active |
 | [TROUBLESHOOTING.md](reference/TROUBLESHOOTING.md) | Failure diagnosis | active |
 

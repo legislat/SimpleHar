@@ -227,9 +227,10 @@ below. No ruling exists on keeping, removing, or changing its default.
 - Expect a per-model split. Files of 25 to 44 GiB approach the box's 95 GiB
   of RAM, so a warm can evict cache the running engine still wants and make
   the next swap slower, not faster.
-- A WSL `Z:\` path may defeat the warm entirely: the bytes live behind the
-  WSL filesystem layer, and the harness-side read may not warm the path the
-  container-side open takes. Measure a row that names a `Z:\` file.
+- A WSL drive-letter path may defeat the warm entirely: the bytes live behind
+  the WSL filesystem layer, and the harness-side read may not warm the path
+  the container-side open takes. Measure a row that names a file behind a
+  drive-letter mount.
 - Time a tray Exit during a knob-on warm. Teardown joins the remaining
   read; the measured delay decides whether the documented bound is
   acceptable or needs a ruling (review B8R-03).
