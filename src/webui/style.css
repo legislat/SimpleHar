@@ -55,11 +55,27 @@ html[data-theme="dark"] {
    * 4.9:1 on its amber hover fill (the dark hover fill is deeper for the same
    * reason - UR-02); the selected pill's ink on the green wash 6.2:1. The
    * amber BORDER stays the graphic --sh-warn (the button carries a text
-   * label, so the border marks, never names). */
+    * label, so the border marks, never names). Depth (operator screenshot
+    * 2026-11-05): the chrome must sit DEEPER than the parchment, not paler -
+    * border #d9c9b2 is a measured 1.44:1 step below the page (#e6dccb was
+    * 1.21:1 and read as light haze), the chrome surface #efe6d6 sits 1.10:1
+    * below the page and 1.19:1 below the card, the tab/header ink #373c44 is
+    * 9.0:1 on it and the muted port label 4.9:1. These depth tokens are
+    * declared ONLY here: every consumer falls back to the pre-fix value, so
+    * the dark theme computes byte-identical. */
   --pico-background-color: #f7f1e6;
   --pico-card-background-color: #fffaf3;
-  --pico-card-border-color: #e6dccb;
+  --pico-card-border-color: #d9c9b2;
   --pico-muted-color: #6b6152;
+  /* Pico paints thead/tfoot cells with --pico-background-color (the PAGE
+   * token - repurposing it would move the page itself) and rules them with
+   * --pico-table-border-color, whose light default is a cool near-white haze.
+   * The rules take the same warm hex as every other border; the header
+   * surface gets the own chrome token below. */
+  --pico-table-border-color: #d9c9b2;
+  --sh-chrome-bg: #efe6d6;
+  --sh-tab-idle-bg: var(--sh-chrome-bg);
+  --sh-panel-head-rule: 1px solid var(--pico-card-border-color);
   --sh-warn-ink: #805a00;
   --sh-warn-tint: #d89b1d40;
   /* UR-01 (2026-11-05): the joined side's background token - Pico re-scopes
@@ -175,6 +191,16 @@ header.sh-header {
   font-weight: 700;
   font-size: 0.85rem;
   width: auto;
+}
+
+/* Unselected pills are chrome (operator 2026-11-05): in light the plain rule
+ * above handed Pico its button-scope blue (a measured rgb(1, 114, 173) plate
+ * under #373c44 ink - 2.5:1, and a lighter-than-paper slab on the parchment).
+ * Light defines --sh-tab-idle-bg as the deeper chrome surface; dark leaves it
+ * undefined and the fallback keeps the very token the plain rule used, so the
+ * dark pill computes exactly as before. The selected tab keeps the green. */
+.sh-tab:not([aria-selected="true"]) {
+  background: var(--sh-tab-idle-bg, var(--pico-background-color));
 }
 
 .sh-tab:hover { border-color: var(--sh-accent-solid); }
@@ -313,7 +339,10 @@ table.sh-models td.sh-row-actions { width: max-content; }
   background: var(--pico-card-background-color);
 }
 
-/* The default chip's own row, in the panel head's empty space (operator 2026-11-01). */
+/* The default chip's own row, in the panel head's empty space (operator 2026-11-01).
+ * Depth (operator 2026-11-05): the head is a chrome surface over the card in
+ * light, closed by a border; both tokens are light-only, so dark keeps the
+ * transparent head and no rule exactly as before. */
 .sh-panel-head {
   display: flex;
   gap: 0.5rem;
@@ -321,10 +350,20 @@ table.sh-models td.sh-row-actions { width: max-content; }
   color: var(--pico-muted-color);
   font-size: 0.8rem;
   padding: 0.1rem 0.1rem 0.45rem;
+  background: var(--sh-chrome-bg, transparent);
+  border-bottom: var(--sh-panel-head-rule, 0);
 }
 
 table.sh-models { margin-bottom: 0; }
 table.sh-models td, table.sh-models th { padding: 0.45rem 0.6rem; }
+/* Pico rules thead/tfoot cells with the PAGE background token and a cool
+ * near-white border (there is no sectioning variable for them here), so the
+ * header surface is set on the table directly. The fallback is that same page
+ * token, keeping the dark header byte-identical; the bottom rule comes from
+ * --pico-table-border-color, now the same warm hex as every other border. */
+table.sh-models thead th {
+  background: var(--sh-chrome-bg, var(--pico-background-color));
+}
 /* Edge cells hug the panel (operator: margins too large, 2026-10-26). */
 table.sh-models th:first-child, table.sh-models td:first-child { padding-left: 0.25rem; }
 table.sh-models th:last-child, table.sh-models td:last-child { padding-right: 0.25rem; }

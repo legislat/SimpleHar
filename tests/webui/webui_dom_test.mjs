@@ -680,7 +680,7 @@ const driver = `
     check("the light theme is the warm parchment palette",
       !!lightBody && lightBody.indexOf("--pico-background-color: #f7f1e6") >= 0 &&
         lightBody.indexOf("--pico-card-background-color: #fffaf3") >= 0 &&
-        lightBody.indexOf("--pico-card-border-color: #e6dccb") >= 0 &&
+        lightBody.indexOf("--pico-card-border-color: #d9c9b2") >= 0 &&
         lightBody.indexOf("--pico-muted-color: #6b6152") >= 0,
       lightBody || "missing");
     // The warm palette is the DEFAULT: its selector list must match an html
@@ -763,6 +763,63 @@ const driver = `
     check("the light hover fill keeps its measured 25 % amber (4.9:1)",
       !!lightBody && lightBody.indexOf("--sh-warn-tint: #d89b1d40") >= 0,
       lightBody || "missing");
+    // Depth (operator screenshot 2026-11-05): in light the chrome must read
+    // DEEPER than the parchment - borders, table rules, table head, panel
+    // head and the unselected pills. Every depth token is light-only: a
+    // consumer falls back to the pre-fix value, so dark computes identical
+    // (the dark/root absence half of this leg is the dark-unchanged guard).
+    const rootBody = bodyOf(":root {");
+    check("light depth tokens exist (table rules, chrome surface, idle tab, head rule)",
+      !!lightBody && lightBody.indexOf("--pico-card-border-color: #d9c9b2") >= 0 &&
+        lightBody.indexOf("--pico-table-border-color: #d9c9b2") >= 0 &&
+        lightBody.indexOf("--sh-chrome-bg: #efe6d6") >= 0 &&
+        lightBody.indexOf("--sh-tab-idle-bg: var(--sh-chrome-bg)") >= 0 &&
+        lightBody.indexOf("--sh-panel-head-rule: 1px solid var(--pico-card-border-color)") >= 0,
+      lightBody || "missing");
+    check("no depth token leaks to dark or the :root defaults",
+      !!darkBody && darkBody.indexOf("--sh-chrome-bg") < 0 &&
+        darkBody.indexOf("--pico-table-border-color") < 0 &&
+        darkBody.indexOf("--sh-tab-idle-bg") < 0 &&
+        darkBody.indexOf("--sh-panel-head-rule") < 0 &&
+        !!rootBody && rootBody.indexOf("--sh-chrome-bg") < 0 &&
+        rootBody.indexOf("--pico-table-border-color") < 0 &&
+        rootBody.indexOf("--sh-tab-idle-bg") < 0 &&
+        rootBody.indexOf("--sh-panel-head-rule") < 0,
+      "dark=" + (darkBody || "missing") .slice(0, 60));
+    const idleTabBody = bodyOf('.sh-tab:not([aria-selected="true"])');
+    check("the unselected pill takes the light-only chrome token, falling back to the old background",
+      !!idleTabBody &&
+        idleTabBody.indexOf("background: var(--sh-tab-idle-bg, var(--pico-background-color))") >= 0,
+      idleTabBody || "missing");
+    const headBody = bodyOf(".sh-panel-head {");
+    check("the panel head sits on the chrome surface with a light-only bottom rule",
+      !!headBody && headBody.indexOf("background: var(--sh-chrome-bg, transparent)") >= 0 &&
+        headBody.indexOf("border-bottom: var(--sh-panel-head-rule, 0)") >= 0,
+      headBody || "missing");
+    const thBody = bodyOf("table.sh-models thead th {");
+    check("the table head takes the chrome surface, falling back to the Pico page token",
+      !!thBody &&
+        thBody.indexOf("background: var(--sh-chrome-bg, var(--pico-background-color))") >= 0,
+      thBody || "missing");
+    // Luminance truth: the chrome and border hexes must sit BELOW the page
+    // (darker), not above it - the exact defect the screenshot showed.
+    const LUM_HEX = "0123456789abcdef";
+    const lumOf = function (hex) {
+      const h = hex.slice(1);
+      const lin = [];
+      for (let k = 0; k < 3; k++) {
+        const raw = LUM_HEX.indexOf(h.charAt(k * 2)) * 16 + LUM_HEX.indexOf(h.charAt(k * 2 + 1));
+        let v = raw / 255;
+        v = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+        lin.push(v);
+      }
+      return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+    };
+    check("the light chrome and border hexes compute darker than the parchment page",
+      lumOf("#efe6d6") < lumOf("#f7f1e6") && lumOf("#d9c9b2") < lumOf("#f7f1e6") &&
+        lumOf("#efe6d6") < lumOf("#fffaf3") && lumOf("#d9c9b2") < lumOf("#fffaf3"),
+      "chrome=" + lumOf("#efe6d6").toFixed(4) + " border=" + lumOf("#d9c9b2").toFixed(4) +
+        " page=" + lumOf("#f7f1e6").toFixed(4) + " card=" + lumOf("#fffaf3").toFixed(4));
   }
 
   const withFault = { ...fixtures["/har/status"], models: fixtures["/har/models"].data, last_error: "broken@WORK: never became ready" };

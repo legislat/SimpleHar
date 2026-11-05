@@ -340,7 +340,7 @@ mod tests {
             "a selected tab must not repaint the joined side - the amber \
              action stays amber in every state"
         );
-        for parchment in ["#f7f1e6", "#fffaf3", "#e6dccb"] {
+        for parchment in ["#f7f1e6", "#fffaf3", "#d9c9b2", "#efe6d6"] {
             assert!(
                 STYLE_CSS.contains(parchment),
                 "the warm parchment palette needs {parchment} in the served stylesheet"
