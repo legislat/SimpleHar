@@ -28,8 +28,9 @@ blockers and the numbers on every refusal. You do not want to deal with software
 with million different options, built in chat, downloader and delivery of dairy products.
 
 The `llama` path (llama.cpp) works on any machine that can run `llama-server.exe`. The
-`strata`, `basalt`, and `ninfer` paths are supported for this operator's own setup. They
-may not fit other machines. Compared with llama-swap, which also swaps models, SimpleHarn
+`strata`, `basalt`, `maya`, and `ninfer` paths run when their engine is installed; see
+[ENGINE-RECIPES.md](docs/reference/ENGINE-RECIPES.md) for the wiring. They are tested on
+this operator's machine and may need adjustment elsewhere. Compared with llama-swap, which also swaps models, SimpleHarn
 adds a memory-accounting scheduler that refuses to overcommit. What this is not: it is
 not multi-user, it is not a router for remote or cloud engines, and it is not a replacement
 for llama-swap. It runs and supervises local engines on one machine only.
