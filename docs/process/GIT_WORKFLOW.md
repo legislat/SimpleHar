@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, reviewer, release-operator]
 source_of_truth_for: [git, release]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
@@ -113,8 +113,10 @@ A release is a task with acceptance criteria. Run the steps in this order:
 7. Run `scripts/release-check.ps1` without `-Prepare` and require PASS. It confirms the
    tag equals the version.
 8. Push the commits and the tag. Each push needs operator approval.
-9. Build the artifact, record its hash, deploy it, and verify the boot.
-10. Keep and name the rollback artifact.
+9. Build the artifact, record its hash, stage the operator copy per "Build and release
+   directories" below, deploy it, and verify the boot.
+10. Keep and name the rollback artifact: the previous release stays in the fallback
+    directory named below.
 
 Rules:
 
@@ -127,6 +129,20 @@ Rules:
 - `scripts/release-check.ps1` check 9 enforces the machine-path ban across the public
   docs (`README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `AGENTS.md`, and
   `docs/**`, including the decision ledger). Documented engine defaults stay allowed.
+
+### Build and release directories
+
+The operator rule (2026-11-06):
+
+- Manual test builds live in one `SimpleHarn_tests` directory under the operator's
+  inference root. Delete that directory when the test concludes.
+- The latest release for the operator lives in `<inference-root>/SimpleHarn_latest`.
+  The previous release stays in `<inference-root>/SimpleHarn_fallback`.
+- After every build or release, sweep every other version and build-artifact directory
+  under the inference root (old test builds and older release copies) once the new
+  latest is verified.
+
+The exact machine paths live in `HANDOFF.md` (local-only).
 
 ## Conflict resolution
 

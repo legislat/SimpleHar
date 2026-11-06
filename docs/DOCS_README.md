@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent, architect]
 source_of_truth_for: [documentation routing]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: release, quarterly, new-decision
 ---
 
@@ -101,6 +101,7 @@ durable and belongs in this tree.
 | Document | Owns | Status |
 |---|---|---|
 | [v1.3.0-card-run.md](evidence/v1.3.0-card-run.md) | v1.3.0 CPU-llama card proof | active |
+| [v1.3.2-card-run.md](evidence/v1.3.2-card-run.md) | v1.3.2 Project Maya engine card proof | active |
 | [2026-11-04-engine-measurement.md](evidence/2026-11-04-engine-measurement.md) | Engine VRAM surface measurements | active |
 
 ## 4. Documentation language

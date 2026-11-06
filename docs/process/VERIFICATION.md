@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, reviewer, release-operator]
 source_of_truth_for: [gate, evidence]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
@@ -46,6 +46,12 @@ first, then the same change in the script.
 - Agents must not execute `-Card` paths.
 - A card verdict needs evidence from the freed window. A cardless session records a card
   leg as BLOCKED or NOT RUN, never as PASS.
+
+Manual test builds go to the one test-build directory named in
+`docs/process/GIT_WORKFLOW.md` ("Build and release directories"), and you remove the
+build when its test concludes, so no test build outlives its evidence. The sweep of the
+other build and version directories runs after each build or release. That file owns the
+full rule.
 
 ## Scheduled checks
 
