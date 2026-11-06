@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [autostart, file layout, upgrade, uninstall, backup, log retention]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
@@ -57,8 +57,11 @@ The harness keeps its state beside the exe:
 | `.simpleharn\strata-profiles\` | The rendered strata profile JSONs, written at each load. |
 | `.simpleharn\basalt-profiles\` | The rendered basalt profile JSONs, written at each load. |
 | `ninfer-claims.json` | The ninfer claim ledger beside the harness exe. |
-| `ninfer-autostart-template.sh` | The readable copy of the ninfer launch template, beside the exe in the release package. |
 | `autostart.vbs` | Present only when you registered autostart, at the path the `Run` key names. |
+
+The repository carries an exact copy of the canonical ninfer launch template
+as `ninfer-autostart-template.sh` at the repository root. The release package
+does not include it.
 
 ## Upgrade
 

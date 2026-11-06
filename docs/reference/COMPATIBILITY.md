@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [OpenAI-compatible surface scope, known-good configurations]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
@@ -18,10 +18,9 @@ fields.
 Every claim here names its evidence: a test name, a source file, or the word
 "untested". A test name runs under `cargo test`. This page makes no claim of
 full OpenAI API coverage. It states the tested behavior and the gaps.
-Dated: 2026-11-05. This page describes the current `main` build, and that
-build is unreleased. The renamed wire values below ship in no released binary
-yet: v1.3.0, the current release, still answers the pre-rename values.
-`CHANGELOG.md` (Unreleased) owns the rename.
+Current release: **v1.3.4**. This page describes the current v1.3.4 build.
+The renamed wire values below shipped in v1.3.1. `CHANGELOG.md` owns the
+dated rename record.
 
 ## 1. Listeners and routes
 
@@ -242,15 +241,16 @@ section 1 answers the 404 envelope
 This table records verified configurations. It does not state a minimum
 requirement. A configuration that is absent here is unproven, not broken.
 An evidence-run name points at the local evidence directory; it links no file
-in this repository. Each row names the build the run used: a run of the
-working tree says `main (unreleased)`, and a run of a release names its tag.
-The 2026-11-05 working-tree runs predate the rename, so no row yet records the
-renamed wire values on a built binary.
+in this repository. Each row names the build the run used: a run of a release
+names its tag, and a pre-rename working-tree run says
+`pre-v1.3.1 working tree (pre-rename)`. The 2026-11-05 runs predate the
+rename and are historical configuration evidence. The current build answers
+the renamed wire values.
 
 | Configuration | OS | GPU | Engines | Harness | Date | Evidence |
 |---|---|---|---|---|---|---|
-| Full rig | Windows 11 | one NVIDIA GPU, 71.7 GiB total, 2.0 GiB reserve | llama.cpp, ninfer, basalt, strata rows | main (unreleased) | 2026-11-05 | Evidence run `2026-11-05-evidence-matrix` (RESULTS.md) |
-| Minimal | Windows | one NVIDIA GPU that fits the model plus the reserve | llama.cpp only | main (unreleased) | 2026-11-05 | The `README.md` quick start; cardless llama adapter tests in `src/engine/llama.rs`. No isolated live leg on record |
+| Full rig | Windows 11 | one NVIDIA GPU, 71.7 GiB total, 2.0 GiB reserve | llama.cpp, ninfer, basalt, strata rows | pre-v1.3.1 working tree (pre-rename) | 2026-11-05 | Evidence run `2026-11-05-evidence-matrix` (RESULTS.md) |
+| Minimal | Windows | one NVIDIA GPU that fits the model plus the reserve | llama.cpp only | pre-v1.3.1 working tree (pre-rename) | 2026-11-05 | The `README.md` quick start; cardless llama adapter tests in `src/engine/llama.rs`. No isolated live leg on record |
 | CPU-only llama | Windows | one NVIDIA GPU, 72 GiB; loads booked host RAM, not the card | llama.cpp only, CPU rows | v1.3.0 (run on pre-tag `9e7ddb7`) | 2026-11-05 | `docs/evidence/v1.3.0-card-run.md` |
 
 ## 9. Glossary

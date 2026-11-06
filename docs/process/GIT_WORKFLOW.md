@@ -18,8 +18,11 @@ Decision D6 approves the narrative commit style recorded here.
 
 - The model is trunk-based. `main` is the only long-lived branch. `main` must stay
   releasable.
-- The authorized main or orchestrator session commits directly to `main`. The project does
-  not use pull requests.
+- Internal work is trunk-based. The authorized main or orchestrator session
+  commits directly to `main`.
+- External contributors may open pull requests. CI runs on `pull_request`.
+  Dependabot opens weekly update pull requests (see Toolchain and dependency
+  policy).
 - Subagents never commit. The main session commits reviewed work.
 - A non-trivial change needs a subagent review before it lands on `main`. The review
   artifact lives in evidence, not in Git. The method lives in `docs/process/REVIEW.md`.
@@ -143,6 +146,8 @@ Rules:
 - `scripts/release-check.ps1` check 9 enforces the machine-path ban across the public
   docs (`README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `AGENTS.md`, and
   `docs/**`, including the decision ledger). Documented engine defaults stay allowed.
+- The README release and asset facts are checked by `node scripts/check-doc-facts.mjs`.
+  CI runs it as a step, and `scripts/release-check.ps1` runs it in the release check.
 
 ### Build and release directories
 

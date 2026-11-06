@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [contributor]
 source_of_truth_for: []
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-06
 review_trigger: release, quarterly
 ---
 
@@ -28,7 +28,21 @@ The live queue, the handoff snapshot, open findings, traps, and evidence are
 machine-local and gitignored. They live in `HANDOFF.md` and `handoff/`. Ask the
 operator if you need them.
 
-## First task path
+## External contributors
+
+You do not need `HANDOFF.md` or `handoff/`. They are gitignored and absent
+from a fresh clone.
+
+1. Read `README.md`, `docs/process/ENGINEERING.md`,
+   `docs/process/VERIFICATION.md`, and `docs/process/GIT_WORKFLOW.md`.
+2. Open an issue to propose the change, or open a pull request directly.
+3. CI runs on every pull request.
+4. The maintainer creates the local task file and queue row when the work
+   needs one.
+
+## First task path (operator and agent sessions)
+
+This path needs the local-only layer in Local-only state above.
 
 1. Read `README.md` and `docs/process/TASKS.md`.
 2. Create a task file under `handoff/tasks/`.

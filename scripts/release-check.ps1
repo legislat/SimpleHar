@@ -18,6 +18,9 @@
 #      locations on the operator machine; the author-machine root is banned
 #      whole - the harness ships no default under it (FR-15).
 #      Rule home: docs/process/GIT_WORKFLOW.md (release section).
+#  10. Release facts agree across Cargo.toml, CHANGELOG.md, README.md,
+#      docs/reference/COMPATIBILITY.md, the webui fixture, and
+#      scripts/make-public-asset.ps1 (node scripts/check-doc-facts.mjs).
 #
 # Exit 0 only when every check passes.
 
@@ -212,6 +215,20 @@ if ($bansError -or $personalPathPatterns.Count -eq 0) {
   }
   Report ($machinePathHits.Count -eq 0) ("public docs carry no machine paths" +
     $(if ($machinePathHits.Count -gt 0) { ": " + (($machinePathHits | Sort-Object -Unique) -join "; ") } else { "" }))
+}
+
+# 10. Release facts agree across the durable documents and the asset script.
+#     The tool prints each FAIL with the file and the expected/actual values;
+#     its output is reported verbatim. Review F-02 and F-05: shape-only checks
+#     passed while the release facts were wrong, so this leg pins the facts.
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+  Report $false "node not on PATH (scripts/check-doc-facts.mjs cannot run)"
+} else {
+  $global:LASTEXITCODE = -1
+  $factsOutput = (& node (Join-Path $PSScriptRoot 'check-doc-facts.mjs') 2>&1 | Out-String).Trim()
+  $factsCode = $LASTEXITCODE
+  if ($factsOutput) { Write-Output $factsOutput }
+  Report ($factsCode -eq 0) "release facts agree (node scripts/check-doc-facts.mjs)"
 }
 
 if ($script:allPass) {

@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, contributor, operator]
 source_of_truth_for: [publication safety]
-last_reviewed: 2026-11-02
+last_reviewed: 2026-11-06
 review_trigger: release, quarterly
 ---
 
@@ -39,6 +39,14 @@ Remove or replace every occurrence of:
 - incident logs that name this machine or its work;
 - prompts, completions, and any personal data found in logs;
 - screenshots that show any of the above.
+
+## Screenshots
+
+- Generate a UI screenshot from generic rows. Show the current version.
+- Check the image for model names, file paths, tokens, hostnames, and local
+  inventory before you commit it.
+- Replace `docs/assets/control-page.png` when the UI or the version changes.
+  The release package ships the current image.
 
 ## Rules
 

@@ -32,6 +32,10 @@ jobs:
         shell: pwsh
         run: node scripts/check-docs.mjs
 
+      - name: Doc facts
+        shell: pwsh
+        run: node scripts/check-doc-facts.mjs
+
       # Task files live in handoff/, which is gitignored and absent on the runner.
       # The task checker runs in the local pre-commit workflow, not here.
       - name: Instruction check

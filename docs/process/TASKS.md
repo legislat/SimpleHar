@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [agent, operator]
 source_of_truth_for: [task lifecycle, task schema]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
@@ -173,6 +173,15 @@ A task is done only when all of these hold:
 - the task file and the queue row are current;
 - evidence is linked;
 - no unrelated change remains uncommitted.
+
+## External contributor path
+
+External work starts from a GitHub issue or pull request, not from this page's
+queue. `handoff/PENDING_CHECKLIST.md` and `handoff/tasks/` are gitignored and
+absent from a fresh clone, so external tasks do not use the local queue. The
+maintainer creates the local task file and queue row when the work needs one.
+The walkthrough below is for operator and agent sessions on the operator's
+machine.
 
 ## First task walkthrough
 

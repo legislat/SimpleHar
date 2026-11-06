@@ -1510,27 +1510,17 @@ mod tests {
         assert!(script.contains("override:ninfer_profile_lt"), "{script}");
     }
 
-    /// The reference script shipped beside the README must teach exactly the R10
-    /// separation the canonical renders. `ec310a5` corrected it by hand; this pin is
-    /// what makes the next drift fail at the gate instead of in a review (F4).
+    /// The shipped reference template must be the canonical script byte for byte,
+    /// not a hand-written copy that drifts from it (review F-01). A partial pin
+    /// (a few `contains` checks) passed while the copy had already diverged; only
+    /// full equality fails at the gate on any drift. To change the reference, edit
+    /// the canonical constant instead.
     #[test]
-    fn the_shipped_reference_template_teaches_the_separation() {
-        let shipped = include_str!("../../ninfer-autostart-template.sh");
-        assert!(
-            shipped.contains("INTERNAL_PORT=8808"),
-            "the shipped reference must teach the R10 default internal port"
-        );
-        assert!(
-            shipped.contains("${3:?"),
-            "the shipped reference must fail closed when the harness omits arg 3"
-        );
-        assert!(
-            !shipped.contains("${3:-"),
-            "the legacy fallback would host-publish the internal port on a missing arg 3"
-        );
-        assert!(
-            !shipped.contains("8004") && !shipped.contains("8005"),
-            "legacy manual-namespace internal ports must not survive in the reference"
+    fn the_shipped_reference_template_is_the_canonical_script() {
+        assert_eq!(
+            include_str!("../../ninfer-autostart-template.sh"),
+            crate::engine::policy::CANONICAL_NINFER_SCRIPT,
+            "the shipped reference must be the exact canonical template; edit the canonical constant instead"
         );
     }
 

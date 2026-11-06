@@ -2,11 +2,18 @@
 # PowerShell 5.1 compatible. Read-only over its inputs: it writes only
 # inside -OutDir and never touches the repository or the source folder.
 #
-# The asset is the minimal public bundle (never the personal deploy
-# directory): simpleharn.exe, LICENSE, README.md,
-# simpleharn.example.json, PUBLICATION-SCRUB.md. SHA256SUMS.txt is
-# written beside the zip in -OutDir and covers the exe and the zip (a
-# file cannot carry the hash of the zip that contains it).
+# The zip carries exactly the five-entry release package manifest (the one
+# documented contract - never the personal deploy directory):
+#   simpleharn.exe
+#   SimpleHarn.vbs
+#   README.md
+#   LICENSE
+#   docs/assets/control-page.png
+# The scrub record and SHA256SUMS.txt are written beside the zip in -OutDir,
+# not inside it. SHA256SUMS.txt covers the exe and the zip (a file cannot
+# carry the hash of the zip that contains it).
+# The zip is named SimpleHarn-<version-without-v>-win-x64.zip (the version
+# without the leading v), the name the README quick start links.
 #
 # Refusals (all hard FAIL):
 #   - the source dir (the exe's folder unless -SourceDir says otherwise)
@@ -14,14 +21,15 @@
 #     those are personal runtime files and stay local (PUBLICATION.md);
 #   - the exe hash differs from -ExpectedSha256 (the hash the changelog
 #     records for that tag);
-#   - any staged file trips the personal machine-path blocklist that
+#   - any staged text file trips the personal machine-path blocklist that
 #     scripts/release-check.ps1 check 9 enforces.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts/make-public-asset.ps1 `
 #     -Version v1.1.3 -ExePath <release-exe> `
 #     -ExpectedSha256 <sha256> -OutDir <fresh-output-dir>
-# Run from the repository root (README.md and LICENSE are read here).
+# Run from the repository root (README.md, LICENSE, SimpleHarn.vbs, and
+# docs/assets/control-page.png are read here).
 # Exit 0 only when every step passes.
 
 param(
@@ -81,40 +89,87 @@ if (-not $script:allPass) {
   exit 1
 }
 
-# 4. Stage the bundle (writes only inside -OutDir).
+# 4. Stage the five-entry manifest (writes only inside -OutDir).
 $staged = Join-Path $OutDir ("staged-" + $Version)
 New-Item -ItemType Directory -Force -Path $staged | Out-Null
 Copy-Item -LiteralPath $exeFull -Destination (Join-Path $staged 'simpleharn.exe') -Force
-Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $staged 'LICENSE') -Force
+Copy-Item -LiteralPath 'SimpleHarn.vbs' -Destination (Join-Path $staged 'SimpleHarn.vbs') -Force
 Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $staged 'README.md') -Force
-Report $true "staged exe, LICENSE, README.md"
+Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $staged 'LICENSE') -Force
+New-Item -ItemType Directory -Force -Path (Join-Path $staged 'docs\assets') | Out-Null
+Copy-Item -LiteralPath 'docs/assets/control-page.png' `
+  -Destination (Join-Path $staged 'docs\assets\control-page.png') -Force
+Report $true "staged simpleharn.exe, SimpleHarn.vbs, README.md, LICENSE, docs/assets/control-page.png"
 
-$exampleJson = @'
-{
-  "internal_host": "127.0.0.1",
-  "vram_total_gb": 8.0,
-  "vram_reserve_gb": 2.5,
-  "categories": [
-    { "id": "WORK", "public_port": 8708, "max_models": 1, "evictable_by": [] },
-    { "id": "RP", "public_port": 8709, "max_models": 1, "evictable_by": ["WORK"] },
-    { "id": "AUX", "public_port": 8710, "max_models": 6, "evictable_by": ["WORK", "RP"] },
-    { "id": "EMB", "public_port": 8711, "max_models": 1, "evictable_by": ["WORK", "RP"] }
-  ]
+# 5. Machine-path scan over the staged text files (same blocklist and
+#    spirit as release-check.ps1 check 9 and scripts/check-docs.mjs; nothing
+#    here carries an exemption). The exe and the png are excluded: both are
+#    binary, and a tagged build legitimately embeds build-machine paths in
+#    Rust panic metadata. The exe's identity is pinned by the SHA256 check
+#    above. LICENSE carries no extension and is scanned like every text file.
+$scanFiles = Get-ChildItem -LiteralPath $staged -File -Recurse |
+  Where-Object { ($_.Extension -ne '.exe') -and ($_.Extension -ne '.png') } |
+  ForEach-Object { $_.FullName }
+# Personal machine-path bans: read the one shared set (scripts/machine-path-bans.json)
+# so this scan, scripts/release-check.ps1 check 9, and scripts/check-docs.mjs can
+# never disagree. The author-machine root is banned whole, with no exception (FR-15).
+$bansPath = Join-Path $PSScriptRoot 'machine-path-bans.json'
+$bansError = ''
+$personalPathPatterns = @()
+try {
+  $personalPathPatterns = @(
+    (Get-Content -LiteralPath $bansPath -Raw -Encoding UTF8 |
+      ConvertFrom-Json).bans)
+} catch {
+  $bansError = "$_"
 }
-'@
-[IO.File]::WriteAllText((Join-Path $staged 'simpleharn.example.json'), $exampleJson)
+$personalPathPatterns = @($personalPathPatterns |
+  Where-Object { ($_ -is [string]) -and ($_ -ne '') })
+if ($bansError -or $personalPathPatterns.Count -eq 0) {
+  Report $false ("shared machine-path ban set missing or empty: " + $bansPath +
+    $(if ($bansError) { " (" + $bansError + ")" } else { "" }))
+} else {
+  $pathHits = @()
+  foreach ($pattern in $personalPathPatterns) {
+    $hits = Select-String -Path $scanFiles -Pattern $pattern -ErrorAction SilentlyContinue
+    foreach ($hit in $hits) { $pathHits += ([IO.Path]::GetFileName($hit.Path) + ":" + $hit.LineNumber) }
+  }
+  Report ($pathHits.Count -eq 0) ("staged files carry no machine paths" +
+    $(if ($pathHits.Count -gt 0) { ": " + (($pathHits | Sort-Object -Unique) -join "; ") } else { "" }))
+}
 
+if (-not $script:allPass) {
+  Write-Output "ASSET BUILD FAIL (staged content failed a check; build stopped)"
+  exit 1
+}
+
+# 6. Zip and sums. The zip name drops the tag's leading v: the README quick
+#    start links SimpleHarn-<version-without-v>-win-x64.zip.
+$assetVersion = $Version -replace '^v', ''
+$zip = Join-Path $OutDir ("SimpleHarn-" + $assetVersion + "-win-x64.zip")
+$zipItems = Get-ChildItem -LiteralPath $staged | ForEach-Object { $_.FullName }
+if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+Compress-Archive -Path $zipItems -DestinationPath $zip -CompressionLevel Optimal
+Report $true ("zipped to " + [IO.Path]::GetFileName($zip))
+
+$zipSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+$sums = ("" + $actualSha + "  simpleharn.exe`n" + $zipSha + "  " + [IO.Path]::GetFileName($zip) + "`n")
+[IO.File]::WriteAllText((Join-Path $OutDir 'SHA256SUMS.txt'), $sums)
+Report $true "wrote SHA256SUMS.txt beside the zip (exe + zip)"
+
+# 7. Scrub record beside the zip (it documents the build; it is not package
+#    content and no longer ships inside the zip).
 $scrub = @'
 # Publication scrub record - <VERSION> public asset
 
 Date: <DATE>. Built by scripts/make-public-asset.ps1 per docs/process/PUBLICATION.md.
 
-Bundle: simpleharn.exe (SHA256 <EXESHA>), LICENSE, README.md,
-simpleharn.example.json, this record. SHA256SUMS.txt ships beside the zip.
+Bundle (inside the zip): simpleharn.exe (SHA256 <EXESHA>), SimpleHarn.vbs,
+README.md, LICENSE, docs/assets/control-page.png. SHA256SUMS.txt and this
+record ship beside the zip, not inside it.
 
-Included from the repository: README.md and LICENSE as tagged; the example
-config is a sanitized template written by the script (loopback 127.0.0.1,
-no control_token, no wsl_user, no model rows).
+Included from the repository: README.md and LICENSE as tagged; the launcher
+SimpleHarn.vbs; the control-page screenshot as committed after its scrub.
 
 Excluded by rule: ModelConf, logs, the deployment config file
 (simpleharn.json), and
@@ -122,57 +177,12 @@ START-NOTES.txt. These name personal paths and rows and stay local.
 
 Checks: the exe hash was compared against the changelog value for this
 tag; every staged text file was scanned against the personal machine-path
-blocklist that scripts/release-check.ps1 check 9 enforces. The exe is
-binary and is pinned by the recorded hash instead.
+blocklist that scripts/release-check.ps1 check 9 enforces. The exe and the
+screenshot are binary and are pinned by the recorded hashes instead.
 '@
 $scrub = $scrub.Replace('<VERSION>', $Version).Replace('<DATE>', (Get-Date -Format 'yyyy-MM-dd')).Replace('<EXESHA>', $actualSha)
-[IO.File]::WriteAllText((Join-Path $staged 'PUBLICATION-SCRUB.md'), $scrub)
-Report $true "wrote simpleharn.example.json and PUBLICATION-SCRUB.md"
-
-# 5. Machine-path scan over the staged text files (same blocklist and
-#    spirit as release-check.ps1 check 9; nothing here carries an
-#    exemption). The exe is excluded: it is binary, and a tagged build
-#    legitimately embeds build-machine paths in Rust panic metadata.
-#    The exe's identity is pinned by the SHA256 check above, which is
-#    exactly what release-check.ps1 treats as durable text.
-$scanFiles = Get-ChildItem -LiteralPath $staged -File |
-  Where-Object { $_.Extension -ne '.exe' } | ForEach-Object { $_.FullName }
-# Legacy machine-path bans: the old-product spellings below are old install,
-# backup and staging directory names on the operator machine - not product names.
-$personalPathPatterns = @(
-  'C:\\Inference\\(?!llama\.cpp)',
-  'C:\\Users\\',
-  'D:\\WORKSPACE-VS',
-  'D:\\SimpleHar-SE-backups',
-  '_release_v',
-  '_test-',
-  'SimpleHar-SE_release',
-  'SimpleHar-SE_test'
-)
-$pathHits = @()
-foreach ($pattern in $personalPathPatterns) {
-  $hits = Select-String -Path $scanFiles -Pattern $pattern -ErrorAction SilentlyContinue
-  foreach ($hit in $hits) { $pathHits += ([IO.Path]::GetFileName($hit.Path) + ":" + $hit.LineNumber) }
-}
-Report ($pathHits.Count -eq 0) ("staged files carry no machine paths" +
-  $(if ($pathHits.Count -gt 0) { ": " + (($pathHits | Sort-Object -Unique) -join "; ") } else { "" }))
-
-if (-not $script:allPass) {
-  Write-Output "ASSET BUILD FAIL (staged content failed a check; build stopped)"
-  exit 1
-}
-
-# 6. Zip and sums.
-$zip = Join-Path $OutDir ("SimpleHarn-" + $Version + "-windows-x64.zip")
-$zipFiles = Get-ChildItem -LiteralPath $staged -File | ForEach-Object { $_.FullName }
-if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-Compress-Archive -Path $zipFiles -DestinationPath $zip -CompressionLevel Optimal
-Report $true ("zipped to " + [IO.Path]::GetFileName($zip))
-
-$zipSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
-$sums = ("" + $actualSha + "  simpleharn.exe`n" + $zipSha + "  " + [IO.Path]::GetFileName($zip) + "`n")
-[IO.File]::WriteAllText((Join-Path $OutDir 'SHA256SUMS.txt'), $sums)
-Report $true "wrote SHA256SUMS.txt (exe + zip)"
+[IO.File]::WriteAllText((Join-Path $OutDir 'PUBLICATION-SCRUB.md'), $scrub)
+Report $true "wrote PUBLICATION-SCRUB.md beside the zip"
 
 Write-Output ("  exe sha256: " + $actualSha)
 Write-Output ("  zip sha256: " + $zipSha)

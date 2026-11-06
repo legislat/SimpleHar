@@ -494,11 +494,13 @@ because reaping is by name.
 
 The authoritative template is compiled into the harness
 (`CANONICAL_NINFER_SCRIPT`), and the launch renders and stages that
-template. You never edit it. A readable copy ships as
-[ninfer-autostart-template.sh](../../ninfer-autostart-template.sh) at the
-repository root, beside `README.md` (and beside the exe in the release
-package). Read that one file to
-see exactly what a launch does. The harness invokes the staged script inside
+template. You never edit it. The repository carries an exact copy at
+[ninfer-autostart-template.sh](../../ninfer-autostart-template.sh), beside
+`README.md`. The copy holds placeholders that the harness fills at load.
+A full parity test fails on any drift between the copy and the canonical
+template. That copy shows the exact canonical template, not a rendered
+launch. The release package does not include the template. The harness
+invokes the staged script inside
 WSL as `bash <staged-script> <profile> <key|nokey> <port>`: the profile and
 key choice are already rendered into the script, and `$3` is the **host**
 publish port the harness assigned. The script demands it: a missing `$3`

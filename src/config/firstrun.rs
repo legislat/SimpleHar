@@ -102,7 +102,7 @@ pub fn detect_llama_server_in<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> O
 }
 
 /// Searches PATH (filtered by [`path_entries`]) — and nothing else (FR-13,
-/// operator ruling 2026-11-06): there is no author-machine install fallback, so
+/// operator ruling 2026-11-06): the harness embeds no author-machine install fallback, so
 /// the first-run choice is the operator's own install or none. The result is
 /// written once into the created config; no answer leaves the key absent, and
 /// each llama row must then name its own `llama_server_exe`.
