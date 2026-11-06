@@ -30,6 +30,27 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
   stages the bytes content-addressed under `.simpleharn/maya-profiles`.
   `cost: greedy` is the honest class, the launch floor is the gate, and
   `exact` is refused.
+- `expert_offload_evict_cpu_above_gb` (default 4.0, `0` disables): a
+  `cost: greedy` admit on an expert-offload engine (`strata`, `basalt`,
+  `maya`) drains every CPU-resident row whose booked host RAM is above the
+  threshold, largest first, through the confirmed release and the RAM settle
+  before the spawn. Rows at the threshold, GPU residents, and protected rows
+  stay; a skipped row never refuses the load.
+- The control page names the running build: `SimpleHarn v<version>` in the
+  header, the browser tab, and the footer, read from `/har/status.version`.
+  An absent version renders the bare name.
+- The release package ships `SimpleHarn.vbs` for a hidden manual launch
+  (window style 0); running the console binary directly remains the
+  diagnostic path.
+
+### Fixed
+
+- `/har/models` reports the digits-only `--max-context` figure captured from
+  a maya row's L1 config at scan, in both spellings; a config with no token
+  answers `null`.
+- A Maya staged render's sidecars prune with the render inside the keep-N
+  bound; orphan sidecars are removed. The shared `vision-memory.json` and
+  savings ledger stay.
 
 ## v1.3.1 - 2026-11-05
 

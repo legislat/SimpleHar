@@ -902,20 +902,45 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                 // a missing key or a bad value is a typed reject; the config's
                 // own keys travel in the sentence.
                 if entry.engine == "maya" {
-                    if let Err(problem) = crate::engine::maya::validate_row(&entry) {
-                        let kind = match &problem {
-                            crate::engine::maya::MayaRowError::MissingPath { .. } => {
-                                ScanKind::ModelPathMissing
+                    match crate::engine::maya::validate_row(&entry) {
+                        Ok(row) => {
+                            // FR-08: capture the effective context once, here,
+                            // beside the door that already read and validated
+                            // the config. The display home reads this carry and
+                            // never the file; the derived figure REPLACES any
+                            // hand-written line of the same name (and its
+                            // absence removes one), so the page can only ever
+                            // show what the staged config launches with. The
+                            // carry is scan-derived, never a yaml key, so a
+                            // clean row earns no unknown/inert-key report of
+                            // its own.
+                            match row.max_context {
+                                Some(context) => {
+                                    entry.raw.insert(
+                                        crate::engine::maya::MAYA_MAX_CONTEXT_KEY.to_string(),
+                                        context,
+                                    );
+                                }
+                                None => {
+                                    entry.raw.remove(crate::engine::maya::MAYA_MAX_CONTEXT_KEY);
+                                }
                             }
-                            crate::engine::maya::MayaRowError::Missing { .. }
-                            | crate::engine::maya::MayaRowError::Bad { .. } => ScanKind::Other,
-                        };
-                        catalog.errors.push(ScanError {
-                            kind,
-                            file: file_name.clone(),
-                            reason: problem.into_engine_error().to_string(),
-                        });
-                        continue;
+                        }
+                        Err(problem) => {
+                            let kind = match &problem {
+                                crate::engine::maya::MayaRowError::MissingPath { .. } => {
+                                    ScanKind::ModelPathMissing
+                                }
+                                crate::engine::maya::MayaRowError::Missing { .. }
+                                | crate::engine::maya::MayaRowError::Bad { .. } => ScanKind::Other,
+                            };
+                            catalog.errors.push(ScanError {
+                                kind,
+                                file: file_name.clone(),
+                                reason: problem.into_engine_error().to_string(),
+                            });
+                            continue;
+                        }
                     }
                 }
                 // The CPU-resident row shapes (operator ruling 2026-11-05):
@@ -3094,6 +3119,91 @@ mod tests {
         assert_eq!(entry.cost, crate::model::CostClass::Greedy);
         assert_eq!(entry.load_timeout_s, Some(900));
         assert_eq!(entry.vram_gate.floor(), Some(20.0));
+    }
+
+    /// FR-08: the scan captures the config's `--max-context` figure once and
+    /// carries it on the entry under the scan-derived key; the `/har/models`
+    /// display home answers it end-to-end; a rescan re-derives the same figure;
+    /// the carry follows the config's bytes (the `=` spelling, and no figure
+    /// when the config spells none); and a hand-written line of the carry name
+    /// never outranks the config — it is replaced or removed as the dead key
+    /// the scan names. The carry itself is not a yaml key, so the valid row
+    /// still publishes with zero reports. Falsifier: dropping the capture
+    /// leaves the display null; reading the carry from yaml instead of the
+    /// derived figure fails the hand-written override legs.
+    #[test]
+    fn a_scanned_maya_row_carries_the_config_max_context_and_rescans_with_it() {
+        let dir = crate::testutil::temp_dir("scan-maya-context");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = maya_install(&dir);
+        std::fs::write(dir.join("row.yaml"), maya_yaml(&dir, &config, &[])).expect("write");
+        fn carry(catalog: &crate::model::scan::Catalog) -> Option<&str> {
+            catalog.models[0]
+                .raw
+                .get(crate::engine::maya::MAYA_MAX_CONTEXT_KEY)
+                .map(String::as_str)
+        }
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        assert!(
+            catalog.errors.is_empty(),
+            "the carry earns no report of its own: {:?}",
+            catalog.errors
+        );
+        assert_eq!(carry(&catalog), Some("131072"));
+        assert_eq!(
+            crate::engine::effective_context(&catalog.models[0]).as_deref(),
+            Some("131072"),
+            "the display home answers the carried figure"
+        );
+        let again = scan_dir(&dir);
+        assert_eq!(
+            carry(&again),
+            Some("131072"),
+            "a rescan re-derives the same figure: {:?}",
+            again.errors
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        value["args"] = serde_json::json!(["--max-context=262144"]);
+        std::fs::write(&config, serde_json::to_string(&value).expect("serialize")).expect("write");
+        let moved = scan_dir(&dir);
+        assert_eq!(
+            crate::engine::effective_context(&moved.models[0]).as_deref(),
+            Some("262144"),
+            "the carried figure follows the staged bytes, not the last display"
+        );
+        value["args"] = serde_json::json!(["--glm-pack", "pack"]);
+        std::fs::write(&config, serde_json::to_string(&value).expect("serialize")).expect("write");
+        let bare = scan_dir(&dir);
+        assert_eq!(crate::engine::effective_context(&bare.models[0]), None);
+        // A hand-written carry line never outranks the config: with no config
+        // figure it is removed, not displayed — and named as the unknown key
+        // it is.
+        std::fs::write(
+            dir.join("row.yaml"),
+            maya_yaml(&dir, &config, &[("maya_max_context", Some("999"))]),
+        )
+        .expect("write");
+        let hand = scan_dir(&dir);
+        assert_eq!(
+            carry(&hand),
+            None,
+            "the absent config figure removes the hand-written carry"
+        );
+        assert!(
+            hand.errors
+                .iter()
+                .any(|e| e.kind == ScanKind::UnknownKey && e.reason.contains("maya_max_context")),
+            "a hand-written carry line is the dead key the scan names: {:?}",
+            hand.errors
+        );
+        // With a config figure, the same hand-written line is replaced by the
+        // derived one: the page shows the config, never the hand-written value.
+        value["args"] = serde_json::json!(["--max-context", "131072"]);
+        std::fs::write(&config, serde_json::to_string(&value).expect("serialize")).expect("write");
+        let overridden = scan_dir(&dir);
+        assert_eq!(carry(&overridden), Some("131072"));
     }
 
     /// A maya row that lacks a key the launch requires, carries one below

@@ -13,8 +13,12 @@ use super::{
 
 impl ActorState {
     /// Whether `ticket` names an engine a live job has already committed to
-    /// release: its ticket is that job's `victim` or one of its queued `victims`
-    /// (R2-02-01). The occupant stays installed until that release is confirmed
+    /// release: its ticket is that job's `victim`, one of its queued `victims`
+    /// (R2-02-01), or one of its queued expert-offload reclaim victims
+    /// (M-R-01 review, operator ruling 2026-11-06: a reclaim victim is just as
+    /// committed from the moment it is planned, or the idle sweep could evict
+    /// it between plan and dequeue and produce two ledger deaths for one
+    /// release). The occupant stays installed until that release is confirmed
     /// ([`ActorState::commit_victim_release`] is the window's close, and the same
     /// commit terminalizes the victim's own load row - EVID-01), so an
     /// `Already` receipt for it would promise a slot the harness has already
@@ -28,7 +32,8 @@ impl ActorState {
         self.jobs.iter().any(|(_, job)| {
             !job.terminal
                 && (job.victim.as_ref().is_some_and(|v| &v.ticket == ticket)
-                    || job.victims.iter().any(|v| &v.ticket == ticket))
+                    || job.victims.iter().any(|v| &v.ticket == ticket)
+                    || job.reclaim.victims.iter().any(|v| &v.ticket == ticket))
         })
     }
 
@@ -431,6 +436,7 @@ impl ActorState {
             measured: None,
             victim: Some(victim),
             victims: Vec::new(),
+            reclaim: super::Reclaim::default(),
             victims_released: Vec::new(),
             released_cost: 0.0,
             holder_released_cost: 0.0,

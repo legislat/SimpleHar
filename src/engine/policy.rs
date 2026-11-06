@@ -672,6 +672,15 @@ pub(crate) fn fit_capable(engine: &str) -> bool {
     engine_policy(engine).is_some_and(|row| row.supports_fit)
 }
 
+/// Whether the row for `engine` offloads expert layers to host RAM (the
+/// `expert_offload` cell is the single answer — the victim planner asks this
+/// instead of matching engine ids, operator ruling 2026-11-06). An unknown
+/// engine id (no row) never expert-offloads.
+#[must_use]
+pub(crate) fn expert_offload_engine(engine: &str) -> bool {
+    engine_policy(engine).is_some_and(|row| row.expert_offload)
+}
+
 /// The canonical ninfer autostart script the harness renders and stages for
 /// every ninfer launch (operator ruling 2026-10-31: "we create a valid template
 /// we can control and adopt for each ninfer start"). The staged copy is what
@@ -856,6 +865,12 @@ pub(crate) struct EnginePolicy {
     /// ladder and the scheduler ask this cell instead of matching engine names
     /// (row-scoped, no new match-arm sprawl).
     pub supports_fit: bool,
+    /// Whether this engine offloads expert layers to host RAM (operator
+    /// ruling 2026-11-06): a `cost: greedy` load admitted on such an engine
+    /// may reclaim host RAM from large CPU residents before spawn. The
+    /// victim planner asks this cell instead of matching engine ids (the
+    /// same row-scoped posture as [`Self::supports_fit`]).
+    pub expert_offload: bool,
 }
 
 static MOCK_ROW: EnginePolicy = EnginePolicy {
@@ -873,6 +888,7 @@ static MOCK_ROW: EnginePolicy = EnginePolicy {
     serve_template: None,
     config_knobs: &["allow_mock_engine"],
     supports_fit: false,
+    expert_offload: false,
 };
 
 static LLAMA_ROW: EnginePolicy = EnginePolicy {
@@ -908,6 +924,9 @@ static LLAMA_ROW: EnginePolicy = EnginePolicy {
         "engines.llama.fit_probe_timeout_s",
     ],
     supports_fit: true,
+    // llama never offloads experts to host RAM on its own: `-ngl 0`
+    // `cpu_offload` is a whole-model CPU residency, not an expert tier.
+    expert_offload: false,
 };
 
 static STRATA_ROW: EnginePolicy = EnginePolicy {
@@ -958,6 +977,7 @@ static STRATA_ROW: EnginePolicy = EnginePolicy {
     // that section, which the test walks in a populated serialization.
     config_knobs: &["engines.strata.python", "engines.strata.cwd"],
     supports_fit: false,
+    expert_offload: true,
 };
 
 static BASALT_ROW: EnginePolicy = EnginePolicy {
@@ -1005,6 +1025,7 @@ static BASALT_ROW: EnginePolicy = EnginePolicy {
     // explicitly); the config-parity test alarms if that ever changes.
     config_knobs: &[],
     supports_fit: false,
+    expert_offload: true,
 };
 
 static NINFER_ROW: EnginePolicy = EnginePolicy {
@@ -1030,6 +1051,7 @@ static NINFER_ROW: EnginePolicy = EnginePolicy {
         "ninfer_log_max_files",
     ],
     supports_fit: false,
+    expert_offload: false,
 };
 
 static MAYA_ROW: EnginePolicy = EnginePolicy {
@@ -1074,6 +1096,7 @@ static MAYA_ROW: EnginePolicy = EnginePolicy {
     serve_template: None,
     config_knobs: &[],
     supports_fit: false,
+    expert_offload: true,
 };
 
 static POLICIES: &[&EnginePolicy] = &[
@@ -1837,6 +1860,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// TASK-RAM-RECLAIM (operator ruling 2026-11-06): the `expert_offload`
+    /// cell is the single answer for "offloads experts to host RAM" —
+    /// strata, basalt and maya carry it; llama, ninfer and mock never do,
+    /// so the victim planner never has to match an engine name. An unknown
+    /// id answers `false` (no row, no fact).
+    /// Falsifier: flip any row's cell in the table and its leg fails here.
+    #[test]
+    fn expert_offload_answers_from_the_cell_not_an_engine_name() {
+        for row in all() {
+            let expected = matches!(row.id, "strata" | "basalt" | "maya");
+            assert_eq!(
+                row.expert_offload, expected,
+                "engine `{}` carries the wrong `expert_offload` cell",
+                row.id
+            );
+            assert_eq!(
+                expert_offload_engine(row.id),
+                expected,
+                "the cell and the lookup must agree for `{}`",
+                row.id
+            );
+        }
+        assert!(
+            !expert_offload_engine("no-such-engine"),
+            "an id the table does not know never expert-offloads"
+        );
     }
 
     /// "One mechanism, six instances": the table and the adapter registry

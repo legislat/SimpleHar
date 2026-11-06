@@ -135,6 +135,14 @@ fn default_greedy_min_free() -> f64 {
     4.0
 }
 
+/// Host GiB a CPU-resident row must exceed before a greedy expert-offload
+/// load evicts it (operator ruling 2026-11-06): strata, basalt and maya
+/// offload experts to host RAM, and freeing a large CPU resident first beats
+/// letting the expert tier spill to SSD. `0` disables the rule.
+fn default_expert_offload_evict_cpu_above() -> f64 {
+    4.0
+}
+
 fn default_measured_sample_s() -> u64 {
     60
 }
@@ -578,6 +586,18 @@ pub struct AppConfig {
     /// (operator design note, 2026-10-26).
     #[serde(default = "default_greedy_min_free")]
     pub greedy_launch_min_free_gb: f64,
+    /// Host-RAM reclaim threshold for expert-offload engines (operator
+    /// ruling 2026-11-06). When a `cost: greedy` load is admitted on an
+    /// engine whose `EnginePolicy` row carries the `expert_offload` cell,
+    /// the victim planner also evicts every CPU-resident row (a `cpu_offload`
+    /// resident with a host-RAM booking) whose booked footprint is strictly
+    /// greater than this figure, largest first, before the spawn. A row at or
+    /// below the threshold stays; GPU residents are never victims of this
+    /// rule, and a `cost: fixed` row never triggers it. `0` disables the
+    /// rule. Validation accepts a finite value greater than or equal to 0;
+    /// a bad value fails boot naming this key.
+    #[serde(default = "default_expert_offload_evict_cpu_above")]
+    pub expert_offload_evict_cpu_above_gb: f64,
     /// WSL distro hosting ninfer containers (`wsl.exe -d <this>`; v3.3 parity).
     #[serde(default = "default_wsl_distro", deserialize_with = "trimmed")]
     pub wsl_distro: String,
@@ -680,6 +700,7 @@ impl fmt::Debug for AppConfig {
             settle_timeout_s,
             witness_tolerance_gb,
             greedy_launch_min_free_gb,
+            expert_offload_evict_cpu_above_gb,
             wsl_distro,
             wsl_user,
             ninfer_log_max_size_mib,
@@ -712,6 +733,10 @@ impl fmt::Debug for AppConfig {
             .field("settle_timeout_s", settle_timeout_s)
             .field("witness_tolerance_gb", witness_tolerance_gb)
             .field("greedy_launch_min_free_gb", greedy_launch_min_free_gb)
+            .field(
+                "expert_offload_evict_cpu_above_gb",
+                expert_offload_evict_cpu_above_gb,
+            )
             .field("wsl_distro", wsl_distro)
             .field("wsl_user", wsl_user)
             .field("ninfer_log_max_size_mib", ninfer_log_max_size_mib)
@@ -742,6 +767,7 @@ impl Default for AppConfig {
             settle_timeout_s: default_settle_timeout(),
             witness_tolerance_gb: default_witness_tolerance(),
             greedy_launch_min_free_gb: default_greedy_min_free(),
+            expert_offload_evict_cpu_above_gb: default_expert_offload_evict_cpu_above(),
             measured_sample_s: default_measured_sample_s(),
             measured_drift_warn_ratio: default_measured_drift_warn_ratio(),
             wsl_distro: default_wsl_distro(),
@@ -1200,6 +1226,24 @@ impl AppConfig {
                     .to_string(),
             });
         }
+        // Expert-offload RAM reclaim (operator ruling 2026-11-06): the same GiB
+        // discipline as the reserves — finite and non-negative. `0` is a
+        // deliberate disable, not a typo; a NaN comparison is false and would
+        // read as "nothing exceeds the threshold" by accident instead of by
+        // setting, and +inf would never name a victim whatever the host holds.
+        if !(self.expert_offload_evict_cpu_above_gb.is_finite()
+            && self.expert_offload_evict_cpu_above_gb >= 0.0)
+        {
+            errors.push(ConfigError::Invalid {
+                field: "expert_offload_evict_cpu_above_gb".to_string(),
+                reason: "must be a finite number greater than or equal to 0 (the host-GiB \
+                         threshold above which a greedy expert-offload load evicts a \
+                         CPU-resident row; 0 disables the rule, while a negative figure \
+                         would evict every CPU resident and NaN makes every comparison \
+                         false)"
+                    .to_string(),
+            });
+        }
         // WSL coordinates are load-bearing for ninfer spawn AND container reap
         // (review, 2026-10-26): a blank distro/user must be a boot error, not a
         // silently ineffective string.
@@ -1620,6 +1664,7 @@ mod tests {
             settle_timeout_s: 44,
             witness_tolerance_gb: 1.5,
             greedy_launch_min_free_gb: 6.5,
+            expert_offload_evict_cpu_above_gb: 5.5,
             wsl_distro: "Ubuntu-24.04".to_string(),
             wsl_user: Some("operator".to_string()),
             source_path: Some(std::path::PathBuf::from("F:/simpleharn.json")),
@@ -1645,6 +1690,7 @@ mod tests {
             ("settle_timeout_s", "44"),
             ("witness_tolerance_gb", "1.5"),
             ("greedy_launch_min_free_gb", "6.5"),
+            ("expert_offload_evict_cpu_above_gb", "5.5"),
             ("wsl_distro", "Ubuntu-24.04"),
             ("wsl_user", "operator"),
             ("source_path", "simpleharn.json"),
@@ -1842,6 +1888,49 @@ mod tests {
                 .iter()
                 .any(|e| e.to_string().contains("greedy_launch_min_free_gb")),
             "inf must be refused, not locked in as a permanent refusal generator"
+        );
+    }
+
+    /// TASK-RAM-RECLAIM (operator ruling 2026-11-06): the reclaim threshold
+    /// defaults to 4.0 GiB, `0` is the deliberate disable, and a nonsense
+    /// figure fails boot naming the key — the same GiB discipline as the
+    /// reserve keys (finite and non-negative; serde_json refuses the `1e999`
+    /// spelling, so +inf and NaN only arrive hand-built).
+    /// Falsifier: drop the validate arm and all three bad figures boot clean;
+    /// invert `>= 0.0` to `> 0.0` and the documented disable (`0`) is refused.
+    #[test]
+    fn expert_offload_evict_threshold_defaults_disables_and_bounds() {
+        assert_eq!(default_expert_offload_evict_cpu_above(), 4.0);
+        assert_eq!(AppConfig::default().expert_offload_evict_cpu_above_gb, 4.0);
+        let disabled =
+            AppConfig::parse("{\"expert_offload_evict_cpu_above_gb\": 0.0}").expect("parses");
+        assert!(
+            disabled.validate().is_empty(),
+            "0 disables the rule and is legal: {:?}",
+            disabled.validate()
+        );
+        let negative =
+            AppConfig::parse("{\"expert_offload_evict_cpu_above_gb\": -1.0}").expect("parses");
+        assert!(fails_with(&negative, "expert_offload_evict_cpu_above_gb"));
+        let nan = AppConfig {
+            expert_offload_evict_cpu_above_gb: f64::NAN,
+            ..AppConfig::default()
+        };
+        assert!(
+            fails_with(&nan, "expert_offload_evict_cpu_above_gb"),
+            "NaN makes every threshold comparison false and would silently disable the rule"
+        );
+        let inf = AppConfig {
+            expert_offload_evict_cpu_above_gb: f64::INFINITY,
+            ..AppConfig::default()
+        };
+        assert!(
+            fails_with(&inf, "expert_offload_evict_cpu_above_gb"),
+            "+inf names no victim whatever the host holds"
+        );
+        assert!(
+            AppConfig::parse("{\"expert_offload_evict_cpu_above_gb\": 1e999}").is_err(),
+            "the JSON route refuses the overflow spelling too"
         );
     }
 

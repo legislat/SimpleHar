@@ -19,6 +19,12 @@
 //! an Ollama-compat `keep_alive: 0` chat — so a resident
 //! the harness booked cannot quietly unload itself.
 //!
+//! The config's `--max-context` figure is read exactly once, beside this
+//! validation door: the scan captures the digits-only token and carries it on
+//! the entry (the scan-derived `maya_max_context` raw key), so `/har/models`
+//! shows the context the staged config really serves while the display door
+//! never re-reads the config file.
+//!
 //! Readiness is the served id on the unauthenticated `/health` body. The server
 //! binds its port only after the engine load returns, so a refused connection is
 //! `NotYet` by construction, with `load_timeout` the harness deadline.
@@ -96,6 +102,39 @@ impl MayaRowError {
     }
 }
 
+/// The scan-derived raw key carrying one maya row's effective served context:
+/// the digits-only `--max-context` figure of the L1 config's `args`, captured
+/// once beside [`validate_row`] and read by [`crate::engine::effective_context`].
+/// It is not a yaml key: a hand-written line of this name is unknown to the
+/// scan and replaced (or removed) by the derived figure, so the page can only
+/// ever show the context the staged config actually launches with.
+pub(crate) const MAYA_MAX_CONTEXT_KEY: &str = "maya_max_context";
+
+/// The config's effective served context: the digits-only token after
+/// `--max-context` in the config's own `args`, spelled with a space
+/// (`--max-context 131072`) or with `=` (`--max-context=131072`). The last
+/// occurrence wins, the way a later argv word overrides an earlier one; a
+/// value slot that is not a non-empty run of ASCII digits is no figure — the
+/// same honest reading `strata::effective_context` gives its argv.
+fn max_context_of(args: &[&str]) -> Option<String> {
+    fn digits(value: &str) -> bool {
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+    }
+    let mut found: Option<String> = None;
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        if *word == "--max-context" {
+            found = words
+                .next()
+                .filter(|value| digits(value))
+                .map(|value| (*value).to_string());
+        } else if let Some(value) = word.strip_prefix("--max-context=") {
+            found = digits(value).then(|| value.to_string());
+        }
+    }
+    found
+}
+
 /// One fully validated Maya row: every path exists, the config's `model_name`
 /// is the row's `serve_model`, and the scrubbed config bytes are ready to stage.
 /// Produced only by [`validate_row`].
@@ -110,6 +149,9 @@ pub(crate) struct MayaRow {
     pub alias: String,
     /// The scrubbed config bytes, staged content-addressed.
     pub text: String,
+    /// The digits-only `--max-context` figure of the config's `args`, if it
+    /// spells one — the effective served context the scan carries for display.
+    pub max_context: Option<String>,
 }
 
 fn knob<'a>(model: &'a ModelEntry, key: &str) -> Option<&'a str> {
@@ -416,6 +458,16 @@ pub(crate) fn validate_row(model: &ModelEntry) -> Result<MayaRow, MayaRowError> 
             return Err(bad(model, "args", "must be a list of string tokens"));
         }
     }
+    // The effective context rides the config's own argv, read once here beside
+    // the shape check that proves the tokens are strings: the display door
+    // reads this figure, never the config file again.
+    let max_context = config
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|args| {
+            let words: Vec<&str> = args.iter().filter_map(serde_json::Value::as_str).collect();
+            max_context_of(&words)
+        });
     if let Some(log) = config
         .get("log")
         .and_then(serde_json::Value::as_str)
@@ -472,6 +524,7 @@ pub(crate) fn validate_row(model: &ModelEntry) -> Result<MayaRow, MayaRowError> 
         cwd,
         alias,
         text,
+        max_context,
     })
 }
 
@@ -751,6 +804,66 @@ mod tests {
         let first = validate_row(&model).expect("first").text;
         let second = validate_row(&model).expect("second").text;
         assert_eq!(first, second);
+    }
+
+    /// FR-08: the effective served context is the config's own `--max-context`
+    /// token. Falsifier: accepting a non-digit value slot, losing the `=`
+    /// spelling, letting the first occurrence win, or reading the row keys
+    /// instead of the argv each fails one leg here.
+    #[test]
+    fn the_figure_reads_the_config_max_context_token() {
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (
+                &["--glm-pack", "pack", "--max-context", "131072"],
+                Some("131072"),
+            ),
+            (&["--max-context=262144"], Some("262144")),
+            (&["--glm-pack", "pack"], None),
+            (&["--max-context", "auto"], None),
+            (&["--max-context", "--glm-pack"], None),
+            (&["--max-context"], None),
+            (&["--max-context="], None),
+            (&["--max-context=auto"], None),
+            (&["--max-context", "-5"], None),
+            (&["--max-contexts", "8192"], None),
+            // argv truth: the last spelling wins, and a later malformed slot
+            // does not resurrect an earlier figure.
+            (
+                &["--max-context", "8192", "--max-context=131072"],
+                Some("131072"),
+            ),
+            (&["--max-context=131072", "--max-context"], None),
+        ];
+        for (args, want) in cases {
+            assert_eq!(max_context_of(args).as_deref(), *want, "args {args:?}");
+        }
+    }
+
+    /// FR-08 through the single door: the figure the config spells rides the
+    /// validated row. Falsifier: dropping the capture from `validate_row`
+    /// leaves the row silent whatever the config says.
+    #[test]
+    fn validate_row_carries_the_figure_the_config_spells() {
+        let (_dir, config, model) = fixture(&[]);
+        let row = validate_row(&model).expect("fixture validates");
+        assert_eq!(
+            row.max_context.as_deref(),
+            Some("131072"),
+            "the fixture config spells `--max-context 131072`"
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        value["args"] = serde_json::json!(["--max-context=262144"]);
+        std::fs::write(&config, serde_json::to_string(&value).expect("serialize")).expect("write");
+        let row = validate_row(&model).expect("`=` form validates");
+        assert_eq!(row.max_context.as_deref(), Some("262144"));
+        value["args"] = serde_json::json!(["--glm-pack", "pack"]);
+        std::fs::write(&config, serde_json::to_string(&value).expect("serialize")).expect("write");
+        let row = validate_row(&model).expect("args without a figure validate");
+        assert_eq!(
+            row.max_context, None,
+            "a config without the token spells no figure"
+        );
     }
 
     #[test]

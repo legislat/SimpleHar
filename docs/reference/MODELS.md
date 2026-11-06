@@ -44,7 +44,7 @@ edit never leaves a half-written model file in use.
 | `serve_model` | The expected engine-reported id. A mismatch records a warning; the harness never trusts it. |
 | `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served: `measured_gb` is the high end and `measured_gb_min` the low end. The harness writes them back after a load. When `vram_gb` is absent, admission books `measured_gb`. The `measured_attribution` stamp decides whose number it is, and only these attributions book: `engine_report` (the container's own startup reservation), `engine_status` (a process engine's own status endpoint stated the footprint), and `per_process` (the witness attributed the bytes to the engine's own process tree). A `total_diff` figure (a free-memory delta) displays but never books. An **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure, whatever the provenance, because it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes. The identity is the profile name, plus the resolved `kv` for an override line. An edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, because the reservation follows the KV pool. The write-back also records `measured_offload`, the `cpu_offload` state the pair was taken under; a later flip voids the pair. |
 | `is_embedding_model` | A truthy value forces category `EMB`. It conflicts with another explicit category. |
-| `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. A `maya` row reports no Ctx figure: the value stays in the staged config's `--max-context` token. |
+| `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. A `maya` row reports the digits-only `--max-context` figure from its L1 config's `args` (either spelling; the scan captures it), or no figure when the config spells none. |
 | `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. For the basalt 482B class, `load_timeout: 1200` is the recommended starting point. A `maya` row must declare 300 or more: the scan refuses a missing or smaller value rather than let a healthy load meet the 120 s default. |
 | `min_turn` | Minimum seconds of service before a different model's request may evict this model. The harness refuses to evict a model that has served less than `min_turn` seconds for a different model's request. Omitting the key means no guard. An explicit request for the model's own slot is never blocked. Range 1-86400 seconds; scan refuses a value outside it. A measured swap runs 14-45 s, so the knob stops a ping-pong of swaps between two hot models. |
 | `strata_exe` | **Required for strata** (template mode): the absolute path of the engine binary that the harness-rendered profile names. Its presence selects template mode. `serve_model` is also required, and it becomes the profile's served model name. |
@@ -99,9 +99,12 @@ load the harness reads it, validates every path it names, removes `host`,
 `<model>-<hash>.json`, atomic write, keep-N prune). The spawn rewrites
 `--config` to exactly that file. The server writes small sidecars beside the
 staged config (`vision-memory.json`, the savings ledger,
-`<staged>.shared-settings.json`); the prune matches only
-`<model>-<hash>.json`, so sidecars accumulate and the harness never renders
-them. See "Maya engines" below.
+`<staged>.shared-settings.json`). A sidecar that carries the staged address
+prunes with its render inside the keep-N bound, and an orphan sidecar is
+removed. `vision-memory.json` and the savings ledger are single shared files
+and stay. The harness never renders a sidecar. A sidecar still held open by a
+live server can survive the best-effort delete on Windows. See "Maya engines"
+below.
 
 The harness keeps unknown keys for reference and reports them as
 `unknown_key` warnings. The model still loads. `host` and `port` keys belong
@@ -136,6 +139,19 @@ working set above both. The same ladder words the surface: `/har/models`
 `cost_basis` names the booked RAM rung, and a `cpu_offload` flip moves the
 row to the other ladder at once. A `ram_gb` never moves a VRAM figure, and
 `vram_gb` never moves a RAM figure.
+
+**A greedy admit on an expert-offload engine frees host RAM first** (operator
+ruling 2026-11-06). The engines strata, basalt, and maya keep expert layers
+in host RAM. When the harness admits a `cost: greedy` row on one of these
+engines and the gate has said yes, it first drains every CPU-resident row
+whose booked host RAM is greater than `expert_offload_evict_cpu_above_gb`,
+largest first, through the same confirmed release the VRAM planner uses. The
+load then spawns into reclaimed RAM instead of spilling to SSD. A row that
+sits exactly at the threshold stays. A holder that the `evictable_by` matrix
+protects, or one inside its `min_turn` guard, is skipped and named in the
+log; it never refuses the load. GPU residents are never victims of this
+drain, and no host-RAM gate exists for GPU rows: the card gate stays exactly
+as it was. Set the key to `0` to disable the rule.
 
 ### Strata engines
 
@@ -335,8 +351,7 @@ computed requirement to book.
 The harness job object kills the Python server and every descendant, the
 engine and the vision children. No conversation is saved across a harness
 swap. Host-RAM booking for the expert tier is a follow-up, not today's
-behavior. `/har/models` reports `context` null for a Maya row: the figure
-stays in the staged config's `--max-context` token.
+behavior. `/har/models` reports the digits-only `--max-context` figure captured from the L1 config at scan; a config with no such token answers `null`.
 
 Do not use the dashboard on a managed instance. The managed server still
 serves Maya's own dashboard and management doors on the loopback slot port,

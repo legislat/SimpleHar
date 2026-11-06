@@ -90,14 +90,28 @@ impl ActorState {
                                 job.victims.clear();
                             }
                             tracing::info!(%job_id, "release sufficient; skipping remaining victims");
-                            self.spawn_settle_task(job_id);
+                            // Minimality ends the DEFICIT queue only: the
+                            // expert-offload reclaim queue (operator ruling
+                            // 2026-11-06) is not gate-driven — the load needs
+                            // no host GiB — so it drains to completion after
+                            // the card is satisfied, before the settle closes.
+                            if !self.dequeue_reclaim_victim(job_id) {
+                                self.spawn_settle_task(job_id);
+                            } else {
+                                self.spawn_kill_confirm(job_id);
+                            }
                         } else {
                             self.spawn_kill_confirm(job_id);
                         }
-                    } else {
+                    } else if !self.dequeue_reclaim_victim(job_id) {
                         // §0.3: release is proven; now the memory evidence must
-                        // settle before the spawn fires.
+                        // settle before the spawn fires. The reclaim queue (if
+                        // any) drains one victim at a time first, each through
+                        // the same confirmed release (operator ruling
+                        // 2026-11-06).
                         self.spawn_settle_task(job_id);
+                    } else {
+                        self.spawn_kill_confirm(job_id);
                     }
                 } else {
                     let note = self.jobs[&job_id]

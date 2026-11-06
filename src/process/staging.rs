@@ -228,7 +228,9 @@ pub(super) fn rewrite_config_slot(mut argv: Vec<String>, path: &str) -> Option<V
 /// * **bounded** — keep-N prune of this slug's
 ///   `<sanitized-slug>-<16hex>.json` pool ([`prune_staged_profiles`]),
 ///   newest first (the in-distro script driver's [`STAGED_SCRIPT_KEEP`] rule
-///   ported to the Windows filesystem).
+///   ported to the Windows filesystem), and every `<pool-name>.<suffix>`
+///   sidecar (Maya's `shared-settings` writes) pruned with its pool file, so
+///   sidecars cannot outlive the renders that minted them (`TASK-MAYA`, FR-09).
 ///
 /// # Returns
 ///
@@ -272,47 +274,95 @@ pub(super) fn stage_rendered_profile(
     Ok(target)
 }
 
-/// Keep-N prune of one slug's staged-profile pool, newest by mtime. Entries are
-/// matched exactly — `<sanitized-slug>-<16 hex>.json`, the SAME name
-/// [`crate::engine::strata::staged_profile_name`] writes (review 25 [3]: raw
-/// vs sanitized would prune zero of its own files and grow the pool without
-/// bound) — so a dot-bearing slug (`har.a`) can never prune another model's
-/// pool (the lesson the ninfer staging driver learned on the distro's
-/// findutils, review 2026-10-31). Two names that sanitize identically
+/// The exact 16-hex content address every staged artifact's name carries.
+fn is_content_address(address: &str) -> bool {
+    address.len() == 16
+        && address
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// The pool file a satellite belongs to. An engine writes sidecar files beside
+/// the staged config it loads — Maya's `<staged>.shared-settings.json` is the
+/// live shape — so a sidecar's name is `<pool-name>.<suffix>`, and the base
+/// must carry the same 16-hex content address as the pool: one model's sidecar
+/// can never name another model's pool, and a name that is not a sidecar of
+/// this slug's address space (a foreign file, the `.staging.<name>.tmp` temp,
+/// a same-prefix file that is not pool-shaped) answers `None`.
+fn sidecar_base(prefix: &str, name: &str) -> Option<String> {
+    let rest = name.strip_prefix(prefix)?;
+    let (address, tail) = rest.split_once('.')?;
+    if !is_content_address(address) {
+        return None;
+    }
+    let suffix = tail.strip_prefix("json.")?;
+    (!suffix.is_empty()).then(|| format!("{prefix}{address}.json"))
+}
+
+/// Keep-N prune of one slug's staged-profile pool, newest by mtime, and the
+/// sidecar sweep that keeps a pruned render from leaving its satellites behind
+/// (FR-09). Entries are matched exactly — `<sanitized-slug>-<16 hex>.json`,
+/// the SAME name [`crate::engine::strata::staged_profile_name`] writes (review
+/// 25 [3]: raw vs sanitized would prune zero of its own files and grow the
+/// pool without bound) — so a dot-bearing slug (`har.a`) can never prune
+/// another model's pool (the lesson the ninfer staging driver learned on the
+/// distro's findutils, review 2026-10-31). Two names that sanitize identically
 /// (`a b` / `a_b`) share one pool by construction: the name is the content
 /// address's owner and a launch re-stages its own bytes anyway.
+///
+/// The sidecar rule (FR-09): a `<pool-name>.<suffix>` file lives and dies with
+/// its pool file — Maya writes a `shared-settings` sidecar beside the config
+/// it loads, and the old pool-only prune let those accumulate past the bound.
+/// A sidecar whose base is among the newest [`STAGED_PROFILE_KEEP`] renders
+/// survives — the same guarantee the config file itself gets, so the render a
+/// live job launched from never loses its sidecar — and a sidecar whose base
+/// is stale, or already gone (the pre-fix accumulation), is deleted with it.
+/// Files carrying no `<slug>-` prefix at all are never touched: Maya's shared
+/// `vision-memory.json` is one file, so nothing accumulates there.
 fn prune_staged_profiles(root: &Path, slug: &str) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     let prefix = format!("{}-", sanitize_slug(slug));
-    let mut pool: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let address = name.strip_suffix(".json")?.strip_prefix(prefix.as_str())?;
-            // Exactly the 16-hex content address, nothing else, marks the pool.
-            let is_address = address.len() == 16
-                && address
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
-            if !is_address {
-                return None;
+    let mut pool: Vec<(std::time::SystemTime, PathBuf, String)> = Vec::new();
+    let mut sidecars: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let Some(rest) = name.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        if let Some(address) = rest.strip_suffix(".json") {
+            // Exactly the 16-hex content address, nothing else, marks the pool;
+            // a NON-pool name ending in `.json` is not finished — a sidecar's
+            // own suffix (`.shared-settings.json`) also ends in `.json`, so
+            // only a proven pool entry leaves this branch.
+            if is_content_address(address) {
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                pool.push((mtime, entry.path(), name.into_owned()));
+                continue;
             }
-            let mtime = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            Some((mtime, entry.path()))
-        })
-        .collect();
-    if pool.len() <= STAGED_PROFILE_KEEP {
-        return;
+        }
+        if let Some(base) = sidecar_base(&prefix, &name) {
+            sidecars.push((base, entry.path()));
+        }
     }
     pool.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    for (_, stale) in &pool[STAGED_PROFILE_KEEP..] {
+    let retained: std::collections::HashSet<&str> = pool
+        .iter()
+        .take(STAGED_PROFILE_KEEP)
+        .map(|(_, _, name)| name.as_str())
+        .collect();
+    for (_, stale, _) in pool.iter().skip(STAGED_PROFILE_KEEP) {
         let _ = std::fs::remove_file(stale);
+    }
+    for (base, sidecar) in &sidecars {
+        if !retained.contains(base.as_str()) {
+            let _ = std::fs::remove_file(sidecar);
+        }
     }
 }
 
@@ -463,5 +513,116 @@ pub(super) async fn stage_script(
         )),
         ControlOutcome::Failed(error) => Err(format!("cannot run the staging driver: {error}")),
         ControlOutcome::TimedOut => Err("the staging driver timed out".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stage one render, paced so the newest-first prune order is observable
+    /// (the same 20 ms pacing the pool-prune pins keep).
+    fn stage(root: &Path, engine: &str, slug: &str, render: u32) -> PathBuf {
+        let text = format!("{{\"render\": {render}}}");
+        let placeholder = staged_profile_name(slug, &text);
+        let landed =
+            stage_rendered_profile(engine, root, slug, &text, &placeholder).expect("stages");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        landed
+    }
+
+    fn sidecar(config: &Path, suffix: &str) -> PathBuf {
+        let path = PathBuf::from(format!("{}.{}", config.display(), suffix));
+        std::fs::write(&path, b"{}").expect("sidecar");
+        path
+    }
+
+    /// FR-09: a sidecar lives and dies with its pool file. Falsifier: pruning
+    /// the pool alone (the pre-fix rule) leaves the stale and orphan sidecars
+    /// behind, or a sweep keyed on the sidecars' own mtime drops the live
+    /// render's sidecar while keeping a stale one.
+    #[test]
+    fn stale_sidecars_prune_with_their_render_and_the_live_ones_survive() {
+        let root = crate::testutil::temp_dir("maya-stage-sidecars");
+        std::fs::create_dir_all(&root).expect("root");
+        let slug = "maya m";
+        let oldest = stage(&root, "maya", slug, 0);
+        let oldest_sidecar = sidecar(&oldest, "shared-settings.json");
+        // A sidecar whose base this root never held — the pre-fix
+        // accumulation — is an orphan from the first sweep onward.
+        let orphan = root.join("maya_m-deadbeefdeadbeef.json.shared-settings.json");
+        std::fs::write(&orphan, b"{}").expect("orphan");
+        // Names the sweep must never claim: Maya's single shared memory file,
+        // a foreign engine's pool and its sidecar, and a same-prefix file
+        // that is not pool-shaped.
+        let shared = root.join("vision-memory.json");
+        std::fs::write(&shared, b"{}").expect("memory");
+        let foreign = root.join("other-0000000000000000.json");
+        std::fs::write(&foreign, b"{}").expect("foreign");
+        let foreign_sidecar = sidecar(&foreign, "shared-settings.json");
+        let unshaped = root.join("maya_m-savings.json");
+        std::fs::write(&unshaped, b"{}").expect("unshaped");
+        // A mid-pool render stays inside the newest KEEP; its sidecar is
+        // written BEFORE the prunes that follow, so surviving them is proven.
+        let kept = stage(&root, "maya", slug, 1);
+        let kept_sidecar = sidecar(&kept, "shared-settings.json");
+        // Fill the pool past the bound: the newest KEEP renders survive.
+        let mut current = kept.clone();
+        for render in 2..=STAGED_PROFILE_KEEP as u32 {
+            current = stage(&root, "maya", slug, render);
+        }
+        let current_sidecar = sidecar(&current, "shared-settings.json");
+        assert!(!oldest.exists(), "the over-bound render is pruned");
+        assert!(
+            !oldest_sidecar.exists(),
+            "its sidecar leaves with it (FR-09)"
+        );
+        assert!(
+            !orphan.exists(),
+            "a sidecar whose base never existed is reaped"
+        );
+        assert!(
+            kept.exists() && kept_sidecar.exists(),
+            "a retained render keeps its sidecar across later prunes"
+        );
+        assert!(
+            current.exists() && current_sidecar.exists(),
+            "the newest render keeps its sidecar"
+        );
+        assert!(
+            shared.exists() && foreign.exists() && foreign_sidecar.exists() && unshaped.exists(),
+            "the sweep claims only this slug's pool-shaped sidecar names"
+        );
+    }
+
+    /// A root that carries no sidecars prunes exactly as the pool-only rule
+    /// did: the same bounded pool, and a file that is nobody's sidecar is
+    /// never touched. Falsifier: a sweep that deletes on name-shape alone
+    /// eats the shared file or an over-broad match.
+    #[test]
+    fn a_root_with_no_sidecars_prunes_exactly_as_before() {
+        let root = crate::testutil::temp_dir("strata-stage-bounded");
+        std::fs::create_dir_all(&root).expect("root");
+        let slug = "strata iq3s";
+        let shared = root.join("vision-memory.json");
+        std::fs::write(&shared, b"{}").expect("memory");
+        let mut last = PathBuf::new();
+        for render in 0..12u32 {
+            last = stage(&root, "strata", slug, render);
+        }
+        assert!(last.exists(), "the newest render survives");
+        assert!(shared.exists(), "a file that is nobody's sidecar stays");
+        let pool: Vec<_> = std::fs::read_dir(&root)
+            .expect("read dir")
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.strip_prefix("strata_iq3s-")
+                    .and_then(|rest| rest.strip_suffix(".json"))
+                    .is_some_and(is_content_address)
+            })
+            .collect();
+        assert_eq!(pool.len(), STAGED_PROFILE_KEEP, "the pool stays bounded");
     }
 }

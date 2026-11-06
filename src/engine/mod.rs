@@ -192,11 +192,12 @@ pub enum Probe {
 /// or the `--max-context=` suffix, digits only ([`strata::effective_context`]);
 /// ninfer
 /// answers the max-context of the profile its launcher resolves
-/// ([`ninfer::effective_context`]); every other engine (mock, basalt, maya)
-/// has no context statement the harness reads and answers `None`: a maya
-/// row's figure lives in the staged config's `--max-context` token, not in a
-/// row key, and reading it back is a follow-up (`TASK-MAYA`). A `None` ships as
-/// null: a stale `context:`
+/// ([`ninfer::effective_context`]); maya answers the digits-only figure the
+/// scan captured once from its L1 config's `--max-context` token, carried on
+/// the entry as the scan-derived `maya_max_context` raw key
+/// ([`maya::MayaAdapter`]; the display never re-reads the config file). Every
+/// other engine (mock, basalt) has no context statement the harness reads and
+/// answers `None`. A `None` ships as null: a stale `context:`
 /// line on a row whose engine never reads it is the dead key the scan reports,
 /// never a display fallback.
 ///
@@ -214,6 +215,7 @@ pub fn effective_context(entry: &ModelEntry) -> Option<String> {
         "llama" => entry.raw.get("context").cloned(),
         "strata" => strata::effective_context(&entry.raw),
         crate::ownership::NINFER_ENGINE => ninfer::effective_context(&entry.raw),
+        "maya" => entry.raw.get(maya::MAYA_MAX_CONTEXT_KEY).cloned(),
         _ => None,
     }
 }
@@ -890,11 +892,25 @@ mod tests {
             effective_context(&entry("strata", &[("context", "4096")])),
             None
         );
-        // A maya row states nothing in a row key: its figure rides the L1
-        // config's `--max-context` token, so the page shows null (TASK-MAYA).
+        // A maya row states nothing in a row key: its figure rides only the
+        // scan-derived carry the scan writes from the L1 config, so an entry
+        // that never went through the scan answers null.
         assert_eq!(
             effective_context(&entry("maya", &[("context", "131072")])),
-            None
+            None,
+            "the dead `context` row key is never a maya display fallback"
+        );
+        // FR-08: the carry is the scan-derived config figure, and it is maya's
+        // alone — a foreign row never displays it.
+        assert_eq!(
+            effective_context(&entry("maya", &[("maya_max_context", "131072")])).as_deref(),
+            Some("131072"),
+            "the carry the scan writes is what the page answers"
+        );
+        assert_eq!(
+            effective_context(&entry("mock", &[("maya_max_context", "131072")])),
+            None,
+            "the carry is maya's alone: a foreign row never displays it"
         );
     }
 

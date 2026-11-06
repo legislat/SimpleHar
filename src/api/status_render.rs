@@ -247,8 +247,9 @@ pub(super) fn model_json(
             .is_some_and(|v| crate::engine::llama::jinja_on(v)),
         // The EFFECTIVE served context (operator ruling 2026-11-02): llama's own
         // row knob, strata's `--max-context` argv token, ninfer's resolved
-        // profile max-context — never the inert row key; null when the engine
-        // speaks none (the one home is `engine::effective_context`).
+        // profile max-context, maya's L1 `--max-context` figure captured at
+        // scan; never the inert row key; null when the engine speaks none (the
+        // one home is `engine::effective_context`).
         "context": crate::engine::effective_context(entry),
         "serve_model": entry.serve_model,
         "model_ref": entry.model_ref,

@@ -173,6 +173,30 @@ pub enum JobKind {
     Unload,
 }
 
+/// The expert-offload RAM reclaim (operator ruling 2026-11-06) planned for a
+/// `cost: greedy` load admitted on an `expert_offload` engine: the CPU-resident
+/// rows queued for drain (largest booked footprint first), the CPU-resident
+/// rows above the threshold that the drain must skip (model, reason), and the
+/// host RAM in GiB the queued rows book. These victims are not the deficit
+/// planner's `victims`: a GPU row has no host-RAM gate, so this queue is the
+/// posture the ruling ordered, drained after the same-slot replacement and the
+/// deficit victims, each through the unchanged confirm-and-settle release path.
+#[derive(Default, Clone)]
+pub(super) struct Reclaim {
+    /// CPU residents above the threshold, drained largest first, in release
+    /// order. `Victim::cost` is `0.0` by design: a CPU release books no card
+    /// bytes, and crediting host GiB to the card's drain re-check would be a
+    /// figure the gate cannot honestly state.
+    pub(super) victims: Vec<Victim>,
+    /// Rows above the threshold the drain skips instead of draining (a
+    /// `min_turn` guard or the `evictable_by` matrix): name and reason, never
+    /// a failure of the incoming load.
+    pub(super) skipped: Vec<(String, String)>,
+    /// Sum of the queued victims' booked host RAM in GiB (the log's reclaimed
+    /// figure, planned at decision time).
+    pub(super) gib: f64,
+}
+
 /// The rung of the making-room ladder an admitted load actually took.
 ///
 /// Shape borrowed from the Berth broker's making-room ladder (fits-now,
@@ -270,6 +294,11 @@ pub(super) struct Job {
     /// Cross-category victims queued by the eviction planner (Step 6), released
     /// one at a time after the same-slot replacement (if any).
     pub(super) victims: Vec<Victim>,
+    /// The expert-offload RAM reclaim planned at admission (operator ruling
+    /// 2026-11-06): CPU residents drained after the deficit queue, the rows
+    /// skipped with their reasons, and the booked host GiB. Empty on every
+    /// load the ruling does not address.
+    pub(super) reclaim: Reclaim,
     /// Cross-category victims whose release is confirmed (observability, G13).
     pub(super) victims_released: Vec<String>,
     /// Ledger cost freed by confirmed releases so far (Step 6 minimality check).

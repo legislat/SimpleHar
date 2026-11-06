@@ -117,6 +117,7 @@ impl ActorState {
             measured: None,
             victim: None,
             victims: Vec::new(),
+            reclaim: super::Reclaim::default(),
             victims_released: Vec::new(),
             released_cost: 0.0,
             holder_released_cost: 0.0,
@@ -654,6 +655,12 @@ impl ActorState {
                 job.need = Some(Gibibytes(booked));
             }
         }
+        // Expert-offload RAM reclaim (operator ruling 2026-11-06): the gate
+        // said yes to a greedy load on an expert-offload engine, so the large
+        // CPU residents go first — no RAM deficit is required, the rule is
+        // the posture. A refusal above returned before this point; a load the
+        // gate never saw is never planned.
+        self.plan_expert_offload_reclaim(job_id);
         // The rung derivation and the release-or-spawn commit are the shared
         // admitted tail — the gate leg above only proved the numbers.
         if crate::observability::extended_logging() {
@@ -688,9 +695,15 @@ impl ActorState {
     fn finish_admit_tail(&mut self, job_id: JobId) {
         let path = if self.jobs[&job_id].release_first {
             AdmissionPath::ReleaseFirst
-        } else if self.jobs[&job_id].victims.is_empty() {
+        } else if self.jobs[&job_id].victims.is_empty()
+            && self.jobs[&job_id].reclaim.victims.is_empty()
+        {
             AdmissionPath::FitsNow
         } else {
+            // A reclaim-only drain is this rung too: the eviction planner
+            // (here, the expert-offload arm) queued cross-category victims
+            // and the load admitted to drain them (operator ruling
+            // 2026-11-06) — the rung says exactly that, no new vocabulary.
             AdmissionPath::Drain
         };
         if let Some(job) = self.jobs.get_mut(&job_id) {
@@ -717,9 +730,10 @@ impl ActorState {
         self.step(job_id, SwapState::Quiesce);
         self.step(job_id, SwapState::Dispose);
         // Ensure a release target: the same-slot replacement first, else the first
-        // queued cross-category victim.
-        if self.jobs[&job_id].victim.is_none() {
-            self.dequeue_victim(job_id);
+        // queued cross-category victim, else the first queued reclaim victim
+        // (operator ruling 2026-11-06: reclaim drains after the deficit queue).
+        if self.jobs[&job_id].victim.is_none() && !self.dequeue_victim(job_id) {
+            self.dequeue_reclaim_victim(job_id);
         }
         if self.jobs[&job_id].victim.is_some() {
             // The release is committed and its wait is about to open: warm
@@ -1197,5 +1211,171 @@ impl ActorState {
         let next = job.victims.remove(0);
         job.victim = Some(next);
         true
+    }
+
+    /// Moves the next queued expert-offload reclaim victim into the release
+    /// slot (operator ruling 2026-11-06); `false` when the queue is empty.
+    /// One at a time, like the deficit queue: every release runs the unchanged
+    /// confirmed-release path, and the settle window still closes the drain
+    /// before the spawn.
+    pub(super) fn dequeue_reclaim_victim(&mut self, job_id: JobId) -> bool {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return false;
+        };
+        if job.reclaim.victims.is_empty() {
+            return false;
+        }
+        let next = job.reclaim.victims.remove(0);
+        job.victim = Some(next);
+        true
+    }
+
+    /// Expert-offload RAM reclaim (operator ruling 2026-11-06): on admission
+    /// of a `cost: greedy` row on an engine carrying the `expert_offload`
+    /// cell, queue every CPU-resident row whose booked host RAM is strictly
+    /// greater than `expert_offload_evict_cpu_above_gb`, largest first, for
+    /// drain through the unchanged victim release path. No host-RAM deficit
+    /// is required and no host-RAM gate is created: a GPU row keeps the card
+    /// gate it always had, and this rule only frees host RAM for the expert
+    /// tier before the engine starts spilling to SSD.
+    ///
+    /// Filters, in order: `0` disables the whole rule; only the card ladder
+    /// plans it (a RAM row is itself the CPU posture); `evictable_by` stays a
+    /// hard category filter (a blocked row is *skipped with a reason*, never
+    /// a failure — the ruling's "skip it rather than fail the load");
+    /// `min_turn` stays a guard, and a young holder is skipped the same way.
+    /// The same-slot occupant is never a reclaim victim: its release IS the
+    /// replacement the request named. GPU residents hold no `ram_need`, so
+    /// the resource filter drops them before any other question — they are
+    /// never victims, never even named. `Victim::cost` stays `0.0`: a CPU
+    /// release frees no card bytes, and the drain's gate re-check and the
+    /// greedy booking must never see host GiB credited as VRAM.
+    fn plan_expert_offload_reclaim(&mut self, job_id: JobId) {
+        let threshold = self.cfg.expert_offload_evict_cpu_above_gb;
+        let (greedy, card_ladder, expert, own_slot, load_category, release_first) = {
+            let job = &self.jobs[&job_id];
+            (
+                job.cost == crate::model::CostClass::Greedy,
+                job.resource == crate::model::Resource::Gpu,
+                crate::engine::policy::expert_offload_engine(&job.engine),
+                job.slot,
+                job.category,
+                job.release_first,
+            )
+        };
+        // A release-first admission has not passed the gate yet — its spawn
+        // is parked on the physical re-gate, and a kill made before that
+        // verdict could destroy rows for a load that may still fail. Nothing
+        // extra is evicted for a load the card has not honestly accepted.
+        if threshold <= 0.0 || !greedy || !card_ladder || !expert || release_first {
+            return;
+        }
+        let evictable_by = |category: CategoryId| {
+            self.cfg
+                .categories
+                .iter()
+                .find(|cat| cat.id == category)
+                .map(|cat| cat.evictable_by.clone())
+                .unwrap_or_default()
+        };
+        let mut candidates: Vec<(usize, f64, Victim)> = Vec::new();
+        let mut skipped: Vec<(String, String)> = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            if own_slot == Some(index) {
+                continue; // the same-slot replacement is the request, not a victim
+            }
+            let Some(occupant) = &slot.occupant else {
+                continue;
+            };
+            // The resource filter, first and strict (the ruling's "GPU residents
+            // are never victims"): only a CPU-resident row books host RAM.
+            let Some(ram) = occupant.ram_need else {
+                continue;
+            };
+            // STRICTLY greater than the threshold: a row at the threshold stays.
+            if ram.0 <= threshold {
+                continue;
+            }
+            let allowed_list = evictable_by(slot.category);
+            if !allowed_list.contains(&load_category) {
+                let reason = if allowed_list.is_empty() {
+                    format!("nothing may evict {}", slot.category)
+                } else {
+                    format!(
+                        "only {} can evict {}",
+                        allowed_list
+                            .iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" and "),
+                        slot.category
+                    )
+                };
+                skipped.push((occupant.model.clone(), reason));
+                continue;
+            }
+            // `min_turn` stays a guard (the ruling: "min_turn ... still apply"),
+            // and this drain is cross-category by construction. A holder inside
+            // its guard is SKIPPED with the same reason the deficit planner
+            // names, not a blocker that fails the load: host RAM is not a gate
+            // here, so nothing waits on it. The knob is read from the catalog
+            // at decision time, exactly as `plan_victims` reads it.
+            let guard = self
+                .catalog
+                .iter()
+                .find(|entry| entry.name == occupant.model)
+                .and_then(|entry| entry.min_turn_s);
+            if let Some(min_turn) = guard {
+                let served = occupant.loaded_at.elapsed().as_secs();
+                if served < min_turn {
+                    skipped.push((
+                        occupant.model.clone(),
+                        format!("served {served}s of its {min_turn}s min_turn guard"),
+                    ));
+                    continue;
+                }
+            }
+            candidates.push((
+                index,
+                ram.0,
+                Victim {
+                    model: occupant.model.clone(),
+                    ticket: occupant.ticket.clone(),
+                    slot: index,
+                    evicted: true,
+                    cost: 0.0,
+                },
+            ));
+        }
+        // The ruling's sentence "the harness logs the decision and the
+        // reclaimed total" holds for a decision that took nothing too: an
+        // active rule that found no eligible victim still says so once,
+        // naming the row and the threshold it compared. Largest booked
+        // footprint first (the ruling's release order): the expert tier wants
+        // the biggest host blocks, and draining them first returns the most
+        // RAM before the engine starts spilling.
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let victims: Vec<Victim> = candidates.iter().map(|(_, _, v)| v.clone()).collect();
+        let reclaimed = candidates.iter().map(|(_, figure, _)| *figure).sum::<f64>();
+        let evicted: Vec<String> = victims.iter().map(|v| v.model.clone()).collect();
+        let skipped_words: Vec<String> = skipped
+            .iter()
+            .map(|(model, reason)| format!("{model}: {reason}"))
+            .collect();
+        let model = self.jobs[&job_id].model.clone();
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            job.reclaim.victims = victims;
+            job.reclaim.skipped = skipped;
+            job.reclaim.gib = reclaimed;
+        }
+        tracing::info!(
+            %job_id,
+            model = %model,
+            threshold_gib = threshold,
+            evicted = ?evicted,
+            reclaimed_gib = reclaimed,
+            skipped = ?skipped_words,
+            "expert-offload admit: host-RAM reclaim decision before the spawn"
+        );
     }
 }

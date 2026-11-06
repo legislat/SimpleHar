@@ -45,7 +45,7 @@ use crate::ownership::SpawnTicket;
 use admission::ReleaseSamples;
 use catalog::{gather_drift_stats, scan_with_binary_check, DriftStats};
 use fit::FitEntry;
-use jobs::{Job, Victim, Waiter};
+use jobs::{Job, Reclaim, Victim, Waiter};
 use measured::{MeasuredAnchor, MeasuredData, Reading};
 use messages::{ActorMsg, Event, ReconcileRelease, ServeIdProbeRelease, SnapshotRelease};
 use occupant::state_last_used;
