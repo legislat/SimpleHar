@@ -76,6 +76,9 @@ cargo build --release
    config file that already exists. The harness ignores an old `simplehar-se.json` or
    `simplehar.json` file and creates `simpleharn.json`.
 
+   To start it without a console window, double-click `SimpleHarn.vbs` beside the exe.
+   Run `simpleharn.exe` directly when you want the live tracing console.
+
 3. Open `http://127.0.0.1:8708/`. Load one model on the page. The harness starts that
    model's engine. No engine runs before a load.
 

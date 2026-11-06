@@ -15,6 +15,11 @@ uninstall, backup, and log retention.
 
 ## Autostart
 
+Manual launch: double-click `SimpleHarn.vbs` beside the exe to start the harness
+with no console window. Run `simpleharn.exe` directly when you want the live
+tracing console. The launcher starts the exe in its own folder and passes no
+arguments.
+
 Replace `<install-dir>` below with the folder that holds
 `simpleharn.exe` and `autostart.vbs`. Create `autostart.vbs` at the path
 the `Run` key below names. It runs the harness hidden at logon, once:
