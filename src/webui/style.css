@@ -224,6 +224,19 @@ header.sh-header {
   margin: 0;
 }
 
+/* The running build's version (TASK-VERSION-UI, 2026-11-06): small and muted so
+ * it reads as a qualifier of the title, not a second headline. The headline row
+ * already aligns items on the baseline and wraps, so the badge sits on the
+ * title's text line and drops to its own line at narrow width instead of
+ * pushing the badges off-screen. */
+.sh-version {
+  color: var(--pico-muted-color);
+  font-size: 0.78rem;
+  font-weight: 500;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .sh-badge {
   display: inline-block;
   padding: 0.1rem 0.55rem;

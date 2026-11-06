@@ -404,8 +404,22 @@ function renderMemory(status) {
   return el("div", { class: "sh-mem" }, ...bars);
 }
 
+// The running build's version, read from the status document — the only source
+// (`status_render.rs` stamps `CARGO_PKG_VERSION` into `/har/status.version`). An
+// absent, null or blank field is not a version: the page renders nothing rather
+// than invent one, so `vundefined` can never reach the screen (TASK-VERSION-UI).
+function statusVersion(status) {
+  const raw = status ? status.version : null;
+  return typeof raw === "string" && raw.trim() !== "" ? raw.trim() : null;
+}
+
 function renderHeader(status) {
   const loaded = status.slots.filter((slot) => slot.model).length;
+  // TASK-VERSION-UI (2026-11-06): the page names the build it is. The badge sits
+  // beside the title and the tab title follows it; an unknown version keeps the
+  // bare name everywhere.
+  const version = statusVersion(status);
+  document.title = version ? `SimpleHarn v${version}` : "SimpleHarn";
   // Both verdicts are computed by the harness (`status_document` reads the registry's
   // own `any_down` / `pending`) and read here as booleans. The page used to decode
   // them from the serde shape of `listeners` — a second brain for a rule the server
@@ -417,6 +431,7 @@ function renderHeader(status) {
     "div",
     { class: "sh-headline" },
     el("h1", { class: "sh-title" }, text("SimpleHarn")),
+    version ? el("span", { class: "sh-version" }, text(`v${version}`)) : null,
     el(
       "span",
       { class: "sh-badge", "data-tone": loaded > 0 ? "ok" : "none" },
@@ -972,6 +987,9 @@ function render() {
   // saved across it (text selection cannot survive a real content change and
   // does not need to; memory-only ticks never reach this function at all).
   const savedScroll = window.scrollY || 0;
+  // TASK-VERSION-UI: the footer names the same version the header badge carries,
+  // read from the status document, never a literal.
+  const version = statusVersion(status);
   const headerHost = document.getElementById("sh-header");
   headerHost.replaceChildren(renderHeader(status));
   const mainHost = document.getElementById("sh-main");
@@ -1022,7 +1040,9 @@ function render() {
     el(
       "footer",
       { class: "sh-footer" },
-      text("SimpleHarn — slots, jobs and refusals straight from /har/*"),
+      text(version
+        ? `SimpleHarn v${version} — slots, jobs and refusals straight from /har/*`
+        : "SimpleHarn — slots, jobs and refusals straight from /har/*"),
     ),
   );
   window.scrollTo(0, savedScroll);

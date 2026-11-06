@@ -61,6 +61,9 @@ globalThis.document = {
     return byId.get(id);
   },
   documentElement: new El("html"),
+  // A real page starts on the static <title> from index.html; the page may only
+  // move it from there (TASK-VERSION-UI reads document.title back).
+  title: "SimpleHarn",
   addEventListener: () => {},
 };
 // The driver below is eval'd in GLOBAL scope, so every switch the legs flip lives on
@@ -1972,6 +1975,91 @@ const driver = `
 
     // Leave the base document applied for anything that reads state afterwards.
     applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+  }
+
+  // ---- TASK-VERSION-UI (2026-11-06): the running build names itself ----
+  // The header badge, the tab title and the footer all read the version from the
+  // status document; an absent or blank version renders nothing and falls the
+  // title back to the bare name. The expected strings are computed from the
+  // fixture and a synthetic 9.9.9 - never from a hardcoded crate version.
+  {
+    const base = { ...fixtures["/har/status"], models: fixtures["/har/models"].data };
+    const fixtureVersion = fixtures["/har/status"].version;
+    const versionBadges = () =>
+      findAll(document.getElementById("sh-header"), "span", "sh-version").map(textOf);
+    const footerText = () => {
+      const foot = findAll(document.getElementById("sh-main"), "footer", "sh-footer");
+      return foot.length === 1 ? textOf(foot[0]) : "footers=" + foot.length;
+    };
+    // VU-03: the badge must SIT beside the title, not merely exist - the stub's
+    // children array pins it as the h1's immediate next sibling inside
+    // .sh-headline, so a move after the badge cannot pass on text alone.
+    const badgeAfterTitle = () => {
+      const head = findAll(document.getElementById("sh-header"), "div", "sh-headline")[0];
+      if (!head) return "no headline";
+      const kids = head.children;
+      const at = kids.findIndex((k) => k.tag === "h1");
+      if (at < 0) return "no h1 in headline";
+      if (kids[at].attrs.class !== "sh-title") return "h1 class=" + kids[at].attrs.class;
+      const next = kids[at + 1];
+      if (!next || next.tag !== "span") return "next=" + (next ? next.tag : "none");
+      if (next.attrs.class !== "sh-version") return "next class=" + next.attrs.class;
+      return textOf(next);
+    };
+    applyState({ ...base, version: "9.9.9" });
+    check("a version change re-renders the header badge (no stale string)",
+      versionBadges().join("|") === "v9.9.9", versionBadges().join("|"));
+    check("a version change re-sets the tab title (no stale string)",
+      document.title === "SimpleHarn v9.9.9", JSON.stringify(document.title));
+    check("a version change re-names the version in the footer (no stale string)",
+      footerText().includes("v9.9.9"), footerText());
+    applyState(base);
+    check("the header renders v + the fixture's version beside the title",
+      versionBadges().join("|") === "v" + fixtureVersion, versionBadges().join("|"));
+    check("the version badge is the immediate next sibling after the title",
+      badgeAfterTitle() === "v" + fixtureVersion, badgeAfterTitle());
+    check("document.title carries the same version as the header",
+      document.title === "SimpleHarn v" + fixtureVersion, JSON.stringify(document.title));
+    check("the footer names the same version, read from the status document",
+      footerText().includes("v" + fixtureVersion) &&
+        footerText().includes("slots, jobs and refusals straight from /har/*"),
+      footerText());
+    applyState({ ...base, version: "   " });
+    check("a blank version renders no version badge",
+      versionBadges().length === 0, versionBadges().join("|"));
+    check("a blank version falls the tab title back to SimpleHarn",
+      document.title === "SimpleHarn", JSON.stringify(document.title));
+    const noVersion = { ...base };
+    delete noVersion.version;
+    applyState(noVersion);
+    check("a missing version renders no version badge",
+      versionBadges().length === 0, versionBadges().join("|"));
+    check("a missing version falls the tab title back to SimpleHarn",
+      document.title === "SimpleHarn", JSON.stringify(document.title));
+    check("nothing invents a version: no vundefined, no blank badge, plain footer",
+      footerText() ===
+        "SimpleHarn \u2014 slots, jobs and refusals straight from /har/*" &&
+        textOf(document.getElementById("sh-header")).indexOf("vundefined") < 0 &&
+        textOf(document.getElementById("sh-header")).indexOf("v   ") < 0 &&
+        textOf(document.getElementById("sh-main")).indexOf("undefined") < 0,
+      "footer=" + footerText());
+    // VU-02: falsify the "typeof raw === string" guard in statusVersion. A
+    // guardless page stringifies what it finds: null renders a broken badge (or
+    // throws into the render error), and the number 13.1 renders v13.1. A
+    // non-string version is no version: no badge, bare tab title, plain footer.
+    applyState({ ...base, version: null });
+    check("a null version renders no badge, bare title and the plain footer",
+      versionBadges().length === 0 && document.title === "SimpleHarn" &&
+        footerText() === "SimpleHarn \u2014 slots, jobs and refusals straight from /har/*",
+      "badges=" + versionBadges().join("|") + " title=" +
+        JSON.stringify(document.title) + " footer=" + footerText());
+    applyState({ ...base, version: 13.1 });
+    check("a numeric version renders no badge, bare title and the plain footer",
+      versionBadges().length === 0 && document.title === "SimpleHarn" &&
+        footerText() === "SimpleHarn \u2014 slots, jobs and refusals straight from /har/*",
+      "badges=" + versionBadges().join("|") + " title=" +
+        JSON.stringify(document.title) + " footer=" + footerText());
+    applyState(base);
   }
 
   for (const [name, ok, extra] of results)
