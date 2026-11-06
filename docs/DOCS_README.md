@@ -24,6 +24,7 @@ this file is the table of contents; other documents link to it.
 | Know a binding product invariant | [docs/architecture/DOCTRINE.md](architecture/DOCTRINE.md) |
 | Understand the system design | [docs/architecture/OVERVIEW.md](architecture/OVERVIEW.md) |
 | Know what the OpenAI surface does and does not do | [docs/reference/COMPATIBILITY.md](reference/COMPATIBILITY.md) |
+| Set up an engine to run with the harness | [docs/reference/ENGINE-RECIPES.md](reference/ENGINE-RECIPES.md) |
 | Know why a decision was made | [docs/architecture/DECISIONS.md](architecture/DECISIONS.md) (and [DESIGN.md](../DESIGN.md) for history) |
 | Add or change code | [docs/process/ENGINEERING.md](process/ENGINEERING.md) |
 | Run the gate | [docs/process/VERIFICATION.md](process/VERIFICATION.md) |
@@ -91,6 +92,7 @@ durable and belongs in this tree.
 |---|---|---|
 | [CONFIG.md](reference/CONFIG.md) | Harness config keys and eviction rules | active |
 | [MODELS.md](reference/MODELS.md) | ModelConf schema and engine-specific model keys | active |
+| [ENGINE-RECIPES.md](reference/ENGINE-RECIPES.md) | Minimal per-engine setup for users and their agents | active |
 | [API.md](reference/API.md) | HTTP control API contract, error codes, memory provenance | active |
 | [COMPATIBILITY.md](reference/COMPATIBILITY.md) | OpenAI compatibility matrix, known-good configurations | active |
 | [OPERATIONS.md](reference/OPERATIONS.md) | Autostart, file layout, upgrade, uninstall, backup, log retention | active |

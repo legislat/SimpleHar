@@ -18,6 +18,12 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
 ## Unreleased
 
+### Added
+
+- `docs/reference/ENGINE-RECIPES.md`: minimal per-engine setup for llama.cpp,
+  Strata, Basalt, Project Maya, and NInferno, each with an installed-engine
+  wiring path and a fresh-install path.
+
 ### Fixed
 
 - The job ledger keeps every live row, the load row of each installed
