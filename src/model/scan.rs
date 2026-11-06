@@ -150,6 +150,7 @@ const CONSUMED_KEYS: &[&str] = &[
     "fit",
     "fit_target",
     "fit_ctx",
+    "llama_server_exe",
     "measured_gb",
     "measured_gb_min",
     "measured_ram_gb",
@@ -691,6 +692,29 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                             reason: crate::engine::ninfer::legacy_removed_sentence(script),
                         });
                         continue;
+                    }
+                }
+                // FR-13 (scan half): a llama row may override the global
+                // binary per row, but a value that cannot launch — blank or
+                // relative — is refused here with the key named, before
+                // admission can evict a resident for a doomed spawn. The
+                // existence check stays in the adapter's spec (same posture
+                // as `strata_exe`): the scan only pins the shape.
+                if entry.engine == "llama" {
+                    if let Some(value) = map.get("llama_server_exe") {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() || !Path::new(trimmed).is_absolute() {
+                            catalog.errors.push(ScanError {
+                                kind: ScanKind::PolicyRefused,
+                                file: file_name.clone(),
+                                reason: "`llama_server_exe` must name an absolute path to \
+                                         llama-server.exe; this row is not published until \
+                                         the key holds an absolute path or is removed \
+                                         (then the global `llama_server_exe` applies)"
+                                    .to_string(),
+                            });
+                            continue;
+                        }
                     }
                 }
                 // One container name may back exactly one model: unload reaps by
@@ -2696,6 +2720,77 @@ mod tests {
         );
     }
 
+    /// FR-13 (scan half): a llama row override that cannot launch — blank or
+    /// relative — is refused with the key named and never published; an
+    /// absolute value publishes silently (existence stays the adapter's
+    /// floor). On a foreign row the key is the usual `InertKey` hint, never a
+    /// refusal. Falsifier: drop the scan gate and a relative override
+    /// publishes as a loadable row that dies at spawn after eviction.
+    #[test]
+    fn a_llama_row_override_that_cannot_launch_is_refused_naming_the_key() {
+        let dir = crate::testutil::temp_dir("scan-llama-exe");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(dir.join("m.gguf"), b"weights").expect("seed model file");
+        std::fs::write(
+            dir.join("relative.yaml"),
+            "engine: llama\nmodel: m.gguf\nllama_server_exe: llama-server.exe\n",
+        )
+        .expect("write relative");
+        std::fs::write(
+            dir.join("blank.yaml"),
+            "engine: llama\nmodel: m.gguf\nllama_server_exe: \"   \"\n",
+        )
+        .expect("write blank");
+        std::fs::write(
+            dir.join("absolute.yaml"),
+            "engine: llama\nmodel: m.gguf\nllama_server_exe: D:/llama/llama-server.exe\n",
+        )
+        .expect("write absolute");
+        std::fs::write(
+            dir.join("foreign.yaml"),
+            "engine: strata\nllama_server_exe: X\n",
+        )
+        .expect("write foreign");
+        let catalog = scan_dir(&dir);
+        let names: Vec<&str> = catalog.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["absolute", "foreign"],
+            "unlaunchable overrides are refused, the rest publish: {:?}",
+            catalog.errors
+        );
+        for file in ["relative.yaml", "blank.yaml"] {
+            let refused = catalog
+                .errors
+                .iter()
+                .find(|e| e.file.contains(file) && e.kind == ScanKind::PolicyRefused)
+                .unwrap_or_else(|| panic!("{file} must be refused: {:?}", catalog.errors));
+            assert!(
+                refused.reason.contains("llama_server_exe"),
+                "the refusal names the key: {}",
+                refused.reason
+            );
+        }
+        assert!(
+            catalog.errors.iter().any(|e| {
+                e.kind == ScanKind::InertKey
+                    && e.file.contains("foreign.yaml")
+                    && e.reason
+                        .contains("`llama_server_exe` is read only by the llama engine(s)")
+            }),
+            "on a strata row the key is the usual inert hint: {:?}",
+            catalog.errors
+        );
+        assert!(
+            catalog
+                .errors
+                .iter()
+                .all(|e| !e.file.contains("absolute.yaml")),
+            "an absolute override on its own row is silent: {:?}",
+            catalog.errors
+        );
+    }
+
     /// Ruling 18b removal (green Wave C): a row that still declares the removed
     /// legacy `ninfer_autostart` path is **refused** at scan and never published,
     /// with the migration sentence naming every template key the row must adopt;
@@ -3477,6 +3572,7 @@ mod tests {
              fit: true\n\
              fit_target: 0.9\n\
              fit_ctx: 2048\n\
+             llama_server_exe: D:/llama/llama-server.exe\n\
              measured_gb: 20.0\n\
              measured_gb_min: 10.0\n\
              measured_ram_gb: 14.0\n\
@@ -3711,6 +3807,7 @@ mod tests {
             "cpu_offload",
             "jinja",
             "extra_args",
+            "llama_server_exe",
             "measured_gb",
             "measured_gb_min",
             "measured_ram_gb",

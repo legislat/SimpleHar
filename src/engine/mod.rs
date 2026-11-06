@@ -597,7 +597,9 @@ pub fn default_adapters(
     }
     adapters.insert(
         "llama".to_string(),
-        Arc::new(llama::LlamaAdapter::new(config.llama_server_exe.clone())),
+        Arc::new(llama::LlamaAdapter::from_config(
+            config.llama_server_exe.clone(),
+        )),
     );
     adapters.insert(
         "strata".to_string(),

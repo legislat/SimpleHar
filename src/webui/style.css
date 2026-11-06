@@ -598,6 +598,23 @@ html[data-theme="light"] input[type="checkbox"] {
   overflow-wrap: anywhere;
 }
 
+/* Config warnings (FR-15): the harness's own config verdicts (e.g. a LAN bind
+   with no token). Persistent amber banner at the top of the page, one line per
+   warning, above the tab and table - readable without opening the harness log,
+   and never dismissible. The warn tone is the same family as the loading dot
+   and the unload border; the fault red stays reserved for errors. */
+.sh-warnline {
+  color: var(--sh-warn-ink);
+  background: var(--sh-warn-tint);
+  border: 1px solid var(--sh-warn);
+  border-radius: var(--sh-radius);
+  padding: 0.4rem 0.7rem;
+  margin: 0 0 0.7rem;
+  font-size: 0.85rem;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
 /* The fault flash (role=alert) is a fault: red ink, its own class, never the
    hygiene amber (FINDINGS-24 [3]). */
 .sh-flash {

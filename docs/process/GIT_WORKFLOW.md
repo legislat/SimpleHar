@@ -90,6 +90,20 @@ Never run these operations to make a tree look clean.
 - The author cannot review their own work.
 - A change with open findings cannot land on `main`.
 
+## Toolchain and dependency policy
+
+- `rust-toolchain.toml` pins the build toolchain. The local build and the CI
+  gate build use the pinned version, never a drifting stable.
+- `Cargo.toml` declares `rust-version`: the minimum supported Rust version
+  (MSRV). The CI `msrv` job checks the crate on exactly that toolchain.
+- Dependabot opens weekly update pull requests for Cargo dependencies and for
+  GitHub Actions.
+- `deny.toml` holds the dependency policy: advisories, licenses, bans, and
+  source rules. The CI `deny` job runs cargo-deny on it.
+- A dependency bump must keep the MSRV a deliberate choice. When a bump needs
+  a newer toolchain, the same change updates `rust-version` and names the new
+  MSRV. Never raise the MSRV as a silent side effect of an update.
+
 ## Release
 
 A release is a task with acceptance criteria. Run the steps in this order:

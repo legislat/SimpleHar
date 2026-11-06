@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [harness configuration keys, category eviction rules]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
@@ -53,7 +53,7 @@ it never applies silent defaults.
 | `wsl_distro` / `wsl_user` | `Ubuntu` / *(set for ninfer)* | WSL coordinates for ninfer containers. |
 | `ninfer_log_max_size_mib` | `25` | Per-container ninfer log rotation size, in MiB. The harness renders it into the canonical autostart script's `--log-opt max-size`. Range 1-1024. Absent means `25`, today's value, so an unchanged file renders byte-identical. |
 | `ninfer_log_max_files` | `5` | Per-container ninfer log rotation file count. The harness renders it into the script's `--log-opt max-file`. Range 1-50. Absent means `5`, today's value. |
-| `llama_server_exe` | `C:\Inference\llama.cpp\llama-server.exe` | Engine binary. Boot refuses a blank value; omit the key to keep the default. First start prefers a `llama-server.exe` found on PATH (absolute entries only) and records the winner in the created file. |
+| `llama_server_exe` | *unset* | Optional default engine binary for every llama row. Boot refuses a blank value; omit the key to keep it unset. First start prefers a `llama-server.exe` found on PATH (absolute entries only) and records the winner in the created file. A llama row may override this default with its own `llama_server_exe` key (see `MODELS.md`). The harness binary embeds no install path. |
 | `engines.strata.python` / `engines.strata.cwd` | documented defaults | Interpreter and working directory for strata launches. The per-model `strata_python`/`strata_cwd` keys still override this section. |
 | `engines.llama.fit_probe` | `false` | When true, the harness asks the engine's own `llama-fit-params` calculator (a sibling of `llama_server_exe`) before spawn how much a llama row will need. The harness projects every llama row after boot and rescan, off the hot path. |
 | `engines.llama.fit_margin_gb` / `engines.llama.mmproj_surcharge_gb` / `engines.llama.fit_probe_timeout_s` | unset | Calibration constants for the projection. The margin is added per active GPU. The surcharge applies to vision rows. The timeout is the probe deadline. While the two figures are unset the probe stays silent and rows fall back down the cost ladder. Set them once from a calibrated card window. |

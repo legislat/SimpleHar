@@ -42,17 +42,16 @@ const PATH_EXEMPT = new Set([
   "docs/architecture/DOCTRINE.md",
 ]);
 // The canonical machine-path ban set, read from the one shared file so this
-// checker and scripts/release-check.ps1 can never disagree. The llama.cpp
-// engine-default allowance lives inside the first ban pattern itself.
+// checker and scripts/release-check.ps1 can never disagree. The author-machine
+// root is banned whole: the harness ships no default under it (FR-15).
 const MACHINE_PATH_BANS = JSON.parse(
   readFileSync(join(HERE, "machine-path-bans.json"), "utf8")
 ).bans.map((pattern) => new RegExp(pattern, "i"));
-// Documented product defaults: the llama.cpp install default, the strata
-// install home, and the model-root example, all named in README/reference.
-// Author-specific paths (for example C:\Users\... or an F:\ model path) are
-// not product defaults and still fail.
+// Documented product defaults: the strata install home and the model-root
+// example, both named in README/reference. Author-specific paths (for example
+// C:\Users\... or an F:\ model path) are not product defaults and still fail.
 const PRODUCT_DEFAULT_PATH =
-  /(?:C:\\Inference\\llama\.cpp|C:\\Strata|D:\\Models)/i;
+  /(?:C:\\Strata|D:\\Models)/i;
 
 function listFiles(relDir) {
   const abs = join(ROOT, relDir);

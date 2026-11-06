@@ -1154,7 +1154,7 @@ fn the_actor_applies_the_binary_verdict_it_is_handed_and_never_stats_for_one() {
     let absent = dir.join("llama-server.exe");
     let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
     let config = crate::config::AppConfig {
-        llama_server_exe: absent.clone(),
+        llama_server_exe: Some(absent.clone()),
         ..crate::config::AppConfig::default()
     };
     let mut state = ActorState::empty(
@@ -1167,7 +1167,7 @@ fn the_actor_applies_the_binary_verdict_it_is_handed_and_never_stats_for_one() {
     );
 
     assert!(
-        missing_binary_error(&absent).is_some(),
+        missing_binary_error(Some(&absent)).is_some(),
         "the fixture binary really is absent"
     );
     state.apply_catalog(
@@ -1186,7 +1186,7 @@ fn the_actor_applies_the_binary_verdict_it_is_handed_and_never_stats_for_one() {
 
     state.apply_catalog(
         crate::model::scan::Catalog::empty(),
-        missing_binary_error(&absent),
+        missing_binary_error(Some(&absent)),
         &DriftStats::default(),
     );
     let report = state
@@ -1197,7 +1197,9 @@ fn the_actor_applies_the_binary_verdict_it_is_handed_and_never_stats_for_one() {
     assert!(
         report.file == "config"
             && report.reason.contains(&absent.display().to_string())
-            && report.reason.contains("llama loads will fail"),
+            && report
+                .reason
+                .contains("without a row `llama_server_exe` will fail"),
         "the page-visible sentence keeps naming the path and the consequence: {:?}",
         report.reason
     );
@@ -1205,7 +1207,12 @@ fn the_actor_applies_the_binary_verdict_it_is_handed_and_never_stats_for_one() {
     // The other polarity: a binary that is there is nothing to report.
     let present = dir.join("present.exe");
     std::fs::write(&present, b"").expect("fixture binary");
-    assert!(missing_binary_error(&present).is_none());
+    assert!(missing_binary_error(Some(&present)).is_none());
+    assert!(
+        missing_binary_error(None).is_none(),
+        "no global binary is no verdict: the unset posture belongs to the rows, \
+         not to a page error (FR-13)"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6683,7 +6690,7 @@ fn fit_config(tool_dir: &std::path::Path) -> crate::config::AppConfig {
         r#"{"engines": {"llama": {"fit_probe": true, "fit_margin_gb": 0.5}}}"#,
     )
     .expect("valid");
-    cfg.llama_server_exe = tool_dir.join("llama-server.exe");
+    cfg.llama_server_exe = Some(tool_dir.join("llama-server.exe"));
     cfg
 }
 
@@ -9223,7 +9230,11 @@ async fn a_rescan_or_a_calculator_swap_retires_the_session_stamp() {
     let ticket = fold_ticket(19_305);
     state.catalog = vec![entry.clone()];
     seat_spawn(&mut state, &entry, &ticket, 19_305);
-    state.on_fit_version(state.fit_gen(), Some("b11669".to_string()));
+    state.on_fit_version(
+        state.fit_gen(),
+        &dir.join("llama-fit-params.exe"),
+        Some("b11669".to_string()),
+    );
     state.witness("fitretire-row", &ticket, 11.0);
     assert!(state.snapshot().fit_validated.contains("fitretire-row"));
     state.spawn_fit_warm();
@@ -9236,7 +9247,11 @@ async fn a_rescan_or_a_calculator_swap_retires_the_session_stamp() {
         state.snapshot().fit_validated.contains("fitretire-row"),
         "the new epoch can earn a fresh stamp"
     );
-    state.on_fit_version(state.fit_gen(), Some("b20000".to_string()));
+    state.on_fit_version(
+        state.fit_gen(),
+        &dir.join("llama-fit-params.exe"),
+        Some("b20000".to_string()),
+    );
     assert!(
         state.snapshot().fit_validated.is_empty(),
         "a replaced calculator voids verdicts earned under the old one"
@@ -9348,17 +9363,20 @@ fn a_replaced_calculator_voids_every_projection() {
     );
     let mut row = fit_llama_entry(&dir, "epoch-row");
     row.fit_gb = Some(31.0);
+    let tool = dir.join("llama-fit-params.exe");
     state.catalog = vec![row];
-    state.fit_version = Some("b11669".to_string());
+    state
+        .fit_versions
+        .insert(tool.clone(), "b11669".to_string());
     state.fit_cache.insert(
-        7,
+        (tool.clone(), 7),
         FitEntry {
             gib: 31.0,
             fingerprint: None,
         },
     );
     let gen = state.fit_gen();
-    state.on_fit_version(gen, Some("b12000".to_string()));
+    state.on_fit_version(gen, &tool, Some("b12000".to_string()));
     assert_eq!(
         state.fit_cache.len(),
         0,
@@ -9368,7 +9386,10 @@ fn a_replaced_calculator_voids_every_projection() {
         state.catalog[0].fit_gb, None,
         "a stripped row falls back to the ladder"
     );
-    assert_eq!(state.fit_version.as_deref(), Some("b12000"));
+    assert_eq!(
+        state.fit_versions.get(&tool).map(String::as_str),
+        Some("b12000")
+    );
     assert!(
         warns_holding(&capture, "the fit calculator changed under us") >= 1,
         "the void must be named, not silent"
@@ -9388,11 +9409,17 @@ fn an_unanswered_version_check_is_silence_about_this_pass_only() {
     );
     let mut row = fit_llama_entry(&dir, "silent-row");
     row.fit_gb = Some(3.0);
+    let tool = dir.join("llama-fit-params.exe");
     state.catalog = vec![row];
-    state.fit_version = Some("b11669".to_string());
+    state
+        .fit_versions
+        .insert(tool.clone(), "b11669".to_string());
     let gen = state.fit_gen();
-    state.on_fit_version(gen, None);
-    assert_eq!(state.fit_version.as_deref(), Some("b11669"));
+    state.on_fit_version(gen, &tool, None);
+    assert_eq!(
+        state.fit_versions.get(&tool).map(String::as_str),
+        Some("b11669")
+    );
     assert_eq!(state.catalog[0].fit_gb, Some(3.0));
     assert!(warns_holding(&capture, "did not answer --version") >= 1);
 }
@@ -9411,7 +9438,13 @@ fn a_stale_epoch_fit_answer_is_dropped_at_the_door() {
     let key = ActorState::fit_row_key(&entry).expect("probeable");
     state.catalog = vec![entry];
     let stale = state.fit_gen().wrapping_add(1);
-    state.on_fit_row_done(stale, "stale-row", key, Ok((31.0, None)));
+    state.on_fit_row_done(
+        stale,
+        &dir.join("llama-fit-params.exe"),
+        "stale-row",
+        key,
+        Ok((31.0, None)),
+    );
     assert_eq!(
         state.catalog[0].fit_gb, None,
         "the superseded epoch's figure is void"
@@ -9592,7 +9625,7 @@ async fn an_admit_hit_books_the_projection_a_proven_change_voids_it() {
 
     // Unstat'able model file (both sides absent): no evidence, figure stands.
     state.fit_cache.insert(
-        key,
+        (dir.join("llama-fit-params.exe"), key),
         FitEntry {
             gib: 31.0,
             fingerprint: None,
@@ -9642,7 +9675,7 @@ async fn an_admit_hit_books_the_projection_a_proven_change_voids_it() {
         size: fresh.size + 1,
     };
     state.fit_cache.insert(
-        key,
+        (dir.join("llama-fit-params.exe"), key),
         FitEntry {
             gib: 31.0,
             fingerprint: Some(stale_stamp),

@@ -364,7 +364,7 @@ async fn main() -> ExitCode {
         let conf_dir = config.modelconf_dir.clone();
         let wsl_account = config.wsl_account().map(str::to_string);
         tokio::spawn(async move {
-            log_boot_banner(&handle, &exe, &conf_dir, wsl_account.as_deref()).await;
+            log_boot_banner(&handle, exe.as_deref(), &conf_dir, wsl_account.as_deref()).await;
         });
     }
     let listeners = simpleharn::listeners::ListenerRegistry::new();
@@ -488,7 +488,7 @@ async fn probe_system(witness: &Arc<simpleharn::witness::NvmlWitness>) -> firstr
     {
         Ok(Ok(found)) => {
             if found.is_none() {
-                tracing::info!("first start: no llama-server.exe on PATH or the default dir; the config keeps the documented path");
+                tracing::info!("first start: no llama-server.exe on PATH; llama_server_exe stays unset — llama rows must each name their own `llama_server_exe`");
             }
             found
         }
@@ -552,25 +552,49 @@ mod boot_order {
 ///
 /// `wsl_account` is [`AppConfig::wsl_account`] resolved at boot: `None` means no
 /// ninfer load can be addressed in WSL.
+/// The llama-binary posture the boot banner warns about (PH-RUST-03: the
+/// CHOICE is a pure function so the falsifier can pin it without a runtime or
+/// a filesystem): unset is a posture, a configured-but-absent binary is a
+/// fault, a present binary is silence. `exe_missing` is the stat verdict, only
+/// meaningful when a binary is configured.
+fn llama_binary_warning(exe: Option<&std::path::Path>, exe_missing: bool) -> Option<&'static str> {
+    match exe {
+        None => Some(
+            "llama_server_exe is not configured: llama loads will refuse unless each row \
+             names its own `llama_server_exe`",
+        ),
+        Some(_) if exe_missing => Some(
+            "llama-server.exe not found; llama-engine loads will fail until \
+             llama_server_exe is configured",
+        ),
+        Some(_) => None,
+    }
+}
+
 async fn log_boot_banner(
     scheduler: &SchedulerHandle,
-    llama_server_exe: &std::path::Path,
+    llama_server_exe: Option<&std::path::Path>,
     modelconf_dir: &std::path::Path,
     wsl_account: Option<&str>,
 ) {
-    let exe_missing = {
-        let exe = llama_server_exe.to_path_buf();
-        tokio::task::spawn_blocking(move || !exe.exists())
-            .await
-            // FINDINGS-14 [8]: fail toward warning — a check that could not run must
-            // not report the reassuring "exe is present" verdict.
-            .unwrap_or(true)
-    };
-    if exe_missing {
-        tracing::warn!(
-            path = %llama_server_exe.display(),
-            "llama-server.exe not found; llama-engine loads will fail until llama_server_exe is configured"
-        );
+    // FR-15: an unset global is legal (rows may each name their own binary),
+    // but it is an unsafe posture worth one boot warn.
+    match llama_server_exe {
+        Some(exe) => {
+            let owned = exe.to_path_buf();
+            let exe_missing = tokio::task::spawn_blocking(move || !owned.exists())
+                .await
+                // FINDINGS-14 [8]: fail toward warning — a check that could not run must
+                // not report the reassuring "exe is present" verdict.
+                .unwrap_or(true);
+            if let Some(message) = llama_binary_warning(Some(exe), exe_missing) {
+                tracing::warn!(path = %exe.display(), "{message}");
+            }
+        }
+        None => tracing::warn!(
+            "{}",
+            llama_binary_warning(None, false).expect("the unset arm always names its posture")
+        ),
     }
     let catalog = match scheduler.catalog().await {
         Ok(catalog) => catalog,
@@ -1058,7 +1082,8 @@ mod tests {
 
     use super::{
         boot_config, boot_order, decode_console_output, first_run_target, gate_verdict,
-        log_boot_banner, parse_excluded_ranges, probe_outcome, run, run_cli, supervise_listener,
+        llama_binary_warning, log_boot_banner, parse_excluded_ranges, probe_outcome, run, run_cli,
+        supervise_listener,
     };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1701,6 +1726,30 @@ Start Port    End Port
         serde_json::from_slice(&bytes).expect("status is JSON")
     }
 
+    /// PH-RUST-03 falsifier: the boot-posture choice is pinned pure. Delete
+    /// the `None` arm of `llama_binary_warning` and the unset leg goes red;
+    /// answer `Some` for a present binary and the silence leg goes red.
+    #[test]
+    fn the_boot_banner_picks_the_llama_binary_posture() {
+        let unset = llama_binary_warning(None, false).expect("unset always names the posture");
+        assert!(
+            unset.contains("llama_server_exe is not configured"),
+            "{unset}"
+        );
+        assert!(
+            llama_binary_warning(None, true).is_some(),
+            "no binary to stat: the unset posture answers either way"
+        );
+        let path = std::path::Path::new("Z:/nowhere/llama-server.exe");
+        let missing =
+            llama_binary_warning(Some(path), true).expect("a configured-absent binary is named");
+        assert!(missing.contains("not found"), "{missing}");
+        assert!(
+            llama_binary_warning(Some(path), false).is_none(),
+            "a present binary owes no warning"
+        );
+    }
+
     /// FINDINGS-14 [5], zero-engine-spawns pin. Everything `lib` owns on the boot
     /// side — the adapter map, `Scheduler::start`, `ApiState::new`, the A6 banner
     /// inventory, the listener registry and the `/har/status` read the page and tray
@@ -1717,7 +1766,7 @@ Start Port    End Port
         let (scheduler, state) = boot_wiring(&config, Arc::new(NeverRuntime));
         log_boot_banner(
             &scheduler,
-            &config.llama_server_exe,
+            config.llama_server_exe.as_deref(),
             &config.modelconf_dir,
             None,
         )

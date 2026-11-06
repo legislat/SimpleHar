@@ -1,0 +1,13 @@
+# Weekly dependency updates (FR-14). A bump must keep the MSRV a deliberate
+# choice: see docs/process/GIT_WORKFLOW.md (Toolchain and dependency policy).
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

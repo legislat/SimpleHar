@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy, rustfmt
 
@@ -37,3 +37,30 @@ jobs:
       - name: Instruction check
         shell: pwsh
         run: node scripts/check-instructions.mjs
+
+  # MSRV gate: Cargo.toml declares rust-version 1.88. This job must build on
+  # exactly that toolchain, so a dependency bump cannot silently raise it.
+  # The committed rust-toolchain.toml outranks the toolchain selected by
+  # dtolnay/rust-toolchain, so the check pins the toolchain explicitly with
+  # `+1.88.0` (and the step env) instead of relying on the action's default.
+  msrv:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check on MSRV
+        env:
+          RUSTUP_TOOLCHAIN: "1.88.0"
+        run: cargo +1.88.0 check --locked --all-targets
+
+  # Dependency policy: advisories, licenses, bans, and sources (deny.toml).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2

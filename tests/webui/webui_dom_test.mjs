@@ -2193,6 +2193,59 @@ const driver = `
     applyState(base);
   }
 
+  // ---- FR-15: config warnings render a persistent banner at the TOP of main ----
+  // The harness owns the verdict (status.config_warnings from /har/status and the
+  // SSE document); the page renders each server message verbatim with role=alert,
+  // above the tab/table, with no dismiss control and no page-side re-derivation
+  // of the LAN condition. Falsifiers: drop the banner from render() and the
+  // present checks go red; render it unconditionally and the empty-array check
+  // goes red.
+  {
+    const warnMessage =
+      "internal_host is 0.0.0.0 and no control token is set: the API is unauthenticated on the LAN";
+    const warnDoc = JSON.parse(JSON.stringify(fixtures["/har/status"]));
+    warnDoc.config_warnings = [{ code: "lan_no_token", message: warnMessage }];
+    applyState({ ...warnDoc, models: fixtures["/har/models"].data });
+    const warnMain = document.getElementById("sh-main");
+    const banners = findAll(warnMain, "div", "sh-warnline");
+    const banner = banners.length === 1 ? banners[0] : null;
+    check("config_warnings render one persistent banner above the table",
+      banners.length === 1 && warnMain.children[0] === banner &&
+        findAll(warnMain, "div", "sh-tabpanel").length === 1 &&
+        warnMain.children.indexOf(banner) <
+          warnMain.children.indexOf(findAll(warnMain, "div", "sh-tabpanel")[0]),
+      "banners=" + banners.length +
+        " firstChildIsBanner=" + (warnMain.children[0] === banner));
+    check("the warning banner carries role=alert and the server message verbatim",
+      !!banner && banner.attrs.role === "alert" && textOf(banner) === warnMessage,
+      banner ? JSON.stringify([banner.attrs, textOf(banner)]) : "missing");
+    applyState({
+      ...warnDoc, config_warnings: [],
+      models: fixtures["/har/models"].data,
+    });
+    check("an empty config_warnings array renders no banner",
+      findAll(document.getElementById("sh-main"), "div", "sh-warnline").length === 0);
+    applyState({
+      ...warnDoc,
+      config_warnings: [
+        { code: "lan_no_token", message: warnMessage },
+        { code: "other", message: "second harness warning" },
+      ],
+      models: fixtures["/har/models"].data,
+    });
+    const twoLines = findAll(document.getElementById("sh-main"), "div", "sh-warnline");
+    check("two warnings render as two lines in one banner",
+      twoLines.length === 1 && textOf(twoLines[0]).includes(warnMessage) &&
+        textOf(twoLines[0]).includes("second harness warning") &&
+        findAll(twoLines[0], "div").length === 2,
+      twoLines.length === 1 ? textOf(twoLines[0]) : "banners=" + twoLines.length);
+    // The banner never claims a dismiss control: nothing on it posts.
+    check("the banner carries no dismiss control",
+      twoLines.length === 1 && findAll(twoLines[0], "button").length === 0,
+      twoLines.length ? JSON.stringify(findAll(twoLines[0], "button").length) : "missing");
+    applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+  }
+
   for (const [name, ok, extra] of results)
     console.log((ok ? "PASS " : "FAIL ") + name + (ok || !extra ? "" : " :: " + extra));
   process.exit(results.every((r) => r[1]) ? 0 : 1);

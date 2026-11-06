@@ -527,6 +527,21 @@ function catalogNotices(status) {
     : null;
 }
 
+// Config warnings the harness decided (FR-15): e.g. a LAN bind with no control
+// token. They live at the TOP of the page, above the tab and table, so the
+// operator reads them without opening the harness log. The page renders each
+// server message verbatim and re-derives no condition (the page-must-not-derive
+// rule). The banner is persistent: it carries no dismiss control.
+function configWarningsBanner(status) {
+  const warnings = Array.isArray(status.config_warnings) ? status.config_warnings : [];
+  if (warnings.length === 0) return null;
+  return el(
+    "div",
+    { class: "sh-warnline", role: "alert" },
+    ...warnings.map((warning) => el("div", {}, text(warning ? warning.message : ""))),
+  );
+}
+
 // The loaded slot whose container reports its reservation (R9 display chain), or
 // null. The slot itself travels, not just its figure: the armed `need_gib` is
 // the gate's side of the same booking, so a cell can name a divergence (F3).
@@ -1049,7 +1064,9 @@ function render() {
     logBody,
   );
   const notices = catalogNotices(status);
+  const configWarnings = configWarningsBanner(status);
   mainHost.replaceChildren(
+    ...(configWarnings ? [configWarnings] : []),
     renderTab(status, state.activeTab),
     ...(jobs ? [jobs] : []),
     el(

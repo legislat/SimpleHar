@@ -29,6 +29,38 @@ When an atomic write fails its own validation, the harness restores the
 original bytes. The error names exactly where every byte ended up. A failed
 edit never leaves a half-written model file in use.
 
+The harness never scans a model directory. It reads only `ModelConf/*.yaml`.
+See "Rows are hand-written" below.
+
+## Rows are hand-written (operator ruling 2026-11-06)
+
+You write one row per model. The harness never scans model directories for
+`.gguf` files. Four reasons make the hand-written row the design:
+
+- Engine keys: a row names engine-specific paths, profiles, and serve ids
+  that a model file cannot carry.
+- Category and cost: the category, the cost class, and the launch floor are
+  operator decisions. A scan cannot guess them.
+- Split files: a GGUF split set needs every shard plus the right `mmproj`.
+  A scan cannot pair a shard set or pick the vision projector.
+- Conservative admission: admission books only figures a row declares or a
+  trusted source proves (DOCTRINE items 3 and 12). An inferred row would
+  publish numbers the gate must not trust.
+
+Start a new row by copy and paste, then edit the fields:
+
+```yaml
+engine: llama
+model: <models-dir>\<model>.gguf
+category: AUX
+vram_gb: 8
+cost: fixed
+context: 8192
+```
+
+The file stem is the model identity (see the `name` key below). Save the file
+in `ModelConf` beside the exe, then rescan or restart.
+
 | Key | Notes |
 |---|---|
 | `name` | Optional. The file stem is the model identity. A `name` that mismatches the stem is refused: rename the file or drop the key. |
@@ -47,6 +79,7 @@ edit never leaves a half-written model file in use.
 | `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. A `maya` row reports the digits-only `--max-context` figure from its L1 config's `args` (either spelling; the scan captures it), or no figure when the config spells none. |
 | `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. For the basalt 482B class, `load_timeout: 1200` is the recommended starting point. A `maya` row must declare 300 or more: the scan refuses a missing or smaller value rather than let a healthy load meet the 120 s default. |
 | `min_turn` | Minimum seconds of service before a different model's request may evict this model. The harness refuses to evict a model that has served less than `min_turn` seconds for a different model's request. Omitting the key means no guard. An explicit request for the model's own slot is never blocked. Range 1-86400 seconds; scan refuses a value outside it. A measured swap runs 14-45 s, so the knob stops a ping-pong of swaps between two hot models. |
+| `llama_server_exe` | **llama only.** Optional absolute path to an existing `llama-server.exe` that **only this row** uses. It selects a different llama.cpp fork for that model. The working directory follows the executable's parent, so the engine DLLs must sit beside the file. The global `llama_server_exe` config key stays the default for rows that set none (see `CONFIG.md`). See "Llama engines" below. |
 | `strata_exe` | **Required for strata** (template mode): the absolute path of the engine binary that the harness-rendered profile names. Its presence selects template mode. `serve_model` is also required, and it becomes the profile's served model name. |
 | `strata_tokenizer` | **Required for strata**: the absolute tokenizer path that the rendered profile names. |
 | `strata_python` | Interpreter. It must be an existing `.exe` **file**; it is the program the harness launches (default `C:\Strata\.venv\Scripts\python.exe`). |
@@ -152,6 +185,44 @@ protects, or one inside its `min_turn` guard, is skipped and named in the
 log; it never refuses the load. GPU residents are never victims of this
 drain, and no host-RAM gate exists for GPU rows: the card gate stays exactly
 as it was. Set the key to `0` to disable the rule.
+
+### Llama engines
+
+Llama rows (`engine: llama`, the default) run a native `llama-server.exe`.
+Two sources name that binary:
+
+- The optional global `llama_server_exe` config key is the default for every
+  row. First start prefers a `llama-server.exe` found on PATH and records it
+  (see `CONFIG.md`).
+- A row may set its own `llama_server_exe`. The value must be an absolute
+  path to an existing `llama-server.exe`, and the harness uses it only for
+  that row. The working directory follows the executable's parent, so the
+  engine DLLs sit beside the chosen binary.
+
+A row override selects a different llama.cpp fork. The fit probe groups its
+cached projections by the effective executable, so two forks with the same
+argv never share one projection. Two rows, two forks (placeholders, not
+machine facts):
+
+```yaml
+# row-a.yaml
+engine: llama
+model: <models-dir>\model-a.gguf
+category: WORK
+vram_gb: 24
+cost: fixed
+llama_server_exe: <fork-a-dir>\llama-server.exe
+```
+
+```yaml
+# row-b.yaml
+engine: llama
+model: <models-dir>\model-b.gguf
+category: AUX
+vram_gb: 8
+cost: fixed
+llama_server_exe: <fork-b-dir>\llama-server.exe
+```
 
 ### Strata engines
 

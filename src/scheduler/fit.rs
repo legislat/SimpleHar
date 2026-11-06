@@ -8,7 +8,7 @@
 
 use crate::engine::EngineRuntime;
 use crate::model::ModelEntry;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,7 +56,8 @@ pub(super) struct FitEntry {
 
 /// One row a fit pass projects: the argv identity, the row it belongs to, and
 /// what the booking formula needs that argv does not carry (the vision
-/// surcharge flag, the model file to fingerprint).
+/// surcharge flag, the model file to fingerprint). The calculator that will
+/// compute it is the row's group (FR-13), not a per-row copy.
 #[derive(Debug, Clone)]
 pub(super) struct FitRowPlan {
     pub(super) model: String,
@@ -66,38 +67,46 @@ pub(super) struct FitRowPlan {
     pub(super) model_file: Option<PathBuf>,
 }
 
-/// A whole fit pass resolved once off the actor: the config-sibling tool, the
-/// calibration constants, the rows to project.
+/// One calculator's group (FR-13): the fit tool, the calibration constants,
+/// and the rows its server binary serves. A pass runs the version leg once
+/// per group and projects only that group's rows.
 #[derive(Debug, Clone)]
-pub(super) struct FitProbePlan {
+pub(super) struct FitToolPlan {
     pub(super) program: PathBuf,
     pub(super) constants: crate::engine::fit::FitConstants,
     pub(super) rows: Vec<FitRowPlan>,
 }
 
+/// A whole fit pass resolved once off the actor: one group per distinct
+/// effective `llama_server_exe` its fit-capable rows resolve to.
+#[derive(Debug, Clone)]
+pub(super) struct FitProbePlan {
+    pub(super) tools: Vec<FitToolPlan>,
+}
+
 /// The version leg shared by the warm pass and the admit refresh: report what
 /// the calculator says it is, then answer whether rows may run at all — no
-/// answer is silence for the whole pass (a tool that will not say its version
-/// will not project either; one warn, not a probe per doomed row). A CHANGED
-/// answer does not stop the pass: the version message lands before every row
-/// message, so rows computed under the new tool are stamped under the new
-/// epoch the handler just minted.
+/// answer is silence for that tool's whole group (a tool that will not say its
+/// version will not project either; one warn, not a probe per doomed row). A
+/// CHANGED answer does not stop the group: the version message lands before
+/// every row message, so rows computed under the new tool are stamped under
+/// the new epoch the handler just minted.
 pub(super) async fn run_fit_version_leg(
     runtime: &Arc<dyn EngineRuntime>,
     tx: &mpsc::UnboundedSender<ActorMsg>,
     gen: u64,
-    plan: &FitProbePlan,
+    tool: &FitToolPlan,
 ) -> bool {
     // Absence is checked and NAMED here (off the actor, immediately before the
     // first probe), never guessed past: a missing calculator is one warn and
-    // the whole ladder stands — no version message, no rows, no silence about
-    // why. Async stat: no synchronous fs on the worker either, the
+    // that group's ladder stands — no version message, no rows, no silence
+    // about why. Async stat: no synchronous fs on the worker either, the
     // FINDINGS2-04 [2] discipline this whole file keeps for its actor turn.
-    let tool_present = match tokio::fs::try_exists(&plan.program).await {
+    let tool_present = match tokio::fs::try_exists(&tool.program).await {
         Ok(present) => present,
         Err(error) => {
             tracing::warn!(
-                path = %plan.program.display(),
+                path = %tool.program.display(),
                 error = %error,
                 "cannot stat the fit tool; the fit pass stays silent and the ladder stands"
             );
@@ -107,7 +116,7 @@ pub(super) async fn run_fit_version_leg(
     if !tool_present {
         tracing::warn!(
             error = %crate::engine::fit::FitError::ToolMissing {
-                path: plan.program.display().to_string(),
+                path: tool.program.display().to_string(),
             },
             "fit pass skipped"
         );
@@ -115,14 +124,15 @@ pub(super) async fn run_fit_version_leg(
     }
     let answer = runtime
         .run_probe_command(
-            &plan.program,
+            &tool.program,
             &crate::engine::fit::version_args(),
-            plan.constants.probe_timeout,
+            tool.constants.probe_timeout,
         )
         .await;
     let established = answer.is_some();
     let _ = tx.send(ActorMsg::FitVersionDone {
         gen,
+        program: tool.program.clone(),
         version: answer,
     });
     established
@@ -135,15 +145,15 @@ pub(super) async fn run_fit_version_leg(
 /// on the NEXT check, the safe direction).
 pub(super) async fn run_fit_row_leg(
     runtime: &Arc<dyn EngineRuntime>,
-    plan: &FitProbePlan,
+    tool: &FitToolPlan,
     row: &FitRowPlan,
 ) -> Result<(f64, Option<crate::model::FileFingerprint>), String> {
     match runtime
-        .run_probe_command(&plan.program, &row.args, plan.constants.probe_timeout)
+        .run_probe_command(&tool.program, &row.args, tool.constants.probe_timeout)
         .await
     {
         Some(stdout) => {
-            crate::engine::fit::parse_and_book(&stdout, row.has_mmproj, &plan.constants)
+            crate::engine::fit::parse_and_book(&stdout, row.has_mmproj, &tool.constants)
                 .map(|gib| {
                     (
                         gib,
@@ -204,10 +214,11 @@ impl ActorState {
     /// R11 warm fit pass (boot scan and every rescan alike): re-stamp the epoch
     /// so probes born under a superseded catalog drop at the handler, then —
     /// only with the probe switched on — project every fit-capable row,
-    /// serially and deferred, off-thread. Like R5's reconcile there is no I/O
-    /// in the actor loop and nothing here can gate, kill or invent: the answer
-    /// lands as a catalog patch through [`ActorState::on_fit_row_done`] or the
-    /// row keeps its ladder.
+    /// serially and deferred, off-thread, one version leg per distinct tool
+    /// (FR-13). Like R5's reconcile there is no I/O in the actor loop and
+    /// nothing here can gate, kill or invent: the answer lands as a catalog
+    /// patch through [`ActorState::on_fit_row_done`] or the row keeps its
+    /// ladder.
     pub(super) fn spawn_fit_warm(&mut self) {
         self.fit_epoch.fetch_add(1, Ordering::Relaxed);
         // R11: the rescan's epoch retires every session cross-check stamp — a
@@ -230,31 +241,51 @@ impl ActorState {
             // competes with nothing at boot, and a rescan mid-pass makes every
             // remaining row of THIS pass stale before its probe (the epoch
             // moved), while answers already sent are dropped by the handler's
-            // own epoch guard.
+            // own epoch guard. A group whose version leg fails skips only its
+            // own rows (FR-13): another tool's calculator can still answer.
             tokio::time::sleep(FIT_WARM_DELAY).await;
-            if !run_fit_version_leg(&runtime, &tx, gen, &plan).await {
-                return;
-            }
-            for row in plan.rows.iter() {
+            for tool in plan.tools.iter() {
                 if epoch.load(Ordering::Relaxed) != gen || tx.is_closed() {
                     return;
                 }
-                let outcome = run_fit_row_leg(&runtime, &plan, row).await;
-                let _ = tx.send(ActorMsg::FitRowDone {
-                    gen,
-                    model: row.model.clone(),
-                    key: row.key,
-                    outcome,
-                });
+                if !run_fit_version_leg(&runtime, &tx, gen, tool).await {
+                    continue;
+                }
+                for row in tool.rows.iter() {
+                    if epoch.load(Ordering::Relaxed) != gen || tx.is_closed() {
+                        return;
+                    }
+                    let outcome = run_fit_row_leg(&runtime, tool, row).await;
+                    let _ = tx.send(ActorMsg::FitRowDone {
+                        gen,
+                        program: tool.program.clone(),
+                        model: row.model.clone(),
+                        key: row.key,
+                        outcome,
+                    });
+                }
             }
         });
+    }
+
+    /// The fit tool one row projects with (FR-13): the sibling
+    /// `llama-fit-params.exe` of the row's EFFECTIVE `llama_server_exe` —
+    /// the row's own override when it carries one, else the config default.
+    /// `None` means neither names a binary: the row cannot be projected and
+    /// keeps its ladder. Pure path derivation — no filesystem touch, so the
+    /// admit turn may call it (FR-02).
+    #[must_use]
+    fn fit_tool_program(entry: &ModelEntry, default: Option<&std::path::Path>) -> Option<PathBuf> {
+        crate::engine::llama::LlamaAdapter::effective_server_exe(default, entry)
+            .map(|exe| crate::engine::fit::resolve_tool(&exe))
     }
 
     /// Resolves the warm plan, or `None` (with the reason warned once per
     /// catalog application) when the pass must stay silent: probe off is total
     /// silence — zero probes, ladder unchanged — while an uncalibrated
     /// constant is a named warn, never a silent zero pretending to be a
-    /// calibration.
+    /// calibration. Rows group by their effective tool (FR-13); a row with no
+    /// binary at all is named once and keeps its ladder.
     pub(super) fn fit_probe_plan(&self) -> Option<FitProbePlan> {
         let llama = self.cfg.llama_fit()?;
         if !self.cfg.llama_fit_probe_enabled() {
@@ -271,39 +302,52 @@ impl ActorState {
                 return None;
             }
         };
-        let rows: Vec<FitRowPlan> = self
+        let default = self.cfg.llama_server_exe.as_deref();
+        let mut groups: std::collections::BTreeMap<PathBuf, Vec<FitRowPlan>> =
+            std::collections::BTreeMap::new();
+        for entry in self
             .catalog
             .iter()
             .filter(|entry| crate::engine::policy::fit_capable(&entry.engine))
-            .filter_map(|entry| {
-                let args = match crate::engine::fit::probe_args(&entry.raw) {
-                    Ok(args) => args,
-                    Err(error) => {
-                        tracing::warn!(model = %entry.name, error = %error, "fit row is not probeable");
-                        return None;
-                    }
-                };
-                let key = crate::engine::fit::args_hash(&args);
-                Some(FitRowPlan {
-                    model: entry.name.clone(),
-                    key,
-                    args,
-                    has_mmproj: entry
-                        .raw
-                        .get("mmproj")
-                        .is_some_and(|v| !v.trim().is_empty()),
-                    model_file: Self::fit_model_file(entry),
-                })
+        {
+            let Some(program) = Self::fit_tool_program(entry, default) else {
+                tracing::warn!(
+                    model = %entry.name,
+                    "fit row resolves no llama_server_exe: the row keeps its ladder"
+                );
+                continue;
+            };
+            let args = match crate::engine::fit::probe_args(&entry.raw) {
+                Ok(args) => args,
+                Err(error) => {
+                    tracing::warn!(model = %entry.name, error = %error, "fit row is not probeable");
+                    continue;
+                }
+            };
+            let key = crate::engine::fit::args_hash(&args);
+            groups.entry(program).or_default().push(FitRowPlan {
+                model: entry.name.clone(),
+                key,
+                args,
+                has_mmproj: entry
+                    .raw
+                    .get("mmproj")
+                    .is_some_and(|v| !v.trim().is_empty()),
+                model_file: Self::fit_model_file(entry),
+            });
+        }
+        let tools: Vec<FitToolPlan> = groups
+            .into_iter()
+            .map(|(program, rows)| FitToolPlan {
+                program,
+                constants: constants.clone(),
+                rows,
             })
             .collect();
-        if rows.is_empty() {
+        if tools.is_empty() {
             return None;
         }
-        Some(FitProbePlan {
-            program: crate::engine::fit::resolve_tool(&self.cfg.llama_server_exe),
-            constants,
-            rows,
-        })
+        Some(FitProbePlan { tools })
     }
 
     /// The R11 admit-time fit refresh, run on the actor BEFORE the booking
@@ -333,10 +377,18 @@ impl ActorState {
         let Some(key) = Self::fit_row_key(entry) else {
             return;
         };
+        // FR-13: the row's OWN calculator owns the figure — the cache key and
+        // the version check both follow the row's effective tool, never a
+        // global one. No resolvable binary: nothing certifies, the ladder
+        // books.
+        let Some(program) = Self::fit_tool_program(entry, self.cfg.llama_server_exe.as_deref())
+        else {
+            return;
+        };
         let fingerprint = Self::fit_carried_fingerprint(entry);
         let hit = self
             .fit_cache
-            .get(&key)
+            .get(&(program.clone(), key))
             .filter(|cell| match (&cell.fingerprint, &fingerprint) {
                 (Some(have), Some(now)) => have == now,
                 // One side unstat'able is the absence of EVIDENCE: the figure
@@ -347,21 +399,24 @@ impl ActorState {
             .map(|cell| cell.gib);
         if let Some(gib) = hit {
             entry.fit_gb = Some(gib);
-            self.patch_catalog_fit(&entry.name, key, gib);
+            self.patch_catalog_fit(&entry.name, &program, key, gib);
             // A booked hit still asks the tool who it is: an admit may not
             // park behind a process spawn, so the check is fire-and-forget.
-            // A replaced calculator voids the cache and strips the row figures
-            // the moment its answer lands, and the NEXT admit is a miss
-            // (ladder); this admit books the figure it had already certified.
-            // Nothing a mismatch could leave behind persists, and the physical
-            // gate remains the witness.
-            if let Some(plan) = self.fit_probe_plan() {
+            // A replaced calculator voids that tool's cache and strips the
+            // rows it minted the moment its answer lands, and the NEXT admit
+            // is a miss (ladder); this admit books the figure it had already
+            // certified. Nothing a mismatch could leave behind persists, and
+            // the physical gate remains the witness.
+            if let Some(tool) = self
+                .fit_probe_plan()
+                .and_then(|plan| plan.tools.into_iter().find(|t| t.program == program))
+            {
                 let gen = self.fit_gen();
                 let runtime = Arc::clone(&self.runtime);
                 let tx = self.tx.clone();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        run_fit_version_leg(&runtime, &tx, gen, &plan).await;
+                        run_fit_version_leg(&runtime, &tx, gen, &tool).await;
                     });
                 }
             }
@@ -370,10 +425,13 @@ impl ActorState {
         // The stale figure, if any, is dropped for THIS booking: the ladder —
         // declared > measured > estimate — books a projection it cannot certify.
         entry.fit_gb = None;
-        let Some(plan) = self.fit_probe_plan() else {
+        let Some(tool) = self
+            .fit_probe_plan()
+            .and_then(|plan| plan.tools.into_iter().find(|t| t.program == program))
+        else {
             return;
         };
-        let Some(row) = plan.rows.iter().find(|row| row.key == key).cloned() else {
+        let Some(row) = tool.rows.iter().find(|row| row.key == key).cloned() else {
             return;
         };
         let gen = self.fit_gen();
@@ -383,12 +441,13 @@ impl ActorState {
             return;
         };
         handle.spawn(async move {
-            if !run_fit_version_leg(&runtime, &tx, gen, &plan).await {
+            if !run_fit_version_leg(&runtime, &tx, gen, &tool).await {
                 return;
             }
-            let outcome = run_fit_row_leg(&runtime, &plan, &row).await;
+            let outcome = run_fit_row_leg(&runtime, &tool, &row).await;
             let _ = tx.send(ActorMsg::FitRowDone {
                 gen,
+                program: tool.program,
                 model: row.model,
                 key: row.key,
                 outcome,
@@ -396,12 +455,13 @@ impl ActorState {
         });
     }
 
-    /// The answer leg of the version probe: a moved epoch voids the whole cache
-    /// and strips every row's figure (a projection belongs to the calculator
-    /// that minted it); no answer is silence about THIS pass only — the
-    /// established epoch and its figures stand (a momentarily absent tool is
-    /// no evidence the tool changed).
-    pub(super) fn on_fit_version(&mut self, gen: u64, version: Option<String>) {
+    /// The answer leg of the version probe: a moved epoch voids that tool's
+    /// whole cache and strips the rows its binary serves (a projection belongs
+    /// to the calculator that minted it, FR-13: another tool's figures and
+    /// rows are untouched); no answer is silence about THIS pass only — the
+    /// established epochs and their figures stand (a momentarily absent tool
+    /// is no evidence the tool changed).
+    pub(super) fn on_fit_version(&mut self, gen: u64, program: &Path, version: Option<String>) {
         if gen != self.fit_gen() {
             return;
         }
@@ -412,25 +472,34 @@ impl ActorState {
             );
             return;
         };
-        if self.fit_version.as_deref() == Some(version.as_str()) {
+        if self.fit_versions.get(program).map(String::as_str) == Some(version.as_str()) {
             return;
         }
-        if self.fit_version.is_some() {
+        if let Some(previous) = self.fit_versions.get(program) {
             tracing::warn!(
-                previous = %self.fit_version.as_deref().unwrap_or_default(),
+                tool = %program.display(),
+                previous = %previous,
                 version = %version,
-                "the fit calculator changed under us: every cached projection is void \
-                 (a figure belongs to the tool that minted it)"
+                "the fit calculator changed under us: this tool's cached projections are \
+                 void (a figure belongs to the tool that minted it)"
             );
         }
-        self.fit_version = Some(version);
-        self.fit_cache.clear();
+        self.fit_versions.insert(program.to_path_buf(), version);
+        // FR-13: only THIS tool's figures die — a figure belongs to the
+        // calculator that minted it, and that is exactly the tool that just
+        // changed. Other tools keep their certified projections.
+        self.fit_cache.retain(|(tool, _), _| tool != program);
         // R11: a replaced calculator voids the session cross-checks too — the
         // tolerance's own margin belongs to the tool that minted the projection,
         // so a verdict earned under the old one says nothing about the new.
+        // Cleared whole on purpose: the stamp map does not carry the tool, and
+        // conservatively retiring a green is the safe direction.
         self.fit_stamps.clear();
         for entry in &mut self.catalog {
-            if crate::engine::policy::fit_capable(&entry.engine) {
+            if crate::engine::policy::fit_capable(&entry.engine)
+                && Self::fit_tool_program(entry, self.cfg.llama_server_exe.as_deref()).as_deref()
+                    == Some(program)
+            {
                 entry.fit_gb = None;
             }
         }
@@ -438,9 +507,10 @@ impl ActorState {
     }
 
     /// The answer leg of a row probe: Ok lands in the cache and patches the
-    /// catalog row that still carries the probed identity, Err is a named warn
-    /// and the ladder. A stale epoch's answer is dropped at the door — the
-    /// superseded catalog is not the catalog this answer describes.
+    /// catalog row that still carries the probed identity — argv key AND tool
+    /// (FR-13) — Err is a named warn and the ladder. A stale epoch's answer is
+    /// dropped at the door — the superseded catalog is not the catalog this
+    /// answer describes.
     ///
     /// FR-02: the probe's fingerprint was taken off-actor after the answer, so
     /// it is the freshest reading of the row's model file — it refreshes the
@@ -450,6 +520,7 @@ impl ActorState {
     pub(super) fn on_fit_row_done(
         &mut self,
         gen: u64,
+        program: &Path,
         model: &str,
         key: u64,
         outcome: Result<(f64, Option<crate::model::FileFingerprint>), String>,
@@ -477,24 +548,25 @@ impl ActorState {
                 crate::model::note_scan_fingerprint(yaml, raw, fingerprint);
             }
         }
-        self.fit_cache.insert(key, FitEntry { gib, fingerprint });
-        self.patch_catalog_fit(model, key, gib);
+        self.fit_cache
+            .insert((program.to_path_buf(), key), FitEntry { gib, fingerprint });
+        self.patch_catalog_fit(model, program, key, gib);
     }
 
-    /// Patches the catalog row the probed identity still describes, then
-    /// republishes so the page's Cost column sees the same figure the gate
-    /// would book (one derivation — the duplication-review rule).
-    fn patch_catalog_fit(&mut self, model: &str, key: u64, gib: f64) {
-        let Some(entry) = self
-            .catalog
-            .iter_mut()
-            .find(|m| m.name == model && crate::engine::policy::fit_capable(&m.engine))
-        else {
+    /// Patches the catalog row the probed identity still describes — argv
+    /// key AND the tool it was projected with (FR-13) — then republishes so
+    /// the page's Cost column sees the same figure the gate would book (one
+    /// derivation — the duplication-review rule).
+    fn patch_catalog_fit(&mut self, model: &str, program: &Path, key: u64, gib: f64) {
+        let default = self.cfg.llama_server_exe.clone();
+        let Some(entry) = self.catalog.iter_mut().find(|m| {
+            m.name == model
+                && crate::engine::policy::fit_capable(&m.engine)
+                && Self::fit_row_key(m) == Some(key)
+                && Self::fit_tool_program(m, default.as_deref()).as_deref() == Some(program)
+        }) else {
             return;
         };
-        if Self::fit_row_key(entry) != Some(key) {
-            return;
-        }
         if entry.fit_gb == Some(gib) {
             return;
         }
@@ -611,9 +683,11 @@ mod tests {
         }
     }
 
-    /// State with the probe switched on and the calibration left unset: the
-    /// refresh gate opens (probe enabled) while `fit_probe_plan` resolves to
-    /// `None`, so the pins drive the cache decision without any spawn.
+    /// State with the probe switched on, a global binary configured (FR-13:
+    /// the cache keys are tool-qualified, so the pins need one), and the
+    /// calibration left unset: the refresh gate opens (probe enabled) while
+    /// `fit_probe_plan` resolves to `None`, so the pins drive the cache
+    /// decision without any spawn.
     fn fit_probe_state() -> ActorState {
         let mut adapters: BTreeMap<String, Arc<dyn crate::engine::EngineAdapter>> = BTreeMap::new();
         adapters.insert(
@@ -621,14 +695,30 @@ mod tests {
             Arc::new(crate::engine::mock::MockAdapter) as Arc<dyn crate::engine::EngineAdapter>,
         );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        ActorState::empty(
+        let state_dir = crate::testutil::temp_dir("fit-fr02-state");
+        let mut cfg =
             crate::config::AppConfig::parse(r#"{"engines": {"llama": {"fit_probe": true}}}"#)
-                .expect("probe on, margin unset"),
-            crate::testutil::temp_dir("fit-fr02-state"),
+                .expect("probe on, margin unset");
+        cfg.llama_server_exe = Some(state_dir.join("llama-server.exe"));
+        ActorState::empty(
+            cfg,
+            state_dir,
             adapters,
             Arc::new(SilentRuntime) as Arc<dyn EngineRuntime>,
             Arc::new(crate::budget::LedgerOnlyWitness),
             tx,
+        )
+    }
+
+    /// The tool the pins' rows resolve to: the state's configured global
+    /// binary's fit sibling (FR-13 cache key).
+    fn fit_program(state: &ActorState) -> std::path::PathBuf {
+        crate::engine::fit::resolve_tool(
+            state
+                .cfg
+                .llama_server_exe
+                .as_deref()
+                .expect("the pins configure a global binary"),
         )
     }
 
@@ -682,9 +772,10 @@ mod tests {
         let carried = fp(1024);
         model::note_scan_fingerprint(&yaml, &raw, carried);
         let key = ActorState::fit_row_key(&entry).expect("probeable row");
+        let program = fit_program(&state);
         state.catalog = vec![entry.clone()];
         state.fit_cache.insert(
-            key,
+            (program, key),
             FitEntry {
                 gib: 30.0,
                 fingerprint: Some(carried),
@@ -726,9 +817,10 @@ mod tests {
         let kept_yaml = kept.file.clone().expect("seeded");
         let kept_raw = kept.fit_model_key().expect("a local model").to_string();
         let key = ActorState::fit_row_key(&kept).expect("probeable row");
+        let program = fit_program(&state);
         state.catalog = vec![kept.clone()];
         state.fit_cache.insert(
-            key,
+            (program.clone(), key),
             FitEntry {
                 gib: 30.0,
                 fingerprint: Some(fp(1024)),
@@ -747,9 +839,10 @@ mod tests {
         let changed_yaml = changed.file.clone().expect("seeded");
         let changed_raw = changed.fit_model_key().expect("a local model").to_string();
         let key = ActorState::fit_row_key(&changed).expect("probeable row");
+        let program = fit_program(&state);
         state.catalog = vec![changed.clone()];
         state.fit_cache.insert(
-            key,
+            (program, key),
             FitEntry {
                 gib: 30.0,
                 fingerprint: Some(fp(1024)),
@@ -788,6 +881,7 @@ mod tests {
         // was ever certified for B (cold cache) — a probe is the only way.
         model::note_scan_fingerprint(&yaml, &raw, fp(2048));
         let key = ActorState::fit_row_key(&entry).expect("probeable row");
+        let program = fit_program(&state);
         state.catalog = vec![entry.clone()];
         model::reset_fingerprint_stat_calls();
         entry.fit_gb = Some(9.0);
@@ -795,6 +889,7 @@ mod tests {
         assert_eq!(entry.fit_gb, None, "cold cache: the ladder books");
         state.on_fit_row_done(
             state.fit_gen(),
+            &program,
             "fr02probe-row",
             key,
             Ok((31.0, Some(fp(2048)))),
@@ -828,9 +923,10 @@ mod tests {
         let mut entry = fit_row(&dir, "fr02keep-none-row");
         entry.file = None; // synthetic: nothing to carry
         let key = ActorState::fit_row_key(&entry).expect("probeable row");
+        let program = fit_program(&state);
         state.catalog = vec![entry.clone()];
         state.fit_cache.insert(
-            key,
+            (program, key),
             FitEntry {
                 gib: 28.0,
                 fingerprint: Some(fp(1024)),
@@ -874,5 +970,76 @@ mod tests {
                 "FR-02: the admit turn must not touch the filesystem: {forbidden}"
             );
         }
+    }
+
+    /// FR-13 falsifier: two rows on DIFFERENT `llama_server_exe` binaries with
+    /// byte-identical probe argv get DISTINCT cache keys (a figure belongs to
+    /// the calculator that minted it), and a version change for tool A voids
+    /// only A's figures — tool B's cached projection and its row's number
+    /// survive. Falsifier: key the cache by argv hash alone and both figures
+    /// share a slot and die together; strip every fit row on a version change
+    /// and row B goes red.
+    #[test]
+    fn two_tools_with_identical_argv_never_share_or_void_each_others_figure() {
+        let dir = crate::testutil::temp_dir("fit-two-tools");
+        let mut state = fit_probe_state();
+        state.cfg.llama_server_exe = None; // every row names its own binary
+        let exe_a = dir.join("a").join("llama-server.exe");
+        let exe_b = dir.join("b").join("llama-server.exe");
+        let mut row_a = fit_row(&dir, "two-a-row");
+        let mut row_b = fit_row(&dir, "two-b-row");
+        // Same weights, same flags: identical probe argv, one differing key.
+        let shared_model = row_a.raw.get("model").cloned().expect("seeded model");
+        row_b.raw.insert("model".to_string(), shared_model);
+        row_a
+            .raw
+            .insert("llama_server_exe".to_string(), exe_a.display().to_string());
+        row_b
+            .raw
+            .insert("llama_server_exe".to_string(), exe_b.display().to_string());
+        let key_a = ActorState::fit_row_key(&row_a).expect("probeable A");
+        let key_b = ActorState::fit_row_key(&row_b).expect("probeable B");
+        assert_eq!(
+            key_a, key_b,
+            "identical argv is the point of this falsifier"
+        );
+        let program_a = dir.join("a").join("llama-fit-params.exe");
+        let program_b = dir.join("b").join("llama-fit-params.exe");
+        assert_ne!(program_a, program_b, "distinct binaries, distinct tools");
+        row_a.fit_gb = Some(31.0);
+        row_b.fit_gb = Some(29.0);
+        state.catalog = vec![row_a, row_b];
+        state.on_fit_row_done(
+            state.fit_gen(),
+            &program_a,
+            "two-a-row",
+            key_a,
+            Ok((31.0, None)),
+        );
+        state.on_fit_row_done(
+            state.fit_gen(),
+            &program_b,
+            "two-b-row",
+            key_b,
+            Ok((29.0, None)),
+        );
+        assert_eq!(
+            state.fit_cache.len(),
+            2,
+            "the same argv under two calculators is two entries"
+        );
+        // Tool A's calculator changes under us: only A's figures die.
+        let gen = state.fit_gen();
+        state.on_fit_version(gen, &program_a, Some("b99999".to_string()));
+        assert_eq!(state.fit_cache.len(), 1, "B's figure survives A's swap");
+        assert_eq!(
+            state.catalog[0].fit_gb, None,
+            "A's row falls back to the ladder"
+        );
+        assert_eq!(
+            state.catalog[1].fit_gb,
+            Some(29.0),
+            "B's row keeps its figure"
+        );
     }
 }

@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [architect, agent]
 source_of_truth_for: [settled and deferred decisions]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: new-decision, release
 ---
 
@@ -718,3 +718,33 @@ recorded here so dated references to ARCHIVED still resolve:
   1.3.2 and ships after the version display, the expert-offload reclaim rule,
   FR-08/FR-09, and the owed card legs. It includes Project Maya, the public
   card evidence, and the new directory rule. | 2026-11-06 | `938660b`
+
+- **Llama engine binary: optional global default and per-row fork override**
+  (operator ruling 2026-11-06): the harness ships no `llama_server_exe`
+  default. First start records a `llama-server.exe` found on absolute `PATH`
+  entries into `simpleharn.json`. A llama model row may name its own absolute
+  `llama_server_exe` to select a different llama.cpp fork; the row value wins.
+  If neither names a binary, the load refuses and names the key. The fit probe
+  groups rows by effective binary and keys its version and cache per tool, so
+  two forks never share a projection. | 2026-11-06 | `this change`
+
+- **LAN bind without a token stays allowed, with a page warning** (operator
+  ruling 2026-11-06): a non-loopback `internal_host` with no `control_token`
+  or `SIMPLEHARN_TOKEN` remains a valid boot. `/har/status` carries a
+  `config_warnings` entry, and the control page shows a persistent warning
+  banner. Boot does not refuse the posture and adds no acknowledgement key.
+  | 2026-11-06 | `this change`
+
+- **Model rows stay hand-written** (operator ruling 2026-11-06): the catalog
+  scans only `ModelConf/*.yaml`; it does not scan model directories.
+  Engine-specific keys, category and cost decisions, split GGUF shards and
+  mmproj files, and conservative admission require an operator-authored row.
+  `MODELS.md` documents the choice and a copy-paste row.
+  | 2026-11-06 | `this change`
+
+- **Toolchain and dependency policy** (operator ruling 2026-11-06): the build
+  toolchain is `1.98.1` in `rust-toolchain.toml`, the declared MSRV is `1.88`,
+  CI tests the MSRV with `cargo +1.88.0`, Dependabot covers cargo and Actions
+  weekly, and cargo-deny enforces advisories, licenses, bans, and sources. A
+  dependency bump must keep the MSRV a deliberate choice.
+  | 2026-11-06 | `this change`

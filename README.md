@@ -56,7 +56,10 @@ can parse them reliably. The trade is that some pages read terse.
 
 ### From source
 
-You need the stable Rust toolchain on Windows.
+You need Rust on Windows. `rust-toolchain.toml` pins the build toolchain to
+Rust 1.98.1. rustup installs the pinned toolchain on the first build. The
+minimum supported Rust version (MSRV) is 1.88. CI checks the crate on the
+MSRV.
 
 ```powershell
 cargo build --release
@@ -79,10 +82,13 @@ cargo build --release
    [MODELS.md](docs/reference/MODELS.md).
 
 2. Run `target\release\simpleharn.exe` with the `ModelConf` folder beside it. First run
-   probes the GPU total (NVML) and `llama-server.exe` on PATH. It writes the authoritative
-   `simpleharn.json` beside the exe, and it binds loopback only. It never overwrites a
-   config file that already exists. The harness ignores an old `simplehar-se.json` or
-   `simplehar.json` file and creates `simpleharn.json`.
+   probes the GPU total (NVML), prefers a `llama-server.exe` found on PATH, and records
+   the winner. It writes the authoritative `simpleharn.json` beside the exe, and it binds
+   loopback only. The binary embeds no engine install path. `llama_server_exe`
+   is an optional global default. A llama row may override it for its own
+   fork. It never overwrites a config file that already exists. The harness
+   ignores an old `simplehar-se.json` or `simplehar.json` file and creates
+   `simpleharn.json`.
 
    To start it without a console window, double-click `SimpleHarn.vbs` beside the exe.
    Run `simpleharn.exe` directly when you want the live tracing console.
@@ -161,7 +167,9 @@ loaded. The control routes, memory provenance, and error codes are in
 ## Security
 
 The API is unauthenticated by default, and it binds to loopback. Set `SIMPLEHARN_TOKEN`
-(or `control_token`) before any non-loopback bind, and never expose the harness to a LAN
+(or `control_token`) before any non-loopback bind. The harness still allows a
+non-loopback `internal_host` such as `0.0.0.0` without a token. The control page then
+shows a persistent warning banner on every read. Do not expose the harness to a LAN
 without a token.
 
 - With a token set, every route except the page assets requires it, on `X-Har-Token` or
@@ -176,7 +184,7 @@ without a token.
 
 | Engine | What runs | What the machine needs |
 |---|---|---|
-| `llama` (default) | a native `llama-server.exe` process per model, serving a GGUF file | a llama.cpp build; first run prefers a `llama-server.exe` found on PATH, and `llama_server_exe` names it |
+| `llama` (default) | a native `llama-server.exe` process per model, serving a GGUF file | a llama.cpp build; first run detects and records a `llama-server.exe` found on PATH; `llama_server_exe` sets an optional global default, and a model row can override it for its own fork |
 | `strata` | a Python server in a virtualenv, on a harness-rendered profile | a Strata install with its virtualenv and engine binary; the interpreter and working directory are config keys |
 | `basalt` | a Python server in a virtualenv, on a harness-rendered profile | a Basalt install with its virtualenv and engine binary; the row names the interpreter, working directory, and engine |
 | `maya` | a Python server in a virtualenv, on a harness-staged model config | a Project Maya install with its virtualenv and engine; the row names the interpreter, root, and model config |

@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, maintainer]
 source_of_truth_for: [release history]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: release
 ---
 
@@ -15,6 +15,31 @@ names they shipped with. The format follows Keep a Changelog. Versions follow Se
 Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
+
+## Unreleased
+
+### Added
+
+- The control page shows a persistent warning banner at the top of the page
+  when the harness boots with config warnings, for example a LAN bind with no
+  control token. The banner names the harness reason verbatim; the operator no
+  longer opens the harness log to see it.
+- A llama row may set `llama_server_exe` to run its own llama.cpp fork. The
+  path is an absolute path to an existing `llama-server.exe` used only by that
+  row; the working directory follows the executable's parent.
+
+### Changed
+
+- The harness no longer embeds a llama.cpp install path. `llama_server_exe` is
+  an optional global default; first start detects and records a
+  `llama-server.exe` found on PATH. A llama load with no configured and no
+  detected binary refuses with a named reason.
+- The build toolchain is pinned (`rust-toolchain.toml`, Rust 1.98.1) and the
+  crate declares MSRV 1.88 (`rust-version`). CI builds the pinned gate, checks
+  the MSRV, runs the cargo-deny policy, and Dependabot updates Cargo and
+  Actions weekly.
+- Documented as a design choice: the harness scans only `ModelConf/*.yaml` and
+  never model directories. Model rows stay hand-written (`MODELS.md`).
 
 ## v1.3.4 - 2026-11-06
 

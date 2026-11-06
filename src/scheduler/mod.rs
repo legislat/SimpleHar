@@ -228,17 +228,19 @@ struct ActorState {
     /// report. Warn fires only when the set CHANGES, so repeated rescans of the
     /// same stranded container never spam the ring.
     last_reported_stranded: Option<BTreeSet<String>>,
-    /// R11 fit cache (in-process only, never persisted): probe argv hash → the
-    /// projection and the model-file fingerprint it was computed against. A
-    /// figure is valid precisely while its argv AND the calculator that minted
-    /// it are unchanged — the version epoch and fingerprint checks are the two
-    /// halves of that identity.
-    fit_cache: HashMap<u64, FitEntry>,
-    /// The fit-tool version line the current cache was minted under. `None` =
-    /// never confirmed; no figure books before the first answer, and a version
-    /// change voids the whole cache (a figure belongs to the calculator that
-    /// minted it).
-    fit_version: Option<String>,
+    /// R11 fit cache (in-process only, never persisted): `(fit tool, probe argv
+    /// hash)` → the projection and the model-file fingerprint it was computed
+    /// against. A figure is valid precisely while its argv AND the calculator
+    /// that minted it are unchanged — the version epoch and fingerprint checks
+    /// are the two halves of that identity. The tool joins the key (FR-13):
+    /// rows served by different `llama_server_exe` binaries never share a
+    /// figure, because each binary's sibling calculator minted its own.
+    fit_cache: HashMap<(PathBuf, u64), FitEntry>,
+    /// The version line each fit tool answered when its current cache was
+    /// minted (FR-13: one entry per tool, keyed by the tool itself). A tool
+    /// absent from the map is never confirmed; a version change voids that
+    /// tool's cache (a figure belongs to the calculator that minted it).
+    fit_versions: HashMap<PathBuf, String>,
     /// The catalog epoch the fit work is stamped with: bumped on every catalog
     /// application, so a warm pass or an admit refresh born under a superseded
     /// catalog is dropped at the handler instead of patching rows that may no
@@ -391,13 +393,20 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
                     state.publish();
                 }
             }
-            ActorMsg::FitVersionDone { gen, version } => state.on_fit_version(gen, version),
+            ActorMsg::FitVersionDone {
+                gen,
+                program,
+                version,
+            } => {
+                state.on_fit_version(gen, &program, version);
+            }
             ActorMsg::FitRowDone {
                 gen,
+                program,
                 model,
                 key,
                 outcome,
-            } => state.on_fit_row_done(gen, &model, key, outcome),
+            } => state.on_fit_row_done(gen, &program, &model, key, outcome),
             ActorMsg::MeasuredPersistFailed { model, data, file } => {
                 state.on_measured_persist_failed(&model, &data, file);
             }
@@ -492,7 +501,7 @@ impl ActorState {
             reconcile_in_flight: false,
             last_reported_stranded: None,
             fit_cache: HashMap::new(),
-            fit_version: None,
+            fit_versions: HashMap::new(),
             fit_epoch: Arc::new(AtomicU64::new(0)),
             fit_stamps: BTreeMap::new(),
             slots,

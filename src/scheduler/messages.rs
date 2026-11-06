@@ -175,16 +175,22 @@ pub(super) enum ActorMsg {
     /// with it): `Some` = the calculator's version line, `None` = the tool did
     /// not answer and the fit pass stays silent. `gen` is the catalog epoch the
     /// probe was born in — a stale epoch's answer is dropped at the door.
+    /// `program` (FR-13) is the fit tool the answer describes — a version
+    /// belongs to one calculator, so it voids that tool's cache, not every
+    /// tool's.
     FitVersionDone {
         gen: u64,
+        program: PathBuf,
         version: Option<String>,
     },
     /// An R11 fit row probe finished: `Ok` = (booked GiB, the model file's
     /// fingerprint at computation); `Err` = why (warn + ladder, never a
     /// fabricated figure). `key` is the probe argv hash the figure was computed
-    /// for — the cache identity.
+    /// for and `program` (FR-13) the tool that computed it — together they are
+    /// the cache identity (a figure belongs to the calculator that minted it).
     FitRowDone {
         gen: u64,
+        program: PathBuf,
         model: String,
         key: u64,
         outcome: Result<(f64, Option<crate::model::FileFingerprint>), String>,

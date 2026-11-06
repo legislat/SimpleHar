@@ -35,6 +35,19 @@ pub enum ConfigError {
     },
 }
 
+/// A page-visible configuration warning (FR-15, operator ruling 2026-11-06):
+/// not a boot error — the harness starts and serves — but a posture the
+/// operator must see on `/har/status` (`config_warnings`) instead of only in
+/// the boot log. `code` is the stable machine vocabulary (snake_case);
+/// `message` is the full human sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigWarning {
+    /// Stable machine code (`lan_open_without_token`, `llama_server_exe_unset`).
+    pub code: &'static str,
+    /// The operator-facing sentence, with the key and the remedy named (G6).
+    pub message: String,
+}
+
 /// The accepted category spellings, quoted wherever a message asks for one — the
 /// vocabulary lives with the type, not in copies of it (duplication review).
 pub const CATEGORY_HINT: &str = "WORK|RP|AUX|EMB";
@@ -198,10 +211,6 @@ fn default_modelconf_dir() -> std::path::PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("ModelConf")))
         .unwrap_or_else(|| std::path::PathBuf::from("ModelConf"))
-}
-
-fn default_llama_server_exe() -> std::path::PathBuf {
-    std::path::PathBuf::from(r"C:\Inference\llama.cpp\llama-server.exe")
 }
 
 /// First port of the sequential engine-port allocation (HANDOFF §3 SE port plan).
@@ -567,10 +576,13 @@ pub struct AppConfig {
     /// Whether the tray icon starts with the harness (Step 15; loopback tool knob, G9).
     #[serde(default = "default_tray_enabled")]
     pub tray_enabled: bool,
-    /// Path to `llama-server.exe` (A.7: the operator's script is the source of truth
-    /// for flags; the binary path is config).
-    #[serde(default = "default_llama_server_exe")]
-    pub llama_server_exe: std::path::PathBuf,
+    /// Global `llama-server.exe` default (A.7: the operator's script is the
+    /// source of truth for flags; the binary path is config). Absent by
+    /// default (FR-13, operator ruling 2026-11-06): the harness ships no
+    /// author-machine install default. A llama row then either carries its
+    /// own `llama_server_exe` key or its load is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama_server_exe: Option<std::path::PathBuf>,
     /// Directory of per-model flat yaml files (Step 9); missing dir = empty catalog.
     #[serde(default = "default_modelconf_dir")]
     pub modelconf_dir: std::path::PathBuf,
@@ -762,7 +774,7 @@ impl Default for AppConfig {
             release_timeout_s: default_release_timeout(),
             load_timeout_s: default_load_timeout(),
             tray_enabled: default_tray_enabled(),
-            llama_server_exe: default_llama_server_exe(),
+            llama_server_exe: None,
             modelconf_dir: default_modelconf_dir(),
             settle_timeout_s: default_settle_timeout(),
             witness_tolerance_gb: default_witness_tolerance(),
@@ -1011,20 +1023,20 @@ impl AppConfig {
                 }
             }
         }
-        // R2-11-06: the same present-but-blank doctrine for the engine binary. A
-        // blank exe booted clean and failed every llama load later at spawn with
-        // an OS error naming `""`, where boot could have named the key.
+        // R2-11-06 (FR-13 reworded): the same present-but-blank doctrine for the
+        // engine binary. A blank exe booted clean and failed every llama load
+        // later at spawn with an OS error naming `""`, where boot could have
+        // named the key. Absent is now the documented neutral state (no global
+        // default exists), not a fallback path.
         if self
             .llama_server_exe
-            .as_os_str()
-            .to_string_lossy()
-            .trim()
-            .is_empty()
+            .as_deref()
+            .is_some_and(|exe| exe.as_os_str().to_string_lossy().trim().is_empty())
         {
             errors.push(ConfigError::Invalid {
                 field: "llama_server_exe".to_string(),
-                reason: "must name a non-blank path; omit the key to keep the documented \
-                         default"
+                reason: "must name a non-blank path; omit the key and let each llama \
+                         row name its own `llama_server_exe`"
                     .to_string(),
             });
         }
@@ -1418,6 +1430,39 @@ impl AppConfig {
             })
             .collect()
     }
+
+    /// FR-15: the page-visible posture warnings, derived from the config alone
+    /// plus whether a control token resolves (`token_present` is
+    /// `ApiState::requires_token()` — this crate stays env-agnostic here).
+    /// Pure and side-effect-free, like [`Self::evictable_by_warnings`]; unlike
+    /// it, these ride every `/har/status` and SSE document, because both
+    /// describe a live consequence the operator may be acting on right now
+    /// (a LAN that can drive the GPU, a llama load that will refuse).
+    #[must_use]
+    pub fn config_warnings(&self, token_present: bool) -> Vec<ConfigWarning> {
+        let mut warnings = Vec::new();
+        if !self.internal_host.is_loopback() && !token_present {
+            warnings.push(ConfigWarning {
+                code: "lan_open_without_token",
+                message: format!(
+                    "The harness listens on {} with no control token. Every device on \
+                     this network can load models and drive the GPU. Set control_token \
+                     or SIMPLEHARN_TOKEN.",
+                    self.internal_host
+                ),
+            });
+        }
+        if self.llama_server_exe.is_none() {
+            warnings.push(ConfigWarning {
+                code: "llama_server_exe_unset",
+                message: "`llama_server_exe` is not configured: every llama row must name \
+                          its own `llama_server_exe`, or its load refuses with that key \
+                          named."
+                    .to_string(),
+            });
+        }
+        warnings
+    }
 }
 
 /// Test/validate helper: mutable access to one category by id (panics only in tests,
@@ -1659,7 +1704,7 @@ mod tests {
             load_timeout_s: 22,
             measured_sample_s: 33,
             tray_enabled: true,
-            llama_server_exe: std::path::PathBuf::from("F:/bin/llama-server.exe"),
+            llama_server_exe: Some(std::path::PathBuf::from("F:/bin/llama-server.exe")),
             modelconf_dir: std::path::PathBuf::from("F:/modelconf"),
             settle_timeout_s: 44,
             witness_tolerance_gb: 1.5,
@@ -2210,9 +2255,127 @@ mod tests {
         }
         let absent = AppConfig::parse("{}").expect("defaults parse");
         assert!(
+            absent.llama_server_exe.is_none(),
+            "FR-13: an absent key is the neutral state — no author-machine default"
+        );
+        assert!(
             absent.validate().is_empty(),
-            "an absent key keeps the documented default: {:?}",
+            "an absent key validates: {:?}",
             absent.validate()
+        );
+    }
+
+    /// FR-13 serialization pin: the unset default never writes the key out —
+    /// a first-run file must not claim a binary this machine does not have.
+    /// Falsifier: drop `skip_serializing_if` and the null/absent legs go red.
+    #[test]
+    fn an_unset_llama_server_exe_is_not_serialized() {
+        let value = serde_json::to_value(AppConfig::default()).expect("default serializes");
+        assert!(
+            value.get("llama_server_exe").is_none(),
+            "unset must be absent, never null: {value}"
+        );
+        let set = AppConfig {
+            llama_server_exe: Some(std::path::PathBuf::from("D:/llama/llama-server.exe")),
+            ..AppConfig::default()
+        };
+        let value = serde_json::to_value(&set).expect("set serializes");
+        assert_eq!(
+            value["llama_server_exe"],
+            serde_json::json!("D:/llama/llama-server.exe")
+        );
+        let round: AppConfig = serde_json::from_value(value).expect("set round-trips");
+        assert_eq!(round, set);
+    }
+
+    /// FR-15 falsifier, PH-RUST-02 sharpened: each posture warns exactly when
+    /// it is real — the contract is "not loopback", and the message names the
+    /// ACTUAL address. Drop the token leg and the LAN row goes silent on an
+    /// open bind; drop the exe leg and an unset `llama_server_exe` boots
+    /// unannounced.
+    #[test]
+    fn config_warnings_name_the_two_unsafe_postures() {
+        let default = AppConfig::default();
+        let warnings = default.config_warnings(false);
+        assert!(
+            warnings.iter().any(|w| w.code == "llama_server_exe_unset"),
+            "an unset llama binary is a posture: {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.code == "lan_open_without_token"),
+            "loopback boot owes no LAN warning: {warnings:?}"
+        );
+
+        let published = AppConfig {
+            internal_host: IpAddr::from([0, 0, 0, 0]),
+            ..AppConfig::default()
+        };
+        let warnings = published.config_warnings(false);
+        let lan = warnings
+            .iter()
+            .find(|w| w.code == "lan_open_without_token")
+            .expect("0.0.0.0 with no token must be named on every status read");
+        assert_eq!(
+            lan.message,
+            "The harness listens on 0.0.0.0 with no control token. Every device on \
+             this network can load models and drive the GPU. Set control_token or \
+             SIMPLEHARN_TOKEN."
+        );
+        assert!(
+            published
+                .config_warnings(true)
+                .iter()
+                .all(|w| w.code != "lan_open_without_token"),
+            "a resolved token retires the LAN warning"
+        );
+
+        // PH-RUST-02: "not loopback" is the contract — a concrete LAN bind is
+        // just as open as the unspecified one, and the sentence names it.
+        let lan_bound = AppConfig {
+            internal_host: IpAddr::from([192, 168, 1, 10]),
+            ..AppConfig::default()
+        };
+        let lan = lan_bound
+            .config_warnings(false)
+            .into_iter()
+            .find(|w| w.code == "lan_open_without_token")
+            .expect("a concrete non-loopback bind with no token is the same posture");
+        assert!(
+            lan.message.contains("listens on 192.168.1.10"),
+            "the warning names the actual address: {}",
+            lan.message
+        );
+
+        // And IPv6 reads correctly too: the unspecified v6 bind is named as `::`.
+        let v6_open = AppConfig {
+            internal_host: "::".parse().expect("v6 unspecified"),
+            ..AppConfig::default()
+        };
+        let lan = v6_open
+            .config_warnings(false)
+            .into_iter()
+            .find(|w| w.code == "lan_open_without_token")
+            .expect(":: with no token warns like the v4 unspecified bind");
+        assert!(
+            lan.message.contains("listens on ::"),
+            "the v6 unspecified bind is named as `::`: {}",
+            lan.message
+        );
+
+        let configured = AppConfig {
+            llama_server_exe: Some(std::path::PathBuf::from("D:/llama/llama-server.exe")),
+            ..AppConfig::default()
+        };
+        assert!(
+            configured
+                .config_warnings(false)
+                .iter()
+                .all(|w| w.code != "llama_server_exe_unset"),
+            "a configured binary owes no unset warning"
+        );
+        assert!(
+            configured.config_warnings(true).is_empty(),
+            "a loopback boot with a configured binary warns about nothing"
         );
     }
 

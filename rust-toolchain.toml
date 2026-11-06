@@ -1,0 +1,7 @@
+# Pinned build toolchain (FR-14). rustup installs this toolchain automatically.
+# The MSRV lives in Cargo.toml (rust-version); a dependency bump must keep the
+# MSRV a deliberate choice (docs/process/GIT_WORKFLOW.md).
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

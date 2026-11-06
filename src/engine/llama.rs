@@ -1,8 +1,9 @@
 //! The llama.cpp adapter (DESIGN Step 7, Appendix A.7).
 //!
 //! The flag map is *data*, byte-equivalent in semantics to the operator's
-//! `C:\Inference\llama.cpp\start.ps1:45-63` — the script is the source of truth,
-//! and the parity test below re-reads it so the harness cannot drift. Two
+//! llama.cpp `start.ps1` (Appendix A.7, lines 45-63) — the script is the source
+//! of truth, and the parity test below re-reads it (via
+//! `SIMPLEHARN_LLAMA_START_SCRIPT`) so the harness cannot drift. Two
 //! harness-level special cases are documented extensions: `cpu_offload` (forces
 //! `-ngl 0`, suppressing `ngl`) and the forced `--host`/`--port` pair. The one
 //! deliberate divergence from the script: `jinja:` is read with a **case-sensitive**
@@ -463,15 +464,43 @@ pub(crate) fn build_args(
 /// governs only the harness's own public listeners, never the engine bind address.
 #[derive(Debug, Clone)]
 pub struct LlamaAdapter {
-    /// Path to `llama-server.exe` (config `llama_server_exe`).
-    pub exe: PathBuf,
+    /// Global `llama-server.exe` default (config `llama_server_exe`); a row's
+    /// own `llama_server_exe:` key overrides it per row (FR-13). `None` — the
+    /// shipped default — means every llama row must name its own binary or its
+    /// load refuses.
+    pub exe: Option<PathBuf>,
 }
 
 impl LlamaAdapter {
-    /// Creates the adapter for the configured binary. The engine bind address is
-    /// not configurable: [`LLAMA_ENGINE_HOST`] is forced into every argv.
+    /// Creates the adapter for a configured global binary. The engine bind
+    /// address is not configurable: [`LLAMA_ENGINE_HOST`] is forced into every
+    /// argv. Test-facing convenience: `Some(exe)` around the given path.
     pub fn new(exe: PathBuf) -> Self {
+        LlamaAdapter { exe: Some(exe) }
+    }
+
+    /// Creates the adapter from the config's optional global default (FR-13):
+    /// `None` leaves no global binary, so each llama row must carry its own
+    /// `llama_server_exe:` key.
+    pub fn from_config(exe: Option<PathBuf>) -> Self {
         LlamaAdapter { exe }
+    }
+
+    /// The one binary a row launches with (FR-13): the row's trimmed
+    /// `llama_server_exe:` override when it carries a non-blank one, else the
+    /// global default. `None` is the refusal state — [`EngineError::MissingField`].
+    #[must_use]
+    pub(crate) fn effective_server_exe(
+        default: Option<&Path>,
+        model: &ModelEntry,
+    ) -> Option<PathBuf> {
+        model
+            .raw
+            .get("llama_server_exe")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| default.map(Path::to_path_buf))
     }
 }
 
@@ -481,13 +510,51 @@ impl EngineAdapter for LlamaAdapter {
     }
 
     fn spec(&self, model: &ModelEntry, port: u16) -> Result<LaunchSpec, EngineError> {
+        // FR-13: the row's own `llama_server_exe:` outranks the global default;
+        // with neither, the launch refuses naming the key, and a row override
+        // must be an absolute existing regular file — the same
+        // doomed-spawn-before-eviction posture the scan's existence traces
+        // keep for `model:`. The scan already refused blank/relative row
+        // overrides; this floor re-checks because a synthetic entry never went
+        // through the scan.
+        let override_present = model
+            .raw
+            .get("llama_server_exe")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        let exe = Self::effective_server_exe(self.exe.as_deref(), model).ok_or_else(|| {
+            EngineError::MissingField {
+                model: model.name.clone(),
+                field: "llama_server_exe".to_string(),
+            }
+        })?;
+        if override_present {
+            let absolute = exe.is_absolute();
+            let regular_file = std::fs::metadata(&exe).is_ok_and(|meta| meta.is_file());
+            if !absolute || !regular_file {
+                return Err(EngineError::Rejected {
+                    engine: "llama".to_string(),
+                    model: model.name.clone(),
+                    reason: format!(
+                        "row `llama_server_exe` must name an absolute existing llama-server.exe; \
+                         `{}` is {}",
+                        exe.display(),
+                        if !absolute {
+                            "not an absolute path"
+                        } else {
+                            "not an existing regular file"
+                        }
+                    ),
+                });
+            }
+        }
         // The catalog dir that anchors a relative `model:` is the parent of
         // the entry's yaml — the dir the scan stat'd for the existence trace
         // and the size booking (R2-09-02); a synthetic entry has none.
         let model_dir = model.file.as_deref().and_then(Path::parent);
         let argv = build_args(&model.raw, port, &model.name, model_dir)?;
         Ok(LaunchSpec {
-            argv: [self.exe.to_string_lossy().into_owned()]
+            argv: [exe.to_string_lossy().into_owned()]
                 .into_iter()
                 .chain(argv)
                 .collect(),
@@ -496,8 +563,7 @@ impl EngineAdapter for LlamaAdapter {
             // path — so the fallback must also fire on the empty parent, or a
             // bare `llama_server_exe` hands `""` (not NULL) to the spawn's
             // working directory instead of the documented current dir.
-            cwd: self
-                .exe
+            cwd: exe
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .map_or_else(|| PathBuf::from("."), PathBuf::from),
@@ -1229,12 +1295,107 @@ mod tests {
         );
     }
 
+    /// FR-13: the shipped default is no global binary. A row that names none
+    /// refuses with the key — never a hidden author-machine path. Falsifier:
+    /// restore a hard-coded default and this leg launches against `""`/a ghost.
+    #[test]
+    fn a_row_without_any_server_exe_refuses_naming_the_key() {
+        let error = LlamaAdapter::from_config(None)
+            .spec(&entry(&[("model", "F:/m.gguf")]), 18109)
+            .expect_err("no binary configured must refuse");
+        let EngineError::MissingField { model, field } = &error else {
+            panic!("expected MissingField, got {error:?}");
+        };
+        assert_eq!(model, "t");
+        assert_eq!(field, "llama_server_exe");
+    }
+
+    /// FR-13: a row's `llama_server_exe:` overrides the global default, and
+    /// argv[0] AND the spawn cwd follow the override — the calculator sibling
+    /// and the weights base both move with the binary that actually runs.
+    #[test]
+    fn a_row_override_launches_in_place_of_the_global_default() {
+        let global_dir = crate::testutil::temp_dir("llama-row-global");
+        let row_dir = crate::testutil::temp_dir("llama-row-override");
+        let override_exe = row_dir.join("llama-server.exe");
+        std::fs::write(&override_exe, b"MZ").expect("seed override exe");
+        let adapter = LlamaAdapter::from_config(Some(global_dir.join("llama-server.exe")));
+        let spec = adapter
+            .spec(
+                &entry(&[
+                    ("model", "F:/m.gguf"),
+                    (
+                        "llama_server_exe",
+                        override_exe.to_str().expect("utf-8 temp path"),
+                    ),
+                ]),
+                18109,
+            )
+            .expect("an existing absolute override launches");
+        assert_eq!(spec.argv[0], override_exe.to_string_lossy());
+        assert_eq!(spec.cwd, row_dir);
+        // A blank override is no override: the global default still answers.
+        let fallback = adapter
+            .spec(
+                &entry(&[("model", "F:/m.gguf"), ("llama_server_exe", "   ")]),
+                18109,
+            )
+            .expect("blank row value falls back to the global");
+        assert_eq!(
+            fallback.argv[0],
+            global_dir
+                .join("llama-server.exe")
+                .to_string_lossy()
+                .as_ref(),
+            "a trimmed-away override must not reach argv"
+        );
+    }
+
+    /// FR-13: the row override is refused before victims are evicted when it
+    /// is relative or names no existing regular file — the key, never a bare
+    /// OS spawn error, carries the answer.
+    #[test]
+    fn a_row_override_must_be_an_absolute_existing_file() {
+        let dir = crate::testutil::temp_dir("llama-row-bad-override");
+        let ghost = dir.join("nowhere").join("llama-server.exe");
+        let dir_as_exe = dir.clone();
+        for bad in [
+            "llama-server.exe".to_string(),
+            ghost.to_str().expect("utf-8 temp path").to_string(),
+            dir_as_exe.to_str().expect("utf-8 temp path").to_string(),
+        ] {
+            let error = LlamaAdapter::from_config(None)
+                .spec(
+                    &entry(&[("model", "F:/m.gguf"), ("llama_server_exe", &bad)]),
+                    18109,
+                )
+                .expect_err("`{bad}` must refuse, never spawn");
+            let EngineError::Rejected {
+                engine,
+                model,
+                reason,
+            } = &error
+            else {
+                panic!("expected Rejected for `{bad}`, got {error:?}");
+            };
+            assert_eq!(engine, "llama");
+            assert_eq!(model, "t");
+            assert!(reason.contains("llama_server_exe"), "{reason}");
+        }
+    }
+
     /// A.7 parity: re-reads the operator's `start.ps1` and requires our table to
     /// match its key->flag lines exactly, so the harness cannot drift from the
-    /// script the operator maintains. Skips (with a note) when the script is absent.
+    /// script the operator maintains. The script's location is the operator's,
+    /// never a built-in path: `SIMPLEHARN_LLAMA_START_SCRIPT` names it, and the
+    /// test skips (with a note) when the variable is unset or the file is absent.
     #[test]
     fn flag_table_matches_the_operators_start_script() {
-        let script = std::path::Path::new(r"C:\Inference\llama.cpp\start.ps1");
+        let Some(script_path) = std::env::var_os("SIMPLEHARN_LLAMA_START_SCRIPT") else {
+            eprintln!("SIMPLEHARN_LLAMA_START_SCRIPT unset; skipping parity check");
+            return;
+        };
+        let script = std::path::Path::new(&script_path);
         let Ok(text) = std::fs::read_to_string(script) else {
             eprintln!("start.ps1 not found; skipping parity check");
             return;

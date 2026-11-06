@@ -1253,6 +1253,86 @@ async fn status_categories_carry_the_effective_label_beside_the_id() {
     }
 }
 
+/// FR-15: `/har/status` publishes the unsafe-but-legal postures —
+/// `config_warnings` always rides as an array of `{code, message}` objects.
+/// `0.0.0.0` without a token names `lan_open_without_token` and a resolved
+/// token retires it; an unset `llama_server_exe` names `llama_server_exe_unset`
+/// and a configured binary retires it; a sane posture warns about nothing (the
+/// exact sentences are pinned where they are minted, `config::config_warnings`).
+/// Falsifier: drop the `config_warnings` line in `render_status_document` and
+/// every leg goes red; drop the token leg of the LAN condition and a guarded
+/// harness starts nagging.
+#[tokio::test]
+async fn status_document_carries_config_warnings_for_unsafe_postures() {
+    async fn warnings(config: AppConfig) -> Vec<serde_json::Value> {
+        let api = ApiState::new(
+            config,
+            SchedulerHandle::test_dummy(),
+            crate::listeners::ListenerRegistry::new(),
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            BootTimings::default(),
+        );
+        let empty = SchedulerStatus {
+            slots: Vec::new(),
+            jobs: Vec::new(),
+            catalog_errors: Vec::new(),
+            stranded_containers: None,
+            fit_validated: Default::default(),
+        };
+        let doc = render_status_document(&api, &empty).await;
+        doc["config_warnings"]
+            .as_array()
+            .expect("`config_warnings` is always an array")
+            .clone()
+    }
+    let has = |warnings: &[serde_json::Value], code: &str| {
+        warnings
+            .iter()
+            .any(|w| w["code"].as_str() == Some(code) && !w["message"].as_str().unwrap().is_empty())
+    };
+
+    let default = warnings(AppConfig::default()).await;
+    assert!(
+        has(&default, "llama_server_exe_unset"),
+        "an unset llama binary is a posture the page must show: {default:?}"
+    );
+    assert!(
+        !has(&default, "lan_open_without_token"),
+        "a loopback boot owes no LAN warning: {default:?}"
+    );
+
+    let published = warnings(AppConfig {
+        internal_host: "0.0.0.0".parse().expect("publish bind"),
+        ..AppConfig::default()
+    })
+    .await;
+    assert!(
+        has(&published, "lan_open_without_token"),
+        "0.0.0.0 with no token must ride every status read: {published:?}"
+    );
+
+    let guarded = warnings(AppConfig {
+        internal_host: "0.0.0.0".parse().expect("publish bind"),
+        control_token: Some("a-token-never-elsewhere".to_string()),
+        ..AppConfig::default()
+    })
+    .await;
+    assert!(
+        !has(&guarded, "lan_open_without_token"),
+        "a resolved token retires the LAN warning: {guarded:?}"
+    );
+
+    let configured = warnings(AppConfig {
+        llama_server_exe: Some(std::path::PathBuf::from("D:/llama/llama-server.exe")),
+        ..AppConfig::default()
+    })
+    .await;
+    assert!(
+        configured.is_empty(),
+        "a loopback boot with a configured binary warns about nothing: {configured:?}"
+    );
+}
+
 /// FINDINGS-14 [7] + the 2026-10-28 "A + amber" ruling: a category whose
 /// supervisor never spoke must be PRESENT in the `listeners` object and LABELED
 /// `Pending`, so the page can never read "no verdict" as "no such category" (the

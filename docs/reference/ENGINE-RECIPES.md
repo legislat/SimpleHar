@@ -42,6 +42,31 @@ sit beside `llama-server.exe`. Then use the row above.
 
 `cpu_offload: true` runs the model on host RAM.
 
+**Which binary.** The `llama_server_exe` key in `simpleharn.json` is an
+optional global default. First start detects a `llama-server.exe` on PATH and
+records it. A row may set `llama_server_exe` to pick a different llama.cpp
+fork for that model only; the path must be an absolute path to an existing
+`llama-server.exe`. The engine DLLs must sit beside the chosen binary. Two
+rows on two forks (placeholders, not machine facts):
+
+```yaml
+name: llama-fork-a
+engine: llama
+model: <models>\<model-a>.gguf
+vram_gb: 24
+cost: fixed
+llama_server_exe: <fork-a-dir>\llama-server.exe
+```
+
+```yaml
+name: llama-fork-b
+engine: llama
+model: <models>\<model-b>.gguf
+vram_gb: 8
+cost: fixed
+llama_server_exe: <fork-b-dir>\llama-server.exe
+```
+
 ## Strata
 
 Upstream: [Niko1221/Strata](https://github.com/Niko1221/Strata) (README install,

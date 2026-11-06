@@ -642,10 +642,10 @@ mod tests {
 
     #[test]
     fn the_tool_is_the_config_sibling() {
-        let exe = Path::new(r"C:\Inference\llama.cpp\llama-server.exe");
+        let exe = Path::new(r"D:\llama\llama-server.exe");
         assert_eq!(
             resolve_tool(exe),
-            PathBuf::from(r"C:\Inference\llama.cpp\llama-fit-params.exe")
+            PathBuf::from(r"D:\llama\llama-fit-params.exe")
         );
     }
 

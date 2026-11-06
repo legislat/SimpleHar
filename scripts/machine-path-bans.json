@@ -1,7 +1,7 @@
 {
-  "comment": "Canonical machine-path ban set for the public docs gates. scripts/check-docs.mjs and scripts/release-check.ps1 both read this file, so a durable doc cannot pass one gate and fail the other on the same path. Entries are regular-expression source text shared by the JavaScript and .NET engines; Select-String and RegExp are case-insensitive on these. The first ban carries the one documented engine-default allowance: the llama.cpp install default under C:\\Inference stays legal, and nothing else under that root is.",
+  "comment": "Canonical machine-path ban set for the public docs gates. scripts/check-docs.mjs and scripts/release-check.ps1 both read this file, so a durable doc cannot pass one gate and fail the other on the same path. Entries are regular-expression source text shared by the JavaScript and .NET engines; Select-String and RegExp are case-insensitive on these. The whole author-machine root C:\\Inference is banned with no exceptions (FR-15, operator ruling 2026-11-06): the harness ships no default under it.",
   "bans": [
-    "C:\\\\Inference\\\\(?!llama\\.cpp)",
+    "C:\\\\Inference",
     "C:\\\\Users\\\\",
     "D:\\\\WORKSPACE-VS",
     "D:\\\\SimpleHar-SE-backups",

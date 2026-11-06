@@ -93,17 +93,17 @@ category: {category}
     dir
 }
 
-/// `AppConfig::default()` whose llama binary exists: a missing
-/// [`AppConfig::llama_server_exe`] surfaces as a config-level
-/// `engine_binary_missing` catalog error on every scan whatever the rows say, so a
-/// test asserting `catalog_errors` is EMPTY must not inherit the host's default
-/// path (a runner without `C:\Inference\llama.cpp` sees one there). `tag` keeps
-/// each test's stand-in directory attributable and isolated.
+/// `AppConfig::default()` with a `llama_server_exe` that exists. Since FR-13
+/// the default is `None` — and `None` reports no `engine_binary_missing` at
+/// all (the unset posture belongs to `config_warnings`, not to a scan error) —
+/// but a test pinning the BINARY-IS-VERDICTED path still needs a configured,
+/// present stand-in. `tag` keeps each test's stand-in directory attributable
+/// and isolated.
 fn config_with_existing_llama(tag: &str) -> AppConfig {
     let stand_in = simpleharn::testutil::temp_dir(tag).join("llama-server.exe");
     std::fs::write(&stand_in, b"test stand-in").expect("llama stand-in file");
     AppConfig {
-        llama_server_exe: stand_in,
+        llama_server_exe: Some(stand_in),
         ..AppConfig::default()
     }
 }
@@ -4869,7 +4869,9 @@ async fn a_bogus_llama_server_exe_is_a_page_visible_engine_binary_missing_error(
     // is not only said once at boot, it is IN `catalog_errors` with its kind on
     // the wire (file `config`, kind `engine_binary_missing`).
     let config = AppConfig {
-        llama_server_exe: std::path::PathBuf::from("Z:/definitely-not-here/llama-server.exe"),
+        llama_server_exe: Some(std::path::PathBuf::from(
+            "Z:/definitely-not-here/llama-server.exe",
+        )),
         ..AppConfig::default()
     };
     let (control, _, _, _, _, _) = app(config, &[("qwen3", "mock", CategoryId::Work, Some(4.0))]);
@@ -4885,8 +4887,46 @@ async fn a_bogus_llama_server_exe_is_a_page_visible_engine_binary_missing_error(
     let reason = error["reason"].as_str().unwrap_or_default();
     assert!(
         reason.contains("llama-server.exe not found at Z:/definitely-not-here/llama-server.exe")
-            && reason.contains("llama loads will fail"),
+            && reason.contains("without a row `llama_server_exe` will fail"),
         "{reason}"
+    );
+}
+
+/// FR-13/FR-15 through the whole surface: an UNSET `llama_server_exe` is a
+/// posture, not a fault — no `engine_binary_missing` scan error (the scan has
+/// no verdict to hand), and `/har/status` names `llama_server_exe_unset` in
+/// `config_warnings` while a loopback bind owes no LAN warning. Falsifier:
+/// re-materialize a hidden default and the unset leg goes red; report a
+/// missing-binary error for `None` and the error leg goes red.
+#[tokio::test]
+async fn an_unset_llama_binary_warns_on_the_page_and_never_fakes_a_scan_error() {
+    let (control, _, _, _, _, _) = app(
+        AppConfig::default(),
+        &[("qwen3", "mock", CategoryId::Work, Some(4.0))],
+    );
+    let (status, body) = get_json(&control, "/har/status").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["catalog_errors"]
+            .as_array()
+            .expect("errors")
+            .iter()
+            .all(|e| e["kind"] != "engine_binary_missing"),
+        "no configured binary is no verdict: {body}"
+    );
+    let codes: Vec<&str> = body["config_warnings"]
+        .as_array()
+        .expect("config_warnings is always an array")
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(
+        codes.contains(&"llama_server_exe_unset"),
+        "the unset posture is page-visible: {body}"
+    );
+    assert!(
+        !codes.contains(&"lan_open_without_token"),
+        "a loopback bind owes no LAN warning: {body}"
     );
 }
 

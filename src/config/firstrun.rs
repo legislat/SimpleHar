@@ -33,13 +33,16 @@ pub struct ProbeResults {
     /// conservative direction for an admission ceiling), or `None` when the probe
     /// failed or answered garbage.
     pub vram_total_gb: Option<f64>,
-    /// An existing `llama-server.exe` found on PATH or in the known install dir.
+    /// An existing `llama-server.exe` found on PATH (FR-13: PATH only — there
+    /// is no hard-coded install directory), or `None` when PATH holds none.
     pub llama_server_exe: Option<PathBuf>,
 }
 
 /// Floor to one decimal: an admission ceiling must never be rounded up.
+/// Not `const`: `f64::floor` is const-stable only since 1.90 and the crate
+/// MSRV is 1.88 (`rust-version`); every call is a runtime probe path.
 #[must_use]
-pub const fn floor_gib(gib: f64) -> f64 {
+pub fn floor_gib(gib: f64) -> f64 {
     (gib * 10.0).floor() / 10.0
 }
 
@@ -67,7 +70,7 @@ pub fn fill(cfg: &mut AppConfig, results: &ProbeResults) -> Vec<(String, String)
         .as_ref()
         .filter(|exe| exe.is_file())
     {
-        cfg.llama_server_exe = exe.clone();
+        cfg.llama_server_exe = Some(exe.clone());
         applied.push(("llama_server_exe".to_string(), exe.display().to_string()));
     }
     applied
@@ -98,15 +101,18 @@ pub fn detect_llama_server_in<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> O
         .find(|candidate| candidate.is_file())
 }
 
-/// Searches PATH (filtered by [`path_entries`]), then the documented install
-/// default. The result is written once into the created config, so the search
-/// order is the operator's first-run engine choice: their PATH install wins over
-/// a leftover convention directory.
+/// Searches PATH (filtered by [`path_entries`]) — and nothing else (FR-13,
+/// operator ruling 2026-11-06): there is no author-machine install fallback, so
+/// the first-run choice is the operator's own install or none. The result is
+/// written once into the created config; no answer leaves the key absent, and
+/// each llama row must then name its own `llama_server_exe`.
 #[must_use]
 pub fn detect_llama_server() -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = path_entries(std::env::var_os("PATH"));
-    dirs.push(PathBuf::from(r"C:\Inference\llama.cpp"));
-    detect_llama_server_in(dirs.iter().map(PathBuf::as_path))
+    detect_llama_server_in(
+        path_entries(std::env::var_os("PATH"))
+            .iter()
+            .map(PathBuf::as_path),
+    )
 }
 
 /// A pinned ceiling that disagrees with the card's own reading by more than the
@@ -272,7 +278,18 @@ mod tests {
             },
         );
         assert_eq!(applied.len(), 1, "a real exe fills");
-        assert_eq!(cfg.llama_server_exe, real);
+        assert_eq!(cfg.llama_server_exe, Some(real));
+        // The default is already `None` (FR-13); spelling it names the posture.
+        let mut none = AppConfig {
+            llama_server_exe: None,
+            ..AppConfig::default()
+        };
+        let applied = fill(&mut none, &ProbeResults::default());
+        assert!(applied.is_empty());
+        assert!(
+            none.llama_server_exe.is_none(),
+            "FR-13: a probe with no answer leaves the key unset, never a hidden default"
+        );
     }
 
     #[test]

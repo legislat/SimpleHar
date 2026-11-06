@@ -15,8 +15,8 @@
 #      that forgets the fixture pin ships a red test; v1.1.3 proved the gap).
 #   9. Public docs carry no machine paths (README.md, CHANGELOG.md,
 #      CONTRIBUTING.md, AGENTS.md, docs/**). The ban targets personal
-#      locations on the operator machine; documented engine defaults stay
-#      allowed (the llama.cpp install default).
+#      locations on the operator machine; the author-machine root is banned
+#      whole - the harness ships no default under it (FR-15).
 #      Rule home: docs/process/GIT_WORKFLOW.md (release section).
 #
 # Exit 0 only when every check passes.
@@ -179,9 +179,9 @@ if (Test-Path -LiteralPath $fixturePath) {
 #    gate and trip only this release leg on the same path. The blocklist names
 #    personal locations on the operator machine: the repo roots, user homes,
 #    the scratch and backup volumes, and the staging and rollback directory
-#    names. Legitimate documented engine defaults are not personal and stay
-#    allowed: the llama.cpp install default lives under C:\Inference, so the
-#    first ban exempts exactly that one subtree.
+#    names. Since FR-15 (operator ruling 2026-11-06) the author-machine root
+#    is banned with no exception: the harness ships no engine default under
+#    it, so no durable doc has a reason to name it.
 $bansPath = Join-Path $PSScriptRoot 'machine-path-bans.json'
 $bansError = ''
 $personalPathPatterns = @()

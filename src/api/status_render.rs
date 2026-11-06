@@ -112,6 +112,9 @@ pub(super) async fn render_status_document(state: &ApiState, scheduler: &Schedul
         // invalid field (§0.2 step 1), so a served document starts empty and the
         // write-back validator is the only producer.
         "config_errors": state.config_errors(),
+        // FR-15: unsafe-but-legal postures the operator should see on the page —
+        // cached derivation only, never a stat or a gate.
+        "config_warnings": state.config.config_warnings(state.requires_token()),
     });
     // R5 report-only reconcile (ruling 9): the stranded-container names the
     // reconcile warned about ride the SAME snapshot, so the page and the log can

@@ -38,37 +38,45 @@ async fn scan_models_dir(dir: PathBuf) -> Result<Catalog, String> {
 /// # Arguments
 ///
 /// * `dir` - the `ModelConf` directory to walk.
-/// * `llama_server_exe` - the configured binary to check.
+/// * `llama_server_exe` - the configured global binary to check, if any
+///   (FR-13: absent means no global default — nothing to report, and each
+///   llama row must name its own).
 ///
 /// # Returns
 ///
 /// The scan result, plus the page-visible error for a missing binary (`None` when there
-/// is nothing to report: the binary is present, or the blocking task itself died, where
-/// silence beats a false alarm).
+/// is nothing to report: the binary is present or unset, or the blocking task itself
+/// died, where silence beats a false alarm).
 pub(super) async fn scan_with_binary_check(
     dir: PathBuf,
-    llama_server_exe: PathBuf,
+    llama_server_exe: Option<PathBuf>,
 ) -> (Result<Catalog, String>, Option<ScanError>) {
     let (scan, binary) = tokio::join!(
         scan_models_dir(dir),
-        tokio::task::spawn_blocking(move || missing_binary_error(&llama_server_exe))
+        tokio::task::spawn_blocking(move || missing_binary_error(llama_server_exe.as_deref()))
     );
     (scan, binary.unwrap_or(None))
 }
 
 /// The `EngineBinaryMissing` report for a binary the config points at but the volume
 /// does not have. Pure apart from the one stat, which is why it runs inside
-/// [`scan_with_binary_check`]'s blocking task and not on the actor.
+/// [`scan_with_binary_check`]'s blocking task and not on the actor. `None` exe is
+/// the FR-13 unset state: no global default to miss.
 #[must_use]
-pub(super) fn missing_binary_error(llama_server_exe: &std::path::Path) -> Option<ScanError> {
-    (!llama_server_exe.exists()).then(|| ScanError {
-        kind: ScanKind::EngineBinaryMissing,
-        file: "config".to_string(),
-        reason: format!(
-            "llama-server.exe not found at {}; llama loads will fail",
-            llama_server_exe.display()
-        ),
-    })
+pub(super) fn missing_binary_error(
+    llama_server_exe: Option<&std::path::Path>,
+) -> Option<ScanError> {
+    llama_server_exe
+        .filter(|exe| !exe.exists())
+        .map(|exe| ScanError {
+            kind: ScanKind::EngineBinaryMissing,
+            file: "config".to_string(),
+            reason: format!(
+                "llama-server.exe not found at {}; llama loads without a row \
+                 `llama_server_exe` will fail",
+                exe.display()
+            ),
+        })
 }
 
 /// The filesystem evidence one catalog application judges: the resident captures

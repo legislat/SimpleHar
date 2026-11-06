@@ -595,6 +595,9 @@ const LLAMA_KNOBS: &[&str] = &[
     "fit",
     "fit_target",
     "fit_ctx",
+    // FR-13: the per-row binary override the adapter reads outside FLAG_TABLE
+    // (the spec's argv[0], never an engine flag).
+    "llama_server_exe",
 ];
 
 const STRATA_KNOBS: &[&str] = &[
@@ -1640,9 +1643,12 @@ mod tests {
         // when absent, so the populated doc carries every value for the scan.
         // The full struct literals are the forcing function: a new
         // `EnginesConfig`/`StrataEngineConfig` field fails to compile here until
-        // this test (and the row's claims) know it.
+        // this test (and the row's claims) know it. `llama_server_exe` is set
+        // here because FR-13 made it skip-if-none: an unset option is the
+        // ABSENCE of the key, so a claimed plain key must be shown set.
         let unset = serde_json::to_value(crate::config::AppConfig {
             wsl_user: Some("ops".to_string()),
+            llama_server_exe: Some(std::path::PathBuf::from("D:/llama/llama-server.exe")),
             ..crate::config::AppConfig::default()
         })
         .expect("config serializes");
@@ -1912,8 +1918,9 @@ mod tests {
     }
 
     /// The knob table (slice 10c generalization of the `cpu_offload` scoping
-    /// ruling): the llama row owns exactly `FLAG_TABLE` plus the three keys the
-    /// adapter reads outside it (`cpu_offload`, `jinja`, `extra_args`) — a new
+    /// ruling): the llama row owns exactly `FLAG_TABLE` plus the four keys the
+    /// adapter reads outside it (`cpu_offload`, `jinja`, `extra_args`, and the
+    /// FR-13 row binary `llama_server_exe`) — a new
     /// flag-table key or a new adapter read must join the row, and
     /// `cpu_offload` answers to the llama row alone (the fact
     /// `OFFLOAD_ENGINES` used to hold). Falsifier: dropping a knob from the row
@@ -1927,13 +1934,13 @@ mod tests {
                 "FLAG_TABLE key `{key}` must be a llama knob"
             );
         }
-        for key in ["cpu_offload", "jinja", "extra_args"] {
+        for key in ["cpu_offload", "jinja", "extra_args", "llama_server_exe"] {
             assert!(llama.knobs.contains(&key), "`{key}` must be a llama knob");
         }
         assert_eq!(
             llama.knobs.len(),
-            crate::engine::llama::FLAG_TABLE.len() + 3,
-            "the llama knob list must be FLAG_TABLE plus the three documented extras, \
+            crate::engine::llama::FLAG_TABLE.len() + 4,
+            "the llama knob list must be FLAG_TABLE plus the four documented extras, \
              no stale members"
         );
         assert_eq!(knob_readers("cpu_offload"), ["llama"]);
