@@ -59,7 +59,7 @@ windows = { version = "0.62", features = [
 # Stream adapters: broadcast receiver -> SSE body stream (Step 12 events).
 tokio-stream = { version = "0.1", features = ["sync"] }
 # NVML in-process witness with a graceful `nvidia-smi` fallback (Step 4, item 5).
-nvml-wrapper = "0.10"
+nvml-wrapper = "0.13"
 # Base64 for staging a harness-rendered autostart script into the distro: the script
 # body rides a quoted heredoc inside a driver fed to `wsl … -- bash -s` on stdin
 # (template adoption, 2026-10-31), so it never touches a shell-tokenized command
