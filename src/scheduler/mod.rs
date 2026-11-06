@@ -334,11 +334,7 @@ async fn actor_loop(mut state: ActorState, mut rx: mpsc::UnboundedReceiver<Actor
             }
             ActorMsg::ReloadFailed { seq, reason } => {
                 tracing::error!(reason = %reason, "rescan task failed; the previous catalog stays in place");
-                state.catalog_errors.push(ScanError {
-                    kind: ScanKind::Other,
-                    file: state.models_dir.display().to_string(),
-                    reason: format!("rescan failed: {reason}"),
-                });
+                state.record_reload_failure(&reason);
                 state.publish();
                 state.drain_reload_waiters(seq);
             }
@@ -748,6 +744,72 @@ impl ActorState {
                 self.begin_unload_slot(slot, "unloaded");
             }
         }
+        // FR-01: this is the one funnel every job exits through (the only writer of
+        // `terminal = true`), so one prune here bounds the ledger and, with it, the
+        // `jobs` array every `/har/status` publish re-serializes.
+        self.prune_terminal_ledger();
+    }
+
+    /// FR-01 job-ledger retention, run at the terminal funnel: keep every live
+    /// (non-terminal) row — the single writer is mid-swap on it — and every
+    /// terminal row still **in service**: the load row whose spawn is an
+    /// installed occupant's ticket. The in-service row is not history: the
+    /// serve-window measured fold reads its [`MeasuredAnchor`] by that
+    /// ticket on every sample (`measured.rs`), and `container_reported_gb` reads
+    /// the container report off it — pruning it under churn would silently stop
+    /// the fold for a long-lived resident. It joins ordinary history the moment
+    /// its slot empties. Everything else that is terminal is retired history:
+    /// the newest [`jobs::TERMINAL_ROW_KEEP`] stand, older ones leave, oldest
+    /// first (`BTreeMap` order is `JobId` order, and ids mint monotonically).
+    /// Pruning never strands a reader: `apply_event` returns on a missing row,
+    /// the EVID-01 victim-row rewrite is a `get`/skip, and idempotency answers
+    /// `Already` from the slot table and `on_swap`'s in-flight attach reads only
+    /// live rows (`commands.rs`) — no decision consults a retired row.
+    fn prune_terminal_ledger(&mut self) {
+        let in_service: Vec<SpawnTicket> = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.occupant.as_ref())
+            .map(|occupant| occupant.ticket.clone())
+            .collect();
+        let mut droppable: Vec<JobId> = Vec::new();
+        for (id, job) in &self.jobs {
+            if !job.terminal {
+                continue;
+            }
+            if job
+                .spawned
+                .as_ref()
+                .is_some_and(|ticket| in_service.iter().any(|held| held == ticket))
+            {
+                continue;
+            }
+            droppable.push(*id);
+        }
+        for id in jobs::terminal_rows_to_prune(&droppable) {
+            self.jobs.remove(id);
+        }
+    }
+
+    /// FR-03 rescan-failure retention: a failed rescan **replaces** the previous
+    /// failure row for this models directory carrying the same reason, so a
+    /// disconnected volume retried forever leaves exactly one honest row in
+    /// `catalog_errors`, not one per attempt. A different reason is different
+    /// news and stands beside it (both are bounded by the reason set, never by
+    /// retry count). A successful rescan replaces the whole error set through
+    /// [`ActorState::apply_catalog`] — a stale failure row never outlives the
+    /// scan that proves the directory readable again, and the per-file errors
+    /// that successful scan reported publish unchanged. This turn only edits
+    /// memory; no filesystem read, no masking of per-file rows (their `file`
+    /// names a yaml, never the directory).
+    fn record_reload_failure(&mut self, reason: &str) {
+        let row = ScanError {
+            kind: ScanKind::Other,
+            file: self.models_dir.display().to_string(),
+            reason: format!("rescan failed: {reason}"),
+        };
+        self.catalog_errors.retain(|seen| *seen != row);
+        self.catalog_errors.push(row);
     }
 
     /// Arms the load queued on `slot` (T3.4), reusing the ledger row registered at
@@ -917,6 +979,380 @@ impl ActorState {
             .expect("invariant: callers hold live job ids");
         let elapsed = job.t0.elapsed().as_millis() as u64;
         *field(&mut job.timings) = Some(elapsed);
+    }
+}
+
+/// Falsifiable pins for the two 1.4 findings owned here: FR-01 job-ledger
+/// retention and FR-03 `catalog_errors` growth. Self-contained fixtures: the
+/// runtime is never reached, no scan, no engine, no channel read.
+#[cfg(test)]
+mod retention_tests {
+    use super::jobs::TERMINAL_ROW_KEEP;
+    use super::*;
+    use crate::budget::LedgerOnlyWitness;
+    use tokio::sync::oneshot;
+
+    /// Never-called stand-in: every pin here drives actor-side memory paths
+    /// only, and a call reaching the runtime would mean a fixture escaped its
+    /// scope.
+    struct NeverRuntime;
+
+    #[async_trait::async_trait]
+    impl EngineRuntime for NeverRuntime {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            unimplemented!("retention pins never spawn")
+        }
+        async fn kill(&self, _ticket: &SpawnTicket) -> Result<(), crate::engine::SpawnError> {
+            unimplemented!("retention pins never kill")
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            unimplemented!("retention pins never reap")
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            unimplemented!("retention pins never probe")
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            unimplemented!("retention pins never discover")
+        }
+    }
+
+    fn state() -> ActorState {
+        let (tx, _rx) = mpsc::unbounded_channel::<ActorMsg>();
+        ActorState::empty(
+            AppConfig::default(),
+            PathBuf::from("models-conf-under-test"),
+            BTreeMap::new(),
+            Arc::new(NeverRuntime) as Arc<dyn EngineRuntime>,
+            Arc::new(LedgerOnlyWitness) as Arc<dyn crate::budget::VramWitness>,
+            tx,
+        )
+    }
+
+    fn row(kind: JobKind, terminal: bool) -> Job {
+        Job {
+            kind,
+            path: None,
+            model: "ledger-row".to_string(),
+            engine: String::new(),
+            category: CategoryId::Work,
+            state: SwapState::Idle,
+            terminal,
+            outcome: terminal.then(|| "loaded".to_string()),
+            error: None,
+            need: None,
+            resource: crate::model::Resource::Gpu,
+            ram_need: None,
+            cost: crate::model::CostClass::Fixed,
+            vram_gate: crate::model::VramGate::default(),
+            load_timeout_s: None,
+            gate_target: None,
+            free_at_admit: None,
+            observed_at_admit: None,
+            release_first: false,
+            container: None,
+            timings: JobTimings::default(),
+            t0: Instant::now(),
+            waiters: Vec::new(),
+            tasks: Vec::new(),
+            spawned: None,
+            readiness: None,
+            measured: None,
+            victim: None,
+            victims: Vec::new(),
+            reclaim: Reclaim::default(),
+            victims_released: Vec::new(),
+            released_cost: 0.0,
+            holder_released_cost: 0.0,
+            other_need_at_admit: 0.0,
+            note: None,
+            warnings: Vec::new(),
+            slot: None,
+            queue_fingerprint: None,
+        }
+    }
+
+    /// Insert one terminal row under `id` — keeps the pin bodies to the counts
+    /// that carry the finding.
+    fn insert_terminal(state: &mut ActorState, id: u64) {
+        state.jobs.insert(JobId(id), row(JobKind::Load, true));
+    }
+
+    fn occupant(name: &str, ticket: &SpawnTicket) -> Occupant {
+        Occupant {
+            model: name.to_string(),
+            need: Gibibytes(2.0),
+            ram_need: None,
+            port: ticket.port,
+            ticket: ticket.clone(),
+            loaded_at: Instant::now(),
+            launched_at_wall: std::time::SystemTime::now(),
+            spawn_config: None,
+            stale_config: false,
+            // An id stands for the fixture: without it the resolve would arm
+            // the FINDINGS-06 [8] re-discovery task, and the sync pins run with
+            // no reactor.
+            serve_id: Some(name.to_string()),
+            measure: None,
+        }
+    }
+
+    fn resident_ticket(port: u16) -> SpawnTicket {
+        SpawnTicket {
+            generation: 1,
+            kind: ResourceKind::ChildProcess,
+            pid: 4242,
+            port,
+        }
+    }
+
+    /// FR-01 pin: 250 terminal rows plus one fresh finish (251 terminal) leave
+    /// exactly the newest 200 — through the terminal funnel, not the pure rule.
+    #[test]
+    fn two_hundred_fifty_terminal_rows_leave_the_newest_two_hundred() {
+        assert_eq!(TERMINAL_ROW_KEEP, 200);
+        let mut state = state();
+        for id in 0..250u64 {
+            insert_terminal(&mut state, id);
+        }
+        let closing = JobId(250);
+        state.jobs.insert(closing, row(JobKind::Load, false));
+        state.finish(closing, Ok(Reply::Done), "loaded");
+        let ids: Vec<u64> = state.jobs.keys().map(|id| id.0).collect();
+        assert_eq!(ids.len(), TERMINAL_ROW_KEEP, "ledger must cap at 200");
+        assert_eq!(ids.first(), Some(&51), "the 51 oldest retired rows left");
+        assert_eq!(ids.last(), Some(&250), "the newest row stands");
+    }
+
+    /// FR-01 pin: a live (non-terminal) row is never pruned, not even as the
+    /// single oldest row while 251 terminal rows pile up behind it.
+    #[test]
+    fn a_live_row_is_never_pruned() {
+        let mut state = state();
+        let oldest_live = JobId(0);
+        state.jobs.insert(oldest_live, row(JobKind::Load, false));
+        for id in 1..=250u64 {
+            insert_terminal(&mut state, id);
+        }
+        let closing = JobId(251);
+        state.jobs.insert(closing, row(JobKind::Unload, false));
+        state.finish(closing, Ok(Reply::Done), "unloaded");
+        assert!(
+            state.jobs.contains_key(&oldest_live),
+            "the single writer is mid-swap on the oldest row: retention may not eat it"
+        );
+        assert!(!state.jobs[&oldest_live].terminal);
+        let terminal = state.jobs.values().filter(|job| job.terminal).count();
+        assert_eq!(terminal, TERMINAL_ROW_KEEP);
+        assert_eq!(state.jobs.len(), TERMINAL_ROW_KEEP + 1);
+    }
+
+    /// FR-01 pin: the `/har/status` view IS the retained view — the published
+    /// `jobs` array carries exactly the ledger rows, so every publish serializes
+    /// the bounded set, never the pruned history.
+    #[test]
+    fn the_status_jobs_view_is_the_retained_view() {
+        let mut state = state();
+        for id in 0..250u64 {
+            insert_terminal(&mut state, id);
+        }
+        let closing = JobId(250);
+        state.jobs.insert(closing, row(JobKind::Load, false));
+        state.finish(closing, Ok(Reply::Done), "loaded");
+        let snapshot = state.snapshot();
+        let snapshot_ids: Vec<u64> = snapshot.jobs.iter().map(|job| job.id.0).collect();
+        let ledger_ids: Vec<u64> = state.jobs.keys().map(|id| id.0).collect();
+        assert_eq!(snapshot.jobs.len(), TERMINAL_ROW_KEEP);
+        assert_eq!(
+            snapshot_ids, ledger_ids,
+            "snapshot and ledger cannot disagree"
+        );
+    }
+
+    /// FR-01 in-service exception: the terminal row of an installed resident
+    /// stands past the cap — its ticket match against the slot occupant keeps
+    /// it, because the serve-window measured fold reads its anchor by exactly
+    /// that ticket on every sample (`measured.rs` finds the row by
+    /// `job.spawned == ticket`).
+    #[test]
+    fn an_in_service_terminal_row_survives_the_cap() {
+        let mut state = state();
+        let ticket = resident_ticket(18_999);
+        let resident = JobId(0);
+        let mut resident_row = row(JobKind::Load, true);
+        resident_row.spawned = Some(ticket.clone());
+        resident_row.state = SwapState::Serving;
+        state.jobs.insert(resident, resident_row);
+        state.slots[0].occupant = Some(occupant("resident", &ticket));
+        for id in 1..=250u64 {
+            insert_terminal(&mut state, id);
+        }
+        let closing = JobId(251);
+        state.jobs.insert(closing, row(JobKind::Load, false));
+        state.finish(closing, Ok(Reply::Done), "loaded");
+        assert!(
+            state.jobs.contains_key(&resident),
+            "pruning the resident's row would silently stop its measured fold"
+        );
+        let terminal = state.jobs.values().filter(|job| job.terminal).count();
+        assert_eq!(
+            terminal,
+            TERMINAL_ROW_KEEP + 1,
+            "200 retired + 1 in service"
+        );
+    }
+
+    /// FR-01 idempotency pin: a repeated load answers `Already` from the slot
+    /// table, and keeps answering `Already` after the ledger row that once
+    /// produced the resident is gone — the exact shape a pruned row leaves. The
+    /// receipt never depends on a terminal ledger row surviving.
+    #[test]
+    fn a_repeat_load_answers_already_with_the_ledger_row_pruned() {
+        let mut state = state();
+        let (map, _) = crate::model::scan::parse_flat_yaml("engine: mock\nvram_gb: 4\n");
+        let mut entry = ModelEntry::from_flat(&map, "res").expect("entry");
+        entry.name = "res".to_string();
+        state.catalog.push(entry);
+        let category = state.slots[0].category;
+        let ticket = resident_ticket(18_998);
+        state.slots[0].occupant = Some(occupant("res", &ticket));
+
+        let produced = JobId(7);
+        let mut produced_row = row(JobKind::Load, true);
+        produced_row.model = "res".to_string();
+        produced_row.spawned = Some(ticket.clone());
+        produced_row.state = SwapState::Serving;
+        state.jobs.insert(produced, produced_row);
+        let (reply, mut receipt) = oneshot::channel();
+        state.on_swap("res".to_string(), category, reply);
+        assert!(
+            matches!(receipt.try_recv(), Ok(Ok(Reply::Already { .. }))),
+            "the loaded resident answers Already while its row still stands"
+        );
+
+        // The FR-01 shape: retention removed the row. The decision reads the
+        // slot table (`commands.rs`), so the repeat is answered identically.
+        state.jobs.remove(&produced);
+        let (reply, mut receipt) = oneshot::channel();
+        state.on_swap("res".to_string(), category, reply);
+        match receipt.try_recv() {
+            Ok(Ok(Reply::Already { model, port, .. })) => {
+                assert_eq!(model, "res");
+                assert_eq!(port, ticket.port);
+            }
+            other => panic!("Already must not depend on a terminal row: {other:?}"),
+        }
+    }
+
+    /// FR-03 pin: three identical failed rescans of the same models directory
+    /// leave ONE row, not three.
+    #[test]
+    fn three_identical_failed_rescans_leave_one_row() {
+        let mut state = state();
+        for _ in 0..3 {
+            state.record_reload_failure("os error 5: Access is denied. (os error 5)");
+        }
+        assert_eq!(
+            state.catalog_errors.len(),
+            1,
+            "repeated identical failures must not grow the report: {:?}",
+            state.catalog_errors
+        );
+        assert_eq!(state.catalog_errors[0].file, "models-conf-under-test");
+        assert!(state.catalog_errors[0].reason.starts_with("rescan failed:"));
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.catalog_errors.len(), 1, "the published view too");
+    }
+
+    /// FR-03 pin: a changed failure reason is different news and stays visible
+    /// beside the previous one; repeating either still never duplicates.
+    #[test]
+    fn a_changed_failure_reason_stays_visible() {
+        let mut state = state();
+        state.record_reload_failure("volume offline");
+        state.record_reload_failure("read_dir denied");
+        state.record_reload_failure("volume offline");
+        assert_eq!(
+            state.catalog_errors.len(),
+            2,
+            "one row per reason, not per try"
+        );
+        let reasons: Vec<&str> = state
+            .catalog_errors
+            .iter()
+            .map(|row| row.reason.as_str())
+            .collect();
+        assert!(reasons.iter().any(|r| r.contains("volume offline")));
+        assert!(reasons.iter().any(|r| r.contains("read_dir denied")));
+    }
+
+    /// FR-03 pin: a successful rescan replaces the failure rows — the scan that
+    /// proves the directory readable again leaves no stale failure behind.
+    #[test]
+    fn a_successful_rescan_clears_the_failure_rows() {
+        let mut state = state();
+        state.record_reload_failure("volume offline");
+        state.record_reload_failure("volume offline");
+        assert_eq!(state.catalog_errors.len(), 1);
+        state.apply_catalog(
+            Catalog {
+                models: Vec::new(),
+                errors: Vec::new(),
+            },
+            None,
+            &DriftStats::default(),
+        );
+        assert!(
+            state.catalog_errors.is_empty(),
+            "a clean rescan clears the failure rows: {:?}",
+            state.catalog_errors
+        );
+    }
+
+    /// FR-03 pin: a rescan failure never masks the per-file scan errors a
+    /// successful scan reported — the replace is scoped to the identical
+    /// directory-failure row only.
+    #[test]
+    fn a_failed_rescan_never_masks_per_file_scan_errors() {
+        let mut state = state();
+        let per_file = ScanError {
+            kind: ScanKind::InvalidName,
+            file: "bad.yaml".to_string(),
+            reason: "name: contradicts the file stem".to_string(),
+        };
+        state.apply_catalog(
+            Catalog {
+                models: Vec::new(),
+                errors: vec![per_file.clone()],
+            },
+            None,
+            &DriftStats::default(),
+        );
+        for _ in 0..3 {
+            state.record_reload_failure("volume offline");
+        }
+        assert_eq!(
+            state.catalog_errors,
+            vec![
+                per_file,
+                ScanError {
+                    kind: ScanKind::Other,
+                    file: "models-conf-under-test".to_string(),
+                    reason: "rescan failed: volume offline".to_string(),
+                }
+            ],
+            "the per-file error stands, the failure appears once"
+        );
     }
 }
 

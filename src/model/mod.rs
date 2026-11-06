@@ -365,16 +365,114 @@ pub struct FileFingerprint {
     pub size: u64,
 }
 
+impl FileFingerprint {
+    /// The fingerprint of an **already-held** metadata read — the same pair
+    /// [`fingerprint`] would stat for, from bytes the caller is holding. The
+    /// FR-02 scan carrier uses it: the model-file existence stat the scan
+    /// already makes is the one reading that yields the fingerprint, so no
+    /// second syscall rides any path that takes it.
+    #[must_use]
+    pub fn from_metadata(meta: &std::fs::Metadata) -> Option<Self> {
+        Some(Self {
+            mtime: meta.modified().ok()?,
+            size: meta.len(),
+        })
+    }
+}
+
+// FR-02 counting seam (test-only): how many sync stats [`fingerprint`] has
+// performed on **this thread**. The fit-admit falsifier arms it, runs the
+// admit refresh, and requires zero — the module promise is no synchronous fs
+// on the actor turn, and a thread-local count says exactly that about the
+// calling thread while the suite runs in parallel (off-actor workers have
+// their own count and never pollute the reading).
+#[cfg(test)]
+thread_local! {
+    static FINGERPRINT_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// FR-02 (test-only): sync stats by [`fingerprint`] on the current thread.
+#[cfg(test)]
+#[must_use]
+pub fn fingerprint_stat_calls() -> usize {
+    FINGERPRINT_STATS.with(std::cell::Cell::get)
+}
+
+/// FR-02 (test-only): zero the current thread's counter before a falsifier leg.
+#[cfg(test)]
+pub fn reset_fingerprint_stat_calls() {
+    FINGERPRINT_STATS.with(|count| count.set(0));
+}
+
 /// The fingerprint of one file; `None` when it cannot be stat'ed (absent, locked,
 /// volume down). Absence of a fingerprint is the absence of **evidence**, never
 /// evidence of change — callers must keep their queue on `None`, never retire on it.
 #[must_use]
 pub fn fingerprint(path: &Path) -> Option<FileFingerprint> {
+    #[cfg(test)]
+    FINGERPRINT_STATS.with(|count| count.set(count.get() + 1));
     let meta = std::fs::metadata(path).ok()?;
-    Some(FileFingerprint {
-        mtime: meta.modified().ok()?,
-        size: meta.len(),
-    })
+    FileFingerprint::from_metadata(&meta)
+}
+
+/// The scan-carried fingerprint table (FR-02, in-process only): the model-file
+/// fingerprints the last scans actually read, keyed by `(yaml path, trimmed
+/// `model:` value)` — the pair that identifies one row's model file without
+/// duplicating the launch-side path resolution. The R11 fit cache guard used to
+/// re-stat the GGUF on every admit turn, breaking the module's no-sync-fs
+/// promise; it now compares the cached fingerprint against **this carried
+/// value**, so the actor turn only reads a map.
+///
+/// Rules, all in one place here:
+/// * `scan_dir` records what its existence trace stat reads (scan.rs), on the
+///   scan's blocking leg — the scan already holds the bytes, so carrying them
+///   costs zero extra syscalls.
+/// * A rescan **refreshes** the value of every row it reads (same key
+///   overwrite); rows of deleted yamls stay as inert tombstones — reachable
+///   only by a catalog row that carries the identical `(yaml, model)` pair, so
+///   a tombstone can never describe a live row. The table never persists,
+///   never crosses the wire, and is bounded by the distinct model-file pairs
+///   this process has ever scanned (kilobytes).
+/// * A landed fit probe refreshes the value with its own off-actor reading
+///   (`on_fit_row_done`), so a file change the probe saw does not leave the
+///   cache and the carried value forever disagreeing.
+/// * Absent is absence: a lookup miss is the KEEP doctrine's absence of
+///   evidence, never evidence of change.
+///
+/// The lock is a leaf: taken for a map read or insert, never held across fs or
+/// a callback. A poisoned table (a panic elsewhere under the lock) is recovered
+/// rather than allowed to kill an actor turn — the table is advisory data, and
+/// losing it only means the next probe re-derives it.
+static SCAN_MODEL_FINGERPRINTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<(PathBuf, String), FileFingerprint>>,
+> = std::sync::OnceLock::new();
+
+fn scan_model_fingerprints(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<(PathBuf, String), FileFingerprint>> {
+    SCAN_MODEL_FINGERPRINTS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Record one model-file fingerprint observed by a scan (or refreshed by a
+/// fit probe). Overwrites the previous value for the same `(yaml, model)` pair.
+pub fn note_scan_fingerprint(yaml: &Path, model_ref: &str, fingerprint: FileFingerprint) {
+    let table = scan_model_fingerprints();
+    let mut table = table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    table.insert((yaml.to_path_buf(), model_ref.to_string()), fingerprint);
+}
+
+/// The carried fingerprint for one `(yaml, model)` pair; `None` when nothing
+/// has read that file's bytes this process life.
+#[must_use]
+pub fn scan_fingerprint(yaml: &Path, model_ref: &str) -> Option<FileFingerprint> {
+    let table = scan_model_fingerprints();
+    let table = table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    table
+        .get(&(yaml.to_path_buf(), model_ref.to_string()))
+        .copied()
 }
 
 /// Renders a wall-clock instant as the fixed-width UTC second form the page prints
@@ -822,6 +920,19 @@ impl ModelEntry {
         self.fit_gb.is_some()
             && self.cost != CostClass::Greedy
             && crate::engine::policy::fit_capable(&self.engine)
+    }
+
+    /// The trimmed `model:` value the fit cache guards, or `None` when the row
+    /// has nothing local to have changed (key absent, blank, or a `scheme://`
+    /// sentinel) — the one rule the scan's fingerprint carrier (FR-02) and the
+    /// scheduler's `fit_model_file`/carried-lookup share, so the record site
+    /// and the lookup site can never disagree about which row has a guard file.
+    #[must_use]
+    pub fn fit_model_key(&self) -> Option<&str> {
+        self.raw
+            .get("model")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty() && !v.contains("://"))
     }
 
     /// Whether this row serves CPU-resident: the engine's policy row reads

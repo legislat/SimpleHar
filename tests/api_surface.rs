@@ -5069,10 +5069,13 @@ async fn wrong_methods_answer_the_envelope_and_keep_the_allow_header() {
 /// ring document with the `limit` fallback. A decoder that rejects in the
 /// future must answer the envelope (the `Result` arm); the legs then move to
 /// the `400` shape, they must not silently return to `text/plain`.
+/// FR-05 (2026-11-06): `limit=abc` left this lenient list — a malformed
+/// `limit` is now a live handler refusal, `400 bad_request` in the project
+/// envelope (pinned in `src/api/tests.rs`), no longer a swallowed default.
 #[tokio::test]
 async fn a_bad_query_on_har_log_stays_inside_the_typed_surface() {
     let (control, _, _, _, _, _) = app(AppConfig::default(), &[]);
-    for query in ["%zz", "%ff", "limit=abc"] {
+    for query in ["%zz", "%ff"] {
         let (status, body) = get_json(&control, &format!("/har/log?{query}")).await;
         assert_eq!(
             status,

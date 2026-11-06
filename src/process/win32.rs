@@ -33,6 +33,14 @@ impl Drop for JobHandle {
 /// The hard bound on [`descendant_pids_of`]'s answer: a healthy engine
 /// family is a handful of pids, so any reachable tree this large is a
 /// pathological one and the walk stops rather than spin.
+///
+/// FR-04: this constant is also the truncation signal. The walk NEVER returns
+/// more than `DESCENDANT_CAP` pids, and the only way an answer reaches exactly
+/// that length is the walk stopping at the bound (or a pathologically complete
+/// tree of exactly cap size). Consumers therefore treat an answer of this
+/// length as **incomplete** and must never sum or book it as complete — see
+/// the refusal legs in `src/scheduler/occupant.rs`, which mirror this value
+/// under a tripwire pin.
 pub(super) const DESCENDANT_CAP: usize = 4_096;
 
 /// ALL descendants of `root`, at every depth, from ONE Toolhelp32 process
@@ -46,6 +54,15 @@ pub(super) const DESCENDANT_CAP: usize = 4_096;
 /// the snapshot only and touches no process. Every failure path — snapshot
 /// refused, walk broken at any point — answers an empty Vec: absence is
 /// reported, never a guess (doctrine 4).
+///
+/// FR-04 truncation contract: the answer is bounded at [`DESCENDANT_CAP`], and
+/// an answer whose length reaches that bound is the walk saying *I stopped* —
+/// it is a partial list. A caller that must not treat a partial tree as
+/// complete (working-set sums, process-tree measurements) checks
+/// `pids.len() >= DESCENDANT_CAP` and refuses or logs; the bound is
+/// conservative in the safe direction (a complete tree of exactly cap size is
+/// declined too — pathological, and a refusal costs one sample, never a
+/// mis-attribution).
 #[must_use]
 pub(super) fn descendant_pids_of(root: u32) -> Vec<u32> {
     use std::collections::{HashMap, HashSet, VecDeque};

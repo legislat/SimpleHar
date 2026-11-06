@@ -132,6 +132,24 @@ pub fn booking_gibs(jobs: &[JobStatus]) -> f64 {
         .sum()
 }
 
+/// FR-01 ledger retention (code constant, never a config key): the newest
+/// retired terminal rows the ledger keeps. Live (non-terminal) rows and the
+/// terminal rows still in service — an installed occupant's own load row, which
+/// the serve-window measured fold and `container_reported_gb` read by its spawn
+/// ticket — stand outside this bound; see `ActorState::prune_terminal_ledger`.
+pub(super) const TERMINAL_ROW_KEEP: usize = 200;
+
+/// The pure retention rule behind FR-01: given the ids of the **droppable**
+/// terminal rows in ledger order (oldest first — `BTreeMap` order is `JobId`
+/// order, and ids mint monotonically), the ids that leave the ledger so at most
+/// [`TERMINAL_ROW_KEEP`] retired terminal rows stand. Never called with live or
+/// in-service rows: those are not droppable (FR-01).
+#[must_use]
+pub(super) fn terminal_rows_to_prune(droppable: &[JobId]) -> &[JobId] {
+    let drop_upto = droppable.len().saturating_sub(TERMINAL_ROW_KEEP);
+    &droppable[..drop_upto]
+}
+
 /// Per-job step timings in milliseconds (§0.3: measurable, not argued about).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct JobTimings {
@@ -335,5 +353,43 @@ impl Job {
     /// must still kill and confirm the victim (chunk 4 [1]).
     pub(super) fn victim_release_pending(&self) -> bool {
         self.victim.is_some()
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    fn ids(count: u64) -> Vec<JobId> {
+        (0..count).map(JobId).collect()
+    }
+
+    #[test]
+    fn the_retention_bound_is_two_hundred_in_code() {
+        // FR-01: the constant is code, not config — pin the figure itself so a
+        // silent edit moves a test, not just every count downstream.
+        assert_eq!(TERMINAL_ROW_KEEP, 200);
+    }
+
+    #[test]
+    fn over_the_bound_prunes_the_oldest_first() {
+        // 250 terminal rows + one fresh finish = 251 droppable: the 51 oldest
+        // (ids 0..=50) leave, the newest 200 stand.
+        let droppable = ids(251);
+        let drop = terminal_rows_to_prune(&droppable);
+        assert_eq!(drop.len(), 51);
+        assert_eq!(drop.first(), Some(&JobId(0)));
+        assert_eq!(drop.last(), Some(&JobId(50)));
+    }
+
+    #[test]
+    fn at_and_under_the_bound_prunes_nothing() {
+        assert!(terminal_rows_to_prune(&ids(TERMINAL_ROW_KEEP as u64)).is_empty());
+        assert!(terminal_rows_to_prune(&ids(1)).is_empty());
+        assert!(terminal_rows_to_prune(&[]).is_empty());
+        // One past the bound drops exactly the oldest.
+        let just_over = ids(TERMINAL_ROW_KEEP as u64 + 1);
+        let drop = terminal_rows_to_prune(&just_over);
+        assert_eq!(drop, [JobId(0)]);
     }
 }

@@ -45,8 +45,9 @@ pub(super) const FIT_VALIDATE_SLACK_GIB: f64 = 2.0;
 /// argv hash (the void identity — a config change is a different key), and a
 /// figure survives on a row only while that fingerprint is unproven-changed:
 /// both sides known and differing voids it (absence of evidence is never
-/// evidence of change, the KEEP doctrine). In-process only — this figure never
-/// persists, so a restart re-derives it.
+/// evidence of change, the KEEP doctrine). The "now" side of that compare is
+/// the scan-carried value (FR-02) — a map read, never an actor-turn stat.
+/// In-process only — this figure never persists, so a restart re-derives it.
 #[derive(Debug, Clone)]
 pub(super) struct FitEntry {
     pub(super) gib: f64,
@@ -178,15 +179,26 @@ impl ActorState {
 
     /// The model file a fit row projects — the `model:` GGUF whose fingerprint
     /// guards the cache. `None` when the row has none (a `scheme://` sentinel
-    /// row has nothing local to have changed).
+    /// row has nothing local to have changed). The which-row-has-a-guard-file
+    /// rule is [`ModelEntry::fit_model_key`], shared with the scan's
+    /// fingerprint carrier so record and lookup can never disagree.
     #[must_use]
     fn fit_model_file(entry: &ModelEntry) -> Option<PathBuf> {
-        entry
-            .raw
-            .get("model")
-            .map(|v| v.trim())
-            .filter(|v| !v.is_empty() && !v.contains("://"))
-            .map(PathBuf::from)
+        entry.fit_model_key().map(PathBuf::from)
+    }
+
+    /// FR-02: the fingerprint carried for this row by the scan (or refreshed
+    /// by a landed fit probe) — the value the cache guard compares against
+    /// WITHOUT touching the filesystem: the admit turn reads a map, never a
+    /// stat. `None` is the KEEP doctrine's absence of evidence (synthetic row,
+    /// sentinel, or a scan that could not read the bytes), never evidence of
+    /// change. A rescan refreshes the value from its existence-trace stat; a
+    /// probe answer refreshes it off-actor.
+    #[must_use]
+    fn fit_carried_fingerprint(entry: &ModelEntry) -> Option<crate::model::FileFingerprint> {
+        let yaml = entry.file.as_deref()?;
+        let raw = entry.fit_model_key()?;
+        crate::model::scan_fingerprint(yaml, raw)
     }
 
     /// R11 warm fit pass (boot scan and every rescan alike): re-stamp the epoch
@@ -303,6 +315,16 @@ impl ActorState {
     /// "version checked at boot AND launch". The refresh never parks the
     /// admit: the physical gate is unchanged, and the next admit (and the
     /// page) get the figure.
+    ///
+    /// FR-02: the "not proven-changed" question is answered from the
+    /// scan-carried fingerprint ([`Self::fit_carried_fingerprint`], a map
+    /// read) — the actor turn makes NO filesystem stat. The change that voids
+    /// the cache is a fresh fingerprint observation disagreeing with the
+    /// cached one: a rescan (its existence-trace stat) or a landed probe
+    /// refreshes the carried value, so a rewritten file is caught at the next
+    /// rescan or the next projection, and an unrescanned silent rewrite keeps
+    /// its figure exactly as the KEEP doctrine keeps everything unobserved —
+    /// the physical gate remains the witness either way.
     pub(super) fn refresh_fit_on_admit(&mut self, entry: &mut ModelEntry) {
         if !crate::engine::policy::fit_capable(&entry.engine) || !self.cfg.llama_fit_probe_enabled()
         {
@@ -311,9 +333,7 @@ impl ActorState {
         let Some(key) = Self::fit_row_key(entry) else {
             return;
         };
-        let fingerprint = Self::fit_model_file(entry)
-            .as_deref()
-            .and_then(crate::model::fingerprint);
+        let fingerprint = Self::fit_carried_fingerprint(entry);
         let hit = self
             .fit_cache
             .get(&key)
@@ -421,6 +441,12 @@ impl ActorState {
     /// catalog row that still carries the probed identity, Err is a named warn
     /// and the ladder. A stale epoch's answer is dropped at the door — the
     /// superseded catalog is not the catalog this answer describes.
+    ///
+    /// FR-02: the probe's fingerprint was taken off-actor after the answer, so
+    /// it is the freshest reading of the row's model file — it refreshes the
+    /// scan-carried value for that identity too, keeping cache and carried
+    /// value in step after a change (without this, the next admit would miss
+    /// forever on the stale scan observation until a rescan).
     pub(super) fn on_fit_row_done(
         &mut self,
         gen: u64,
@@ -439,6 +465,18 @@ impl ActorState {
             );
             return;
         };
+        if let (Some(fingerprint), Some(entry)) = (
+            fingerprint,
+            self.catalog.iter().find(|m| {
+                m.name == model
+                    && crate::engine::policy::fit_capable(&m.engine)
+                    && Self::fit_row_key(m) == Some(key)
+            }),
+        ) {
+            if let (Some(yaml), Some(raw)) = (entry.file.as_deref(), entry.fit_model_key()) {
+                crate::model::note_scan_fingerprint(yaml, raw, fingerprint);
+            }
+        }
         self.fit_cache.insert(key, FitEntry { gib, fingerprint });
         self.patch_catalog_fit(model, key, gib);
     }
@@ -535,5 +573,306 @@ impl ActorState {
         }
         self.fit_stamps.insert(model.to_string(), (gen, true));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActorState, FitEntry};
+    use crate::engine::EngineRuntime;
+    use crate::model::{self, FileFingerprint, ModelEntry};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// The fit row the pins book from: probeable keys, its yaml on disk, and
+    /// `file` set the way `scan_dir` sets it. Unique names per test keep the
+    /// scan-fingerprint table (a process-wide carrier) collision-free while
+    /// the suite runs in parallel.
+    fn fit_row(dir: &std::path::Path, name: &str) -> ModelEntry {
+        let yaml = dir.join(format!("{name}.yaml"));
+        std::fs::write(
+            &yaml,
+            format!("engine: llama\nvram_gb: 24\nmodel: {name}.gguf\ncontext: 4096\nngl: 99\n"),
+        )
+        .expect("seed yaml");
+        let text = std::fs::read_to_string(&yaml).expect("readable");
+        let (map, problems) = crate::model::scan::parse_flat_yaml(&text);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mut entry = ModelEntry::from_flat(&map, name).expect("valid row");
+        entry.file = Some(yaml);
+        entry
+    }
+
+    fn fp(size: u64) -> FileFingerprint {
+        FileFingerprint {
+            mtime: UNIX_EPOCH + Duration::from_secs(1),
+            size,
+        }
+    }
+
+    /// State with the probe switched on and the calibration left unset: the
+    /// refresh gate opens (probe enabled) while `fit_probe_plan` resolves to
+    /// `None`, so the pins drive the cache decision without any spawn.
+    fn fit_probe_state() -> ActorState {
+        let mut adapters: BTreeMap<String, Arc<dyn crate::engine::EngineAdapter>> = BTreeMap::new();
+        adapters.insert(
+            "llama".to_string(),
+            Arc::new(crate::engine::mock::MockAdapter) as Arc<dyn crate::engine::EngineAdapter>,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        ActorState::empty(
+            crate::config::AppConfig::parse(r#"{"engines": {"llama": {"fit_probe": true}}}"#)
+                .expect("probe on, margin unset"),
+            crate::testutil::temp_dir("fit-fr02-state"),
+            adapters,
+            Arc::new(SilentRuntime) as Arc<dyn EngineRuntime>,
+            Arc::new(crate::budget::LedgerOnlyWitness),
+            tx,
+        )
+    }
+
+    struct SilentRuntime;
+
+    #[async_trait::async_trait]
+    impl EngineRuntime for SilentRuntime {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: crate::ownership::SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            panic!("the FR-02 pins never spawn")
+        }
+        async fn kill(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<(), crate::engine::SpawnError> {
+            panic!("the FR-02 pins never kill")
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &crate::ownership::SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            panic!("the FR-02 pins never reach release evidence")
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            panic!("the FR-02 pins never reach readiness")
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("the FR-02 pins never reach readiness")
+        }
+    }
+
+    /// FR-02 counting probe: the admit-turn cache hit books the certified
+    /// figure and the current thread's sync-stat counter stays exactly where
+    /// the reset left it — zero. Falsifier: restore the pre-fix
+    /// `fingerprint(fit_model_file(entry))` on the refresh and the counter
+    /// reads one, turning this pin red.
+    #[test]
+    fn the_admit_turn_hit_books_the_projection_without_one_single_stat() {
+        let dir = crate::testutil::temp_dir("fit-fr02-hit");
+        let mut state = fit_probe_state();
+        let mut entry = fit_row(&dir, "fr02hit-row");
+        let yaml = entry.file.clone().expect("seeded");
+        let raw = entry.fit_model_key().expect("a local model").to_string();
+        let carried = fp(1024);
+        model::note_scan_fingerprint(&yaml, &raw, carried);
+        let key = ActorState::fit_row_key(&entry).expect("probeable row");
+        state.catalog = vec![entry.clone()];
+        state.fit_cache.insert(
+            key,
+            FitEntry {
+                gib: 30.0,
+                fingerprint: Some(carried),
+            },
+        );
+        entry.fit_gb = None;
+        model::reset_fingerprint_stat_calls();
+        state.refresh_fit_on_admit(&mut entry);
+        assert_eq!(
+            model::fingerprint_stat_calls(),
+            0,
+            "FR-02: the actor turn must not stat the model file"
+        );
+        assert_eq!(
+            entry.fit_gb,
+            Some(30.0),
+            "the certified figure still books the load"
+        );
+        assert_eq!(
+            state.catalog[0].fit_gb,
+            Some(30.0),
+            "the page row keeps the same figure the gate booked"
+        );
+    }
+
+    /// FR-02 invalidation, both legs: a rescan that re-read the model file
+    /// leaves a carried fingerprint differing from the cached one, and the
+    /// next admit misses to the ladder; an unchanged carried value keeps the
+    /// hit. Neither leg stats. Falsifiers: drop the fingerprint compare from
+    /// the hit filter and the void leg keeps booking; treat an absent side as
+    /// change and the keep leg drops to the ladder.
+    #[test]
+    fn a_changed_fingerprint_voids_the_cache_and_an_unchanged_one_keeps_it() {
+        let dir = crate::testutil::temp_dir("fit-fr02-void");
+        let mut state = fit_probe_state();
+        model::reset_fingerprint_stat_calls();
+
+        let mut kept = fit_row(&dir, "fr02keep-row");
+        let kept_yaml = kept.file.clone().expect("seeded");
+        let kept_raw = kept.fit_model_key().expect("a local model").to_string();
+        let key = ActorState::fit_row_key(&kept).expect("probeable row");
+        state.catalog = vec![kept.clone()];
+        state.fit_cache.insert(
+            key,
+            FitEntry {
+                gib: 30.0,
+                fingerprint: Some(fp(1024)),
+            },
+        );
+        model::note_scan_fingerprint(&kept_yaml, &kept_raw, fp(1024));
+        kept.fit_gb = None;
+        state.refresh_fit_on_admit(&mut kept);
+        assert_eq!(
+            kept.fit_gb,
+            Some(30.0),
+            "an unchanged file keeps the certified figure"
+        );
+
+        let mut changed = fit_row(&dir, "fr02void-row");
+        let changed_yaml = changed.file.clone().expect("seeded");
+        let changed_raw = changed.fit_model_key().expect("a local model").to_string();
+        let key = ActorState::fit_row_key(&changed).expect("probeable row");
+        state.catalog = vec![changed.clone()];
+        state.fit_cache.insert(
+            key,
+            FitEntry {
+                gib: 30.0,
+                fingerprint: Some(fp(1024)),
+            },
+        );
+        model::note_scan_fingerprint(&changed_yaml, &changed_raw, fp(1024));
+        // The rescan re-read the bytes: the carried value moves, the cached
+        // figure was certified against the old ones — proven-changed, void.
+        model::note_scan_fingerprint(&changed_yaml, &changed_raw, fp(2048));
+        changed.fit_gb = Some(30.0);
+        state.refresh_fit_on_admit(&mut changed);
+        assert_eq!(
+            changed.fit_gb, None,
+            "a changed model file must not book a projection it cannot certify"
+        );
+        assert_eq!(
+            model::fingerprint_stat_calls(),
+            0,
+            "both invalidation legs are map reads, never stats"
+        );
+    }
+
+    /// FR-02 refresh: a landed probe carries its own off-actor fingerprint and
+    /// updates the carried value for that identity, so the next admit hits on
+    /// the fresh pair instead of missing forever against the stale scan
+    /// reading. Falsifier: drop the carrier update in `on_fit_row_done` and
+    /// the second admit misses (stale carried value) — pin red.
+    #[test]
+    fn a_landed_probe_refreshes_the_carried_value_so_the_next_hit_holds() {
+        let dir = crate::testutil::temp_dir("fit-fr02-probe");
+        let mut state = fit_probe_state();
+        let mut entry = fit_row(&dir, "fr02probe-row");
+        let yaml = entry.file.clone().expect("seeded");
+        let raw = entry.fit_model_key().expect("a local model").to_string();
+        // File rewritten after the scan: carried moved to B while no figure
+        // was ever certified for B (cold cache) — a probe is the only way.
+        model::note_scan_fingerprint(&yaml, &raw, fp(2048));
+        let key = ActorState::fit_row_key(&entry).expect("probeable row");
+        state.catalog = vec![entry.clone()];
+        model::reset_fingerprint_stat_calls();
+        entry.fit_gb = Some(9.0);
+        state.refresh_fit_on_admit(&mut entry);
+        assert_eq!(entry.fit_gb, None, "cold cache: the ladder books");
+        state.on_fit_row_done(
+            state.fit_gen(),
+            "fr02probe-row",
+            key,
+            Ok((31.0, Some(fp(2048)))),
+        );
+        assert_eq!(
+            model::scan_fingerprint(&yaml, &raw),
+            Some(fp(2048)),
+            "the probe's reading is the freshest carried value"
+        );
+        entry.fit_gb = None;
+        state.refresh_fit_on_admit(&mut entry);
+        assert_eq!(
+            entry.fit_gb,
+            Some(31.0),
+            "cache and carried value agree again: the next admit hits"
+        );
+        assert_eq!(
+            model::fingerprint_stat_calls(),
+            0,
+            "the whole loop never stats on this thread"
+        );
+    }
+
+    /// FR-02 KEEP doctrine survives the move: a row whose carried value cannot
+    /// be known (no `file:` — a synthetic entry) is never punished for it:
+    /// one side unknown is absence of evidence and the figure stands.
+    #[test]
+    fn an_unknown_carried_fingerprint_is_absence_never_change() {
+        let dir = crate::testutil::temp_dir("fit-fr02-keep");
+        let mut state = fit_probe_state();
+        let mut entry = fit_row(&dir, "fr02keep-none-row");
+        entry.file = None; // synthetic: nothing to carry
+        let key = ActorState::fit_row_key(&entry).expect("probeable row");
+        state.catalog = vec![entry.clone()];
+        state.fit_cache.insert(
+            key,
+            FitEntry {
+                gib: 28.0,
+                fingerprint: Some(fp(1024)),
+            },
+        );
+        entry.fit_gb = None;
+        model::reset_fingerprint_stat_calls();
+        state.refresh_fit_on_admit(&mut entry);
+        assert_eq!(
+            entry.fit_gb,
+            Some(28.0),
+            "absence of evidence must not retire a certified figure"
+        );
+        assert_eq!(model::fingerprint_stat_calls(), 0, "no stat either");
+    }
+
+    /// FR-02 structural tripwire: the admit refresh's own body holds no
+    /// filesystem call. The counting probe catches `model::fingerprint`; this
+    /// leg catches a reintroduction through any other sync-fs door.
+    /// Falsifier: put any of the forbidden calls back into the body.
+    #[test]
+    fn the_admit_refresh_body_holds_no_filesystem_call() {
+        let source = include_str!("fit.rs");
+        let body = source
+            .split("fn refresh_fit_on_admit(")
+            .nth(1)
+            .expect("the refresh stays")
+            .split("\n    }\n")
+            .next()
+            .expect("the refresh body closes");
+        for forbidden in [
+            "model::fingerprint(",
+            "std::fs",
+            "fs::metadata",
+            "try_exists",
+            "symlink_metadata",
+            "read_dir",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "FR-02: the admit turn must not touch the filesystem: {forbidden}"
+            );
+        }
     }
 }

@@ -1374,10 +1374,18 @@ async fn envelope_router_errors(
 /// `GET /har/log?limit=N` — the last N harness log events from the in-memory
 /// ring (Step 16): why did the last load fail, without opening files.
 ///
-/// A query the extractor rejects answers `400 bad_request` in the project
-/// envelope, never axum's plain-text rejection (R2-05-03). The branch is
-/// defensive: the 0.8 form decoder is lossy and the map type accepts every
-/// pair, so a query rarely rejects on this surface today.
+/// Two refusal arms, one envelope (R2-05-03, FR-05):
+/// * A query the extractor itself rejects answers `400 bad_request` in the
+///   project envelope, never axum's plain-text rejection. The branch stays
+///   defensive: the 0.8 form decoder is lossy and the map type accepts every
+///   pair, so the extractor rarely rejects on this surface.
+/// * FR-05 (live arm): `limit` is parsed by the handler, not the decoder. A
+///   `limit` that is present but not a whole number — `limit=abc`, `limit=`,
+///   `limit=-1` — is a request-shape error answered `400 bad_request` in the
+///   same dual envelope (flat + OpenAI), never silently swallowed into the
+///   default the way `.ok()` used to swallow it. A valid number keeps its
+///   clamp to [`crate::observability::RING_CAPACITY`]; an absent `limit` keeps
+///   the default.
 async fn har_log(
     query: Result<
         axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -1387,11 +1395,13 @@ async fn har_log(
     let axum::extract::Query(query) = query.map_err(|rejection| ApiError::BadRequest {
         reason: rejection.to_string(),
     })?;
-    let limit = query
-        .get("limit")
-        .and_then(|limit| limit.parse::<usize>().ok())
-        .unwrap_or(100)
-        .min(crate::observability::RING_CAPACITY);
+    let limit = match query.get("limit") {
+        Some(raw) => raw.parse::<usize>().map_err(|_| ApiError::BadRequest {
+            reason: format!("limit must be a whole number of events, got `{raw}`"),
+        })?,
+        None => 100,
+    }
+    .min(crate::observability::RING_CAPACITY);
     let (events, dropped) = crate::observability::ring_tail(limit);
     Ok(Json(
         json!({ "events": events, "dropped": dropped, "capacity": crate::observability::RING_CAPACITY }),

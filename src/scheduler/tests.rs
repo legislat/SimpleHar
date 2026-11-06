@@ -9632,7 +9632,9 @@ async fn an_admit_hit_books_the_projection_a_proven_change_voids_it() {
 
     // A PROVEN model-file change (both fingerprints known, differing) is the
     // only thing that voids the hit — and this admit books the ladder now
-    // while the refresh re-projects.
+    // while the refresh re-projects. FR-02: the admit never stats; the proven
+    // change reaches it the way production delivers it — the rescan re-read
+    // the file and left the fresh reading on the scan-carried table.
     std::fs::write(dir.join("turbo.gguf"), b"weights").expect("model file");
     let fresh = crate::model::fingerprint(&dir.join("turbo.gguf")).expect("stat");
     let stale_stamp = crate::model::FileFingerprint {
@@ -9647,7 +9649,15 @@ async fn an_admit_hit_books_the_projection_a_proven_change_voids_it() {
         },
     );
     let mut changed_row = entry.clone();
+    // The carrier rides the row's yaml identity; the admit reads the table,
+    // it never stats.
+    changed_row.file = Some(dir.join("admit-row.yaml"));
     changed_row.fit_gb = Some(31.0);
+    crate::model::note_scan_fingerprint(
+        changed_row.file.as_deref().expect("carrier yaml"),
+        changed_row.fit_model_key().expect("a local model"),
+        fresh,
+    );
     state.refresh_fit_on_admit(&mut changed_row);
     assert_eq!(
         changed_row.fit_gb, None,
@@ -9793,7 +9803,8 @@ fn a_refusal_quotes_a_place_only_behind_real_loads() {
     );
 
     // A terminal row is not "ahead": finishing the two Work loads empties the
-    // set without deleting the rows (the ledger never deletes).
+    // set without pruning the rows (this test bypasses the terminal funnel;
+    // the real funnel keeps only the newest 200 terminal rows).
     for id in [ahead_a, ahead_b] {
         state.jobs.get_mut(&id).expect("row").terminal = true;
     }

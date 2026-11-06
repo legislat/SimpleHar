@@ -727,6 +727,18 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                     .filter(|r| !r.contains("://"))
                     .map(|raw| trace_under_yaml_dir(dir, raw));
                 let stat = local.as_ref().and_then(|p| regular_file_metadata(p));
+                // FR-02: the trace's stat IS the fingerprint reading — carry it.
+                // The R11 fit-cache guard compares against this scan-carried
+                // value on the admit turn instead of re-statting the GGUF on
+                // the actor. Keyed by `(yaml, trimmed model:)` from the shared
+                // rule; rows refused below this line keep only an inert
+                // tombstone (never looked up without a published row), and a
+                // later rescan refreshes every row it reads.
+                if let (Some(raw), Some(meta)) = (entry.fit_model_key(), stat.as_ref()) {
+                    if let Some(fingerprint) = crate::model::FileFingerprint::from_metadata(meta) {
+                        crate::model::note_scan_fingerprint(&path, raw, fingerprint);
+                    }
+                }
                 if entry.engine == "llama" && stat.is_none() {
                     if let Some(missing) = &local {
                         catalog.errors.push(ScanError {
@@ -2235,6 +2247,53 @@ mod tests {
         assert!(
             catalog.models[0].gguf_size_gb.is_some_and(|s| s > 0.0),
             "the same stat still books the size"
+        );
+    }
+
+    /// FR-02 producer leg: the scan's existence-trace stat doubles as the
+    /// carried fingerprint the fit cache invalidates with, keyed by the row's
+    /// own identity rule. Falsifier: drop the `note_scan_fingerprint` call at
+    /// the stat and the lookup answers `None`, turning this pin red; a silent
+    /// rewrite between rescans then never voids anything (documented window).
+    #[test]
+    fn the_scan_leaves_the_carried_fingerprint_the_fit_cache_reads() {
+        let dir = crate::testutil::temp_dir("scan-carried-fp");
+        std::fs::write(dir.join("weights.gguf"), b"0123456789").expect("write gguf");
+        let yaml = dir.join("ok.yaml");
+        std::fs::write(
+            &yaml,
+            format!(
+                "engine: llama\nmodel: {}\n",
+                dir.join("weights.gguf").display()
+            ),
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        let entry = &catalog.models[0];
+        let raw = entry.fit_model_key().expect("a local model");
+        assert_eq!(
+            crate::model::scan_fingerprint(&yaml, raw),
+            crate::model::fingerprint(&dir.join("weights.gguf")),
+            "the scan's observation is exactly the file's fingerprint"
+        );
+        // A sentinel names no file: the scan never stats it, so nothing is
+        // carried — absence stays absence and never fabricates a fingerprint.
+        let remote = dir.join("remote.yaml");
+        std::fs::write(
+            &remote,
+            "engine: llama\nmodel: hf://org/repo/x.gguf\nvram_gb: 4\n",
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(catalog.errors.is_empty(), "{:?}", catalog.errors);
+        assert!(
+            catalog
+                .models
+                .iter()
+                .find(|m| m.name == "remote")
+                .is_some_and(|m| m.fit_model_key().is_none()),
+            "a sentinel row has no carrier identity, so the scan can carry nothing for it"
         );
     }
 

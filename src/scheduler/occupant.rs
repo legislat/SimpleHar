@@ -261,8 +261,25 @@ impl ActorState {
                 // plus every descendant at every depth — the captured
                 // engines hang two levels below the harness child, so a
                 // one-generation sum misses the process holding the card.
+                // FR-04: a cap-stopped (truncated) walk would under-count the
+                // tree, so this measurement is refused outright — the `None`
+                // below is the same stand-in posture the module already
+                // carries for every refusal: the witness loop keeps the
+                // measurement honest instead of losing it.
+                let descendants = runtime.descendant_pids(ctx.ticket.pid).await;
+                if Self::descendants_truncated(&descendants) {
+                    tracing::warn!(
+                        model = %ctx.model,
+                        engine = %ctx.engine,
+                        root_pid = ctx.ticket.pid,
+                        cap = Self::DESCENDANT_REPORT_CAP,
+                        "process-tree measurement refused: the descendant walk was \
+                         truncated; the witness loop stands in"
+                    );
+                    return None;
+                }
                 let mut pids = vec![ctx.ticket.pid];
-                pids.extend(runtime.descendant_pids(ctx.ticket.pid).await);
+                pids.extend(descendants);
                 let own = sample.own_gib(&pids)?;
                 EngineMeasurement {
                     gpu_gib: own,
@@ -454,16 +471,64 @@ impl ActorState {
     /// probe cannot read is skipped: a child that exited between the pid walk
     /// and the query shrinks the tree honestly. Nothing readable at all is
     /// absence: the caller treats it as the tree being gone and ends its
-    /// sampler. The unit stays bytes until [`Self::working_set_to_gib`].
+    /// sampler. A **truncated** walk (FR-04, [`Self::descendants_truncated`])
+    /// is also absence here — a partial tree is refused, never summed as if
+    /// complete — but it is *not* the tree being gone: a sampler that must
+    /// keep polling samples the pure sum leg directly and skips the tick
+    /// instead. The unit stays bytes until [`Self::working_set_to_gib`].
+    #[cfg_attr(not(test), allow(dead_code))] // the W2 tree-sum pins call this
+                                             // one-call form directly; the production RAM loop runs the split legs so a
+                                             // truncated tick skips instead of ending the sampler (FR-04).
     pub(super) async fn tree_working_set_gib(
         runtime: &Arc<dyn EngineRuntime>,
         probe: &Arc<dyn crate::process::WorkingSetProbe>,
         root_pid: u32,
     ) -> Option<crate::budget::Gibibytes> {
-        let mut pids = vec![root_pid];
-        pids.extend(runtime.descendant_pids(root_pid).await);
+        let descendants = runtime.descendant_pids(root_pid).await;
+        if Self::descendants_truncated(&descendants) {
+            tracing::warn!(
+                root_pid,
+                cap = Self::DESCENDANT_REPORT_CAP,
+                "the descendant walk stopped at its cap: the working-set sample is \
+                 refused, never booked as complete"
+            );
+            return None;
+        }
+        Self::sum_tree_working_set_gib(root_pid, &descendants, probe)
+    }
+
+    /// The descendant-walk bound the Win32 Toolhelp answer is capped at
+    /// (`DESCENDANT_CAP` in `src/process/win32.rs`): a walk answer reaching
+    /// this length is the walk reporting a **partial** tree (FR-04 — the cap
+    /// length is itself the truncation signal, since the walk never returns
+    /// more). Callers refuse such an answer rather than treat it as complete;
+    /// the bound is conservative in the safe direction (a pathologically
+    /// complete tree of exactly cap size is declined too — the cost is one
+    /// skipped sample, never a mis-attributed booking). The mirror is kept
+    /// honest by `the_descendant_cap_mirror_tracks_the_win32_walk`, which
+    /// reads the walk's source and fails on any drift.
+    pub(super) const DESCENDANT_REPORT_CAP: usize = 4_096;
+
+    /// Whether a descendant answer reached the cap and must be treated as a
+    /// truncated (partial) tree (FR-04).
+    #[must_use]
+    pub(super) fn descendants_truncated(descendants: &[u32]) -> bool {
+        descendants.len() >= Self::DESCENDANT_REPORT_CAP
+    }
+
+    /// Sum the working sets of the root pid and a KNOWN-COMPLETE descendant
+    /// list (saturating bytes, unreadable pids skipped, one conversion at the
+    /// end). The pure sum leg split out of [`Self::tree_working_set_gib`] so
+    /// a caller that has already checked for truncation can keep its sampler
+    /// alive across a refusal (`ram_refresh` skips the tick instead of
+    /// reading this `None` as the tree being gone).
+    fn sum_tree_working_set_gib(
+        root_pid: u32,
+        descendants: &[u32],
+        probe: &Arc<dyn crate::process::WorkingSetProbe>,
+    ) -> Option<crate::budget::Gibibytes> {
         let mut total: Option<u64> = None;
-        for pid in pids {
+        for pid in std::iter::once(root_pid).chain(descendants.iter().copied()) {
             if let Some(bytes) = probe.working_set_bytes(pid) {
                 total = Some(total.map_or(bytes, |acc| acc.saturating_add(bytes)));
             }
@@ -505,7 +570,22 @@ impl ActorState {
             if tokio::time::Instant::now() >= deadline {
                 return;
             }
-            let Some(ram_gib) = Self::tree_working_set_gib(runtime, probe, ctx.ticket.pid).await
+            let descendants = runtime.descendant_pids(ctx.ticket.pid).await;
+            if Self::descendants_truncated(&descendants) {
+                // FR-04: a cap-stopped walk is a partial tree — this sample
+                // is refused and logged, never booked; the sampler survives
+                // and the last honest figure stays booked (silence posture,
+                // like every other skipped tick).
+                tracing::warn!(
+                    model = %ctx.model,
+                    root_pid = ctx.ticket.pid,
+                    cap = Self::DESCENDANT_REPORT_CAP,
+                    "RAM sample refused: the descendant walk was truncated; skipping \
+                     this tick, the last honest figure stays booked"
+                );
+                continue;
+            }
+            let Some(ram_gib) = Self::sum_tree_working_set_gib(ctx.ticket.pid, &descendants, probe)
             else {
                 return; // the tree this sampler belongs to is gone
             };
@@ -583,4 +663,288 @@ pub(super) fn state_last_used(
         .copied()
         .unwrap_or(occupant.loaded_at)
         .max(occupant.loaded_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// The cap-length answer the Win32 walk returns when it stops at the bound
+    /// (FR-04): the partial tree the callers must refuse.
+    fn capped_walk_answer() -> Vec<u32> {
+        (1..=ActorState::DESCENDANT_REPORT_CAP as u32).collect()
+    }
+
+    /// Runtime stub answering `descendant_pids` from a scripted queue, then a
+    /// fixed tail — the stand-in for a walk that truncates on one tick and
+    /// answers completely on the next (a 4097-process tree cannot be spawned
+    /// in a cardless test, so the caller's refusal is pinned through the
+    /// injectable runtime seam, as the finding allows).
+    struct ScriptedWalk {
+        answers: Mutex<VecDeque<Vec<u32>>>,
+        tail: Vec<u32>,
+    }
+
+    impl ScriptedWalk {
+        fn new(answers: Vec<Vec<u32>>, tail: Vec<u32>) -> Self {
+            Self {
+                answers: Mutex::new(VecDeque::from(answers)),
+                tail,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EngineRuntime for ScriptedWalk {
+        async fn spawn(
+            &self,
+            _spec: &crate::engine::LaunchSpec,
+            _ticket: SpawnTicket,
+        ) -> Result<crate::engine::Spawned, crate::engine::SpawnError> {
+            panic!("the FR-04 pins never spawn")
+        }
+        async fn kill(&self, _ticket: &SpawnTicket) -> Result<(), crate::engine::SpawnError> {
+            panic!("the FR-04 pins never kill")
+        }
+        async fn release_confirmed(
+            &self,
+            _ticket: &SpawnTicket,
+        ) -> Result<bool, crate::engine::SpawnError> {
+            panic!("the FR-04 pins never reach release evidence")
+        }
+        async fn probe(
+            &self,
+            _port: u16,
+            _readiness: &crate::engine::ReadinessSpec,
+        ) -> crate::engine::Probe {
+            panic!("the FR-04 pins never reach readiness")
+        }
+        async fn discover_model_id(&self, _port: u16) -> Option<String> {
+            panic!("the FR-04 pins never reach readiness")
+        }
+        async fn descendant_pids(&self, _pid: u32) -> Vec<u32> {
+            let mut answers = self.answers.lock().expect("script lock");
+            answers.pop_front().unwrap_or_else(|| self.tail.clone())
+        }
+    }
+
+    /// Probe answering every pid with the same working set; counts the queries
+    /// so a refusal can be pinned to happen BEFORE any per-pid work.
+    struct FlatProbe {
+        bytes: u64,
+        calls: AtomicUsize,
+    }
+
+    impl FlatProbe {
+        fn new(bytes: u64) -> Arc<Self> {
+            Arc::new(Self {
+                bytes,
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl crate::process::WorkingSetProbe for FlatProbe {
+        fn working_set_bytes(&self, _pid: u32) -> Option<u64> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Some(self.bytes)
+        }
+    }
+
+    /// Witness stub: a healthy 72 GiB card attributing 5.0 GiB to pid 4242.
+    struct StubCard;
+
+    #[async_trait::async_trait]
+    impl crate::budget::VramWitness for StubCard {
+        async fn sample(&self) -> Result<crate::budget::MemorySample, String> {
+            let processes = vec![(4242u32, 5.0f64)];
+            Ok(crate::budget::MemorySample {
+                total_gib: 72.0,
+                used_gib: 40.0,
+                attribution: crate::budget::attribution_from_processes(&processes),
+                processes,
+            })
+        }
+        fn source(&self) -> String {
+            "fr04-stub".to_string()
+        }
+    }
+
+    fn fr04_ticket() -> SpawnTicket {
+        SpawnTicket {
+            generation: 7,
+            kind: crate::ownership::ResourceKind::ChildProcess,
+            pid: 4242,
+            port: 19_401,
+        }
+    }
+
+    fn fr04_ctx(model: &str, engine: &str) -> SamplerCtx {
+        SamplerCtx {
+            model: model.to_string(),
+            ticket: fr04_ticket(),
+            own_pids: Vec::new(),
+            container: None,
+            engine: engine.to_string(),
+        }
+    }
+
+    /// FR-04: an answer that reached the walk's cap is a partial tree — the
+    /// tree-sum refuses it outright, before a single per-pid query, and never
+    /// books it; a tree under the cap sums exactly as before. Falsifiers:
+    /// drop the `descendants_truncated` guard and the first assert sees a
+    /// 4097-pid sum with every probe queried; invert the predicate and the
+    /// honest-tree leg refuses.
+    #[tokio::test]
+    async fn a_truncated_descendant_walk_is_refused_never_summed() {
+        let runtime = Arc::new(ScriptedWalk::new(
+            vec![capped_walk_answer()],
+            capped_walk_answer(),
+        )) as Arc<dyn EngineRuntime>;
+        let probe = FlatProbe::new(1 << 30);
+        let probe_dyn = Arc::clone(&probe) as Arc<dyn crate::process::WorkingSetProbe>;
+        assert_eq!(
+            ActorState::tree_working_set_gib(&runtime, &probe_dyn, 4242).await,
+            None,
+            "a cap-length answer is truncation: the sample is refused"
+        );
+        assert_eq!(
+            probe.calls(),
+            0,
+            "the refusal must precede every per-pid query"
+        );
+        let runtime =
+            Arc::new(ScriptedWalk::new(vec![vec![4243]], Vec::new())) as Arc<dyn EngineRuntime>;
+        let probe = FlatProbe::new(1 << 30);
+        let probe_dyn = Arc::clone(&probe) as Arc<dyn crate::process::WorkingSetProbe>;
+        assert_eq!(
+            ActorState::tree_working_set_gib(&runtime, &probe_dyn, 4242).await,
+            Some(crate::budget::Gibibytes(2.0)),
+            "a complete tree under the cap still sums root plus descendants"
+        );
+    }
+
+    /// FR-04: a truncated RAM tick is skipped and LOGGED while the sampler
+    /// keeps polling — the next honest tick re-books. Falsifiers: read the
+    /// refusal as tree-gone (`return` instead of `continue`) and the message
+    /// never arrives; send the truncated sample through the band check and
+    /// the 4097-pid figure books.
+    #[tokio::test]
+    async fn a_truncated_ram_tick_is_skipped_and_the_sampler_keeps_polling() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let runtime = Arc::new(ScriptedWalk::new(vec![capped_walk_answer()], vec![4243]))
+            as Arc<dyn EngineRuntime>;
+        let probe = FlatProbe::new(1 << 30);
+        let probe_dyn = Arc::clone(&probe) as Arc<dyn crate::process::WorkingSetProbe>;
+        let ctx = fr04_ctx("fr04-ram", "llama");
+        let sampler = tokio::spawn(async move {
+            ActorState::ram_refresh(
+                &runtime,
+                &tx,
+                &ctx,
+                &probe_dyn,
+                8.0,
+                Duration::from_millis(40),
+            )
+            .await;
+        });
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the sampler survives the refused tick and re-books")
+            .expect("actor channel open");
+        let ActorMsg::MeasuredRam { ram_gib, .. } = msg else {
+            panic!("expected a RAM reading");
+        };
+        assert!(
+            (ram_gib.0 - 2.0).abs() < 1e-9,
+            "the honest sample after the refusal books whole: {}",
+            ram_gib.0
+        );
+        assert!(
+            probe.calls() >= 2,
+            "the surviving tick really probed the tree"
+        );
+        sampler.abort();
+    }
+
+    /// FR-04: the process-tree measurement fallback refuses a truncated walk
+    /// — the `None` is the module's established stand-in posture (the witness
+    /// loop keeps the measurement honest), and nothing reaches the actor.
+    /// Below the cap the same leg still lands its figure. Falsifiers: remove
+    /// the guard and the truncated leg answers `Some` off a partial tree;
+    /// return `Some` on refusal and the stand-in is consumed by a lie.
+    #[tokio::test]
+    async fn the_process_tree_measurement_refuses_a_truncated_walk() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ActorMsg>();
+        let witness = Arc::new(StubCard) as Arc<dyn crate::budget::VramWitness>;
+        let ctx = fr04_ctx("fr04-meas", "strata");
+        let runtime = Arc::new(ScriptedWalk::new(
+            vec![capped_walk_answer()],
+            capped_walk_answer(),
+        )) as Arc<dyn EngineRuntime>;
+        assert_eq!(
+            ActorState::report_measurement(&runtime, &tx, &ctx, &witness).await,
+            None,
+            "the witness-tree sum refuses a partial tree outright"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused measurement never reaches the actor"
+        );
+        let runtime =
+            Arc::new(ScriptedWalk::new(vec![vec![4243]], Vec::new())) as Arc<dyn EngineRuntime>;
+        assert_eq!(
+            ActorState::report_measurement(&runtime, &tx, &ctx, &witness).await,
+            Some(5.0),
+            "below the cap the per-process tree figure still lands"
+        );
+        let msg = rx.recv().await.expect("measurement message");
+        assert!(
+            matches!(
+                msg,
+                ActorMsg::MeasuredProcessReport {
+                    measurement: EngineMeasurement {
+                        source: MeasurementSource::ProcessTreeNvml,
+                        confidence: MeasurementConfidence::Low,
+                        gpu_gib: 5.0,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "the landed figure keeps its tree provenance"
+        );
+    }
+
+    /// FR-04 tripwire: the refusal side mirrors the Win32 walk's own cap
+    /// constant. Falsifier: move `DESCENDANT_CAP` in `src/process/win32.rs`
+    /// without moving the mirror and this pin goes red on the drift.
+    #[test]
+    fn the_descendant_cap_mirror_tracks_the_win32_walk() {
+        let source = include_str!("../process/win32.rs");
+        let tail = source
+            .split("DESCENDANT_CAP: usize = ")
+            .nth(1)
+            .expect("the walk keeps declaring its cap");
+        let declared: usize = tail
+            .split(';')
+            .next()
+            .expect("the literal ends")
+            .trim()
+            .replace('_', "")
+            .parse()
+            .expect("the cap stays a plain integer literal");
+        assert_eq!(
+            declared,
+            ActorState::DESCENDANT_REPORT_CAP,
+            "the caller-side refusal must mirror the walk bound (FR-04)"
+        );
+    }
 }

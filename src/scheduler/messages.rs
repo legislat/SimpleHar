@@ -225,22 +225,6 @@ pub(super) enum ActorMsg {
     },
 }
 
-impl Clone for ActorMsg {
-    /// Only the persist-fail reconcile is ever cloned: it must leave the blocking
-    /// write with the bytes it wrote, while a reply channel cannot be cloned and the
-    /// rest of the variants never cross a thread boundary twice.
-    fn clone(&self) -> Self {
-        match self {
-            Self::MeasuredPersistFailed { model, data, file } => Self::MeasuredPersistFailed {
-                model: model.clone(),
-                data: data.clone(),
-                file: file.clone(),
-            },
-            _ => unreachable!("only the persist-fail reconcile is cloned"),
-        }
-    }
-}
-
 /// Result of an async step, sent back to the actor by the spawned step task.
 #[derive(Debug)]
 pub(super) enum Event {

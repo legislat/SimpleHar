@@ -16,6 +16,25 @@ Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
+## Unreleased
+
+### Fixed
+
+- The job ledger keeps every live row, the load row of each installed
+  occupant, and the newest 200 terminal rows; `/har/status` `jobs` stays
+  bounded over long uptimes. An aged id answers unknown on the job and
+  cancel routes.
+- An admit no longer stats the model file on the scheduler turn. A cached
+  fit projection is voided by the fingerprint the last scan or probe actually
+  read; a silent rewrite is caught at the next scan or probe, and the
+  physical gate stays the witness.
+- Repeated failed rescans leave one `catalog_errors` row per reason; the next
+  successful scan replaces the set with that scan's own errors.
+- A descendant walk that stops at the 4,096-pid cap is refused as a RAM or
+  measurement sample instead of being booked as complete.
+- `GET /har/log` answers `400 bad_request` for a `limit` that is present but
+  not a whole number, instead of silently using the default.
+
 ## v1.3.2 - 2026-11-06
 
 ### Added
