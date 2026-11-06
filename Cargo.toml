@@ -41,7 +41,7 @@ async-trait = "0.1"
 # `stream` enables byte-for-byte SSE pass-through.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
 # Tray icon + menu (Step 15): the only GUI dependency; no Qt/egui.
-tray-icon = "0.21"
+tray-icon = "0.26"
 # Win32: tray message pump (Step 15) and Job Objects + single-instance mutex (Step 8).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
