@@ -14,17 +14,10 @@ Prebuilt binaries: see the GitHub Releases page of this repository. The release
 zip holds `simpleharn.exe`, `SimpleHarn.vbs`, `README.md`, and `LICENSE`; models
 and engine installs are yours.
 
-## Rename from SimpleHar SE
-
-The project shipped under the working name SimpleHar SE. An unrelated utility named
-SimpleHAR, a HAR-file viewer, already used that name. The product, binary, crate, config
-file, env names, wire identifiers, and custody dirs are now SimpleHarn. There is no
-backward compatibility and no migration. The harness ignores an old `simplehar-se.json`
-or `simplehar.json` config file. The old `SIMPLEHAR_*` environment names are inert. The
-harness never reads the old wire values or the old `.simplehar` custody dirs.
-
 > This is a personal harness, built for my own machine and my own setup. Feel free to try
 > it out, give feedback, and contribute.
+
+![SimpleHarn control page](docs/assets/control-page.png)
 
 ## Who this is for
 
@@ -208,6 +201,15 @@ refusal (unload something; the harness never over-admits). The full list, with t
 
 Found a problem or have an idea? Open an issue. Contributions are welcome; start with
 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Rename from SimpleHar SE
+
+The project shipped under the working name SimpleHar SE. An unrelated utility named
+SimpleHAR, a HAR-file viewer, already used that name. The product, binary, crate, config
+file, env names, wire identifiers, and custody dirs are now SimpleHarn. There is no
+backward compatibility and no migration. The harness ignores an old `simplehar-se.json`
+or `simplehar.json` config file. The old `SIMPLEHAR_*` environment names are inert. The
+harness never reads the old wire values or the old `.simplehar` custody dirs.
 
 ## Special thanks
 
