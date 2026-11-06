@@ -18,6 +18,19 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
 ## Unreleased
 
+### Added
+
+- Project Maya engines: an `engine: maya` row names `maya_python`,
+  `maya_cwd`, `maya_config`, and `serve_model`, and it requires a
+  `load_timeout` of 300 s or more. The harness launches `serve.server`
+  headless (never the `maya.py` launcher) and forces the loopback bind, the
+  slot port, and `--idle-unload 0`. It launches only a scrubbed copy of the
+  operator config: the harness strips `host`, `port`, `api_key`,
+  `idle_unload_s`, and `cors_origins`, forces `model_management` off, and
+  stages the bytes content-addressed under `.simpleharn/maya-profiles`.
+  `cost: greedy` is the honest class, the launch floor is the gate, and
+  `exact` is refused.
+
 ## v1.3.1 - 2026-11-05
 
 ### Added

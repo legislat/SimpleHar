@@ -2,8 +2,8 @@
 //!
 //! Doctrine: *"external engines obey only harness-owned configuration"*. This is
 //! the single-source, compiled-in data table behind the L1/L2/L3 layering — one
-//! row per engine (`mock`, `llama`, `strata`, `ninfer`), "one mechanism, four
-//! instances". Built as L3's **render+scrub contract**, not a validator: the
+//! row per engine (`mock`, `llama`, `strata`, `basalt`, `maya`, `ninfer`), "one
+//! mechanism, six instances". Built as L3's **render+scrub contract**, not a validator: the
 //! row says what the harness always writes (`forced_fields`) and what may never
 //! be admitted from L1 (`forbidden_words`); the per-engine renderers read the
 //! row instead of hiding the same facts in code. The validator falls out as the
@@ -53,6 +53,15 @@ pub(crate) const STRATA_RENDERED_PROFILES_ROOT: &str = ".simpleharn/strata-profi
 /// basalt launch can never stage into strata's pool or the reverse
 /// (`TASK-BASALT` stage 1; `process::rendered_profiles_dir` resolves it).
 pub(crate) const BASALT_RENDERED_PROFILES_ROOT: &str = ".simpleharn/basalt-profiles";
+
+/// The Windows directory harness-rendered Maya configs stage into, as the tail
+/// below the executable's own directory — the same exe-adjacent custody posture
+/// as the strata and basalt roots, one directory per engine (`TASK-MAYA`). The
+/// operator's JSON config is the L1 artifact: the adapter strips `host`, `port`,
+/// `api_key`, `idle_unload_s` and `cors_origins`, forces `model_management`
+/// off, and stages the scrubbed bytes here, and the
+/// spawn rewrites `--config` to exactly that file.
+pub(crate) const MAYA_RENDERED_PROFILES_ROOT: &str = ".simpleharn/maya-profiles";
 
 /// The CLOSED allow-list of `extra_args` option words an operator may pass
 /// through to llama-server (FINDINGS2-0910 [1]): the inversion of the old
@@ -615,6 +624,8 @@ const BASALT_KNOBS: &[&str] = &[
     "basalt_engine_args",
 ];
 
+const MAYA_KNOBS: &[&str] = &["maya_python", "maya_cwd", "maya_config"];
+
 const NINFER_KNOBS: &[&str] = &[
     "ninfer_autostart",
     "ninfer_container",
@@ -1021,7 +1032,58 @@ static NINFER_ROW: EnginePolicy = EnginePolicy {
     supports_fit: false,
 };
 
-static POLICIES: &[&EnginePolicy] = &[&MOCK_ROW, &LLAMA_ROW, &STRATA_ROW, &BASALT_ROW, &NINFER_ROW];
+static MAYA_ROW: EnginePolicy = EnginePolicy {
+    id: "maya",
+    forced_fields: &[
+        ForcedField {
+            flag: "--engine",
+            value: ForcedValue::Literal("maya"),
+        },
+        ForcedField {
+            flag: "--host",
+            // The same loopback literal every process-engine row forces: the
+            // staged config carries no `host`, and the bind is harness argv.
+            value: ForcedValue::Literal(super::maya::MAYA_ENGINE_HOST),
+        },
+        ForcedField {
+            flag: "--config",
+            value: ForcedValue::OperatorData,
+        },
+        ForcedField {
+            flag: "--port",
+            value: ForcedValue::SlotPort,
+        },
+        ForcedField {
+            flag: "--idle-unload",
+            // The harness books a resident for as long as it keeps the job; an
+            // idle unload would return the model's memory without a release
+            // the scheduler decided. 0 = never.
+            value: ForcedValue::Literal("0"),
+        },
+    ],
+    // The row carries no operator-extra word surface: the only argv words are
+    // the harness's own, and the L1 config's `args` go to the native engine,
+    // never to the server's parser.
+    forbidden_words: &[],
+    allow_words: &[],
+    extra_words: None,
+    knobs: MAYA_KNOBS,
+    path_markers: &["--config"],
+    custody_exec_roots: &[],
+    custody_data_roots: &[MAYA_RENDERED_PROFILES_ROOT],
+    serve_template: None,
+    config_knobs: &[],
+    supports_fit: false,
+};
+
+static POLICIES: &[&EnginePolicy] = &[
+    &MOCK_ROW,
+    &LLAMA_ROW,
+    &STRATA_ROW,
+    &BASALT_ROW,
+    &MAYA_ROW,
+    &NINFER_ROW,
+];
 
 /// Every row of the compiled-in table, in table order. The acceptance and
 /// parity tests iterate it; production code always resolves its own row by id.
@@ -1275,6 +1337,9 @@ mod tests {
             "basalt" => crate::engine::basalt::BasaltAdapter
                 .spec(entry, 18109)
                 .expect("basalt renders"),
+            "maya" => crate::engine::maya::MayaAdapter
+                .spec(entry, 18109)
+                .expect("maya renders"),
             "ninfer" => crate::engine::ninfer::NinferAdapter::new("Ubuntu", "ops")
                 .spec(entry, 18109)
                 .expect("ninfer renders"),
@@ -1335,6 +1400,43 @@ mod tests {
                 );
                 model.model_ref = Some(weights.to_str().expect("utf-8").to_string());
                 model.serve_model = Some("basalt-policy".to_string());
+                model
+            }
+            "maya" => {
+                let dir = crate::testutil::temp_dir("policy-maya");
+                let tokenizer = dir.join("tokenizer");
+                std::fs::create_dir_all(&tokenizer).expect("tokenizer dir");
+                std::fs::write(tokenizer.join("vocab.json"), b"{}").expect("vocab fixture");
+                std::fs::write(dir.join("python.exe"), b"p").expect("python fixture");
+                std::fs::write(dir.join("maya.exe"), b"e").expect("engine fixture");
+                let config = dir.join("maya.json");
+                std::fs::write(
+                    &config,
+                    serde_json::json!({
+                        "exe": dir.join("maya.exe"),
+                        "args": ["--glm-pack", "pack"],
+                        "cwd": dir,
+                        "tokenizer": tokenizer,
+                        "model_name": "maya-policy",
+                        "gpu": [0],
+                    })
+                    .to_string(),
+                )
+                .expect("config fixture");
+                let mut model = entry(
+                    "maya",
+                    &[
+                        (
+                            "maya_python",
+                            dir.join("python.exe").to_str().expect("utf-8"),
+                        ),
+                        ("maya_cwd", dir.to_str().expect("utf-8")),
+                        ("maya_config", config.to_str().expect("utf-8")),
+                        ("load_timeout", "900"),
+                    ],
+                );
+                model.serve_model = Some("maya-policy".to_string());
+                model.load_timeout_s = Some(900);
                 model
             }
             "ninfer" => entry(
@@ -1737,7 +1839,7 @@ mod tests {
         }
     }
 
-    /// "One mechanism, five instances": the table and the adapter registry
+    /// "One mechanism, six instances": the table and the adapter registry
     /// must know the same engine ids — a new adapter without a row, or a row
     /// without an adapter, is exactly the fork this chunk exists to close.
     #[test]

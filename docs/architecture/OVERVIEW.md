@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [contributor, agent, architect]
 source_of_truth_for: [current architecture]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release, new-decision
 ---
 
@@ -21,8 +21,8 @@ model, and API reference tables live in `docs/reference/`.
 
 - SimpleHarn is a Windows tray harness: one Rust crate
   (`simpleharn`, `Cargo.toml`), one process, one NVIDIA GPU, several local
-  LLM inference engines (`llama`, `strata`, `basalt`, `ninfer`, plus a
-  test-only `mock`).
+  LLM inference engines (`llama`, `strata`, `basalt`, `maya`, `ninfer`, plus
+  a test-only `mock`).
 - It owns engine processes as its children, swaps models between four
   category listeners through one single-writer scheduler, and admits loads
   against the card's live reading. It refuses with named blockers rather than
@@ -193,7 +193,7 @@ One harness process, one tokio runtime, plus OS-level children:
   builds the map. `LaunchSpec` must be constructible from data alone.
 - Policy table (`src/engine/policy.rs`, `EnginePolicy::all`): the compiled-in
   single-source table behind L1/L2/L3 - one row per engine, `forced_fields`,
-  forbidden words, and word contracts. One mechanism, five instances.
+  forbidden words, and word contracts. One mechanism, six instances.
 - `llama` (`src/engine/llama.rs`): native `llama-server.exe` per GGUF. The
   flag map is data, parity-tested against the operator's start script. The
   harness forces `--host 127.0.0.1` (`LLAMA_ENGINE_HOST`) and the assigned
@@ -224,6 +224,24 @@ One harness process, one tokio runtime, plus OS-level children:
   `vram_gb` with `cost: fixed`; no Fit, because the engine reports no
   projection. Kill is the job object; the engine child rides Basalt's own
   kill-on-close job.
+- `maya` (`src/engine/maya.rs`): Project Maya, a Python server in front of a
+  native engine. The harness launches `python -m serve.server --engine maya`
+  directly in `maya_cwd` (not the `maya.py` launcher, which opens a browser
+  and may recalibrate), forces `--host 127.0.0.1`, the assigned `--port`, and
+  `--idle-unload 0`. The row's `maya_config` is the L1 file: the adapter
+  validates every path it names, strips `host`, `port`, `api_key`,
+  `idle_unload_s`, and `cors_origins`, and forces `model_management` false,
+  so no client can switch the model on a managed resident and no config can
+  grant CORS. It stages the scrubbed JSON under
+  `.simpleharn\maya-profiles` (`process::rendered_profiles_dir`,
+  content-addressed, atomic, keep-N prune) and rewrites `--config` to exactly
+  that staged file. Readiness is `/health` 200 whose `model` is the
+  `serve_model`; the server probes the port once before the load and serves
+  only after it, so a closed port is NotYet and `load_timeout` (required,
+  300 s floor) is the deadline. Cost is `greedy` (the expert cache
+  spills to RAM/SSD; the launch floor is the gate) or `fixed` with a declared
+  `vram_gb`; `exact` is refused. Kill is the job object: it takes the server
+  and all descendants.
 - `ninfer` (`src/engine/ninfer.rs`): GPU container inside WSL2. Template
   mode is the current and only mode: the row declares `ninfer_image`, and
   the harness renders the canonical autostart script
@@ -318,7 +336,7 @@ One harness process, one tokio runtime, plus OS-level children:
 | `src/budget.rs` | admission arithmetic, `AdmissionError`, witnesses' types |
 | `src/prefetch.rs` | release-window OS-cache warm of the weight files the incoming row's launch opens (knob-gated, fire-and-forget) |
 | `src/witness.rs` | NVML witness with `nvidia-smi` fallback, TTL caches |
-| `src/engine/` | adapters (`llama.rs`, `strata.rs`, `basalt.rs`, `ninfer.rs`, `mock.rs`), `EnginePolicy` table (`policy.rs`), Fit probe (`fit.rs`) |
+| `src/engine/` | adapters (`llama.rs`, `strata.rs`, `basalt.rs`, `maya.rs`, `ninfer.rs`, `mock.rs`), `EnginePolicy` table (`policy.rs`), Fit probe (`fit.rs`) |
 | `src/process.rs` | Job-Object supervision, script staging, single-instance guard, log files |
 | `src/ownership.rs` | `SpawnTicket` provenance, `ContainerClaims` ledger, boot-reap rule |
 | `src/custody.rs` | harness-side custody sidecar for strata launches |

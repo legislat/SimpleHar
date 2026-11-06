@@ -8,6 +8,7 @@
 pub(crate) mod basalt;
 pub(crate) mod fit;
 pub mod llama;
+pub mod maya;
 pub mod mock;
 pub mod ninfer;
 pub mod policy;
@@ -191,8 +192,11 @@ pub enum Probe {
 /// or the `--max-context=` suffix, digits only ([`strata::effective_context`]);
 /// ninfer
 /// answers the max-context of the profile its launcher resolves
-/// ([`ninfer::effective_context`]); every other engine (mock) has no context
-/// statement and answers `None`. A `None` ships as null: a stale `context:`
+/// ([`ninfer::effective_context`]); every other engine (mock, basalt, maya)
+/// has no context statement the harness reads and answers `None`: a maya
+/// row's figure lives in the staged config's `--max-context` token, not in a
+/// row key, and reading it back is a follow-up (`TASK-MAYA`). A `None` ships as
+/// null: a stale `context:`
 /// line on a row whose engine never reads it is the dead key the scan reports,
 /// never a display fallback.
 ///
@@ -566,7 +570,7 @@ pub trait EngineRuntime: Send + Sync {
 }
 
 /// Production boot's adapter map (FINDINGS-10 \[3]): llama + strata + basalt +
-/// ninfer always, the test-facing `mock` adapter only on the config's explicit
+/// maya + ninfer always, the test-facing `mock` adapter only on the config's explicit
 /// `allow_mock_engine` grant (its argv is the bare name `mock-engine`, which
 /// `CreateProcessW` resolves through the harness's own directories). A stray
 /// `engine: mock` yaml without the grant therefore meets an adapter-lookup
@@ -601,6 +605,7 @@ pub fn default_adapters(
         )),
     );
     adapters.insert("basalt".to_string(), Arc::new(basalt::BasaltAdapter));
+    adapters.insert("maya".to_string(), Arc::new(maya::MayaAdapter));
     adapters.insert(
         "ninfer".to_string(),
         Arc::new(
@@ -885,6 +890,12 @@ mod tests {
             effective_context(&entry("strata", &[("context", "4096")])),
             None
         );
+        // A maya row states nothing in a row key: its figure rides the L1
+        // config's `--max-context` token, so the page shows null (TASK-MAYA).
+        assert_eq!(
+            effective_context(&entry("maya", &[("context", "131072")])),
+            None
+        );
     }
 
     #[test]
@@ -893,14 +904,14 @@ mod tests {
         let ids: Vec<String> = default_adapters(&config).into_keys().collect();
         assert_eq!(
             ids,
-            ["basalt", "llama", "ninfer", "strata"],
+            ["basalt", "llama", "maya", "ninfer", "strata"],
             "default boot has no mock"
         );
         config.allow_mock_engine = true;
         let ids: Vec<String> = default_adapters(&config).into_keys().collect();
         assert_eq!(
             ids,
-            ["basalt", "llama", "mock", "ninfer", "strata"],
+            ["basalt", "llama", "maya", "mock", "ninfer", "strata"],
             "the grant adds mock"
         );
     }

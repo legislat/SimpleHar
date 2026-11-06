@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [ModelConf schema, engine-specific model keys]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
@@ -33,7 +33,7 @@ edit never leaves a half-written model file in use.
 |---|---|
 | `name` | Optional. The file stem is the model identity. A `name` that mismatches the stem is refused: rename the file or drop the key. |
 | `model` | GGUF path (or the engine's model URI). **Required for llama**. A basalt row requires an absolute `.basalt` pack path. |
-| `engine` | `llama` (default), `strata`, `basalt`, or `ninfer`. |
+| `engine` | `llama` (default), `strata`, `basalt`, `maya`, or `ninfer`. |
 | `category` | `WORK`/`RP`/`AUX`/`EMB`. |
 | `vram_gb` | Declared admission cost in GiB. `fixed` falls back to `file size x 1.15 + 2`. `exact` refuses without it. |
 | `cost` | `fixed` (default): the declared size binds admission. `greedy`: the model offloads to RAM/SSD; the size never refuses, but a launch floor is mandatory. `exact`: an engine-computed number, required and binding. |
@@ -44,8 +44,8 @@ edit never leaves a half-written model file in use.
 | `serve_model` | The expected engine-reported id. A mismatch records a warning; the harness never trusts it. |
 | `measured_gb` / `measured_gb_min` | The footprint range the harness measured while this model served: `measured_gb` is the high end and `measured_gb_min` the low end. The harness writes them back after a load. When `vram_gb` is absent, admission books `measured_gb`. The `measured_attribution` stamp decides whose number it is, and only these attributions book: `engine_report` (the container's own startup reservation), `engine_status` (a process engine's own status endpoint stated the footprint), and `per_process` (the witness attributed the bytes to the engine's own process tree). A `total_diff` figure (a free-memory delta) displays but never books. An **absent** stamp is grandfathered and books on `fixed` rows. `greedy` never books a measured figure, whatever the provenance, because it is offloaded by design. Ninfer rows also carry `measured_profile`: an `engine_report` figure is voided when the resolved profile identity changes. The identity is the profile name, plus the resolved `kv` for an override line. An edit to the line's `ctx`/`conc`/`kv_dtype` that leaves `kv` alone keeps the figure, because the reservation follows the KV pool. The write-back also records `measured_offload`, the `cpu_offload` state the pair was taken under; a later flip voids the pair. |
 | `is_embedding_model` | A truthy value forces category `EMB`. It conflicts with another explicit category. |
-| `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. |
-| `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. For the basalt 482B class, `load_timeout: 1200` is the recommended starting point. |
+| `context`, `batch`, `flash_attn`, and other flag keys | The harness maps these keys to the corresponding `llama-server` flags. `context` is **llama only**: on other engines it stays an inert key (the scan says so), and the page and API never display it there. The Ctx figure shown for a strata row is the `--max-context` figure in its `strata_args` (the `--max-context` token or the `--max-context=` spelling, digits only). For a ninfer row it is the max-context of the resolved profile. A `maya` row reports no Ctx figure: the value stays in the staged config's `--max-context` token. |
+| `load_timeout` | Per-model readiness deadline in seconds. The llama default is 120; strata and ninfer cold starts commonly need 600 to 1200. For the basalt 482B class, `load_timeout: 1200` is the recommended starting point. A `maya` row must declare 300 or more: the scan refuses a missing or smaller value rather than let a healthy load meet the 120 s default. |
 | `min_turn` | Minimum seconds of service before a different model's request may evict this model. The harness refuses to evict a model that has served less than `min_turn` seconds for a different model's request. Omitting the key means no guard. An explicit request for the model's own slot is never blocked. Range 1-86400 seconds; scan refuses a value outside it. A measured swap runs 14-45 s, so the knob stops a ping-pong of swaps between two hot models. |
 | `strata_exe` | **Required for strata** (template mode): the absolute path of the engine binary that the harness-rendered profile names. Its presence selects template mode. `serve_model` is also required, and it becomes the profile's served model name. |
 | `strata_tokenizer` | **Required for strata**: the absolute tokenizer path that the rendered profile names. |
@@ -65,6 +65,9 @@ edit never leaves a half-written model file in use.
 | `basalt_exe` | **Required for basalt**: the engine binary. It must be an absolute path to an existing file, and the harness passes it as `--engine-bin`. |
 | `basalt_parallel` | Optional worker-pool size passed as `--parallel`: a whole number `1..=8`, default `1`. It changes the KV footprint, so the row's declared cost must match it. |
 | `basalt_engine_args` | Comma-separated engine flags appended to the launch line; each entry is exactly one word. Long options only (`--flag` or `--flag=value`). The harness refuses a server-owned flag by exact name and says which mechanism owns that decision. |
+| `maya_python` | **Required for maya**: the interpreter `.exe`. It must be an absolute path to an existing file, and it is the program the harness launches. |
+| `maya_cwd` | **Required for maya**: the Project Maya root directory. It must be an absolute path to an existing directory. The `-m serve.server` module resolves from this working directory. |
+| `maya_config` | **Required for maya**: the operator's Maya JSON config. It must be an absolute path to an existing file. The harness reads it at every load, validates every path it names, and launches only its own scrubbed, staged copy. `serve_model` must equal the config's `model_name`, and `load_timeout` is required with a floor of 300 seconds. See "Maya engines" below. |
 | `extra_args` | **Closed allow-list, not a denial list.** The harness splits the value on whitespace and appends a word to the argv only when it is a reviewed option: `--embedding`, `--embeddings`, `--pooling <mode>`, `--temp`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--seed`, `--warmup`, `--no-warmup`. The value words a reviewed option consumes are appended too. A value may not be option-shaped, so it cannot smuggle another flag. **Anything else is refused with the launch**, and the message names the word. The model, host, port, gpu-layers, jinja, api-key, lora, and rpc options and every other option are not on the list, so their absence refuses them and there is nothing to dodge. The harness appends its forced `--host 127.0.0.1`, `--port`, and `cpu_offload` `-ngl 0` after these args, and they win. |
 | `ninfer_image` | **Required for ninfer**: selects **template mode, the only mode**. The harness renders the canonical autostart script from your yaml, stages it into the distro, verifies it by distro-side checksum, and launches exactly **that** script. Its required companions are `ninfer_model_name` (the directory that holds the artifact), `ninfer_artifact` (the file inside it), and `ninfer_model_roots` (comma-separated absolute WSL directories, searched in order). Each must be a plain word, and the harness refuses a bad value and names the key. `ninfer_internal_port` (the port the container binds inside its own namespace) is optional and defaults to the harness internal number **8808**. That is the harness's 87xx family plus 100: clear of the manual 80xx world, the 87xx listeners, and the 181xx engine plan. It may not name a `protected_ports`, public-listener, or harness engine port. The manual/harness separation covers container-internal numbers too, so the harness refuses a row that borrows one at load, and the rescan names it. |
 | `ninfer_serve_cmd` | The server command inside the container (default `ninfer-serve`). |
@@ -87,6 +90,18 @@ staged copy. See "Strata engines" below.
 The harness renders basalt rows the same way. At every load it writes its
 `{"server": ...}` profile into `.simpleharn\basalt-profiles` beside the exe
 and launches only its own staged copy. See "Basalt engines" below.
+
+A Maya row keeps the operator's own JSON config as its L1 input. At every
+load the harness reads it, validates every path it names, removes `host`,
+`port`, `api_key`, `idle_unload_s`, and `cors_origins`, forces
+`model_management` to `false`, and stages the scrubbed copy into
+`.simpleharn\maya-profiles` beside the exe (content-addressed
+`<model>-<hash>.json`, atomic write, keep-N prune). The spawn rewrites
+`--config` to exactly that file. The server writes small sidecars beside the
+staged config (`vision-memory.json`, the savings ledger,
+`<staged>.shared-settings.json`); the prune matches only
+`<model>-<hash>.json`, so sidecars accumulate and the harness never renders
+them. See "Maya engines" below.
 
 The harness keeps unknown keys for reference and reports them as
 `unknown_key` warnings. The model still loads. `host` and `port` keys belong
@@ -275,6 +290,78 @@ The `vram_gb` figure and its floor here are illustrative only. Basalt fills
 the card's free VRAM up to its reserve policy, so the row must declare the
 ceiling you intend. Measure your current card and one witnessed serve, then
 write the number; do not copy a figure from a note.
+
+### Maya engines
+
+Maya models (`engine: maya`) run the Project Maya Python server in front of
+its native engine. The harness launches
+`<maya_python> -m serve.server --engine maya --host 127.0.0.1 --config <staged> --port <assigned> --idle-unload 0`
+in `maya_cwd`. It never uses the `maya.py` launcher: that program opens a
+browser when the model is ready, and it may rebuild or recalibrate a config
+before starting. Both are decisions the harness owns.
+
+The row's `maya_config` is an L1 artifact. The harness parses it and
+validates every path it names before the load gesture: the engine `exe`, the
+engine `cwd`, the `tokenizer` directory with its `vocab.json`, and, when the
+config carries a `vision` block, its `exe`, `mmproj`, and `model` files. The
+config's `model_name` must equal the row's `serve_model`, or the scan
+refuses the row. The config's `env` may hold only `MAYA_*` names with scalar
+values; the scan refuses any other name by name. The harness then removes
+`host`, `port`, `api_key`, `idle_unload_s`, and `cors_origins`, forces
+`model_management` to `false`, stages the scrubbed JSON content-addressed
+under `.simpleharn\maya-profiles` beside the exe, and rewrites `--config` to
+exactly that file. The bind is the forced loopback argv, the port is
+harness-assigned, and there is no API key. The forced
+`model_management: false` lets no client unload, load, or switch the model
+on a managed resident, and the removed `cors_origins` lets no config grant
+CORS. The
+engine binary and the engine `cwd` stay in the staged copy: the server reads
+them from the config, not from argv.
+
+Readiness is `GET /health` with status 200 whose `model` value is exactly
+the `serve_model`. The server probes the port once before the load and
+serves only after it, so a closed port is NotYet: only the serving bind
+answers 200. The load waits inside `load_timeout`. A Maya row requires
+`load_timeout` of 300 seconds or more: a big pack loads for minutes, and the
+120-second global default would kill a healthy load. A missing key is a scan
+refusal.
+
+`cost: greedy` is the honest class: the expert cache fills VRAM and spills
+to RAM and SSD. A greedy row may omit `vram_gb`; the row's
+`launch_only_with_at_least_vram_free` is the gate. `cost: fixed` is accepted
+with a declared `vram_gb`. `cost: exact` is refused: the engine reports no
+computed requirement to book.
+
+The harness job object kills the Python server and every descendant, the
+engine and the vision children. No conversation is saved across a harness
+swap. Host-RAM booking for the expert tier is a follow-up, not today's
+behavior. `/har/models` reports `context` null for a Maya row: the figure
+stays in the staged config's `--max-context` token.
+
+Do not use the dashboard on a managed instance. The managed server still
+serves Maya's own dashboard and management doors on the loopback slot port,
+and the harness does not disable them. A local client that posts JSON with
+no origin can still change the listen port (`POST /api/port`), which breaks
+the harness slot mapping; reload the context (`POST /api/context`,
+transient: the next harness load re-renders the staged config); or start an
+update (`/api/update`). Keep the dashboard for the manual launch only.
+
+Example row (placeholders, not machine facts):
+
+```yaml
+engine: maya
+category: WORK
+serve_model: <served-id>
+cost: greedy
+launch_only_with_at_least_vram_free: 60
+load_timeout: 1800
+maya_python: <maya-dir>\.venv\Scripts\python.exe
+maya_cwd: <maya-dir>
+maya_config: <maya-dir>\maya-<row>.json
+```
+
+A Maya engine starts only when you load it; booting the harness starts
+nothing.
 
 ### Ninfer engines
 

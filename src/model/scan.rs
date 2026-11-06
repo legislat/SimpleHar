@@ -58,8 +58,8 @@ pub enum ScanKind {
     /// entry still publishes. The mechanism is the knob table (slice 10c
     /// generalization of the 2026-10-28 `cpu_offload` ruling): every
     /// engine-scoped key — `cpu_offload` and its llama siblings, the strata,
-    /// basalt and ninfer key families — is scoped the same data-driven way, so
-    /// a new row knob needs no new scan code.
+    /// basalt, maya and ninfer key families — is scoped the same data-driven
+    /// way, so a new row knob needs no new scan code.
     InertKey,
     /// A yaml file the scan refuses to publish (Fork C doctrine): it carried at
     /// least one problem line — then the `reason` names every offending line — or it
@@ -115,8 +115,8 @@ impl Catalog {
 }
 
 /// The canonical set of yaml keys the harness reads anywhere: scan identity, the
-/// typed entry, the llama flag table and its extra reads, the strata, basalt and
-/// ninfer adapters, and the measured triple. This const is THE source of truth for the
+/// typed entry, the llama flag table and its extra reads, the strata, basalt,
+/// maya and ninfer adapters, and the measured triple. This const is THE source of truth for the
 /// unknown-key report: a key outside it is published with a warn-only
 /// [`ScanKind::UnknownKey`] (entry stays loadable — README: "preserved for
 /// reference"). The `consumed_keys_cover_every_key_the_code_reads` test fails when
@@ -176,6 +176,9 @@ const CONSUMED_KEYS: &[&str] = &[
     "basalt_exe",
     "basalt_parallel",
     "basalt_engine_args",
+    "maya_python",
+    "maya_cwd",
+    "maya_config",
     "ninfer_autostart",
     "ninfer_container",
     "ninfer_profile",
@@ -882,6 +885,30 @@ pub fn scan_dir(dir: &Path) -> Catalog {
                             crate::engine::basalt::BasaltRowError::Missing { .. } => {
                                 ScanKind::Other
                             }
+                        };
+                        catalog.errors.push(ScanError {
+                            kind,
+                            file: file_name.clone(),
+                            reason: problem.into_engine_error().to_string(),
+                        });
+                        continue;
+                    }
+                }
+                // A maya row passes through the adapter's single door: the row
+                // names the interpreter, the Maya root and the operator's JSON
+                // config, and the config is read here exactly as the adapter
+                // reads it, so the scan refuses at rescan what the spawn would
+                // refuse after eviction. An absent path is the model-path door;
+                // a missing key or a bad value is a typed reject; the config's
+                // own keys travel in the sentence.
+                if entry.engine == "maya" {
+                    if let Err(problem) = crate::engine::maya::validate_row(&entry) {
+                        let kind = match &problem {
+                            crate::engine::maya::MayaRowError::MissingPath { .. } => {
+                                ScanKind::ModelPathMissing
+                            }
+                            crate::engine::maya::MayaRowError::Missing { .. }
+                            | crate::engine::maya::MayaRowError::Bad { .. } => ScanKind::Other,
                         };
                         catalog.errors.push(ScanError {
                             kind,
@@ -2981,6 +3008,217 @@ mod tests {
         );
     }
 
+    /// The disk shape a valid maya row validates against (the same shape
+    /// `maya::validate_row` walks in its own module): an interpreter, an engine
+    /// binary, a tokenizer dir carrying `vocab.json`, and a minimal config JSON
+    /// shaped like the operator's installs. Returns the config path.
+    fn maya_install(dir: &Path) -> std::path::PathBuf {
+        let tokenizer = dir.join("tokenizer");
+        std::fs::create_dir_all(&tokenizer).expect("write tokenizer dir");
+        std::fs::write(tokenizer.join("vocab.json"), b"{}").expect("write vocab");
+        std::fs::write(dir.join("python.exe"), b"p").expect("write interpreter");
+        std::fs::write(dir.join("maya.exe"), b"e").expect("write engine");
+        let config = dir.join("maya.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "exe": dir.join("maya.exe"),
+                "args": ["--glm-pack", "pack", "--max-context", "131072"],
+                "cwd": dir,
+                "tokenizer": tokenizer,
+                "model_name": "maya-served",
+            })
+            .to_string(),
+        )
+        .expect("write config");
+        config
+    }
+
+    /// One maya row document in the valid shape, every path under `dir`. An
+    /// override `Some(value)` replaces (or adds) the line; `None` drops it —
+    /// the shape `validate_row` answers with the missing-key door.
+    fn maya_yaml(dir: &Path, config: &Path, overrides: &[(&str, Option<&str>)]) -> String {
+        let mut lines: Vec<(&str, String)> = vec![
+            ("engine", "maya".to_string()),
+            ("serve_model", "maya-served".to_string()),
+            ("cost", "greedy".to_string()),
+            ("launch_only_with_at_least_vram_free", "20".to_string()),
+            ("load_timeout", "900".to_string()),
+            (
+                "maya_python",
+                dir.join("python.exe").to_string_lossy().into_owned(),
+            ),
+            ("maya_cwd", dir.to_string_lossy().into_owned()),
+            ("maya_config", config.to_string_lossy().into_owned()),
+        ];
+        for (key, value) in overrides {
+            if let Some(line) = lines.iter_mut().find(|(k, _)| *k == *key) {
+                if let Some(value) = value {
+                    line.1 = value.to_string();
+                } else {
+                    line.0 = "";
+                }
+            } else if let Some(value) = value {
+                lines.push((key, value.to_string()));
+            }
+        }
+        lines
+            .iter()
+            .filter(|(k, _)| !k.is_empty())
+            .map(|(k, v)| format!("{k}: {v}\n"))
+            .collect()
+    }
+
+    /// The happy path pinned whole (same posture as basalt's): a valid maya
+    /// row publishes with its three knobs live — zero reports, neither
+    /// `UnknownKey` (the knobs are consumed) nor `InertKey` (the maya row
+    /// reads them) — and the greedy booking posture (no declared `vram_gb`,
+    /// the launch floor is the gate) lands intact. Falsifier: dropping the
+    /// knob lines from the consumed const warns the live row on its own keys.
+    #[test]
+    fn a_valid_maya_row_publishes_with_its_three_knobs_live() {
+        let dir = crate::testutil::temp_dir("scan-maya-valid");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = maya_install(&dir);
+        std::fs::write(dir.join("row.yaml"), maya_yaml(&dir, &config, &[])).expect("write");
+        let catalog = scan_dir(&dir);
+        assert_eq!(catalog.models.len(), 1, "{:?}", catalog.errors);
+        assert!(
+            catalog.errors.is_empty(),
+            "a knob on its own row stays silent: {:?}",
+            catalog.errors
+        );
+        let entry = &catalog.models[0];
+        assert_eq!(entry.engine, "maya");
+        assert_eq!(entry.serve_model.as_deref(), Some("maya-served"));
+        assert_eq!(entry.cost, crate::model::CostClass::Greedy);
+        assert_eq!(entry.load_timeout_s, Some(900));
+        assert_eq!(entry.vram_gate.floor(), Some(20.0));
+    }
+
+    /// A maya row that lacks a key the launch requires, carries one below
+    /// the Maya load floor, or claims a cost class the engine cannot book,
+    /// is refused at rescan — before any load could evict a resident for the
+    /// doomed spawn — and the report names the key (the adapter's
+    /// `validate_row` is the single source of the required set, so the scan
+    /// names whatever that door names). Falsifier: no maya branch in the
+    /// scan publishes the row and the report is empty.
+    #[test]
+    fn a_maya_row_missing_or_below_a_required_key_is_refused_naming_the_key() {
+        let dir = crate::testutil::temp_dir("scan-maya-missing-key");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = maya_install(&dir);
+        for (key, value) in [
+            ("maya_config", None),
+            ("maya_python", None),
+            ("load_timeout", None),
+            // A present value below the floor is the same door with its
+            // number: the global 120 s default would kill a healthy load.
+            ("load_timeout", Some("120")),
+            // The engine reports no computed requirement: `exact` books a
+            // figure that does not exist (same posture as basalt).
+            ("cost", Some("exact")),
+        ] {
+            std::fs::write(
+                dir.join("row.yaml"),
+                maya_yaml(&dir, &config, &[(key, value)]),
+            )
+            .expect("write row");
+            let catalog = scan_dir(&dir);
+            assert!(
+                catalog.models.is_empty(),
+                "`{key}` missing/below-floor must refuse the row: {:?}",
+                catalog.errors
+            );
+            let error = catalog
+                .errors
+                .iter()
+                .find(|e| e.file.contains("row.yaml"))
+                .unwrap_or_else(|| panic!("`{key}` must be reported: {:?}", catalog.errors));
+            assert_eq!(error.kind, ScanKind::Other, "{error:?}");
+            assert!(
+                error.reason.contains(key),
+                "must name `{key}`: {}",
+                error.reason
+            );
+        }
+    }
+
+    /// A `maya_config` the disk lacks is the `ModelPathMissing` door (the
+    /// same class as llama's `model:` and basalt's pack — refuse before
+    /// admission can evict a victim for the doomed spawn), not a generic
+    /// typed reject, and the reason names both the key and the path.
+    /// Falsifier: mapping `MayaRowError::MissingPath` to `Other` reports the
+    /// right file under the wrong kind.
+    #[test]
+    fn a_maya_row_naming_a_missing_config_is_model_path_missing() {
+        let dir = crate::testutil::temp_dir("scan-maya-missing-config");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = maya_install(&dir);
+        std::fs::write(
+            dir.join("row.yaml"),
+            maya_yaml(
+                &dir,
+                &config,
+                &[("maya_config", Some("Z:/absent-maya.json"))],
+            ),
+        )
+        .expect("write");
+        let catalog = scan_dir(&dir);
+        assert!(
+            catalog.models.is_empty(),
+            "a config that is not on disk must not publish: {:?}",
+            catalog.errors
+        );
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.kind == ScanKind::ModelPathMissing)
+            .expect("the missing config travels the model-path door");
+        assert!(error.file.contains("row.yaml"), "{error:?}");
+        assert!(
+            error.reason.contains("maya_config") && error.reason.contains("absent-maya.json"),
+            "the reason names the key and the absent path: {}",
+            error.reason
+        );
+    }
+
+    /// The served id is verified, not trusted: a config whose `model_name`
+    /// is not the row's `serve_model` would pass readiness against a
+    /// different model, so the scan refuses the row and the sentence names
+    /// both keys. Falsifier: dropping the `model_name` check in
+    /// `validate_row` publishes the mismatched row.
+    #[test]
+    fn a_maya_row_whose_config_model_name_mismatches_is_refused_naming_the_keys() {
+        let dir = crate::testutil::temp_dir("scan-maya-name-mismatch");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let config = maya_install(&dir);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        value["model_name"] = serde_json::json!("ghost-model");
+        std::fs::write(&config, serde_json::to_string(&value).expect("serialize")).expect("write");
+        std::fs::write(dir.join("row.yaml"), maya_yaml(&dir, &config, &[])).expect("write row");
+        let catalog = scan_dir(&dir);
+        assert!(
+            catalog.models.is_empty(),
+            "a mismatched served id must not publish: {:?}",
+            catalog.errors
+        );
+        let error = catalog
+            .errors
+            .iter()
+            .find(|e| e.file.contains("row.yaml"))
+            .expect("the mismatch is reported");
+        assert_eq!(error.kind, ScanKind::Other, "{error:?}");
+        assert!(
+            error.reason.contains("serve_model")
+                && error.reason.contains("model_name")
+                && error.reason.contains("ghost-model"),
+            "the sentence names both keys and the foreign id: {}",
+            error.reason
+        );
+    }
+
     #[test]
     fn a_one_edit_typo_gets_a_unique_suggestion() {
         assert_eq!(did_you_mean("contex"), " (did you mean 'context'?)");
@@ -3096,6 +3334,9 @@ mod tests {
              basalt_exe: C:/Basalt/bin/basalt.exe\n\
              basalt_parallel: 1\n\
              basalt_engine_args: --temp=0.7\n\
+             maya_python: D:/Maya/.venv/Scripts/python.exe\n\
+             maya_cwd: D:/Maya\n\
+             maya_config: D:/Maya/maya-maya-m.json\n\
              ninfer_autostart: /opt/a.sh\n\
              ninfer_container: golden-box\n\
              ninfer_profile: b\n\
@@ -3325,6 +3566,9 @@ mod tests {
             "basalt_exe",
             "basalt_parallel",
             "basalt_engine_args",
+            "maya_python",
+            "maya_cwd",
+            "maya_config",
             "ninfer_autostart",
             "ninfer_container",
             "ninfer_profile",
