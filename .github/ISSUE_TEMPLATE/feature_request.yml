@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest a change to SimpleHarn
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem first. A feature that fits the single-machine,
+        admission-first design is more likely to be accepted.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is hard or impossible today, and for whom?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What should the harness do instead? Name the user-visible behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: What you tried, and why it is not enough.
+    validations:
+      required: false
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and risks
+      description: Does this touch admission, the scheduler, an engine adapter, or docs?
+    validations:
+      required: false
