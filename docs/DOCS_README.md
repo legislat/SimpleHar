@@ -68,6 +68,7 @@ durable and belongs in this tree.
 | [AGENTS.md](../AGENTS.md) | Agent entry point: precedence, autonomy, routing | active |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Human contributor pointer | active |
 | [SECURITY.md](../SECURITY.md) | Vulnerability reporting and supported versions | active |
+| [CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md) | Contributor Covenant 2.1 code of conduct and enforcement contacts | active |
 | [CHANGELOG.md](../CHANGELOG.md) | Dated release history | active |
 | [DESIGN.md](../DESIGN.md) | Historical design record; never a current spec | historical |
 
