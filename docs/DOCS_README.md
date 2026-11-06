@@ -61,6 +61,7 @@ durable and belongs in this tree.
 | [README.md](../README.md) | Product overview, quick start, safety, navigation | active |
 | [AGENTS.md](../AGENTS.md) | Agent entry point: precedence, autonomy, routing | active |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Human contributor pointer | active |
+| [SECURITY.md](../SECURITY.md) | Vulnerability reporting and supported versions | active |
 | [CHANGELOG.md](../CHANGELOG.md) | Dated release history | active |
 | [DESIGN.md](../DESIGN.md) | Historical design record; never a current spec | historical |
 

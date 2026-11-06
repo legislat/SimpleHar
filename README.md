@@ -10,7 +10,9 @@ and it refuses to overcommit. The product name is SimpleHarn, and the repository
 and the environment names use the `SIMPLEHARN_` prefix.
 
 Current release: **v1.3.3**. Windows 10/11, one NVIDIA GPU, single user.
-Prebuilt binaries: see the GitHub Releases page of this repository.
+Prebuilt binaries: see the GitHub Releases page of this repository. The release
+zip holds `simpleharn.exe`, `SimpleHarn.vbs`, `README.md`, and `LICENSE`; models
+and engine installs are yours.
 
 ## Rename from SimpleHar SE
 
@@ -172,10 +174,12 @@ without a token.
 | `llama` (default) | a native `llama-server.exe` process per model, serving a GGUF file | a llama.cpp build; first run prefers a `llama-server.exe` found on PATH, and `llama_server_exe` names it |
 | `strata` | a Python server in a virtualenv, on a harness-rendered profile | a strata install with its virtualenv; the interpreter and working directory are config keys |
 | `basalt` | a Python server in a virtualenv, on a harness-rendered profile | a Basalt install with its venv and engine binary; the model row names them |
+| `maya` | a Maya server, launched headless on a scrubbed model config | a Project Maya install; the row names the interpreter, root, and config |
 | `ninfer` | a GPU container inside WSL2, staged and reaped by the harness | a WSL2 distro, Docker, and the ninfer image; set `wsl_distro` / `wsl_user` |
 
 GPU memory is read through NVML with an `nvidia-smi` fallback. WSL2 and Docker are needed
-only for `ninfer`. One GGUF file is needed per `llama` model.
+only for `ninfer`. One GGUF file is needed per `llama` model. Minimal per-engine setup is
+in [ENGINE-RECIPES.md](docs/reference/ENGINE-RECIPES.md).
 
 ## Troubleshooting
 
