@@ -667,3 +667,20 @@ recorded here so dated references to ARCHIVED still resolve:
   control page can serve its icon without a token. No other surface changes;
   DOCTRINE item 7 and the standing guard-order entry above state the new list.
   | 2026-11-05 | `8fe7d2c..`
+
+- **Project Maya engine adopted** (operator request 2026-11-06): `engine: maya`
+  runs the installed Maya `serve.server` directly (`maya_python -m serve.server
+  --engine maya`), never `maya.py` (that launcher opens a browser and may rebuild
+  or calibrate). The row's `maya_config` is the L1 file: the harness validates
+  every path it names, strips `host`, `port`, `api_key`, `idle_unload_s` and
+  `cors_origins`, forces `model_management: false`, stages the scrubbed JSON
+  content-addressed under `.simpleharn/maya-profiles`, and forces
+  `--host 127.0.0.1`, the slot `--port` and `--idle-unload 0`. Readiness is
+  `/health` 200 with `/model` equal to `serve_model`; `load_timeout` must be
+  300 s or more; `cost` is `fixed` (with `vram_gb`) or `greedy`, and `exact` is
+  refused. Card run 2026-11-06: both operator configs served and released
+  (19.6 and 9.1 tok/s, 4 s unload), the 60 GiB launch floor refused with a
+  foreign Basalt resident, and the model-management doors answered 404.
+  Residual: Maya's own dashboard doors stay on the loopback slot port; do not
+  use them on a managed instance (`MODELS.md`). Evidence:
+  `handoff/evidence/2026-11-06-maya/`. | 2026-11-06 | `2de4725`
