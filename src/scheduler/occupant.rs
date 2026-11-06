@@ -465,20 +465,20 @@ impl ActorState {
         crate::budget::Gibibytes(bytes as f64 / (1024.0f64 * 1024.0 * 1024.0))
     }
 
-    /// The engine's own pid plus every descendant at every depth, summed as
-    /// bytes (saturating — no working-set sum of a real tree overflows a u64,
-    /// and a saturating miss is absence, not a wrapped negative). A pid the
-    /// probe cannot read is skipped: a child that exited between the pid walk
-    /// and the query shrinks the tree honestly. Nothing readable at all is
-    /// absence: the caller treats it as the tree being gone and ends its
-    /// sampler. A **truncated** walk (FR-04, [`Self::descendants_truncated`])
-    /// is also absence here — a partial tree is refused, never summed as if
-    /// complete — but it is *not* the tree being gone: a sampler that must
-    /// keep polling samples the pure sum leg directly and skips the tick
-    /// instead. The unit stays bytes until [`Self::working_set_to_gib`].
-    #[cfg_attr(not(test), allow(dead_code))] // the W2 tree-sum pins call this
-                                             // one-call form directly; the production RAM loop runs the split legs so a
-                                             // truncated tick skips instead of ending the sampler (FR-04).
+    /// The TEST-ONLY one-call form of the guarded tree sample (FR-11), driven
+    /// by the W2 tree-sum pins: the engine's own pid plus every descendant at
+    /// every depth, summed as bytes (saturating — no working-set sum of a real
+    /// tree overflows a u64, and a saturating miss is absence, not a wrapped
+    /// negative). A pid the probe cannot read is skipped: a child that exited
+    /// between the pid walk and the query shrinks the tree honestly. Nothing
+    /// readable at all is absence: the caller treats it as the tree being gone
+    /// and ends its sampler. A **truncated** walk (FR-04,
+    /// [`Self::descendants_truncated`]) is also absence here — a partial tree
+    /// is refused, never summed as if complete — but it is *not* the tree
+    /// being gone, so production [`Self::ram_refresh`] runs the same two
+    /// guarded legs split, letting a truncated tick skip instead of ending the
+    /// sampler. The unit stays bytes until [`Self::working_set_to_gib`].
+    #[cfg(test)]
     pub(super) async fn tree_working_set_gib(
         runtime: &Arc<dyn EngineRuntime>,
         probe: &Arc<dyn crate::process::WorkingSetProbe>,
@@ -518,9 +518,9 @@ impl ActorState {
 
     /// Sum the working sets of the root pid and a KNOWN-COMPLETE descendant
     /// list (saturating bytes, unreadable pids skipped, one conversion at the
-    /// end). The pure sum leg split out of [`Self::tree_working_set_gib`] so
-    /// a caller that has already checked for truncation can keep its sampler
-    /// alive across a refusal (`ram_refresh` skips the tick instead of
+    /// end). The pure sum leg of the guarded tree walk: a caller that has
+    /// already checked [`Self::descendants_truncated`] can keep its sampler
+    /// alive across a refusal ([`Self::ram_refresh`] skips the tick instead of
     /// reading this `None` as the tree being gone).
     fn sum_tree_working_set_gib(
         root_pid: u32,
