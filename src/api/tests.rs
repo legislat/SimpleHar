@@ -4070,3 +4070,143 @@ async fn a_landed_but_unverified_write_restates_the_recorded_config_verdict() {
              the unknown key they carry), not keep the previous clean verdict: {doc}"
     );
 }
+
+/// FR-05: a `limit` the handler cannot parse is a request-shape refusal —
+/// `400 bad_request` in the project dual envelope (flat + OpenAI `error`),
+/// never the default-100 the old `.ok()` silently swallowed it into, and
+/// never axum text/plain (R2-05-03's envelope rule). The malformed legs:
+/// `abc`, empty, negative. Falsifiers: restore `.parse().ok().unwrap_or(100)`
+/// and the 400 legs answer 200; answer `text/plain` and the content-type and
+/// envelope legs fail; the `%zz` leg (no `limit` key at all) must STAY 200 —
+/// lenient decoding is not a limit error.
+#[tokio::test]
+async fn a_malformed_log_limit_answers_400_in_the_project_envelope() {
+    let api = Arc::new(unit_state());
+    for query in ["limit=abc", "limit=", "limit=-1"] {
+        let response = control_router(Arc::clone(&api))
+            .oneshot(
+                Request::get(format!("/har/log?{query}"))
+                    .header("host", "127.0.0.1:8708")
+                    .body(Body::empty())
+                    .expect("log request"),
+            )
+            .await
+            .expect("in-process log request");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "`{query}` must be refused, not swallowed"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            "application/json",
+            "the refusal answers the project envelope, never text/plain"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("refusal body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json envelope");
+        assert_eq!(body["code"], serde_json::json!("bad_request"), "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            serde_json::json!("bad_request"),
+            "the OpenAI sub-object carries the same class: {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("limit"),
+            "the refusal names the refused parameter: {message}"
+        );
+        if query == "limit=abc" {
+            assert!(
+                message.contains("abc"),
+                "the refusal quotes the malformed value back: {message}"
+            );
+        }
+    }
+    // The lenient-decode legs that are NOT limit errors stay inside the ring
+    // document (the R2-05-03 posture for inputs without a `limit` key).
+    let response = control_router(api)
+        .oneshot(
+            Request::get("/har/log?%zz")
+                .header("host", "127.0.0.1:8708")
+                .body(Body::empty())
+                .expect("log request"),
+        )
+        .await
+        .expect("in-process log request");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a query with no limit key still answers the ring document"
+    );
+}
+
+/// FR-05, the other leg: a valid `limit` still answers the ring document and
+/// still clamps to the ring capacity. `limit=2` returns exactly the newest 2
+/// events; `limit=999999` is accepted (not a refusal) and capped by
+/// `RING_CAPACITY` — the events list can never exceed capacity. Falsifiers:
+/// the new 400 arm rejecting a valid number fails the 200 legs; dropping the
+/// `.min(RING_CAPACITY)` is invisible in shape but the `limit=2` leg pins the
+/// clamp itself (a list longer than 2 here fails).
+#[tokio::test]
+async fn a_valid_log_limit_still_clamps_to_the_ring_capacity() {
+    let api = Arc::new(unit_state());
+    for index in 0..3 {
+        crate::observability::ring_push(crate::observability::LogEntry::now(
+            "INFO",
+            "test::har_log_clamp",
+            format!("fr05-clamp-marker-{index}"),
+        ));
+    }
+    async fn get_log(api: &Arc<ApiState>, query: &str) -> (StatusCode, serde_json::Value) {
+        let response = control_router(Arc::clone(api))
+            .oneshot(
+                Request::get(format!("/har/log?{query}"))
+                    .header("host", "127.0.0.1:8708")
+                    .body(Body::empty())
+                    .expect("log request"),
+            )
+            .await
+            .expect("in-process log request");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("log body");
+        let body = serde_json::from_slice(&bytes).expect("ring document");
+        (status, body)
+    }
+    let (status, body) = get_log(&api, "limit=2").await;
+    assert_eq!(status, StatusCode::OK, "a valid limit is never refused");
+    let events = body["events"].as_array().expect("events list");
+    assert_eq!(
+        events.len(),
+        2,
+        "limit=2 returns exactly the newest 2: {body}"
+    );
+    assert!(
+        events[1]["message"]
+            .as_str()
+            .is_some_and(|m| m == "fr05-clamp-marker-2"),
+        "the tail is the newest event: {body}"
+    );
+    let (status, body) = get_log(&api, "limit=999999").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a huge limit is clamped, not refused"
+    );
+    let events = body["events"].as_array().expect("events list");
+    assert_eq!(
+        body["capacity"],
+        serde_json::json!(crate::observability::RING_CAPACITY)
+    );
+    assert!(
+        events.len() <= crate::observability::RING_CAPACITY,
+        "the answer can never exceed the ring capacity"
+    );
+}
