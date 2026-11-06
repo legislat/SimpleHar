@@ -16,6 +16,16 @@ Versioning.
 
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
+## v1.3.4 - 2026-11-06
+
+### Fixed
+
+- The slot pill keeps the departing occupant, the `releasing` state and a live
+  Unload action while a release drain is in flight, instead of showing an empty
+  or loading look.
+- A superseded load shows the ledger reason verbatim; a cancel now uses muted
+  ink, while a real refusal keeps the fault-red error style.
+
 ## v1.3.3 - 2026-11-06
 
 ### Added

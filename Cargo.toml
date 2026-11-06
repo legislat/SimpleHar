@@ -1,6 +1,6 @@
 [package]
 name = "simpleharn"
-version = "1.3.3"
+version = "1.3.4"
 edition = "2021"
 description = "One app managing local inference engines with a simple, reliable, adjustable model swap"
 license = "Apache-2.0"

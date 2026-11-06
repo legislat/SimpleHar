@@ -9,7 +9,7 @@ and it refuses to overcommit. The product name is SimpleHarn, and the repository
 `legislat/SimpleHarn`. The binary is `simpleharn.exe`, the config file is `simpleharn.json`,
 and the environment names use the `SIMPLEHARN_` prefix.
 
-Current release: **v1.3.3**. Windows 10/11, one NVIDIA GPU, single user.
+Current release: **v1.3.4**. Windows 10/11, one NVIDIA GPU, single user.
 Prebuilt binaries: see the GitHub Releases page of this repository. The release
 zip holds `simpleharn.exe`, `SimpleHarn.vbs`, `README.md`, and `LICENSE`; models
 and engine installs are yours.
