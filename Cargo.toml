@@ -64,7 +64,7 @@ nvml-wrapper = "0.10"
 # body rides a quoted heredoc inside a driver fed to `wsl … -- bash -s` on stdin
 # (template adoption, 2026-10-31), so it never touches a shell-tokenized command
 # line, only this alphabet.
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` drives the router in tests without binding a port.
