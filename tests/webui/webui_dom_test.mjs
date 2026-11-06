@@ -1129,6 +1129,82 @@ const driver = `
       plain.length === 1 && !rungs.some((rung) => plain[0].endsWith("· " + rung)),
       plain.join(" | "));
   }
+
+  // Superseded load reason (card-run 2026-11-05): the strip must surface the
+  // ledger's reason string, not only the machine state. The reason field is
+  // jobs[].error - the scheduler terminalizes a superseded load as
+  // SchedulerError::Cancelled, so the wire row reads Idle with error
+  // "cancelled: superseded by a newer load" and outcome "cancelled" (the
+  // status words); the reason is the error text, verbatim. A cancel is
+  // policy, not a fault (UIFR-01): the reason rides the muted note class,
+  // and the fault red stays for real errors. Falsifiers: drop error from
+  // the row data and the reason checks go red; revert the outcome branch
+  // and the class checks go red.
+  {
+    const mkSuperseded = (error) => ({
+      id: 41, kind: "Load", model: "supme-one", category: "WORK", state: "Idle",
+      terminal: true, outcome: "cancelled", error, need_gib: 4,
+      free_at_admit_gib: 40, observed_at_admit_gib: null, gate_target_gib: null,
+      victims_released: [], warnings: [], timings: {}, is_fault: false,
+    });
+    const mkRefusal = () => ({
+      id: 42, kind: "Load", model: "refusone", category: "WORK", state: "AdmitFail",
+      terminal: true, outcome: "admission refused",
+      error: "insufficient VRAM: need 9.0 GiB, free 1.0 GiB, reserve 2.0 GiB",
+      need_gib: 9, free_at_admit_gib: 1, observed_at_admit_gib: 1,
+      gate_target_gib: 9, victims_released: [], warnings: [], timings: {},
+      is_fault: true,
+    });
+    const supStrip = () => findAll(document.getElementById("sh-main"), "div", "sh-jobs")
+      .find((d) => findAll(d, "h3").map(textOf).includes("Recent jobs"));
+    const supLine = (needle) => {
+      const strip = supStrip();
+      const line = strip
+        ? findAll(strip, "div", "sh-job").find((d) => textOf(d).includes(needle))
+        : null;
+      return line ? textOf(line) : "row missing";
+    };
+    const spanWith = (needle) => {
+      const strip = supStrip();
+      return strip
+        ? findAll(strip, "span").find((s) => textOf(s).includes(needle))
+        : null;
+    };
+    const REASON = "cancelled: superseded by a newer load";
+    applyState({
+      ...fixtures["/har/status"], models: fixtures["/har/models"].data,
+      jobs: [...fixtures["/har/status"].jobs, mkSuperseded(REASON), mkRefusal()],
+    });
+    check("a superseded load row shows the status AND the ledger reason",
+      supLine("supme-one").includes("Idle") && supLine("supme-one").includes(REASON),
+      supLine("supme-one"));
+    const supSpan = spanWith(REASON);
+    check("the superseded reason renders verbatim, no page-side rewording",
+      !!supSpan && textOf(supSpan) === REASON,
+      supSpan ? textOf(supSpan) : "no reason span");
+    check("the superseded reason rides the muted note class, not the fault red (UIFR-01)",
+      !!supSpan && supSpan.attrs.class === "sh-job-note",
+      supSpan ? JSON.stringify(supSpan.attrs) : "no reason span");
+    const refSpan = spanWith("insufficient VRAM: need 9.0");
+    check("a real refusal keeps the fault-red error class (UIFR-01)",
+      !!refSpan && refSpan.attrs.class === "sh-job-error",
+      refSpan ? JSON.stringify(refSpan.attrs) : "no refusal span");
+    const cssRaw = globalThis.servedPage.css;
+    const noteAt = cssRaw.indexOf(".sh-job-note {");
+    const noteBody = noteAt < 0 ? ""
+      : cssRaw.slice(noteAt, cssRaw.indexOf("}", noteAt) + 1);
+    check("the served stylesheet gives the note class the muted ink, not the bad red",
+      noteAt >= 0 && noteBody.indexOf("var(--pico-muted-color)") >= 0 &&
+        noteBody.indexOf("--sh-bad") < 0,
+      noteBody || "no .sh-job-note rule");
+    applyState({
+      ...fixtures["/har/status"], models: fixtures["/har/models"].data,
+      jobs: [...fixtures["/har/status"].jobs, mkSuperseded(null)],
+    });
+    check("dropping the reason from the row data drops it from the strip",
+      !supLine("supme-one").includes("superseded"), supLine("supme-one"));
+    applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
+  }
   applyState({
     ...fixtures["/har/status"],
     models: [
@@ -1468,6 +1544,61 @@ const driver = `
     const mixPillText = textOf(mixPill);
     check("the mixed-slot pill names the serving occupant, not releasing",
       mixPillText.includes("keepone") && !mixPillText.includes("releasing"), mixPillText);
+  }
+
+  // Drain past the slot table (card-run 2026-11-05): the confirmed release has
+  // already cleared slots[].model while the Unload row is still live in the
+  // ledger (Reap/CancelRequested - the release cleanup in flight) and still
+  // names the departing occupant. The pill must keep naming that occupant and
+  // keep a usable Unload - never the loading/idle look with the lost gesture.
+  // Falsifier: remove the drain branch in renderTabItem and this pill falls
+  // back to "loading…" with no side button - every check below goes red on
+  // the old render.
+  {
+    const drainModel = {
+      id: "drainone", engine: "llama", category: "WORK", vram_gb: 4, cost: "fixed",
+      cost_basis: "declared", launch_floor_gb: null, measured_gb: null,
+      measured_min_gb: null, context: null, model_ref: "F:/n.gguf",
+      serve_model: null, cpu_offload: false,
+    };
+    const drainSlot = { category: "WORK", index: 0, model: null, port: null,
+      pid: null, need_gib: null, idle_s: null, serve_id: null, loading_job: 31,
+      launched_at: null, stale_config: null, container_reported_gb: null,
+      state: "loading" };
+    const drainJob = { id: 31, kind: "Unload", model: "drainone", category: "WORK",
+      state: "Reap", terminal: false, outcome: null, error: null, need_gib: null,
+      free_at_admit_gib: null, observed_at_admit_gib: null, gate_target_gib: null,
+      victims_released: [], warnings: [], timings: {}, is_fault: false };
+    applyState({ ...fixtures["/har/status"], slots: [drainSlot], models: [drainModel],
+      jobs: [...fixtures["/har/status"].jobs, drainJob] });
+    const drainPill = findAll(document.getElementById("sh-header"), "span", "sh-tab-item")[0];
+    const drainPillText = textOf(drainPill);
+    check("a drain in flight names the departing occupant in the pill",
+      drainPillText.includes("drainone") && !drainPillText.includes("loading…"),
+      drainPillText);
+    const drainDot = findAll(drainPill, "span", "sh-dot")[0];
+    check("the draining pill dot reads releasing, never loading or idle",
+      !!drainDot && drainDot.attrs["data-state"] === "releasing",
+      drainDot ? JSON.stringify(drainDot.attrs) : "no pill dot");
+    const drainSide = findAll(drainPill, "button").find(function (b) {
+      return textOf(b) === "Unload";
+    });
+    check("the draining pill keeps the joined amber Unload",
+      !!drainSide && (drainSide.attrs.class || "").indexOf("sh-unload") >= 0,
+      drainSide ? drainSide.attrs.class : "no side Unload on the draining pill");
+    // The gesture, not an attribute (UIFR-02): the side Unload must actually
+    // post the category scope. A pill that renders the button without its
+    // handler - or without the button - fails here.
+    globalThis.posts = [];
+    if (drainSide) drainSide.dispatch("click", {});
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    const drained = (globalThis.posts || []).some(function (p) {
+      return p.path === "/har/unload" && p.body.indexOf('"category":"WORK"') > 0;
+    });
+    check("the draining pill's Unload is a live gesture: posts the WORK category scope",
+      drained, JSON.stringify(globalThis.posts));
+    applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });
   }
 
   applyState({ ...fixtures["/har/status"], models: fixtures["/har/models"].data });

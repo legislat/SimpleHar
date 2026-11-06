@@ -1062,10 +1062,11 @@ async fn g07_release_is_proven_by_the_port_not_a_sleep() {
 // ---------------------------------------------------------------- G8 (FINDINGS-17 [8])
 
 /// ADVERSARIAL, no card needed: both log rules run against the SAME synthetic
-/// directory. The old bound (count by prefix <= LOG_FILE_CAP) passes a real leak
-/// and fails on harmless machine litter; the run-local bound (baseline delta,
-/// this run's model names, its own spawn count) fails the leak and ignores the
-/// litter. A bound that cannot fail is the finding.
+/// directory. The retired T-suite per-prefix cap (count by prefix <= a fixed
+/// number) passes a real leak and fails on harmless machine litter; the
+/// run-local bound (baseline delta, this run's model names, its own spawn
+/// count) fails the leak and ignores the litter. A bound that cannot fail is
+/// the finding.
 #[test]
 #[ignore = "operator-gated via handoff/gate-honesty/RUN.md: synthetic, kept with the suite"]
 fn g08_log_bound_fails_a_leak_and_ignores_litter() {
@@ -1096,8 +1097,8 @@ fn g08_log_bound_fails_a_leak_and_ignores_litter() {
         "CONFIRMED-g8: the old bound passed a 12-file leak on a clean machine"
     );
     println!(
-        "G8 REFUTED: run-local bound fails leaks and shrugs off litter; the LOG_FILE_CAP \
-         bound does neither (12 leaked files <= 50 = green)"
+        "G8 REFUTED: run-local bound fails leaks and shrugs off litter; the retired \
+         per-prefix cap does neither (12 leaked files <= 50 = green)"
     );
 }
 

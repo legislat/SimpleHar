@@ -44,9 +44,9 @@ const HARNESS_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Harness log files kept in `logs/`, the live one included — one boot holds several
 /// once it rolls, so this counts files, not boots. Enforced at boot
 /// (`attach_file_sink`) and again after every rotation (`rotate_sink`), so a long boot
-/// cannot roll past the budget. Independent of `LOG_FILE_CAP` on purpose: a swap-heavy
-/// session burns the engine budget, and the log that explains a refusal must not be
-/// evicted by the next 50 spawns.
+/// cannot roll past the budget. Independent of the retired T-suite per-prefix
+/// file cap on purpose: a swap-heavy session burns the engine budget, and the
+/// log that explains a refusal must not be evicted by the next 50 spawns.
 pub const HARNESS_LOG_CAP: usize = 10;
 
 /// Runtime extended-logging switch (the page's "Extended Logging" checkbox,

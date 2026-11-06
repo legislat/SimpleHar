@@ -196,6 +196,23 @@ function slotJobsFor(status, category) {
   return status.jobs.filter((job) => job.category === category && !job.terminal);
 }
 
+// The Unload rows of a category that are still in flight. An Unload row names
+// only an installed resident, so a live row carries the occupant the slot table
+// has already dropped: the drain window between the committed release clearing
+// the slot and the release's terminalization (the 2026-11-05 card-run window
+// where the ledger still read the release in flight while the pill showed an
+// empty/loading look and lost the Unload gesture).
+function drainingJobsFor(status, category) {
+  return status.jobs.filter(
+    (job) =>
+      job.category === category &&
+      !job.terminal &&
+      job.kind === "Unload" &&
+      typeof job.model === "string" &&
+      job.model !== "",
+  );
+}
+
 // The tab IS the slot card (operator compaction, 2026-11-01), and the whole pill is
 // the click target (operator follow-up, 2026-11-01): dot, category, port, occupant
 // live INSIDE the tab button - a port rendered as a bare link read as chrome, not
@@ -211,6 +228,14 @@ function renderTabItem(status, category) {
   // every slot row: a committed release shows `releasing` while the occupant
   // is still installed. No `releasing` slot leaves the derivation untouched.
   const releasing = slots.some((slot) => slot.state === "releasing");
+  // Drain past the slot table (card-run 2026-11-05): once the confirmed
+  // release clears the occupant, the slot no longer names it while the
+  // Unload row is still in flight. The live row still does, so the pill
+  // keeps naming the occupant and keeps the gesture through the drain -
+  // never the loading/idle look.
+  const draining = drainingJobsFor(status, category);
+  const drainNames = [...new Set(draining.map((job) => job.model))];
+  const named = occupants.length > 0 ? occupants : drainNames;
   // The pill text names the first occupant OUTSIDE the releasing slots
   // (review B3R-02, 2026-11-04): a slot releasing beside a serving one still
   // names the serving model, and the releasing dot carries the in-flight
@@ -219,9 +244,9 @@ function renderTabItem(status, category) {
     .filter((slot) => slot.state !== "releasing")
     .map((slot) => slot.model)
     .filter(Boolean);
-  const dotState = releasing
+  const dotState = releasing || (occupants.length === 0 && drainNames.length > 0)
     ? "releasing"
-    : occupants.length > 0
+    : named.length > 0
       ? "serving"
       : loading
         ? "loading"
@@ -229,11 +254,11 @@ function renderTabItem(status, category) {
   const button = el(
     "button",
     {
-      class: occupants.length > 0 ? "sh-tab sh-tab-part" : "sh-tab",
+      class: named.length > 0 ? "sh-tab sh-tab-part" : "sh-tab",
       role: "tab",
       "aria-selected": String(state.activeTab === category),
       title: `${category} listener :${entry ? entry.public_port : "?"}` +
-        (occupants.length > 0 ? ` - ${occupants.join(", ")}` : ""),
+        (named.length > 0 ? ` - ${named.join(", ")}` : ""),
       onclick: () => {
         state.activeTab = category;
         render();
@@ -243,7 +268,13 @@ function renderTabItem(status, category) {
     text(categoryLabel(status, category)),
   );
   if (entry) button.append(el("span", { class: "sh-tab-port" }, text(`:${entry.public_port}`)));
-  if (releasing && kept.length === 0) {
+  if (occupants.length === 0 && drainNames.length > 0) {
+    // The drain branch: the model of the in-flight Unload row, plus the
+    // in-flight word - the occupant and the truth of what is happening.
+    button.append(el("span", { class: "sh-tab-model" }, text(drainNames[0])));
+    if (drainNames.length > 1) button.append(text(` +${drainNames.length - 1}`));
+    button.append(text(" releasing…"));
+  } else if (releasing && kept.length === 0) {
     button.append(el("span", { class: "sh-tab-model sh-empty" }, text("releasing…")));
   } else if (loading && occupants.length === 0) {
     button.append(el("span", { class: "sh-tab-model sh-empty" }, text("loading…")));
@@ -252,7 +283,7 @@ function renderTabItem(status, category) {
     if (kept.length > 1) button.append(text(` +${kept.length - 1}`));
   }
   const item = el("span", { class: "sh-tab-item" }, button);
-  if (occupants.length > 0) {
+  if (named.length > 0) {
     // The Unload is the tab's second segment (operator 2026-11-01): flush against
     // the pill, shared border - two parts of one entity, not a stray button.
     item.append(
@@ -941,7 +972,17 @@ function renderJobs(status) {
     // renders nothing, so refusals and unloads keep their plain line.
     const rung = job.path ? ` · ${job.path}` : "";
     line.append(text(`${job.id} · ${job.model} · ${job.state}${rung}`));
-    if (job.error) line.append(el("span", { class: "sh-job-error" }, text(job.error)));
+    // A cancelled row (supersede, request cancel) is operator policy, not a
+    // fault (UIFR-01): its reason keeps the placement but takes the muted
+    // note class - the fault red stays for real errors only.
+    if (job.error)
+      line.append(
+        el(
+          "span",
+          { class: job.outcome === "cancelled" ? "sh-job-note" : "sh-job-error" },
+          text(job.error),
+        ),
+      );
     wrap.append(line);
   }
   return wrap;
