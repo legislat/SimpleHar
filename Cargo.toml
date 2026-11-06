@@ -26,7 +26,7 @@ tokio = { version = "1", features = [
     "io-util",
 ] }
 # HTTP layers: tracing, compression, timeouts (AGENTS.md observability rule).
-tower-http = { version = "0.6", features = ["trace", "compression-gzip", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "compression-gzip", "timeout"] }
 # Structured logging; no println!/eprintln! on production paths (AGENTS.md).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
