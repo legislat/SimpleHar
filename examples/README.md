@@ -6,7 +6,7 @@ into the `ModelConf` folder beside the exe, then edit it.
 Two groups:
 
 - `engine-*.yaml` - one row per engine (`llama`, `strata`, `basalt`,
-  `ninfer`). Each row carries every key that engine requires.
+  `maya`, `ninfer`). Each row carries every key that engine requires.
 - `tab-*.yaml` - one row per category (`WORK`, `RP`, `AUX`, `EMB`), with
   the eviction rule of that category in the header comment.
 
@@ -27,6 +27,7 @@ Required keys per engine (schema: `docs/reference/MODELS.md`):
 | `llama` | `model` |
 | `strata` | `strata_exe`, `serve_model`, `strata_tokenizer` |
 | `basalt` | `model` (an absolute `.basalt` pack), `serve_model`, `basalt_python`, `basalt_cwd`, `basalt_exe` |
+| `maya` | `maya_python`, `maya_cwd`, `maya_config`, `serve_model`, `load_timeout` (300 s or more) |
 | `ninfer` | `ninfer_image`, `ninfer_container`, `ninfer_model_name`, `ninfer_artifact`, `ninfer_model_roots` |
 
 An unknown key warns but never drops a row; an engine key the row's

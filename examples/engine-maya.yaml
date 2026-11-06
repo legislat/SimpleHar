@@ -1,0 +1,17 @@
+# maya row template. Required keys: maya_python, maya_cwd, maya_config,
+# serve_model, and load_timeout (300 s or more). All paths below are
+# PLACEHOLDERS: replace them with real absolute paths before copying this
+# file into ModelConf. The harness validates every path the JSON config
+# names; a missing path drops the row at scan.
+engine: maya
+category: RP
+maya_python: C:\models\maya\.venv\Scripts\python.exe
+maya_cwd: C:\models\maya
+maya_config: C:\models\maya\maya-example.json
+serve_model: example-maya-model
+cost: greedy
+launch_only_with_at_least_vram_free: 60
+load_timeout: 1800
+# serve_model must equal the config's "model_name". The harness runs
+# serve.server headless, strips host/port/api_key/cors_origins and
+# idle_unload_s, and forces model_management off. See MODELS.md.

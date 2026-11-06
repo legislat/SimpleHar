@@ -50,7 +50,8 @@ can parse them reliably. The trade is that some pages read terse.
 
 1. Download `SimpleHarn-1.3.3-win-x64.zip` from the Releases page and unzip it.
 2. Put one flat `.yaml` row in `ModelConf` beside the exe. The harness creates that
-   folder on boot if it is missing; it does not create an example row.
+   folder on boot if it is missing; it does not create an example row. Ready rows for
+   every engine are in [examples/](examples/README.md).
 3. Double-click `SimpleHarn.vbs`, open `http://127.0.0.1:8708/`, and load the model.
 
 ### From source
@@ -62,7 +63,8 @@ cargo build --release
 ```
 
 1. Put one flat `.yaml` file per model in `ModelConf` beside the built exe. The harness
-   creates the folder on boot if it is missing.
+   creates the folder on boot if it is missing. Start from a ready row in
+   [examples/](examples/README.md).
 
    ```yaml
    engine: llama
@@ -202,6 +204,7 @@ refusal (unload something; the harness never over-admits). The full list, with t
 | HTTP API reference | [docs/reference/API.md](docs/reference/API.md) |
 | OpenAI compatibility matrix | [docs/reference/COMPATIBILITY.md](docs/reference/COMPATIBILITY.md) |
 | Model schema reference | [docs/reference/MODELS.md](docs/reference/MODELS.md) |
+| Example model rows | [examples/README.md](examples/README.md) |
 | Configuration reference | [docs/reference/CONFIG.md](docs/reference/CONFIG.md) |
 | Documentation map | [docs/DOCS_README.md](docs/DOCS_README.md) |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
