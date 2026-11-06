@@ -684,3 +684,37 @@ recorded here so dated references to ARCHIVED still resolve:
   Residual: Maya's own dashboard doors stay on the loopback slot port; do not
   use them on a managed instance (`MODELS.md`). Evidence:
   `handoff/evidence/2026-11-06-maya/`. | 2026-11-06 | `2de4725`
+
+- **Expert-offload RAM reclaim** (operator ruling 2026-11-06): strata, basalt and
+  maya offload expert layers to host RAM and then to SSD. A `cost: greedy` admit
+  on one of these engines now drains every CPU-resident row whose booked host
+  RAM is greater than `expert_offload_evict_cpu_above_gb` (default `4.0`,
+  `0` disables), largest first, through the same confirmed release and RAM
+  settle the VRAM planner uses, before the single spawn. A row at the threshold
+  stays, GPU residents are never victims, and a fixed row or a non-expert engine
+  never triggers the rule. A protected row or one inside `min_turn` is skipped
+  and named; the load proceeds. This is the operator's simple posture in place
+  of a host-RAM budget for GPU rows; an admission that queued a victim still
+  fails the load if that victim cannot be released, like any drain. Evidence:
+  gate `handoff/evidence/2026-11-06-ram-reclaim/`; card proof owed in the
+  1.3.2 window. | 2026-11-06 | `938660b`
+
+- **Build and release directories** (operator ruling 2026-11-06): manual test
+  builds live in one tests directory below the operator inference root and are
+  deleted when the test concludes. The release the operator uses lives in
+  `SimpleHarn_latest`; the previous release stays in `SimpleHarn_fallback`.
+  After every build or release, every other version and build-artifact
+  directory is swept once the new latest is verified. The exact machine paths
+  stay in the local-only layer; `GIT_WORKFLOW.md` owns the rule. | 2026-11-06 |
+  `ac7e197`
+
+- **Hidden manual launcher** (operator approval 2026-11-06): the release package
+  ships `SimpleHarn.vbs`, which starts `simpleharn.exe` with window style 0 from
+  its own folder. The binary stays a console build: running the exe directly is
+  the diagnostic path, and a console `.bat` wrapper is not shipped. | 2026-11-06
+  | `6a371a0`
+
+- **Release 1.3.2 target** (operator approval 2026-11-06): the next release is
+  1.3.2 and ships after the version display, the expert-offload reclaim rule,
+  FR-08/FR-09, and the owed card legs. It includes Project Maya, the public
+  card evidence, and the new directory rule. | 2026-11-06 | `938660b`
