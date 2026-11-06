@@ -513,12 +513,18 @@ async fn a_fake_python_basalt_launch_serves_the_verified_id_end_to_end() {
         profile.text
     );
     // The child received the staged path, not the placeholder.
+    // The child creates the file before its bytes land, so a read can catch an
+    // empty or partial document. Retry the parse, not just the open: the gate saw
+    // `EOF while parsing a value` once on this leg (2026-11-06, PS 5.1 gate), and
+    // the isolated re-run passed - a false red, never a launch defect.
     let argv_path = dir.join("argv.json");
     let mut argv: Option<Vec<String>> = None;
     for _ in 0..50 {
         if let Ok(text) = std::fs::read_to_string(&argv_path) {
-            argv = Some(serde_json::from_str(&text).expect("child argv json"));
-            break;
+            if let Ok(parsed) = serde_json::from_str(&text) {
+                argv = Some(parsed);
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
