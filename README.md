@@ -46,13 +46,23 @@ can parse them reliably. The trade is that some pages read terse.
 
 ## Quick start
 
+### Prebuilt
+
+1. Download `SimpleHarn-1.3.3-win-x64.zip` from the Releases page and unzip it.
+2. Put one flat `.yaml` row in `ModelConf` beside the exe. The harness creates that
+   folder on boot if it is missing; it does not create an example row.
+3. Double-click `SimpleHarn.vbs`, open `http://127.0.0.1:8708/`, and load the model.
+
+### From source
+
 You need the stable Rust toolchain on Windows.
 
 ```powershell
 cargo build --release
 ```
 
-1. Create a `ModelConf` folder beside the built exe. Put one flat `.yaml` file per model:
+1. Put one flat `.yaml` file per model in `ModelConf` beside the built exe. The harness
+   creates the folder on boot if it is missing.
 
    ```yaml
    engine: llama
@@ -63,7 +73,7 @@ cargo build --release
    context: 8192
    ```
 
-   The file stem (`example`) is the model identity. The schema is in
+   The filename, for example `example.yaml`, is the model identity. The schema is in
    [MODELS.md](docs/reference/MODELS.md).
 
 2. Run `target\release\simpleharn.exe` with the `ModelConf` folder beside it. First run
@@ -202,7 +212,7 @@ refusal (unload something; the harness never over-admits). The full list, with t
 Found a problem or have an idea? Open an issue. Contributions are welcome; start with
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Plans (not commitments)
+## Plans
 
 - Multiple GPU support
 - Possible Linux fork
@@ -220,11 +230,11 @@ harness never reads the old wire values or the old `.simplehar` custody dirs.
 
 ## Special thanks
 
-https://github.com/ggml-org/llama.cpp
-https://github.com/mostlygeek/llama-swap
-https://github.com/T-Crypt/berth
-https://github.com/Niko1221/Strata
-https://github.com/jesdga95/basalt
-https://github.com/Neroued/ninfer
-https://github.com/iamwavecut/ninfer-all
-https://github.com/mw00/project-maya
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [llama-swap](https://github.com/mostlygeek/llama-swap)
+- [berth](https://github.com/T-Crypt/berth)
+- [Strata](https://github.com/Niko1221/Strata)
+- [Basalt](https://github.com/jesdga95/basalt)
+- [NInfer](https://github.com/Neroued/ninfer)
+- [NInfer-all](https://github.com/iamwavecut/ninfer-all)
+- [Project Maya](https://github.com/mw00/project-maya)
