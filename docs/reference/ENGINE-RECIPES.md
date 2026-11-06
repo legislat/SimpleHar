@@ -10,14 +10,13 @@ review_trigger: engine-change, release
 
 # Engine setup recipes
 
-Minimal recipes for the engines the harness runs. Each engine has two cases:
-it is already installed, or it is not. Rows go in `ModelConf/`; restart the
-harness or run rescan after you add one. The harness forces the bind, the port
-and the key, so a row never names them.
+Minimal recipes for the engines the harness runs, for an installed engine or a
+fresh install. Rows go in `ModelConf/`; restart or rescan after you add one.
+The harness forces the bind, the port and the key.
 
-Use `cost: greedy` and `launch_only_with_at_least_vram_free` for an engine that
-offloads experts to RAM and SSD. Use `cost: fixed` with `vram_gb` for a fixed
-resident. `load_timeout` is the cold-load deadline in seconds.
+Use `cost: greedy` with a launch floor for an engine that offloads experts;
+`cost: fixed` with `vram_gb` for a fixed resident. `load_timeout` is the
+cold-load deadline.
 
 ## llama.cpp
 
@@ -77,8 +76,7 @@ Or build from source per [SOURCE_INSTALL.md](https://github.com/Niko1221/Strata/
 engine and the Python environment; it can also download a model. Then use the
 row above.
 
-Keep engine tuning in `strata_args`. `strata_config` is superseded; use the
-template keys above or run `simpleharn import strata <profile.json>`.
+Keep engine tuning in `strata_args`.
 
 ## Basalt
 
@@ -112,7 +110,7 @@ pip install -r requirements.txt
 ```
 
 Make or copy a `.basalt` pack with [model-file.md](https://github.com/jesdga95/basalt/blob/main/docs/model-file.md); v0.2.x reads pack
-version 2. Then use the row above. `basalt_engine_args` is optional.
+version 2. Then use the row above.
 
 ## Project Maya
 
