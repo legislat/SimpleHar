@@ -147,10 +147,12 @@ The harness runs `serve.server` directly, not `maya.py`. Keep the config
 `model_name` equal to `serve_model`; the harness ignores `host`, `port`,
 `api_key`, `cors_origins` and `idle_unload_s`.
 
-## NInferno (ninfer)
+## NInfer (ninfer)
 
-Upstream: [Brontir/NInferno](https://github.com/Brontir/NInferno)
-([windows.md](https://github.com/Brontir/NInferno/blob/main/docs/windows.md), [building.md](https://github.com/Brontir/NInferno/blob/main/docs/building.md)).
+Upstream (container path): [Neroued/ninfer](https://github.com/Neroued/ninfer)
+and [iamwavecut/ninfer-all](https://github.com/iamwavecut/ninfer-all). The native
+Windows [NInferno](https://github.com/Brontir/NInferno) build is a separate
+manual path; the harness does not launch it.
 
 **Already installed.** The harness path is the container template. Use Docker
 in WSL, the model roots, and the `.ninfer` artifact.
@@ -171,13 +173,12 @@ vram_gb: 26
 load_timeout: 600
 ```
 
-**Not installed.** Install Docker in WSL and build or pull the `ninfer` image
-from the upstream container instructions. Put the `.ninfer` artifact under one
+**Not installed.** Install Docker in WSL and build or pull the `ninfer` or
+`ninfer-all` image from those repositories. Put the `.ninfer` artifact under one
 of the model roots. Then use the row above.
 
-The native Windows build in [windows.md](https://github.com/Brontir/NInferno/blob/main/docs/windows.md) is a separate manual path; the
-harness does not launch it. Use the space form for serve flags
-(`--flag value`), never `--flag=value`.
+The native Windows build is a separate manual path; the harness does not launch
+it. Use the space form for serve flags (`--flag value`), never `--flag=value`.
 
 ## Verify
 

@@ -25,7 +25,7 @@ You run local LLMs on Windows with one NVIDIA GPU. You want several models that 
 quickly, each on its own OpenAI-compatible endpoint, with no console windows to manage.
 You want one safe budget manager that never force-loads onto a full GPU and names the
 blockers and the numbers on every refusal. You do not want to deal with software juggernauts
-with million different options, built in chat, downloader and delivery of dairy products.
+with a million different options and built-in chat, downloader, and more.
 
 The `llama` path (llama.cpp) works on any machine that can run `llama-server.exe`. The
 `strata`, `basalt`, `maya`, and `ninfer` paths run when their engine is installed; see
@@ -93,7 +93,8 @@ The four category listeners on ports 8708-8711 answer the OpenAI-compatible API.
   evict AUX and EMB. Same-slot replacement is always allowed. When several victims would
   cover the deficit, the planner takes the cheapest sufficient set.
 - **Config file is king.** One JSON file beside the exe plus one flat YAML file per model.
-  Both hot-reload, and every edit on the page writes back to those exact files.
+  The catalog reloads on rescan; page edits write back to `simpleharn.json`, and keys that
+  bind at boot take effect on restart.
 
 ## Categories and ports
 
@@ -113,14 +114,12 @@ The full port plan is in [docs/reference/CONFIG.md](docs/reference/CONFIG.md).
 
 ## Control page and tray
 
-![The SimpleHarn control page in the light theme](docs/assets/control-page.png)
-
 The page shows slot cards, memory bars (observed VRAM, the reserve, in-flight bookings,
 host RAM), per-model rows with Load and Default, recent jobs, and the harness log. A
 rescan re-reads the catalog; a serving model keeps the launch it was spawned with, so an
 edit to a live model takes effect on its next load. The tray shows green loaded, yellow
-swap in flight, gray idle, or red listener down. The menu offers Open Web UI, Unload All,
-and Exit.
+swap in flight, gray idle, or red listener down. The menu offers Open Web UI, the
+unload actions, and Exit.
 
 ## Configuration
 
@@ -202,6 +201,13 @@ refusal (unload something; the harness never over-admits). The full list, with t
 
 Found a problem or have an idea? Open an issue. Contributions are welcome; start with
 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Plans (not commitments)
+
+- Multiple GPU support
+- Possible Linux fork
+- More engines
+- UI and user experience enhancements
 
 ## Rename from SimpleHar SE
 
