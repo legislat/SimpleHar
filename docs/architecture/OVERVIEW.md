@@ -107,7 +107,10 @@ One harness process, one tokio runtime, plus OS-level children:
   `total - reserve - observed_used`, credits the same-slot victim, and
   debits in-flight bookings (`SwapState::reserves_vram`). `need_gb` costs a
   load as declared `vram_gb`, else GGUF size x 1.15 + 2, else
-  `AdmissionError::UnderSpecified`.
+  `AdmissionError::UnderSpecified`. The same-slot credit is the larger of the
+  victim's booking and the VRAM footprint its own spawn folded: a release
+  projection, never a booking, and the settle re-gate stays the physical truth
+  (operator ruling 2026-11-06).
 - Refusals name facts, not just numbers: `BudgetFacts`, `VictimInfo`, and
   `BlockerInfo` carry `unreleasable`, `used_gib`, and `booked_total` into the
   refusal text and the job ledger (`GET /har/jobs`).

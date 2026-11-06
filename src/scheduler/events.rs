@@ -339,6 +339,7 @@ impl ActorState {
                 stale_config: false,
                 serve_id: serve_id.clone(),
                 measure: None,
+                live_measured_gb: None,
             });
         }
         // Measured footprint (§0.4, rehearsal item c): witness readings taken while the

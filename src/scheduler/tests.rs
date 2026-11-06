@@ -734,6 +734,7 @@ fn seat_spawn(state: &mut ActorState, entry: &ModelEntry, ticket: &SpawnTicket, 
             stale_config: false,
             serve_id: None,
             measure: None,
+            live_measured_gb: None,
         }),
         job: Some(job_id),
     }];
@@ -2676,6 +2677,7 @@ async fn a_vanished_row_fails_the_fold_closed_and_retires_the_sampler() {
             stale_config: false,
             serve_id: None,
             measure: None,
+            live_measured_gb: None,
         }),
         job: None,
     }];
@@ -2922,6 +2924,7 @@ fn resident_on_a_file() -> (
             stale_config: false,
             serve_id: None,
             measure: None,
+            live_measured_gb: None,
         }),
         job: None,
     }];
@@ -3773,6 +3776,7 @@ fn a_cost_only_edit_never_moves_a_ram_resident_into_the_vram_ledger() {
             stale_config: false,
             serve_id: None,
             measure: None,
+            live_measured_gb: None,
         }),
         job: None,
     }];
@@ -4332,6 +4336,319 @@ async fn a_greedy_basalt_resident_credits_only_its_room_at_admit() {
         "basalt-greedy",
         "the replacement names the greedy resident it is freeing"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T6-a (TASK-GREEDY-SWAP-CREDIT, the field falsifier of 2026-11-06): a greedy
+/// Strata books its nominal 12.0 while ITS OWN spawn's fold witnessed 68.4 GiB
+/// on the card (driven here through the real `fold` entry with a Vram FoldPlan
+/// for the installed ticket). The card holds 71.1 of the helper's 72 GiB
+/// (field: 71.66) and a greedy Work replacement declared 67.4 with a 60 GiB
+/// floor arrives — the release frees the footprint, not the booking, so the
+/// swap must ADMIT on the projected release instead of dying with the field's
+/// verdict ("59.1 GiB unreleasable … No releases allow for the VRAM floor").
+/// The booking itself never moves: the projection is a credit for this one
+/// gate, and the settle re-gate stays the physical truth. Falsifier: crediting
+/// the victim at its booking alone (the pre-ruling shape) flips the green arm
+/// back to `no_releases_reach` — red first, green with the ruling.
+#[tokio::test]
+async fn a_greedy_residents_folded_footprint_credits_the_same_slot_release() {
+    use super::measured::{FoldPlan, MeasuredPair};
+    let dir = crate::testutil::temp_dir("readmit-live-credit");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let resident_yaml = dir.join("strata-greedy.yaml");
+    std::fs::write(
+        &resident_yaml,
+        "engine: strata\ncost: greedy\nvram_gb: 12\n",
+    )
+    .expect("seed");
+    let incoming_yaml = dir.join("basalt-live.yaml");
+    std::fs::write(
+        &incoming_yaml,
+        "engine: basalt\ncost: greedy\nvram_gb: 67.4\nlaunch_only_with_at_least_vram_free: 60\n",
+    )
+    .expect("seed");
+    let (mut state, _rx) = readmit_state(71.1);
+    let resident = rescan_entry(&resident_yaml, "strata-greedy");
+    let ticket = fold_ticket(18_120);
+    state.catalog = vec![resident.clone()];
+    seat_spawn(&mut state, &resident, &ticket, 18_120);
+    // The greedy admit left the nominal booking behind, not the 68.4 the card
+    // physically carries (the same clamp T5 pins).
+    state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(12.0);
+    let incoming = rescan_entry(&incoming_yaml, "basalt-live");
+    // The gate preflights the launch before it evicts: the row rides.
+    state.catalog.push(incoming.clone());
+
+    state.fold(&FoldPlan {
+        model: "strata-greedy".to_string(),
+        ticket: ticket.clone(),
+        high: 68.4,
+        low: 68.4,
+        attribution: crate::model::MeasuredAttribution::EngineStatus,
+        profile: None,
+        fold_range: true,
+        pair: MeasuredPair::Vram,
+    });
+    assert_eq!(
+        state.slots[0]
+            .occupant
+            .as_ref()
+            .expect("resident")
+            .live_measured_gb,
+        Some(68.4),
+        "the spawn's own fold is what stands behind the release credit"
+    );
+    assert_eq!(
+        state.snapshot().slots[0].need_gib,
+        Some(12.0),
+        "the booking stays the greedy nominal (DOCTRINE 12): a projection is not a booking"
+    );
+
+    let green = admit_round(&mut state, &incoming, 71.1);
+    let job = &state.jobs[&green];
+    assert!(
+        !job.terminal && job.error.is_none(),
+        "the projected release carries the 60 floor over: {:?}",
+        job.error
+    );
+    assert_eq!(
+        job.path,
+        Some(AdmissionPath::FitsNow),
+        "with the footprint credited the numbers already reach the floor — no drain is queued"
+    );
+    let victim = job.victim.as_ref().expect("victim");
+    assert_eq!(victim.model, "strata-greedy");
+    assert_eq!(
+        victim.ticket, ticket,
+        "the committed release names THIS spawn's resident"
+    );
+    await_yaml_keys(&resident_yaml, &["measured_gb: 68.4"]).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T6-b (the stale-credit falsifier): the same shape, but THIS spawn never
+/// folded — and the on-disk row already carries the previous launch's 68.4
+/// pair. A disk figure is not this process's evidence (`live_measured_gb` is
+/// spawn-ticket-scoped and never seeded from disk), so the credit stays the
+/// booking and the 2026-11-01 guard keeps its verdict: no release reaches the
+/// floor. Falsifier: seeding `live_measured_gb` from the catalog's measured
+/// pair — the stale pair the ruling forbids — turns this red.
+#[tokio::test]
+async fn a_greedy_resident_without_this_spawns_fold_keeps_the_paper_refusal() {
+    use super::{AdmissionError, SchedulerError};
+    let dir = crate::testutil::temp_dir("readmit-live-credit-nofold");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let resident_yaml = dir.join("strata-greedy.yaml");
+    std::fs::write(
+        &resident_yaml,
+        "engine: strata\ncost: greedy\nvram_gb: 12\nmeasured_gb: 68.4\nmeasured_gb_min: 40\n",
+    )
+    .expect("seed");
+    let incoming_yaml = dir.join("basalt-live.yaml");
+    std::fs::write(
+        &incoming_yaml,
+        "engine: basalt\ncost: greedy\nvram_gb: 67.4\nlaunch_only_with_at_least_vram_free: 60\n",
+    )
+    .expect("seed");
+    let (mut state, _rx) = readmit_state(71.1);
+    let resident = rescan_entry(&resident_yaml, "strata-greedy");
+    let ticket = fold_ticket(18_121);
+    state.catalog = vec![resident.clone()];
+    seat_spawn(&mut state, &resident, &ticket, 18_121);
+    state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(12.0);
+    assert_eq!(
+        state.slots[0]
+            .occupant
+            .as_ref()
+            .expect("resident")
+            .live_measured_gb,
+        None,
+        "the seat never seeds the live figure from the row's on-disk pair"
+    );
+    let incoming = rescan_entry(&incoming_yaml, "basalt-live");
+    state.catalog.push(incoming.clone());
+
+    let red = admit_round(&mut state, &incoming, 71.1);
+    assert!(
+        matches!(
+            state.jobs[&red].error,
+            Some(SchedulerError::Admission(
+                AdmissionError::BelowLaunchFloor {
+                    no_releases_reach: true,
+                    ..
+                }
+            ))
+        ),
+        "without this spawn's fold the refusal stands on the booked 12: {:?}",
+        state.jobs[&red].error
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T6-c (the cross-slot falsifier): the projection never crosses a slot. The
+/// card holds a folded greedy Work resident on ANOTHER slot while the load's
+/// own slot is empty; the fold still finds its ticket by spawn match, but the
+/// same-slot lookup finds no victim, nothing the harness may release reaches
+/// the floor (Work is evicted by nobody), and the refusal keeps the guard's
+/// verdict. Falsifier: crediting `live_measured_gb` from any occupant instead
+/// of the job's own slot turns this green on a foreign resident's bytes.
+#[tokio::test]
+async fn a_folded_footprint_never_credits_a_cross_slot_replacement() {
+    use super::measured::{FoldPlan, MeasuredPair};
+    use super::{AdmissionError, SchedulerError};
+    let dir = crate::testutil::temp_dir("readmit-live-credit-cross");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let resident_yaml = dir.join("strata-greedy.yaml");
+    std::fs::write(
+        &resident_yaml,
+        "engine: strata\ncost: greedy\nvram_gb: 12\n",
+    )
+    .expect("seed");
+    let incoming_yaml = dir.join("basalt-live.yaml");
+    std::fs::write(
+        &incoming_yaml,
+        "engine: basalt\ncost: greedy\nvram_gb: 67.4\nlaunch_only_with_at_least_vram_free: 60\n",
+    )
+    .expect("seed");
+    let (mut state, _rx) = readmit_state(71.1);
+    let resident = rescan_entry(&resident_yaml, "strata-greedy");
+    let ticket = fold_ticket(18_122);
+    state.catalog = vec![resident.clone()];
+    seat_spawn(&mut state, &resident, &ticket, 18_122);
+    state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(12.0);
+    let seated = JobId(state.next_job - 1);
+    // Stand the resident on slot 1 and leave the incoming's slot 0 empty: the
+    // fold must still find its ticket there, but the same-slot credit must not.
+    state.slots.push(Slot {
+        category: CategoryId::Work,
+        index: 1,
+        engine_port: 18_123,
+        occupant: None,
+        job: None,
+    });
+    state.slots[1].occupant = state.slots[0].occupant.take();
+    state.slots[1].job = state.slots[0].job.take();
+    if let Some(job) = state.jobs.get_mut(&seated) {
+        job.slot = Some(1);
+    }
+    state.fold(&FoldPlan {
+        model: "strata-greedy".to_string(),
+        ticket: ticket.clone(),
+        high: 68.4,
+        low: 68.4,
+        attribution: crate::model::MeasuredAttribution::EngineStatus,
+        profile: None,
+        fold_range: true,
+        pair: MeasuredPair::Vram,
+    });
+    assert_eq!(
+        state.slots[1]
+            .occupant
+            .as_ref()
+            .expect("resident")
+            .live_measured_gb,
+        Some(68.4),
+        "the fold credits the slot its ticket actually stands on"
+    );
+    let incoming = rescan_entry(&incoming_yaml, "basalt-live");
+    state.catalog.push(incoming.clone());
+
+    let red = admit_round(&mut state, &incoming, 71.1);
+    assert!(
+        matches!(
+            state.jobs[&red].error,
+            Some(SchedulerError::Admission(
+                AdmissionError::BelowLaunchFloor {
+                    no_releases_reach: true,
+                    ..
+                }
+            ))
+        ),
+        "a folded footprint on a foreign slot is not this swap's release: {:?}",
+        state.jobs[&red].error
+    );
+    await_yaml_keys(&resident_yaml, &["measured_gb: 68.4"]).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T6-d (GSC-01, review 2026-11-06): the credit is the largest of THIS SPAWN's
+/// own readings, never the range-merge result. The spawn starts on a row that
+/// already carries the previous launch's persisted pair (68.4 / 68.3 — the
+/// `MeasuredAnchor` seeds its range from it), then lands ONE small witness
+/// fold of 40.0 through the real `fold`. The merged pair is what the yaml and
+/// the catalog keep (history), but `live_measured_gb` may only hold the spawn's
+/// own 40.0 — a stale on-disk figure must never be credited. A greedy
+/// replacement with a 60 floor therefore still refuses conservatively
+/// (booked 12, own reading 40: no release reaches the floor). Falsifier on the
+/// merge-folded shape: crediting the merged high (68.4, seeded from disk) flips
+/// the live figure and admits the load on the previous launch's bytes.
+#[tokio::test]
+async fn a_stale_persisted_pair_never_rides_the_release_credit() {
+    use super::measured::{FoldPlan, MeasuredPair};
+    use super::{AdmissionError, SchedulerError};
+    let dir = crate::testutil::temp_dir("readmit-live-credit-stale");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let resident_yaml = dir.join("strata-greedy.yaml");
+    std::fs::write(
+        &resident_yaml,
+        "engine: strata\ncost: greedy\nvram_gb: 12\nmeasured_gb: 68.4\nmeasured_gb_min: 68.3\n",
+    )
+    .expect("seed");
+    let incoming_yaml = dir.join("basalt-live.yaml");
+    std::fs::write(
+        &incoming_yaml,
+        "engine: basalt\ncost: greedy\nvram_gb: 67.4\nlaunch_only_with_at_least_vram_free: 60\n",
+    )
+    .expect("seed");
+    let (mut state, _rx) = readmit_state(71.1);
+    let resident = rescan_entry(&resident_yaml, "strata-greedy");
+    let ticket = fold_ticket(18_124);
+    state.catalog = vec![resident.clone()];
+    seat_spawn(&mut state, &resident, &ticket, 18_124);
+    state.slots[0].occupant.as_mut().expect("resident").need = Gibibytes(12.0);
+    let incoming = rescan_entry(&incoming_yaml, "basalt-live");
+    state.catalog.push(incoming.clone());
+
+    state.fold(&FoldPlan {
+        model: "strata-greedy".to_string(),
+        ticket: ticket.clone(),
+        high: 40.0,
+        low: 40.0,
+        attribution: crate::model::MeasuredAttribution::EngineStatus,
+        profile: None,
+        fold_range: true,
+        pair: MeasuredPair::Vram,
+    });
+    assert_eq!(
+        state.slots[0]
+            .occupant
+            .as_ref()
+            .expect("resident")
+            .live_measured_gb,
+        Some(40.0),
+        "the credit is the spawn's own reading; the persisted 68.4 that seeded the range merge is excluded"
+    );
+
+    let red = admit_round(&mut state, &incoming, 71.1);
+    assert!(
+        matches!(
+            state.jobs[&red].error,
+            Some(SchedulerError::Admission(
+                AdmissionError::BelowLaunchFloor {
+                    no_releases_reach: true,
+                    ..
+                }
+            ))
+        ),
+        "booked 12 + own 40 reaches nothing near the 60 floor: {:?}",
+        state.jobs[&red].error
+    );
+    await_yaml_keys(&resident_yaml, &["measured_gb: 68.4"]).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4916,6 +5233,7 @@ fn seated_occupant(name: &str, ticket: &SpawnTicket) -> Occupant {
         stale_config: false,
         serve_id: None,
         measure: None,
+        live_measured_gb: None,
     }
 }
 
@@ -5829,6 +6147,7 @@ async fn a_drained_admission_records_the_drain_rung() {
                 stale_config: false,
                 serve_id: None,
                 measure: None,
+                live_measured_gb: None,
             }),
             job: None,
         },
@@ -6124,6 +6443,7 @@ async fn a_whole_row_waits_for_every_other_holder_and_evicts_nothing() {
                 stale_config: false,
                 serve_id: None,
                 measure: None,
+                live_measured_gb: None,
             }),
             job: None,
         },
@@ -6228,6 +6548,7 @@ async fn a_whole_row_waits_for_every_other_holder_and_evicts_nothing() {
                 stale_config: false,
                 serve_id: None,
                 measure: None,
+                live_measured_gb: None,
             }),
             job: None,
         },
@@ -6294,6 +6615,7 @@ async fn a_whole_row_replaces_its_own_slot_and_waits_for_the_rest() {
                     stale_config: false,
                     serve_id: None,
                     measure: None,
+                    live_measured_gb: None,
                 }),
                 job: None,
             },
@@ -6313,6 +6635,7 @@ async fn a_whole_row_replaces_its_own_slot_and_waits_for_the_rest() {
                     stale_config: false,
                     serve_id: None,
                     measure: None,
+                    live_measured_gb: None,
                 }),
                 job: None,
             },
@@ -6869,6 +7192,7 @@ async fn a_cpu_row_over_the_ram_floor_refuses_naming_its_numbers() {
                 stale_config: false,
                 serve_id: None,
                 measure: None,
+                live_measured_gb: None,
             }),
             job: None,
         },
@@ -6971,6 +7295,7 @@ async fn the_vram_planner_never_considers_or_blames_a_ram_occupant() {
                 stale_config: false,
                 serve_id: None,
                 measure: None,
+                live_measured_gb: None,
             }),
             job: None,
         },
@@ -7065,6 +7390,7 @@ async fn a_whole_gpu_row_never_sees_a_ram_resident_as_a_holder() {
         stale_config: false,
         serve_id: None,
         measure: None,
+        live_measured_gb: None,
     };
     state.slots = vec![
         Slot {
@@ -7324,6 +7650,7 @@ fn ram_settle_seat(model: &str, need: f64, ram_need: Option<f64>, port: u16) -> 
         stale_config: false,
         serve_id: None,
         measure: None,
+        live_measured_gb: None,
     }
 }
 
@@ -7889,6 +8216,7 @@ fn the_two_ledgers_keep_their_rows_apart() {
         stale_config: false,
         serve_id: None,
         measure: None,
+        live_measured_gb: None,
     };
     state.slots = vec![
         Slot {
@@ -8004,6 +8332,7 @@ async fn a_ram_replacement_credits_its_own_slot_once_and_pays_other_ram_loads() 
                     stale_config: false,
                     serve_id: None,
                     measure: None,
+                    live_measured_gb: None,
                 }),
                 job: None,
             },
@@ -8111,6 +8440,7 @@ async fn a_ram_short_admission_evicts_the_yielding_ram_resident() {
                 stale_config: false,
                 serve_id: None,
                 measure: None,
+                live_measured_gb: None,
             }),
             job: None,
         },
@@ -8199,6 +8529,7 @@ async fn a_ram_short_admission_with_no_evictable_ram_resident_refuses_naming_hol
                 stale_config: false,
                 serve_id: None,
                 measure: None,
+                live_measured_gb: None,
             }),
             job: None,
         },
@@ -8302,6 +8633,7 @@ async fn the_ram_planner_never_considers_a_gpu_occupant_as_a_victim() {
                 stale_config: false,
                 serve_id: None,
                 measure: None,
+                live_measured_gb: None,
             }),
             job: None,
         },
@@ -8731,6 +9063,7 @@ async fn a_young_ram_holder_is_a_min_turn_blocker_never_a_same_slot_wall() {
         stale_config: false,
         serve_id: None,
         measure: None,
+        live_measured_gb: None,
     };
     let write_row = |name: &str, ram_gb: &str, min_turn: Option<&str>| {
         let yaml = dir.join(format!("{name}.yaml"));
@@ -9491,6 +9824,7 @@ fn serve_id_state(port: u16, generation: u64, serve_id: Option<&str>) -> ActorSt
             stale_config: false,
             serve_id: serve_id.map(str::to_string),
             measure: None,
+            live_measured_gb: None,
         }),
         job: None,
     }];
@@ -10465,6 +10799,7 @@ async fn the_snapshot_drops_the_ram_labels_for_a_twin_the_fold_never_rebooked() 
             stale_config: false,
             serve_id: None,
             measure: None,
+            live_measured_gb: None,
         }),
         job: None,
     });

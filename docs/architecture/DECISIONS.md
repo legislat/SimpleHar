@@ -758,3 +758,22 @@ recorded here so dated references to ARCHIVED still resolve:
   weekly, and cargo-deny enforces advisories, licenses, bans, and sources. A
   dependency bump must keep the MSRV a deliberate choice.
   | 2026-11-06 | `this change`
+
+- **Same-slot release projection** (operator approval 2026-11-06): the admit
+  credit for the occupant a replacement is about to release is the larger of
+  its booked need and the VRAM footprint its own spawn folded; it is a
+  projection, never a booking, and the settle re-gate stays the physical truth.
+  The figure is `Occupant.live_measured_gb`: set only by a VRAM fold that
+  matches the spawn ticket, never seeded from disk, so no stale pair can be
+  credited; a victim with no this-spawn fold keeps the booked credit and the
+  2026-11-01 guard's verdict. The booking itself is unchanged (DOCTRINE 12).
+  Field incident: a greedy Strata booked `vram_gb: 12` while holding 68.4 GiB,
+  and a Basalt replacement with a 60 GiB floor died on paper ("No releases
+  allow for the VRAM floor") although the release physically fit - the
+  release-first door of the 2026-11-01 ruling was unreachable on a booked
+  credit. Extended logging gained `victim_need_gib` and `victim_release_gib`.
+  Residual (accepted): when the projection overstates what a release frees
+  (foreign traffic during the serve), the release-first kill can precede a
+  settle re-gate that refuses; that is the accepted cost of the 2026-11-01
+  release-first ruling, and the card is never overcommitted.
+  | 2026-11-06 | `this change`

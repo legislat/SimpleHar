@@ -331,8 +331,13 @@ impl ActorState {
     /// The Admit decision, once the witness sample returns. The card's own reading
     /// is the budget (operator 2026-10-26): `total - reserve - observed_used`,
     /// credited for the occupant this job is about to release and debited for what
-    /// other loads have already committed. The ledger survives only as the `budget`
-    /// figure a refusal quotes, and as the whole basis of `ledger_only` witness mode.
+    /// other loads have already committed. The same-slot credit is the larger of
+    /// that occupant's booking and the VRAM footprint its own spawn folded
+    /// (operator ruling 2026-11-06) — a projection, never a booking: the settle
+    /// window re-gates against the physically re-sampled card before spawn, so
+    /// that re-gate stays the physical truth and a wrong projection cannot
+    /// overcommit. The ledger survives only as the `budget` figure a refusal
+    /// quotes, and as the whole basis of `ledger_only` witness mode.
     ///
     /// The two ladders decide here and share one admitted tail: a RAM row is
     /// dispatched to [`Self::finish_admit_ram`] and the card is never consulted
@@ -374,16 +379,51 @@ impl ActorState {
         };
         let declared = self.jobs[&job_id].need;
         let need = declared.unwrap_or_default();
+        // The whole determination reads only the job's gate, so it stands before
+        // the victim block: the whole posture never evicts, so the 2026-11-06
+        // release projection must not ride its `free` either (GSC-02, review
+        // 2026-11-06). The `(greedy, vram_gate)` block below keeps its own reads
+        // and must not redefine this.
+        let whole = matches!(self.jobs[&job_id].vram_gate, crate::model::VramGate::Whole);
         let victim_need = self.jobs[&job_id]
             .slot
             .map(|slot| self.slots[slot].occupant.as_ref().map_or(0.0, |o| o.need.0))
             .unwrap_or(0.0);
+        // The release PROJECTION for the same-slot victim (operator ruling
+        // 2026-11-06): a release frees what the resident physically holds, and for
+        // a greedy row the booking is the nominal `vram_gb` (DOCTRINE 12 keeps the
+        // booking at the declared cost — it does not fix what a release frees), so
+        // the booked figure can badly understate the reclaim. The honest projection
+        // is the larger of the booking and the footprint this spawn's own fold
+        // witnessed (`live_measured_gb`: spawn-ticket matched, never seeded from
+        // disk, so never a stale pair), clamped to what the card actually holds.
+        // The field incident this closes (Strata booked 12.0 / held 68.4, Basalt
+        // floor 60 refused): the swap physically fit and died on paper anyway.
+        // The projection rides the NON-whole credit only (GSC-02): the whole
+        // posture never evicts, so its `free` and its `unreleasable` arm stay on
+        // the booking.
+        let victim_release = self.jobs[&job_id]
+            .slot
+            .map(|slot| {
+                self.slots[slot].occupant.as_ref().map_or(0.0, |o| {
+                    o.need
+                        .0
+                        .max(o.live_measured_gb.unwrap_or(0.0))
+                        .min(occupied)
+                })
+            })
+            .unwrap_or(0.0);
+        // One figure per posture: a `whole` row waits and replaces nothing beyond
+        // its named occupant's booking, so it never spends a projection; every
+        // other posture credits the projected release.
+        let victim_credit = if whole { victim_need } else { victim_release };
         // The bytes this job is about to reclaim are still physically on the card at
-        // sample time, so they are credited; what other loads have committed but not
-        // yet installed is debited, or two concurrent loads spend the same free GiB.
+        // sample time, so they are credited at the posture's figure; what other
+        // loads have committed but not yet installed is debited, or two concurrent
+        // loads spend the same free GiB.
         let in_flight = self.in_flight_need(job_id);
         let free =
-            Gibibytes(total_gib - self.cfg.vram_reserve_gb - occupied + victim_need - in_flight);
+            Gibibytes(total_gib - self.cfg.vram_reserve_gb - occupied + victim_credit - in_flight);
         let facts = BudgetFacts {
             budget: Some(budget::free_gb(
                 Gibibytes(total_gib),
@@ -404,7 +444,6 @@ impl ActorState {
             let job = &self.jobs[&job_id];
             (job.cost == crate::model::CostClass::Greedy, job.vram_gate)
         };
-        let whole = matches!(vram_gate, crate::model::VramGate::Whole);
         // Launch floor: the model's numeric key, else the global greedy
         // default — a greedy quant spawned onto a card already busy with
         // foreign processes thrashes RAM/SSD for minutes before serving
@@ -468,7 +507,10 @@ impl ActorState {
                     // release nothing but the credited same-slot replacement,
                     // so everything else the card holds is unreleasable here
                     // (the reserve band is the operator's allowance for the
-                    // driver baseline — see the variant doc).
+                    // driver baseline — see the variant doc). The whole posture
+                    // credits and quotes the BOOKING only (GSC-02): the
+                    // 2026-11-06 release projection rides the non-whole credit,
+                    // never this account — the posture does not evict.
                     facts.unreleasable = Some(Gibibytes((occupied - victim_need).max(0.0)));
                     facts.used_gib = Some(Gibibytes(occupied));
                     facts.booked_total = Some(self.ledger_sum());
@@ -543,12 +585,13 @@ impl ActorState {
                     // may perform reaches the floor, refuse BEFORE any kill —
                     // "no releases allow for the VRAM floor - check foreign
                     // residents". Releasable = the same-slot victim (already
-                    // credited in `free`) plus every evictable candidate; blockers
-                    // and foreign holders never count toward meeting a floor
-                    // (R5's principle, same arithmetic as R3's `unreleasable`).
-                    // The guard precedes the release-first arm: destroying the
-                    // resident is an accepted cost only for a deficit a release
-                    // could actually fix, never for a floor the card denies.
+                    // credited in `free` at its projected release) plus every
+                    // evictable candidate; blockers and foreign holders never
+                    // count toward meeting a floor (R5's principle, same
+                    // arithmetic as R3's `unreleasable`). The guard precedes the
+                    // release-first arm: destroying the resident is an accepted
+                    // cost only for a deficit a release could actually fix,
+                    // never for a floor the card denies.
                     let best_free = free.0 + considered.iter().map(|v| v.need_gib).sum::<f64>();
                     let no_releases_reach =
                         floor.is_some_and(|f| f - self.cfg.witness_tolerance_gb > best_free);
@@ -556,11 +599,17 @@ impl ActorState {
                     // for same-slot replacements. The victim's booked need can
                     // understate what it actually holds, and a swap that physically
                     // fits must not die on paper (the round-2(A) 5 GiB paper deficit).
-                    // Destroy the victim — it was being replaced by request anyway —
-                    // and let the settle window re-gate the load against the card as
-                    // physically re-sampled. Cross-slot victims are NOT queued here:
-                    // the planner found no sufficient set, and nothing beyond the
-                    // already-doomed resident may be killed on a paper decision.
+                    // Since the 2026-11-06 ruling the credited figure is the larger
+                    // of the booking and the footprint this spawn's own fold
+                    // witnessed, so a greedy resident that books far below its
+                    // footprint reaches this arm on the projection instead of
+                    // dying at the guard; the settle re-gate remains the physical
+                    // truth. Destroy the victim — it was being replaced by request
+                    // anyway — and let the settle window re-gate the load against
+                    // the card as physically re-sampled. Cross-slot victims are NOT
+                    // queued here: the planner found no sufficient set, and nothing
+                    // beyond the already-doomed resident may be killed on a paper
+                    // decision.
                     if !no_releases_reach
                         && self.jobs[&job_id].victim.is_some()
                         && !self.jobs[&job_id].release_first
@@ -584,7 +633,7 @@ impl ActorState {
                         let mut facts = facts;
                         if observed_free.is_some() {
                             let releasable =
-                                victim_need + considered.iter().map(|v| v.need_gib).sum::<f64>();
+                                victim_release + considered.iter().map(|v| v.need_gib).sum::<f64>();
                             facts.unreleasable = Some(Gibibytes((occupied - releasable).max(0.0)));
                             facts.used_gib = Some(Gibibytes(occupied));
                             facts.booked_total = Some(self.ledger_sum());
@@ -678,6 +727,8 @@ impl ActorState {
                 budget_gib = facts.budget.map(|budget| budget.0),
                 booked_gib = self.in_flight_need(job_id),
                 victim = ?job.victim.as_ref().map(|v| v.model.clone()),
+                victim_need_gib = victim_need,
+                victim_release_gib = victim_release,
                 victims = ?job.victims.iter().map(|v| v.model.clone()).collect::<Vec<_>>(),
                 gate_gib = gate_target,
                 "admission decision (extended)"

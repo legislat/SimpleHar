@@ -178,6 +178,12 @@ struct Occupant {
     /// Serving-window witness sampler folding this occupant's total-diff into the
     /// model's measured range; aborted the moment the slot empties (§0.4).
     measure: Option<tokio::task::JoinHandle<()>>,
+    /// The largest VRAM footprint this spawn's own fold witnessed
+    /// (TASK-GREEDY-SWAP-CREDIT, operator ruling 2026-11-06). `None` until this
+    /// spawn folds: never seeded from disk, so it can never be a stale pair —
+    /// the same-slot release credit may only spend what THIS process proved it
+    /// holds (DOCTRINE 12's provenance rule, projected not booked).
+    live_measured_gb: Option<f64>,
 }
 
 struct ActorState {
@@ -1113,6 +1119,7 @@ mod retention_tests {
             // no reactor.
             serve_id: Some(name.to_string()),
             measure: None,
+            live_measured_gb: None,
         }
     }
 

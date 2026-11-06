@@ -349,6 +349,32 @@ impl ActorState {
         } else {
             (high, low)
         };
+        // Same-slot release credit (TASK-GREEDY-SWAP-CREDIT, operator ruling
+        // 2026-11-06): a greedy row books its nominal `vram_gb` (DOCTRINE 12), so
+        // the booking can badly understate what releasing this resident would
+        // physically free, and a replacement swap dies on paper (field incident
+        // 2026-11-06: booked 12.0, held 68.4). Stamp the largest of THIS SPAWN's
+        // OWN readings (`plan.high` of each fold, running max) on the slot
+        // occupant, matched by spawn ticket: the persisted seed the range merge
+        // above uses is excluded, so a stale pair can never be credited (GSC-01,
+        // review 2026-11-06) — the merged `high` stays exactly where it belongs,
+        // in the catalog row and the persist. Admission projects the release from
+        // the own-reading figure; placed before the row-idempotence early return
+        // on purpose: the credit speaks for the process the card still holds, not
+        // for whether the yaml already carries these bytes. A miss (no slot
+        // carries this ticket) is a resident that already left — nothing to
+        // credit. The RAM pair never touches the card figure.
+        if matches!(pair, MeasuredPair::Vram) {
+            let own = plan.high;
+            for slot in self.slots.iter_mut() {
+                if let Some(occupant) = slot.occupant.as_mut() {
+                    if &occupant.ticket == ticket {
+                        occupant.live_measured_gb =
+                            Some(occupant.live_measured_gb.map_or(own, |held| held.max(own)));
+                    }
+                }
+            }
+        }
         let data = MeasuredData {
             high,
             low,
