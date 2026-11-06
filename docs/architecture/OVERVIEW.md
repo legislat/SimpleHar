@@ -11,7 +11,8 @@ review_trigger: behavior-change, release, new-decision
 # OVERVIEW.md
 
 Up: `docs/DOCS_README.md`. This file describes the architecture as shipped,
-verified against `src/` and `Cargo.toml` on 2026-11-03. Binding rules live in
+last verified against `src/` and `Cargo.toml` on 2026-11-03 and editorially
+reviewed on 2026-11-06. Binding rules live in
 `docs/architecture/DOCTRINE.md`; rulings and rationale live in
 `docs/architecture/DECISIONS.md`. This file summarizes and links; it does not
 duplicate either ledger. User-facing setup lives in `README.md`; the config,
@@ -371,8 +372,8 @@ One harness process, one tokio runtime, plus OS-level children:
 
 ## 10. Key invariants
 
-The binding list is `docs/architecture/DOCTRINE.md` (18 items as of
-2026-11-02). Architecturally load-bearing among them: the witness is budget
+The binding list is `docs/architecture/DOCTRINE.md`. Architecturally
+load-bearing among them: the witness is budget
 truth; the scheduler is the single writer; engines obey only harness-owned
 configuration; the harness launches only from L3; reaping is ownership-
 scoped; a stale `(port, generation)` ticket is refused; card evidence

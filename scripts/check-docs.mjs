@@ -2,23 +2,29 @@
 // Rules (docs/DOCS_README.md sections 5 and 6):
 //   1. Front matter with the seven required keys. README.md is exempt: it is the
 //      storefront page and GitHub renders front matter there as a table (2026-11-05 ruling).
-//   2. Relative Markdown links resolve to existing files.
+//   2. Relative Markdown links resolve to existing files, and same-page anchors
+//      (#name) resolve to a heading whose GitHub slug matches (duplicate headings
+//      take -1, -2 suffixes). Cross-file anchors are not checked.
 //   3. No author-specific absolute Windows drive paths in durable docs. Documented
 //      product defaults in README/reference and exact quoted decisions are allowed.
 //      (fail inside code fences too, except for those documented defaults). The
 //      shared machine-path ban set in scripts/machine-path-bans.json is enforced
 //      here and by scripts/release-check.ps1 alike.
 //   4. No duplicate H1.
-//   5. Every durable doc is listed in docs/DOCS_README.md by filename or path.
+//   5. Every durable doc is listed in docs/DOCS_README.md by exact path or by a
+//      link that resolves to it.
 //   6. No literal DRAFT in a doc whose front matter status is active.
 //   7. Repo-relative paths written as inline code resolve to existing files.
 //      Local-only paths (handoff/, ModelConf/, archive/, base-archive/, .kilo/)
-//      are exempt; a path that names a line range keeps its base file.
-// Not scanned: DESIGN.md (historical), handoff/* (local), archive/ and
-// base-archive/ (frozen).
+//      are exempt; a path that names a line range keeps its base file. The
+//      historical DESIGN.md is exempt from this rule only: its dated research
+//      references are frozen history.
+// Not scanned: handoff/* (local), archive/ and base-archive/ (frozen). The
+// frozen pages inside docs/archive/ are not scanned either; only its README,
+// the archive index itself, is a durable checked document.
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -63,7 +69,9 @@ function listFiles(relDir) {
 }
 
 const candidates = [
-  "README.md", "AGENTS.md", "CONTRIBUTING.md", "CHANGELOG.md", INDEX,
+  "README.md", "AGENTS.md", "CONTRIBUTING.md", "CHANGELOG.md", "SECURITY.md",
+  "DESIGN.md", INDEX,
+  "docs/archive/README.md", "examples/README.md",
   ...listFiles("docs/process"),
   ...listFiles("docs/architecture"),
   ...listFiles("docs/evidence"),
@@ -98,7 +106,34 @@ function parseFrontMatter(rel, entries) {
   return { keys, status };
 }
 
-function checkLinks(rel, entries) {
+// GitHub heading slugs: lowercase, drop punctuation and symbols (keep word
+// characters, spaces, and hyphens), then spaces to hyphens. Duplicate headings
+// gain -1, -2 suffixes, as on GitHub.
+function headingSlug(text) {
+  return text
+    .toLowerCase()
+    .replace(/[\u2000-\u206F\u2E00-\u2E7F\\'!"#$%&()*+,./:;<=>?@[\]^`{|}~]/g, "")
+    .replace(/\s/g, "-");
+}
+
+function headingSlugs(entries) {
+  const slugs = new Set();
+  const counts = new Map();
+  for (const e of entries) {
+    if (e.inFence) continue;
+    const m = e.line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (!m) continue;
+    const text = m[2].replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+    let slug = headingSlug(text);
+    const seen = counts.get(slug) || 0;
+    if (seen > 0) slug = `${slug}-${seen}`;
+    counts.set(headingSlug(text), seen + 1);
+    slugs.add(slug);
+  }
+  return slugs;
+}
+
+function checkLinks(rel, entries, slugs) {
   const baseDir = dirname(join(ROOT, rel));
   for (const e of entries) {
     if (e.inFence) continue;
@@ -107,7 +142,13 @@ function checkLinks(rel, entries) {
     while ((m = re.exec(e.line)) !== null) {
       let target = m[1];
       if (/^[a-z][a-z0-9+.-]*:/i.test(target)) continue; // http:, mailto:, ...
-      if (target.startsWith("#")) continue; // same-page anchor
+      if (target.startsWith("#")) {
+        const anchor = decodeURIComponent(target.slice(1)).toLowerCase();
+        if (!slugs.has(anchor)) {
+          fail(rel, e.n, `unresolved same-page anchor: ${target}`);
+        }
+        continue;
+      }
       target = decodeURIComponent(target.split("#")[0]);
       if (target === "") continue;
       if (!existsSync(resolve(baseDir, target))) {
@@ -134,7 +175,14 @@ function isLocalOnly(target) {
     LOCAL_ONLY_PREFIXES.some((p) => target.startsWith(p));
 }
 
+// Rule 7 exemption: the historical design record cites dated local research
+// paths that no longer resolve, and its frozen text is never edited to satisfy
+// a checker (the review's "stale local-only references are historical by
+// design"). Every other rule still applies to it.
+const PATH_RULE_EXEMPT = new Set(["DESIGN.md"]);
+
 function checkInlinePaths(rel, entries) {
+  if (PATH_RULE_EXEMPT.has(rel)) return;
   const baseDir = join(ROOT, rel);
   for (const e of entries) {
     if (e.inFence) continue;
@@ -167,6 +215,28 @@ const indexText = existsSync(join(ROOT, INDEX))
   : "";
 if (indexText === "") fail(INDEX, 1, "documentation index is missing; coverage cannot be checked");
 
+// Exact index coverage: every link target in the index, resolved against the
+// index file's directory. A plain full-path string in the index text also
+// counts; a bare filename no longer does (substring matching hid orphans).
+const indexResolved = new Set();
+if (indexText !== "") {
+  const indexDir = dirname(join(ROOT, INDEX));
+  for (const e of parseLines(indexText)) {
+    if (e.inFence) continue;
+    const re = /\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+    let m;
+    while ((m = re.exec(e.line)) !== null) {
+      let target = m[1];
+      if (/^[a-z][a-z0-9+.-]*:/i.test(target)) continue;
+      target = decodeURIComponent(target.split("#")[0]);
+      if (target === "") continue;
+      const abs = resolve(indexDir, target);
+      const relTarget = relative(ROOT, abs).split(sep).join("/");
+      if (!relTarget.startsWith("..")) indexResolved.add(relTarget);
+    }
+  }
+}
+
 for (const rel of docs) {
   const text = readFileSync(join(ROOT, rel), "utf8");
   const entries = parseLines(text);
@@ -191,8 +261,8 @@ for (const rel of docs) {
     }
   }
 
-  // 2. Relative links.
-  checkLinks(rel, entries);
+  // 2. Relative links and same-page anchors.
+  checkLinks(rel, entries, headingSlugs(entries));
 
   // 7. Repo-relative paths in inline code.
   checkInlinePaths(rel, entries);
@@ -229,12 +299,15 @@ for (const rel of docs) {
     fail(rel, e.n, `duplicate H1 (first H1 is line ${h1s[0].n})`);
   }
 
-  // 5. Index coverage: the index lists every durable doc by path or filename.
-  //    The index itself cannot list itself.
+  // 5. Index coverage: the index lists every durable doc by exact path, by a
+  //    link that resolves to it, or by a docs-relative path string. The index
+  //    itself cannot list itself.
   if (rel !== INDEX && indexText !== "") {
-    const name = rel.split("/").pop();
-    if (!indexText.includes(rel) && !indexText.includes(name)) {
-      fail(rel, 1, `orphan doc: not listed in ${INDEX} by path or filename`);
+    const docsRel = rel.startsWith("docs/") ? rel.slice("docs/".length) : null;
+    const listed = indexResolved.has(rel) || indexText.includes(rel) ||
+      (docsRel !== null && indexText.includes(docsRel));
+    if (!listed) {
+      fail(rel, 1, `orphan doc: not listed in ${INDEX} by exact path or resolving link`);
     }
   }
 }

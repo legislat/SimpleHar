@@ -13,6 +13,17 @@ review_trigger: behavior-change, release
 Up: `docs/DOCS_README.md`. This file owns the ModelConf schema and the
 engine-specific model keys.
 
+## Contents
+
+- [Model files: `ModelConf/*.yaml`](#model-files-modelconfyaml)
+- [Rows are hand-written (operator ruling 2026-11-06)](#rows-are-hand-written-operator-ruling-2026-11-06)
+- [Llama engines](#llama-engines)
+- [Strata engines](#strata-engines)
+- [Basalt engines](#basalt-engines)
+- [Maya engines](#maya-engines)
+- [Ninfer engines](#ninfer-engines)
+  - [autostart.sh template](#autostartsh-template)
+
 ## Model files: `ModelConf/*.yaml`
 
 Write one flat `key: value` file per model. The harness keeps `#` comments

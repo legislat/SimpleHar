@@ -25,6 +25,12 @@ this file is the table of contents; other documents link to it.
 | Understand the system design | [docs/architecture/OVERVIEW.md](architecture/OVERVIEW.md) |
 | Know what the OpenAI surface does and does not do | [docs/reference/COMPATIBILITY.md](reference/COMPATIBILITY.md) |
 | Set up an engine to run with the harness | [docs/reference/ENGINE-RECIPES.md](reference/ENGINE-RECIPES.md) |
+| Know the security policy or report a security problem | [SECURITY.md](../SECURITY.md) |
+| Operate the harness: autostart, upgrade, backup, logs | [docs/reference/OPERATIONS.md](reference/OPERATIONS.md) |
+| Recover from a down listener, stuck release, or refusal | [docs/reference/RUNBOOK.md](reference/RUNBOOK.md) |
+| Diagnose a failure case | [docs/reference/TROUBLESHOOTING.md](reference/TROUBLESHOOTING.md) |
+| Use the command line or the import verb | [docs/reference/CLI.md](reference/CLI.md) |
+| Start from a ready model row | [examples/README.md](../examples/README.md) |
 | Know why a decision was made | [docs/architecture/DECISIONS.md](architecture/DECISIONS.md) (and [DESIGN.md](../DESIGN.md) for history) |
 | Add or change code | [docs/process/ENGINEERING.md](process/ENGINEERING.md) |
 | Run the gate | [docs/process/VERIFICATION.md](process/VERIFICATION.md) |
@@ -98,14 +104,28 @@ durable and belongs in this tree.
 | [COMPATIBILITY.md](reference/COMPATIBILITY.md) | OpenAI compatibility matrix, known-good configurations | active |
 | [OPERATIONS.md](reference/OPERATIONS.md) | Autostart, file layout, upgrade, uninstall, backup, log retention | active |
 | [TROUBLESHOOTING.md](reference/TROUBLESHOOTING.md) | Failure diagnosis | active |
+| [RUNBOOK.md](reference/RUNBOOK.md) | Sanitized operator recovery procedures | active |
+| [CLI.md](reference/CLI.md) | Command-line verbs and exit behavior | active |
 
 ### docs/evidence/ (dated card and measurement records)
 
 | Document | Owns | Status |
 |---|---|---|
-| [v1.3.0-card-run.md](evidence/v1.3.0-card-run.md) | v1.3.0 CPU-llama card proof | active |
-| [v1.3.2-card-run.md](evidence/v1.3.2-card-run.md) | v1.3.2 Project Maya engine card proof | active |
-| [2026-11-04-engine-measurement.md](evidence/2026-11-04-engine-measurement.md) | Engine VRAM surface measurements | active |
+| [v1.3.0-card-run.md](evidence/v1.3.0-card-run.md) | v1.3.0 CPU-llama card proof | historical |
+| [v1.3.2-card-run.md](evidence/v1.3.2-card-run.md) | v1.3.2 Project Maya engine card proof | historical |
+| [2026-11-04-engine-measurement.md](evidence/2026-11-04-engine-measurement.md) | Engine VRAM surface measurements (cited as current by MODELS.md) | active |
+
+### examples/
+
+| File | Owns | Status |
+|---|---|---|
+| [README.md](../examples/README.md) | Model-row templates: one row per engine, one row per category | active |
+
+### docs/archive/
+
+| File | Owns | Status |
+|---|---|---|
+| [README.md](archive/README.md) | Index and banner convention for superseded durable documents | active |
 
 ## 4. Documentation language
 
@@ -137,10 +157,11 @@ style.
   its `last_reviewed`. New decisions and new engines trigger immediate review
   of the affected overview.
 - Archive rule: a superseded durable project document moves to
-  `docs/archive/` with a status banner, never silently deleted. Maintenance
-  and audit records live in the local-only layer, never in the public tree.
-  `archive/` and `base-archive/` are frozen and are never read for current
-  behavior.
+  `docs/archive/` with a status banner, never silently deleted. A superseded
+  page is listed in [docs/archive/README.md](archive/README.md).
+  Maintenance and audit records live in the local-only layer, never in the
+  public tree. `archive/` and `base-archive/` are frozen and are never read
+  for current behavior.
 - No duplication: one fact, one home; every other mention is a pointer. A
   labeled summary that links to the source is allowed; copying a command
   list, a doctrine paragraph, or a schema table is a defect.

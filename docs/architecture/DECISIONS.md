@@ -23,6 +23,16 @@ with one operator-ruled exception dated 2026-11-03: the status annotation pass m
 lifecycle labels, the section title, and reference qualifiers only; ruling text may not
 change and no ruling may be deleted.
 
+## Contents
+
+Entries carry no stable IDs, so this index points at the four sections. The
+entries themselves are bullet lines inside each section.
+
+- [LOCKED (operator doctrine - binding on all agents)](#locked-operator-doctrine---binding-on-all-agents)
+- [DEFERRED (decided later - tripwire in parentheses re-opens it)](#deferred-decided-later---tripwire-in-parentheses-re-opens-it)
+- [DELIVERED (tripwire fired; the delivery line lives in the dated rulings)](#delivered-tripwire-fired-the-delivery-line-lives-in-the-dated-rulings)
+- [DATED RULINGS (binding until superseded; status is explicit)](#dated-rulings-binding-until-superseded-status-is-explicit)
+
 ## LOCKED (operator doctrine - binding on all agents)
 
 - Scrapped by operator: bonsai class, engine adoption, preload at boot, parallel soak,

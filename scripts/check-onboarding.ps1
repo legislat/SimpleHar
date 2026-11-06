@@ -50,11 +50,15 @@ try {
     "AGENTS.md",
     "README.md",
     "CONTRIBUTING.md",
+    "SECURITY.md",
     "CHANGELOG.md",
+    "DESIGN.md",
     "docs/DOCS_README.md",
+    "docs/archive/README.md",
     "docs/architecture/DOCTRINE.md",
     "docs/architecture/DECISIONS.md",
     "docs/architecture/OVERVIEW.md",
+    "docs/architecture/DEFERRED-IDEAS.md",
     "docs/process/ENGINEERING.md",
     "docs/process/VERIFICATION.md",
     "docs/process/GIT_WORKFLOW.md",
@@ -62,7 +66,8 @@ try {
     "docs/process/HANDOFF.md",
     "docs/process/REVIEW.md",
     "docs/process/GOTCHAS.md",
-    "docs/process/PUBLICATION.md"
+    "docs/process/PUBLICATION.md",
+    "examples/README.md"
   )
   foreach ($rel in $required) {
     Report (Test-Path -LiteralPath (Join-Path $clone $rel)) ("required file exists: " + $rel)
@@ -72,6 +77,10 @@ try {
     "docs/reference/CONFIG.md",
     "docs/reference/MODELS.md",
     "docs/reference/API.md",
+    "docs/reference/COMPATIBILITY.md",
+    "docs/reference/ENGINE-RECIPES.md",
+    "docs/reference/CLI.md",
+    "docs/reference/RUNBOOK.md",
     "docs/reference/OPERATIONS.md",
     "docs/reference/TROUBLESHOOTING.md"
   )

@@ -20,9 +20,10 @@ Decision D6 approves the narrative commit style recorded here.
   releasable.
 - Internal work is trunk-based. The authorized main or orchestrator session
   commits directly to `main`.
-- External contributors may open pull requests. CI runs on `pull_request`.
-  Dependabot opens weekly update pull requests (see Toolchain and dependency
-  policy).
+- External contributions arrive as pull requests from forks. CI runs on both
+  `push` to `main` and `pull_request`.
+- Dependabot opens weekly update pull requests for dependencies (see Toolchain
+  and dependency policy).
 - Subagents never commit. The main session commits reviewed work.
 - A non-trivial change needs a subagent review before it lands on `main`. The review
   artifact lives in evidence, not in Git. The method lives in `docs/process/REVIEW.md`.

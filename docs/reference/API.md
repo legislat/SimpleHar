@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [HTTP control API contract, error codes, memory provenance]
-last_reviewed: 2026-11-05
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
@@ -31,7 +31,11 @@ names the state or the blockers in `message`. The `wakes_slot` predicate and
 its route-table falsifier pin this contract. A future route that would wake a
 slot on a read fails the pin.
 
-## Control listener endpoints (8708)
+## Control listener endpoints (default port 8708)
+
+The control listener is the category that carries `control: true` in the
+config file. Its public port defaults to 8708; a `public_port` value can move
+it. `CONFIG.md` owns the category listener port matrix.
 
 | Endpoint | Body / meaning |
 |---|---|

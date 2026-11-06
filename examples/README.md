@@ -1,3 +1,13 @@
+---
+title: Example model rows
+owner: operator
+status: active
+audience: [user]
+source_of_truth_for: [example model row set]
+last_reviewed: 2026-11-06
+review_trigger: behavior-change, release
+---
+
 # examples
 
 Model-row templates for SimpleHarn. They are not config. Copy one file

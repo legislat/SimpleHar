@@ -10,9 +10,10 @@ review_trigger: behavior-change, release
 
 # Configuration reference
 
-Up: `docs/DOCS_README.md`. This file owns the harness configuration keys and
-the category eviction rules. The category and port matrix itself lives in
-`README.md` (Categories and ports).
+Up: `docs/DOCS_README.md`. This file owns the harness configuration keys,
+the category eviction rules, and the category listener port matrix. The
+`README.md` Categories and ports section is a short summary of these
+documented defaults; this file is the owner.
 
 ## The config file: `simpleharn.json`
 
@@ -30,6 +31,19 @@ is authoritative.** A `default_model` change made on the page persists back
 to the exact file boot read, through an atomic rewrite. The harness completes
 partial files. An invalid file stops boot and the harness logs every problem;
 it never applies silent defaults.
+
+## Environment variables
+
+The harness reads exactly three environment names: `SIMPLEHARN_CONFIG`,
+`SIMPLEHARN_TOKEN`, and `SIMPLEHARN_LOG`. No other spelling is read. The old
+`SIMPLEHAR_*` names are inert: they change nothing, warn nothing, and grant
+nothing.
+
+| Name | Behavior |
+|---|---|
+| `SIMPLEHARN_CONFIG` | The explicit config file path. It wins over the default location beside the executable. The named file must exist: boot fails when it does not, and first-start creation never writes to this path. |
+| `SIMPLEHARN_TOKEN` | The control token. It beats the `control_token` field and keeps the secret out of the file. When the name is unset, `control_token` still applies. |
+| `SIMPLEHARN_LOG` | The tracing filter for the console and the `/har/log` ring, as an `EnvFilter` directive (for example `info`, `debug`, or `simpleharn=trace`). Unset: the level is `info`. An invalid value does not silence the harness: it falls back to `info`, and the harness logs one warning after the log subscriber exists. The on-disk harness log keeps its own `INFO` floor whatever this name asks for (see the Log retention section of `docs/reference/OPERATIONS.md`). |
 
 ## Fields
 
@@ -79,7 +93,7 @@ Each entry in `categories` declares one category. The keys:
   the id. An unset key serializes nothing, so an existing file keeps its
   exact shape, and the write-back preserves a set label.
 - `public_port`: the public HTTP listener that serves the category. The
-  defaults are the matrix in `README.md` (Categories and ports).
+  defaults are the table in "Category listener ports" below.
 - `max_models`: the slot count. 1-6 for AUX, exactly 1 for every other
   category. AUX can hold up to six models at once.
 - `default_model`: the model the harness loads for the category when a
@@ -98,6 +112,19 @@ Each entry in `categories` declares one category. The keys:
 
 Every value is declarative.
 
+## Category listener ports
+
+This table is the category listener port matrix. A `public_port` value can
+move a category off its default. Exactly one category carries `control:
+true`: it hosts the control page and the `/har/*` routes.
+
+| Category id | Default port | Default slots | Control listener |
+|---|---|---|---|
+| `WORK` | 8708 | 1 | yes (default carrier) |
+| `RP` | 8709 | 1 | no |
+| `AUX` | 8710 | 1-6 | no |
+| `EMB` | 8711 | 1 | no |
+
 ## Port plan
 
 The harness assigns engine ports per slot, sequentially from 18109. The
@@ -108,8 +135,7 @@ the plan reaches `18117`.
 
 ## Eviction rules
 
-The `evictable_by` field is the eviction priority matrix: the "Evicted by"
-column of the matrix in `README.md` (Categories and ports). It is the only
+The `evictable_by` field is the eviction priority matrix. It is the only
 category-level rule that decides which models the scheduler unloads to make
 room. When a load does not fit the free VRAM, the scheduler first unloads
 occupants of the **other** categories that may evict them. The matrix is a

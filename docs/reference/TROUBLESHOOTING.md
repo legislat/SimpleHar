@@ -4,15 +4,16 @@ owner: operator
 status: active
 audience: [user, contributor, agent]
 source_of_truth_for: [troubleshooting and failure diagnosis]
-last_reviewed: 2026-11-03
+last_reviewed: 2026-11-06
 review_trigger: behavior-change, release
 ---
 
 # Troubleshooting
 
 Up: `docs/DOCS_README.md`. This file owns troubleshooting and failure
-diagnosis. Log retention counts live in the Log retention section of
-`docs/reference/OPERATIONS.md`.
+diagnosis. The operator recovery sequences for these cases live in
+[RUNBOOK.md](RUNBOOK.md). Log retention counts live in the Log retention
+section of `docs/reference/OPERATIONS.md`.
 
 - **A port will not bind.** The status line and the log name the port. If a
   Hyper-V/WSL2 dynamic reservation covers the port, the harness already

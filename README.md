@@ -126,9 +126,9 @@ The four category listeners on ports 8708-8711 answer the OpenAI-compatible API.
 The four category names are display-only defaults. A `categories` entry can
 set an optional `label` to rename what the page and `/har/status` show. The
 ids stay the vocabulary: requests, model yamls, and the eviction matrix keep
-using them. See [docs/reference/CONFIG.md](docs/reference/CONFIG.md).
-
-The full port plan is in [docs/reference/CONFIG.md](docs/reference/CONFIG.md).
+using them. This table is a summary of the documented defaults. The category
+port matrix, the engine port plan, and the eviction rules live in
+[docs/reference/CONFIG.md](docs/reference/CONFIG.md).
 
 ## Control page and tray
 
@@ -141,20 +141,13 @@ unload actions, and Exit.
 
 ## Configuration
 
-The authoritative `simpleharn.json` sits beside the exe; page edits persist to it. Core
-keys:
-
-- `internal_host`: bind address. Default `127.0.0.1`. Read Security before you change it.
-- `control_token`: when set, every route except the page assets requires it. The
-  `SIMPLEHARN_TOKEN` environment variable overrides it and keeps the secret out of the
-  file. The old `SIMPLEHAR_TOKEN` spelling is inert.
-- `categories`: per-category id, port, slots, default model, and eviction.
-- `vram_total_gb`: admission ceiling. First run normally detects it from the card.
-- `modelconf_dir`: catalog directory. Default: a `ModelConf` folder beside the exe.
-
-The full field table is in [docs/reference/CONFIG.md](docs/reference/CONFIG.md). Each
-model is one flat `key: value` YAML file in `ModelConf`; the full schema and the engine
-knobs are in [docs/reference/MODELS.md](docs/reference/MODELS.md).
+The authoritative `simpleharn.json` sits beside the exe; page edits persist to
+it. Each model is one flat `key: value` YAML file in `ModelConf`. The core
+keys cover the bind address, the control token, the categories, the admission
+ceiling, and the catalog directory. The full field table, the environment
+variables, the category port matrix, and the eviction rules are in
+[docs/reference/CONFIG.md](docs/reference/CONFIG.md). The model schema and the
+engine knobs are in [docs/reference/MODELS.md](docs/reference/MODELS.md).
 
 ## HTTP API
 
@@ -166,41 +159,34 @@ loaded. The control routes, memory provenance, and error codes are in
 
 ## Security
 
-The API is unauthenticated by default, and it binds to loopback. Set `SIMPLEHARN_TOKEN`
-(or `control_token`) before any non-loopback bind. The harness still allows a
-non-loopback `internal_host` such as `0.0.0.0` without a token. The control page then
-shows a persistent warning banner on every read. Do not expose the harness to a LAN
-without a token.
-
-- With a token set, every route except the page assets requires it, on `X-Har-Token` or
-  `Authorization: Bearer`. The harness never logs the token and never accepts it from a
-  URL.
-- The harness forces every engine it starts onto a loopback listener, regardless of
-  `internal_host`. The token guards the harness's own listeners only.
-- Structural guards run before the token check: a cross-site `Origin` on a POST gets 403,
-  and a missing `application/json` content type gets 415.
+The API is unauthenticated by default, and it binds to loopback. Set
+`SIMPLEHARN_TOKEN` (or `control_token`) before any non-loopback bind. The
+harness still allows a non-loopback `internal_host` such as `0.0.0.0` without
+a token. The control page then shows a persistent warning banner on every
+read. Do not expose the harness to a LAN without a token. With a token set,
+every route except the page assets requires it. The harness forces every
+engine it starts onto a loopback listener, whatever `internal_host` says. The
+full policy is in [SECURITY.md](SECURITY.md); the token and bind keys are in
+[docs/reference/CONFIG.md](docs/reference/CONFIG.md).
 
 ## Requirements
 
-| Engine | What runs | What the machine needs |
-|---|---|---|
-| `llama` (default) | a native `llama-server.exe` process per model, serving a GGUF file | a llama.cpp build; first run detects and records a `llama-server.exe` found on PATH; `llama_server_exe` sets an optional global default, and a model row can override it for its own fork |
-| `strata` | a Python server in a virtualenv, on a harness-rendered profile | a Strata install with its virtualenv and engine binary; the interpreter and working directory are config keys |
-| `basalt` | a Python server in a virtualenv, on a harness-rendered profile | a Basalt install with its virtualenv and engine binary; the row names the interpreter, working directory, and engine |
-| `maya` | a Python server in a virtualenv, on a harness-staged model config | a Project Maya install with its virtualenv and engine; the row names the interpreter, root, and model config |
-| `ninfer` | a GPU container inside WSL2, staged and reaped by the harness | a WSL2 distro, Docker, and the ninfer image; set `wsl_distro` / `wsl_user` |
-
-GPU memory is read through NVML with an `nvidia-smi` fallback. WSL2 and Docker are needed
-only for `ninfer`. One GGUF file is needed per `llama` model. Minimal per-engine setup is
-in [ENGINE-RECIPES.md](docs/reference/ENGINE-RECIPES.md).
+Windows 10 or 11, one NVIDIA GPU. The `llama` path needs a llama.cpp build
+that runs `llama-server.exe`; first run detects one found on PATH. The
+`strata`, `basalt`, and `maya` paths need their engine install and its Python
+environment. The `ninfer` path needs WSL2 and Docker; it runs a GPU container.
+GPU memory is read through NVML with an `nvidia-smi` fallback. One GGUF file
+is needed per `llama` model. Minimal per-engine setup is in
+[ENGINE-RECIPES.md](docs/reference/ENGINE-RECIPES.md).
 
 ## Troubleshooting
 
-Common cases: a port that will not bind (a Hyper-V/WSL2 reservation often covers it), a
-missing model file at boot (the scan drops the row and reports it), and a repeated
-refusal (unload something; the harness never over-admits). The full list, with the
-`netsh` fix for reserved ports, is in
+Common cases: a port that will not bind (a Hyper-V/WSL2 reservation often
+covers it), a missing model file at boot (the scan drops the row and reports
+it), and a repeated refusal (unload something; the harness never
+over-admits). The full list, with the `netsh` fix for reserved ports, is in
 [docs/reference/TROUBLESHOOTING.md](docs/reference/TROUBLESHOOTING.md).
+Operator recovery procedures are in [docs/reference/RUNBOOK.md](docs/reference/RUNBOOK.md).
 
 ## Docs, help, and license
 
@@ -211,6 +197,11 @@ refusal (unload something; the harness never over-admits). The full list, with t
 | Architecture overview | [docs/architecture/OVERVIEW.md](docs/architecture/OVERVIEW.md) |
 | HTTP API reference | [docs/reference/API.md](docs/reference/API.md) |
 | OpenAI compatibility matrix | [docs/reference/COMPATIBILITY.md](docs/reference/COMPATIBILITY.md) |
+| Security policy and reporting | [SECURITY.md](SECURITY.md) |
+| Operations reference | [docs/reference/OPERATIONS.md](docs/reference/OPERATIONS.md) |
+| Troubleshooting | [docs/reference/TROUBLESHOOTING.md](docs/reference/TROUBLESHOOTING.md) |
+| CLI verbs | [docs/reference/CLI.md](docs/reference/CLI.md) |
+| Operator runbook | [docs/reference/RUNBOOK.md](docs/reference/RUNBOOK.md) |
 | Model schema reference | [docs/reference/MODELS.md](docs/reference/MODELS.md) |
 | Example model rows | [examples/README.md](examples/README.md) |
 | Configuration reference | [docs/reference/CONFIG.md](docs/reference/CONFIG.md) |

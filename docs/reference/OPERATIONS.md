@@ -99,3 +99,9 @@ survive, rolled generations included. Engine children keep
 `logs/<model>-<epoch>.log`. Per model, the newest five launches' client
 captures and container snapshots survive; the harness log budget is
 separate and can neither consume nor add to that per-model budget.
+
+## Recovery
+
+For repeatable recovery procedures (a down listener, a stuck release, a
+stale row, a foreign resident, wrong-looking free memory), see
+[RUNBOOK.md](RUNBOOK.md).

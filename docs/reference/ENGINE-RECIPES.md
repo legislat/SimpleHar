@@ -12,7 +12,10 @@ review_trigger: engine-change, release
 
 Minimal recipes for the engines the harness runs, for an installed engine or a
 fresh install. Rows go in `ModelConf/`; restart or rescan after you add one.
-The harness forces the bind, the port and the key.
+The harness forces the bind, the port and the key. The YAML file stem is the
+model identity: a `name` key that differs from the stem is refused at scan,
+so rename the file or drop the key. Ready rows are in
+[examples/README.md](../../examples/README.md).
 
 Use `cost: greedy` with a launch floor for an engine that offloads experts;
 `cost: fixed` with `vram_gb` for a fixed resident. `load_timeout` is the

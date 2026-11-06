@@ -13,7 +13,7 @@ body:
     attributes:
       label: SimpleHarn version
       description: The version shown in the page header or `GET /har/status`.
-      placeholder: "1.3.3"
+      placeholder: "<version>"
     validations:
       required: true
   - type: input
