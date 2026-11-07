@@ -9,7 +9,7 @@ and it refuses to overcommit. The product name is SimpleHarn, and the repository
 `legislat/SimpleHarn`. The binary is `simpleharn.exe`, the config file is `simpleharn.json`,
 and the environment names use the `SIMPLEHARN_` prefix.
 
-Current release: **v1.3.4**. Windows 10/11, one NVIDIA GPU, single user.
+Current release: **v1.4.0**. Windows 10/11, one NVIDIA GPU, single user.
 Prebuilt binaries: see the GitHub Releases page of this repository. The release
 zip holds `simpleharn.exe`, `SimpleHarn.vbs`, `README.md`, `LICENSE`, and
 `docs/assets/control-page.png`. Models and engine installs are yours.
@@ -48,7 +48,7 @@ can parse them reliably. The trade is that some pages read terse.
 
 ### Prebuilt
 
-1. Download `SimpleHarn-1.3.4-win-x64.zip` from the Releases page and unzip it.
+1. Download `SimpleHarn-1.4.0-win-x64.zip` from the Releases page and unzip it.
 2. Put one flat `.yaml` row in `ModelConf` beside the exe. The harness creates that
    folder on boot if it is missing; it does not create an example row. Ready rows for
    every engine are in [examples/](examples/README.md).

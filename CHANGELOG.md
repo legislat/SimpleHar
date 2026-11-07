@@ -4,7 +4,7 @@ owner: operator
 status: active
 audience: [user, maintainer]
 source_of_truth_for: [release history]
-last_reviewed: 2026-11-06
+last_reviewed: 2026-11-07
 review_trigger: release
 ---
 
@@ -17,6 +17,8 @@ Versioning.
 Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
 
 ## Unreleased
+
+## v1.4.0 - 2026-11-07
 
 ### Added
 
@@ -40,6 +42,18 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
   Actions weekly.
 - Documented as a design choice: the harness scans only `ModelConf/*.yaml` and
   never model directories. Model rows stay hand-written (`MODELS.md`).
+- Dependencies updated: nvml-wrapper 0.13, reqwest 0.13, tower-http 0.7,
+  base64 0.23. The card witness reads the NVML v2 memory report, so witness
+  figures may shift slightly.
+
+### Fixed
+
+- A same-slot replacement of a greedy model now admits when it physically
+  fits. The release credit is the larger of the resident's nominal booking and
+  the footprint its own running spawn measured; once that measurement lands,
+  the swap clears the floor and the victim releases first. Before the first
+  measurement lands the nominal booking still governs, and the paper refusal
+  is unchanged.
 
 ## v1.3.4 - 2026-11-06
 
