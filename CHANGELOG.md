@@ -55,6 +55,12 @@ Rule: no tag without a dated entry here and a matching `Cargo.toml` version.
   measurement lands the nominal booking still governs, and the paper refusal
   is unchanged.
 
+Tag: `v1.4.0`. Commit: `4978343` (release prep). Artifact: `simpleharn.exe`,
+built 2026-11-07, SHA256
+`284FD5708BDBAEB7C406255B670CE7290BB2677385F5D725B0AE1DA44588E33E`, zip
+`SimpleHarn-1.4.0-win-x64.zip` SHA256
+`5735531E40FA0007CAD0D5D3571D17E53D7039D00401490DE449F477A056FCCA`.
+
 ## v1.3.4 - 2026-11-06
 
 ### Fixed
